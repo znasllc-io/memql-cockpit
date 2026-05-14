@@ -1,34 +1,59 @@
-.PHONY: cockpit cockpit-gui cockpit-all-platforms cockpit-gui-all-platforms \
-        cockpit-darwin-arm64 cockpit-darwin-amd64 cockpit-linux-amd64 cockpit-linux-arm64 \
-        cockpit-gui-darwin-arm64 cockpit-gui-darwin-amd64 cockpit-gui-linux-amd64 cockpit-gui-linux-arm64 \
-        run-cockpit clean test vet
+# memQL Cockpit Makefile
+# Source of truth for all build, test, run, and development commands.
+#
+# Usage:
+#   make              Build memQL Cockpit (host platform, headless)
+#   make help         Show all available targets
+#   make cockpit-gui  Build GUI variant (CGO + RobotGo)
+#   make test         Run all tests
 
-GO     ?= go
-GOFLAGS ?=
-BIN_DIR ?= bin
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+GO          := go
+GOFLAGS     := -v
+CGO_ENABLED := 0
+BIN_DIR     := bin
+VERSION     := $(shell cat VERSION 2>/dev/null || echo "dev")
+
+# ---------------------------------------------------------------------------
+# Build targets
+# ---------------------------------------------------------------------------
+
+.PHONY: all cockpit cockpit-darwin-arm64 cockpit-darwin-amd64 cockpit-linux-amd64 cockpit-linux-arm64 cockpit-all-platforms cockpit-gui cockpit-gui-darwin-arm64 cockpit-gui-darwin-amd64 cockpit-gui-linux-amd64 cockpit-gui-linux-arm64 cockpit-gui-all-platforms
+
+## Default target -- build memQL Cockpit (host platform, headless)
+all: cockpit
 
 ## Build memQL Cockpit (host platform, headless)
 cockpit:
 	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/memql-cockpit ./cmd/memql-cockpit
 
+## Build Cockpit for macOS Apple Silicon
 cockpit-darwin-arm64:
 	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BIN_DIR)/memql-cockpit-darwin-arm64 ./cmd/memql-cockpit
 
+## Build Cockpit for macOS Intel
 cockpit-darwin-amd64:
 	GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BIN_DIR)/memql-cockpit-darwin-amd64 ./cmd/memql-cockpit
 
+## Build Cockpit for Linux x86_64
 cockpit-linux-amd64:
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BIN_DIR)/memql-cockpit-linux-amd64 ./cmd/memql-cockpit
 
+## Build Cockpit for Linux aarch64
 cockpit-linux-arm64:
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BIN_DIR)/memql-cockpit-linux-arm64 ./cmd/memql-cockpit
 
+## Build Cockpit for all supported platforms (headless)
 cockpit-all-platforms: cockpit-darwin-arm64 cockpit-darwin-amd64 cockpit-linux-amd64 cockpit-linux-arm64
 
 ## Build Cockpit GUI variant (CGO + RobotGo). Enables workerComputer.*
 ## actions in `memql-cockpit worker run`. Requires platform-native
 ## build tooling: macOS Xcode CLT, Linux gcc + libxtst-dev / libxinerama-dev /
-## libxkbcommon-dev / libpng-dev.
+## libxkbcommon-dev / libpng-dev. Default `make cockpit` is the
+## headless variant and ships everywhere.
 cockpit-gui:
 	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags gui -o $(BIN_DIR)/memql-cockpit-gui ./cmd/memql-cockpit
 
@@ -44,16 +69,128 @@ cockpit-gui-linux-amd64:
 cockpit-gui-linux-arm64:
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags gui -o $(BIN_DIR)/memql-cockpit-gui-linux-arm64 ./cmd/memql-cockpit
 
+## Build Cockpit GUI variant for all supported platforms
 cockpit-gui-all-platforms: cockpit-gui-darwin-arm64 cockpit-gui-darwin-amd64 cockpit-gui-linux-amd64 cockpit-gui-linux-arm64
 
+# ---------------------------------------------------------------------------
+# Run targets
+# ---------------------------------------------------------------------------
+
+.PHONY: run-cockpit
+
+## Build and run memQL Cockpit. Reads ~/.memql/clusters.yaml for the
+## active cluster + credential (PAT or cached OIDC token). Run
+## `memql-cockpit authorize <url>` once to authorize against an
+## identity service if you haven't already.
 run-cockpit: cockpit
 	./$(BIN_DIR)/memql-cockpit
 
+# ---------------------------------------------------------------------------
+# Test targets
+# ---------------------------------------------------------------------------
+
+.PHONY: test test-v test-cover
+
+## Run all tests
 test:
 	$(GO) test ./...
 
+## Run all tests with verbose output
+test-v:
+	$(GO) test -v ./...
+
+## Run tests with coverage report
+test-cover:
+	$(GO) test -coverprofile=coverage.out ./...
+	$(GO) tool cover -func=coverage.out
+	@rm -f coverage.out
+
+# ---------------------------------------------------------------------------
+# Code quality
+# ---------------------------------------------------------------------------
+
+.PHONY: vet fmt lint tidy generate
+
+## Run go vet on all packages
 vet:
 	$(GO) vet ./...
 
+## Format all Go files
+fmt:
+	$(GO) fmt ./...
+
+## Run vet + fmt (quick lint)
+lint: fmt vet
+
+## Tidy go.mod dependencies
+tidy:
+	$(GO) mod tidy
+
+## Run code generation (protobuf, etc.)
+generate:
+	$(GO) generate ./...
+
+# ---------------------------------------------------------------------------
+# Utility targets
+# ---------------------------------------------------------------------------
+
+.PHONY: clean version version-stamp help
+
+## Remove build artifacts
 clean:
-	rm -rf $(BIN_DIR)
+	rm -rf $(BIN_DIR)/ coverage.out
+
+## Print the current version
+version:
+	@echo $(VERSION)
+
+## Refresh the epoch suffix in VERSION. Keeps the semver prefix,
+## stamps a fresh Unix timestamp. Run on each release / build to
+## keep VERSION current. Edit VERSION by hand to bump the semver
+## prefix; this target only touches the suffix.
+version-stamp:
+	@base="$$(cat VERSION 2>/dev/null | sed 's/-.*//' | head -1)"; \
+	if [ -z "$$base" ]; then base="0.1.0"; fi; \
+	new="$$base-$$(date +%s)"; \
+	echo "$$new" > VERSION; \
+	echo "VERSION -> $$new"
+
+## Show all available targets
+help:
+	@echo "memQL Cockpit Makefile -- v$(VERSION)"
+	@echo ""
+	@echo "BUILD"
+	@echo "  make                                Build memQL Cockpit (host platform, headless)"
+	@echo "  make cockpit                        Build memQL Cockpit (host platform, headless)"
+	@echo "  make cockpit-darwin-arm64           Cross-build for macOS Apple Silicon"
+	@echo "  make cockpit-darwin-amd64           Cross-build for macOS Intel"
+	@echo "  make cockpit-linux-amd64            Cross-build for Linux x86_64"
+	@echo "  make cockpit-linux-arm64            Cross-build for Linux aarch64"
+	@echo "  make cockpit-all-platforms          Cross-build for all platforms (headless)"
+	@echo "  make cockpit-gui                    Build GUI variant (CGO + RobotGo)"
+	@echo "  make cockpit-gui-darwin-arm64       GUI cross-build for macOS Apple Silicon"
+	@echo "  make cockpit-gui-darwin-amd64       GUI cross-build for macOS Intel"
+	@echo "  make cockpit-gui-linux-amd64        GUI cross-build for Linux x86_64"
+	@echo "  make cockpit-gui-linux-arm64        GUI cross-build for Linux aarch64"
+	@echo "  make cockpit-gui-all-platforms      GUI cross-build for all platforms"
+	@echo ""
+	@echo "RUN"
+	@echo "  make run-cockpit  Build and run memQL Cockpit (uses ~/.memql/clusters.yaml)"
+	@echo ""
+	@echo "TEST"
+	@echo "  make test         Run all tests"
+	@echo "  make test-v       Run all tests (verbose)"
+	@echo "  make test-cover   Run tests with coverage report"
+	@echo ""
+	@echo "QUALITY"
+	@echo "  make vet          Run go vet"
+	@echo "  make fmt          Format all Go files"
+	@echo "  make lint         Run fmt + vet"
+	@echo "  make tidy         Tidy go.mod dependencies"
+	@echo "  make generate     Run code generation (protobuf)"
+	@echo ""
+	@echo "UTILITY"
+	@echo "  make clean         Remove build artifacts"
+	@echo "  make version       Print current version"
+	@echo "  make version-stamp Refresh the epoch suffix in VERSION (keeps semver prefix)"
+	@echo "  make help          Show this help"
