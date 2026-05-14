@@ -71,3 +71,11 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260203192932-546029d2fa20 // indirect
 	mellium.im/sasl v0.3.2 // indirect
 )
+
+// Local development: resolve memql core from the sibling tree.
+// go.work alone is not sufficient because the require above is the
+// epoch-zero placeholder pseudo-version, which Go can only validate
+// against a real remote OR a replace pointing at a local path.
+// Once memql is published as a tagged version, drop this replace
+// and pin a real version in the require block above.
+replace github.com/visionarys-io/memql => ../memql
