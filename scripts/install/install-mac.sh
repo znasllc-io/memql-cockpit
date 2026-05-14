@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+#
+# scripts/install/install-mac.sh
+# ===============================
+#
+# Install memql-cockpit-worker on macOS. Downloads the appropriate
+# binary, drops a LaunchAgent at ~/Library/LaunchAgents/, and
+# (optionally) generates a worker.yaml from a token supplied on the
+# command line.
+#
+# Usage:
+#   ./install-mac.sh --token mql_wkr_<...> --cluster https://app.copresent.ai
+#
+# Flags:
+#   --token <token>     Worker token (mql_wkr_<...>). Required.
+#   --cluster <url>     Cluster URL. Required.
+#   --name <name>       Worker name (default: hostname).
+#   --gui               Install the GUI variant (memql-cockpit-gui).
+#   --download-base <u> Base URL for binary downloads.
+#   --force             Overwrite existing worker.yaml.
+#   --no-service        Skip LaunchAgent installation.
+
+set -euo pipefail
+
+# shellcheck source=lib.sh
+source "$(dirname "$0")/lib.sh"
+
+readonly DEFAULT_DOWNLOAD_BASE="https://app.copresent.ai/admin/workers/install"
+
+function show_help() {
+    cat << EOF
+Usage: $(basename "$0") --token <token> --cluster <url> [options]
+
+Required:
+    --token <token>           Worker token (mql_wkr_<...>)
+    --cluster <url>           Cluster URL (e.g. https://app.copresent.ai)
+
+Options:
+    --name <name>             Worker name (default: hostname)
+    --gui                     Install the GUI variant (memql-cockpit-gui)
+    --download-base <url>     Override binary download base URL
+    --force                   Overwrite existing worker.yaml
+    --no-service              Skip LaunchAgent installation
+    --help                    Print this help
+EOF
+}
+
+function parse_args() {
+    TOKEN=""
+    CLUSTER_URL=""
+    NAME="$(hostname -s)"
+    FLAVOUR="headless"
+    DOWNLOAD_BASE="$DEFAULT_DOWNLOAD_BASE"
+    FORCE="no"
+    INSTALL_SERVICE="yes"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --token)         TOKEN="$2"; shift 2 ;;
+            --cluster)       CLUSTER_URL="$2"; shift 2 ;;
+            --name)          NAME="$2"; shift 2 ;;
+            --gui)           FLAVOUR="gui"; shift ;;
+            --download-base) DOWNLOAD_BASE="$2"; shift 2 ;;
+            --force)         FORCE="yes"; shift ;;
+            --no-service)    INSTALL_SERVICE="no"; shift ;;
+            --help|-h)       show_help; exit 0 ;;
+            *)
+                echo "ERROR: unknown flag $1" >&2
+                show_help
+                exit 1
+                ;;
+        esac
+    done
+
+    if [[ -z "$TOKEN" || -z "$CLUSTER_URL" ]]; then
+        echo "ERROR: --token and --cluster are required" >&2
+        show_help
+        exit 1
+    fi
+    if [[ ! "$TOKEN" =~ ^mql_wkr_ ]]; then
+        echo "ERROR: token must start with mql_wkr_" >&2
+        exit 1
+    fi
+}
+
+function install_binary() {
+    local binary
+    binary="$(binary_name_for "$FLAVOUR")"
+    local url="${DOWNLOAD_BASE}/${binary}"
+    local dest_dir="${HOME}/.memql/bin"
+    mkdir -p "$dest_dir"
+    local dest="${dest_dir}/${binary}"
+    download_binary "$url" "$dest"
+
+    # Symlink the friendly name.
+    local friendly
+    if [[ "$FLAVOUR" == "gui" ]]; then
+        friendly="${dest_dir}/memql-cockpit-gui"
+    else
+        friendly="${dest_dir}/memql-cockpit"
+    fi
+    ln -sf "$dest" "$friendly"
+    INSTALLED_BINARY="$friendly"
+}
+
+function write_config() {
+    local path="${HOME}/.memql/worker.yaml"
+    write_worker_yaml "$path" "$CLUSTER_URL" "$TOKEN" "$NAME" "$FORCE"
+    if [[ "$FLAVOUR" == "gui" ]]; then
+        # Ensure GUI capability is advertised.
+        cat > "$path" << YAML
+cluster_url: ${CLUSTER_URL}
+token: ${TOKEN}
+name: ${NAME}
+labels:
+  os: darwin
+  arch: $(detect_arch)
+concurrency:
+  HEADLESS: 8
+  GUI: 1
+state_dir: ${HOME}/.memql/state
+log_level: info
+capabilities:
+  - HEADLESS
+  - GUI
+YAML
+        chmod 600 "$path"
+    fi
+    echo "INFO: wrote $path"
+}
+
+function install_launch_agent() {
+    if [[ "$INSTALL_SERVICE" != "yes" ]]; then
+        echo "INFO: --no-service set; skipping LaunchAgent installation"
+        return 0
+    fi
+    local plist_dir="${HOME}/Library/LaunchAgents"
+    local plist="${plist_dir}/com.visionarys.memql-cockpit-worker.plist"
+    mkdir -p "$plist_dir"
+    cat > "$plist" << PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.visionarys.memql-cockpit-worker</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${INSTALLED_BINARY}</string>
+        <string>worker</string>
+        <string>run</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${HOME}/.memql/state/worker.log</string>
+    <key>StandardErrorPath</key>
+    <string>${HOME}/.memql/state/worker.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>${HOME}</string>
+    </dict>
+</dict>
+</plist>
+PLIST
+    chmod 644 "$plist"
+    echo "INFO: wrote $plist"
+    launchctl unload "$plist" >/dev/null 2>&1 || true
+    launchctl load "$plist"
+    echo "INFO: launched memql-cockpit-worker LaunchAgent"
+}
+
+function main() {
+    parse_args "$@"
+    install_binary
+    write_config
+    install_launch_agent
+
+    cat << EOF
+
+================================================================
+SUCCESS: memql-cockpit-worker installed.
+
+Binary:    ${INSTALLED_BINARY}
+Config:    ${HOME}/.memql/worker.yaml
+Logs:      ${HOME}/.memql/state/worker.log
+
+The worker is running as a LaunchAgent and will reconnect on
+boot. To check the status:
+
+  launchctl list | grep memql-cockpit-worker
+
+To stop it:
+
+  launchctl unload ~/Library/LaunchAgents/com.visionarys.memql-cockpit-worker.plist
+================================================================
+EOF
+}
+
+main "$@"

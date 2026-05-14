@@ -1,0 +1,579 @@
+// Package cluster provides the Cluster tab for memQL Cockpit.
+// It renders a visual topology diagram of cluster nodes using tcell
+// box-drawing characters for crisp, scalable rendering.
+package cluster
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/gdamore/tcell/v2"
+	"github.com/visionarys-io/memql-cockpit/cli/ui"
+	nodev1 "github.com/visionarys-io/memql/component/node/gen"
+)
+
+// NodeInfo describes a cluster node for rendering. The Health field is the
+// proto-defined enum from component/node/node.proto -- the source of truth
+// for node states across backend, concept schema, and CLI. Display labels
+// and colors are derived from the enum value via healthLabel() /
+// nodeHealthColor().
+//
+// `Type` is the free-form nodeType string from v1:cluster:node (e.g. "bff",
+// "voice", "cognition", "agent", "planner"). There is no hard-coded
+// whitelist here: whatever types the server reports get rendered, grouped
+// by the order established via SetNodeTypes (seeded from
+// v1:cluster:nodeType) with unknown types appended at the end.
+type NodeInfo struct {
+	ID      string
+	Name    string
+	Type    string
+	Address string
+	Version string
+	Health  nodev1.NodeHealthStatus
+	Labels  map[string]string
+}
+
+// NodeTypeInfo is a row from the v1:cluster:nodeType concept. The CLI
+// fetches these once on connect (via queryClusterNodeTypes) and uses
+// Name + seed order to drive the topology display. Description is kept
+// around for future tooltip / detail-pane work.
+type NodeTypeInfo struct {
+	Name        string
+	Description string
+}
+
+// View renders the Cluster topology using tcell box-drawing characters.
+type View struct {
+	Theme     ui.Theme
+	Nodes     []NodeInfo
+	NodeTypes []NodeTypeInfo // seed order from v1:cluster:nodeType, drives row layout
+	Edges     [][2]int       // pairs of node indices that are connected
+
+	// OnInitialLoad is called once at startup and on reconnect to pull the
+	// initial topology snapshot via queryClusterNodes(). After that, live updates
+	// arrive via the gRPC subscription in wireCluster and are applied
+	// through ApplyNodeUpdate -- no manual refresh.
+	OnInitialLoad func() []NodeInfo
+
+	// panX, panY shift the diagram within the drawing pane. Positive values
+	// move the diagram left/up (revealing content to the right/below).
+	// Driven by the W/A/S/D keys in HandleEvent.
+	panX int
+	panY int
+
+	// disconnected is true when the CLI's gRPC stream to the cluster is
+	// down (detected via Dispatcher.Done). While disconnected, every box
+	// renders red/offline regardless of the last-known Health, because
+	// we have no live signal -- the cached state is stale.
+	disconnected bool
+
+	// ClusterName is the display name of the cluster whose topology is
+	// being rendered. Prefixed onto the inner section header ("Local
+	// CLUSTER TOPOLOGY") so the user always knows which cluster the
+	// diagram represents. Empty renders as just "CLUSTER TOPOLOGY".
+	ClusterName string
+}
+
+// SetDisconnected toggles the "stream lost" rendering override. Does not
+// mutate node data; when the stream recovers the existing Health values
+// resume display.
+func (v *View) SetDisconnected(disconnected bool) {
+	v.disconnected = disconnected
+}
+
+// Pan step in cells per keypress. Horizontal gets a larger step because
+// terminal cells are roughly half as wide as they are tall.
+const (
+	panStepX = 3
+	panStepY = 2
+)
+
+// NewView creates an empty topology view.
+func NewView(theme ui.Theme) *View {
+	return &View{Theme: theme}
+}
+
+// SetNodes updates the cluster topology data.
+func (v *View) SetNodes(nodes []NodeInfo) {
+	v.Nodes = nodes
+	v.buildEdges()
+}
+
+// SetNodeTypes stores the ordered nodeType list (from
+// queryClusterNodeTypes). This is what drives the row order in the
+// topology diagram -- the first entry is drawn on the top row, the
+// rest in sequence. When empty, drawTopology falls back to the order
+// in which types appear on registered nodes.
+func (v *View) SetNodeTypes(types []NodeTypeInfo) {
+	v.NodeTypes = types
+}
+
+
+// ApplyNodeUpdate merges a single-node change into the topology model. If
+// the node already exists (matched by ID, or by Type for single-node-per-
+// type deployments) its record is updated in place; otherwise it is
+// appended. Nodes that transitioned to OFFLINE or STOPPED remain in the
+// view (colored red) rather than disappearing, so the user sees that the
+// node went away rather than silently losing it from the diagram.
+func (v *View) ApplyNodeUpdate(incoming NodeInfo) {
+	if incoming.Type == "" && incoming.ID == "" {
+		return
+	}
+	idx := v.findNodeIndex(incoming)
+	if idx < 0 {
+		v.Nodes = append(v.Nodes, incoming)
+		v.buildEdges()
+		return
+	}
+	// Preserve any fields the subscription payload didn't carry.
+	existing := &v.Nodes[idx]
+	if incoming.ID != "" {
+		existing.ID = incoming.ID
+	}
+	if incoming.Name != "" {
+		existing.Name = incoming.Name
+	}
+	if incoming.Type != "" {
+		existing.Type = incoming.Type
+	}
+	if incoming.Address != "" {
+		existing.Address = incoming.Address
+	}
+	if incoming.Version != "" {
+		existing.Version = incoming.Version
+	}
+	if incoming.Health != nodev1.NodeHealthStatus_NODE_HEALTH_UNSPECIFIED {
+		existing.Health = incoming.Health
+	}
+	if incoming.Labels != nil {
+		existing.Labels = incoming.Labels
+	}
+	v.buildEdges()
+}
+
+func (v *View) findNodeIndex(target NodeInfo) int {
+	if target.ID != "" {
+		for i, n := range v.Nodes {
+			if n.ID == target.ID {
+				return i
+			}
+		}
+	}
+	// Fall back to matching by type (initial load + spawn events only knew
+	// type, so the first "real" event should update that row).
+	if target.Type != "" {
+		for i, n := range v.Nodes {
+			if n.ID == "" && n.Type == target.Type {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// Draw renders the topology view.
+func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
+	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, v.Theme.BaseStyle())
+
+	// Title. Just the cluster name in Info (lighter blue) -- the outer
+	// " TOPOLOGY " pane title already says what this pane is, so a
+	// "CLUSTER TOPOLOGY" subtitle was redundant noise.
+	//
+	// Cluster name is rendered VERBATIM -- no auto-title-casing. The
+	// user's chosen capitalization in clusters.yaml (e.g. "Visionarys",
+	// "local") is the source of truth.
+	if v.ClusterName != "" {
+		nameStyle := tcell.StyleDefault.Foreground(v.Theme.Info).Background(v.Theme.BG).Bold(true)
+		screen.DrawText(bounds.X+2, bounds.Y, bounds.Width-3, v.ClusterName, nameStyle)
+	}
+
+	if len(v.Nodes) > 0 {
+		v.drawTopology(screen, bounds)
+	}
+
+	// Status bar at bottom.
+	statusY := bounds.Y + bounds.Height - 1
+	statusStyle := tcell.StyleDefault.Foreground(v.Theme.Subtle).Background(v.Theme.BG)
+	screen.FillRect(bounds.X, statusY, bounds.Width, 1, statusStyle)
+
+	// Left side of the status row. When there are no nodes yet, the
+	// "Nodes:N Online:..." tally has nothing to say, so the
+	// empty-state hint ("No nodes...") lives here instead -- on the
+	// same row as the WASD/R:Reset hints on the right, which is what
+	// makes the two halves visually balance.
+	statusText := ""
+	if len(v.Nodes) == 0 {
+		statusText = " No nodes. Waiting for cluster data..."
+	} else if v.disconnected {
+		// Force the offline tally to match the override rendering.
+		statusText = fmt.Sprintf(" Nodes: %d  Offline:%d", len(v.Nodes), len(v.Nodes))
+	} else {
+		healthy, degraded, offline := v.healthCounts()
+		statusText = fmt.Sprintf(" Nodes: %d", len(v.Nodes))
+		if healthy > 0 {
+			statusText += fmt.Sprintf("  Online:%d", healthy)
+		}
+		if degraded > 0 {
+			statusText += fmt.Sprintf("  Degraded:%d", degraded)
+		}
+		if offline > 0 {
+			statusText += fmt.Sprintf("  Offline:%d", offline)
+		}
+	}
+	screen.DrawText(bounds.X, statusY, bounds.Width/2, statusText, statusStyle)
+
+	// Right-align: pan/reset hints. The "live" indicator was redundant
+	// (a healthy stream is the implicit default); only the "stale"
+	// warning surfaces, and only when we've actually lost the stream.
+	hints := "WASD:Pan  R:Reset View"
+	if v.disconnected {
+		hints += "  stale"
+	}
+	screen.DrawText(bounds.X+bounds.Width-len(hints)-1, statusY, len(hints), hints, statusStyle)
+}
+
+// drawTopology renders nodes as boxes with connection lines.
+//
+// Layout is computed in an unbounded "world" coordinate space (positions
+// ignore the pane size), then every cell is shifted by (-panX, -panY) and
+// clipped to the drawing area. That keeps the pan logic trivial and
+// guarantees we never bleed into the clusters pane on the left.
+func (v *View) drawTopology(screen *ui.Screen, bounds ui.Rect) {
+	const boxW = 16
+	const boxH = 4
+
+	// Group by type for hierarchical layout. Row order comes from the
+	// seeded nodeType list (v.NodeTypes, fetched via
+	// queryClusterNodeTypes); any type present on a node but missing
+	// from that list gets appended at the end so we still render
+	// unexpected nodes rather than silently dropping them.
+	groups := map[string][]int{}
+	for i, n := range v.Nodes {
+		groups[n.Type] = append(groups[n.Type], i)
+	}
+	typeOrder := v.buildTypeOrder(groups)
+
+	type nodePos struct {
+		x, y int // top-left of box (world coords)
+		cx   int // center x for connections
+	}
+	positions := make([]nodePos, len(v.Nodes))
+
+	// Drawing area (below title, above status). Anything outside this
+	// rectangle is clipped by plotCell/plotText below.
+	area := ui.Rect{
+		X:      bounds.X + 2,
+		Y:      bounds.Y + 3,
+		Width:  bounds.Width - 4,
+		Height: bounds.Height - 5,
+	}
+
+	// Lay out every row starting from the same origin regardless of how
+	// much of it fits -- pan determines what's visible, not the layout.
+	rowY := area.Y
+
+	for _, nodeType := range typeOrder {
+		indices := groups[nodeType]
+		if len(indices) == 0 {
+			continue
+		}
+
+		totalW := len(indices)*boxW + (len(indices)-1)*3
+		// Center within the pane when it fits; otherwise left-align so
+		// the first nodes are visible at pan=0.
+		startX := area.X
+		if totalW < area.Width {
+			startX = area.X + (area.Width-totalW)/2
+		}
+
+		for j, idx := range indices {
+			x := startX + j*(boxW+3)
+			positions[idx] = nodePos{x: x, y: rowY, cx: x + boxW/2}
+		}
+
+		rowY += boxH + 2 // Gap between rows.
+	}
+
+	// Draw connection lines first.
+	for _, edge := range v.Edges {
+		p1 := positions[edge[0]]
+		p2 := positions[edge[1]]
+
+		lineX := p1.cx
+		lineStyle := tcell.StyleDefault.Foreground(v.Theme.Subtle).Background(v.Theme.BG)
+
+		// Vertical line from bottom of parent to top of child.
+		fromY := p1.y + boxH
+		toY := p2.y
+
+		for y := fromY; y < toY; y++ {
+			ch := '│'
+			if y == fromY {
+				ch = '┬'
+			}
+			v.plotCell(screen, lineX, y, area, ch, lineStyle)
+		}
+
+		// If child is offset, draw horizontal + corner.
+		if p2.cx != lineX {
+			cornerY := toY - 1
+			if cornerY <= fromY {
+				cornerY = fromY + 1
+			}
+
+			minCX := lineX
+			maxCX := p2.cx
+			if minCX > maxCX {
+				minCX, maxCX = maxCX, minCX
+			}
+			for x := minCX; x <= maxCX; x++ {
+				v.plotCell(screen, x, cornerY, area, '─', lineStyle)
+			}
+
+			if p2.cx > lineX {
+				v.plotCell(screen, lineX, cornerY, area, '├', lineStyle)
+				v.plotCell(screen, p2.cx, cornerY, area, '┐', lineStyle)
+			} else {
+				v.plotCell(screen, lineX, cornerY, area, '┤', lineStyle)
+				v.plotCell(screen, p2.cx, cornerY, area, '┌', lineStyle)
+			}
+
+			for y := cornerY + 1; y < toY; y++ {
+				v.plotCell(screen, p2.cx, y, area, '│', lineStyle)
+			}
+			v.plotCell(screen, p2.cx, toY, area, '▼', lineStyle)
+		} else if toY > fromY {
+			v.plotCell(screen, lineX, toY-1, area, '▼', lineStyle)
+		}
+	}
+
+	// Draw node boxes.
+	for i, node := range v.Nodes {
+		pos := positions[i]
+		v.drawNodeBox(screen, pos.x, pos.y, boxW, boxH, area, node)
+	}
+}
+
+// plotCell writes a cell in world coordinates, applying the pan offset
+// and clipping to the drawing area. All topology drawing must go through
+// this (or plotText) so nothing escapes the pane.
+func (v *View) plotCell(screen *ui.Screen, worldX, worldY int, area ui.Rect, ch rune, style tcell.Style) {
+	sx := worldX - v.panX
+	sy := worldY - v.panY
+	if sx < area.X || sx >= area.X+area.Width {
+		return
+	}
+	if sy < area.Y || sy >= area.Y+area.Height {
+		return
+	}
+	screen.SetCell(sx, sy, ch, style)
+}
+
+// plotText writes a string in world coordinates with clipping.
+func (v *View) plotText(screen *ui.Screen, worldX, worldY int, area ui.Rect, text string, style tcell.Style) {
+	for _, ch := range text {
+		v.plotCell(screen, worldX, worldY, area, ch, style)
+		worldX++
+	}
+}
+
+// drawNodeBox renders a single node as a bordered box.
+// Layout: line 1 = TYPE, line 2 = name, line 3 = status
+// Coordinates are in world space -- plotCell/plotText apply pan + clip.
+// When the view is disconnected, every box is forced to the OFFLINE
+// visual treatment regardless of the node's last-known Health.
+func (v *View) drawNodeBox(screen *ui.Screen, x, y, w, h int, area ui.Rect, node NodeInfo) {
+	effectiveHealth := node.Health
+	if v.disconnected {
+		effectiveHealth = nodev1.NodeHealthStatus_NODE_HEALTH_OFFLINE
+	}
+	healthColor := nodeHealthColor(effectiveHealth)
+	borderStyle := tcell.StyleDefault.Foreground(healthColor).Background(v.Theme.BG)
+	typeStyle := tcell.StyleDefault.Foreground(v.Theme.FG).Background(v.Theme.BG).Bold(true)
+
+	// Border.
+	v.plotCell(screen, x, y, area, '┌', borderStyle)
+	v.plotCell(screen, x+w-1, y, area, '┐', borderStyle)
+	v.plotCell(screen, x, y+h-1, area, '└', borderStyle)
+	v.plotCell(screen, x+w-1, y+h-1, area, '┘', borderStyle)
+	for i := x + 1; i < x+w-1; i++ {
+		v.plotCell(screen, i, y, area, '─', borderStyle)
+		v.plotCell(screen, i, y+h-1, area, '─', borderStyle)
+	}
+	for i := y + 1; i < y+h-1; i++ {
+		v.plotCell(screen, x, i, area, '│', borderStyle)
+		v.plotCell(screen, x+w-1, i, area, '│', borderStyle)
+	}
+
+	// Line 1: node type (bold).
+	typeLabel := nodeTypeShort(node.Type)
+	v.plotText(screen, x+1, y+1, area, clipText(typeLabel, w-2), typeStyle)
+
+	// Line 2: health status (colored).
+	status := healthLabel(effectiveHealth)
+	v.plotText(screen, x+1, y+2, area, clipText(status, w-2), tcell.StyleDefault.Foreground(healthColor).Background(v.Theme.BG))
+}
+
+// HandleEvent processes keyboard input. The topology view is driven by
+// gRPC event subscriptions -- there is no manual refresh key. WASD pans
+// the diagram within the pane so the user can inspect off-screen nodes.
+func (v *View) HandleEvent(ev tcell.Event) bool {
+	keyEv, ok := ev.(*tcell.EventKey)
+	if !ok {
+		return false
+	}
+	if keyEv.Key() != tcell.KeyRune {
+		return false
+	}
+	switch keyEv.Rune() {
+	case 'w', 'W':
+		v.panY -= panStepY
+		return true
+	case 's', 'S':
+		v.panY += panStepY
+		return true
+	case 'a', 'A':
+		v.panX -= panStepX
+		return true
+	case 'd', 'D':
+		v.panX += panStepX
+		return true
+	case 'r', 'R':
+		v.panX, v.panY = 0, 0
+		return true
+	}
+	return false
+}
+
+// clipText trims a string to fit within the given max width in cells.
+func clipText(s string, maxW int) string {
+	if maxW <= 0 {
+		return ""
+	}
+	if len(s) <= maxW {
+		return s
+	}
+	return s[:maxW]
+}
+
+// buildEdges creates connections between nodes.
+// BFF connects to all other nodes in the mesh topology.
+func (v *View) buildEdges() {
+	v.Edges = nil
+	bffIdx := -1
+	for i, n := range v.Nodes {
+		if n.Type == "bff" {
+			bffIdx = i
+			break
+		}
+	}
+	if bffIdx < 0 {
+		return
+	}
+	for i := range v.Nodes {
+		if i != bffIdx {
+			v.Edges = append(v.Edges, [2]int{bffIdx, i})
+		}
+	}
+}
+
+func (v *View) healthCounts() (healthy, degraded, offline int) {
+	for _, n := range v.Nodes {
+		switch n.Health {
+		case nodev1.NodeHealthStatus_NODE_HEALTH_HEALTHY:
+			healthy++
+		case nodev1.NodeHealthStatus_NODE_HEALTH_DEGRADED,
+			nodev1.NodeHealthStatus_NODE_HEALTH_DRAINING,
+			nodev1.NodeHealthStatus_NODE_HEALTH_CONNECTING:
+			degraded++
+		case nodev1.NodeHealthStatus_NODE_HEALTH_OFFLINE,
+			nodev1.NodeHealthStatus_NODE_HEALTH_STOPPED:
+			offline++
+		default:
+			degraded++
+		}
+	}
+	return
+}
+
+// buildTypeOrder returns the row order for drawTopology. NodeTypes is
+// the authoritative source (seeded from v1:cluster:nodeType); any type
+// present on a registered node but not in NodeTypes is appended at the
+// end in first-seen order so a brand-new node type renders immediately
+// even before the seed catches up.
+func (v *View) buildTypeOrder(groups map[string][]int) []string {
+	seen := make(map[string]bool, len(v.NodeTypes)+len(groups))
+	order := make([]string, 0, len(v.NodeTypes)+len(groups))
+
+	for _, t := range v.NodeTypes {
+		name := strings.TrimSpace(t.Name)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		order = append(order, name)
+	}
+	// Preserve insertion order from v.Nodes so unknown types render
+	// deterministically (map iteration alone would flap between draws).
+	for _, n := range v.Nodes {
+		name := strings.TrimSpace(n.Type)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		order = append(order, name)
+	}
+	return order
+}
+
+// nodeTypeShort returns the uppercase rendering of the nodeType used
+// on the first line of each topology box. Accepts any string so new
+// node types (anything the server writes to v1:cluster:node.nodeType)
+// show up without a Go change.
+func nodeTypeShort(t string) string {
+	t = strings.TrimSpace(t)
+	if t == "" {
+		return "NODE"
+	}
+	return strings.ToUpper(t)
+}
+
+// healthLabel formats the proto-defined NodeHealthStatus enum for display.
+// The proto enum is the source of truth; keep this function as the only
+// place that maps enum -> visible string.
+func healthLabel(health nodev1.NodeHealthStatus) string {
+	switch health {
+	case nodev1.NodeHealthStatus_NODE_HEALTH_CONNECTING:
+		return "connecting"
+	case nodev1.NodeHealthStatus_NODE_HEALTH_HEALTHY:
+		return "online"
+	case nodev1.NodeHealthStatus_NODE_HEALTH_DEGRADED:
+		return "degraded"
+	case nodev1.NodeHealthStatus_NODE_HEALTH_DRAINING:
+		return "draining"
+	case nodev1.NodeHealthStatus_NODE_HEALTH_OFFLINE:
+		return "offline"
+	case nodev1.NodeHealthStatus_NODE_HEALTH_STOPPED:
+		return "stopped"
+	default:
+		return "unknown"
+	}
+}
+
+// nodeHealthColor picks a border color for the node box based on the enum.
+func nodeHealthColor(health nodev1.NodeHealthStatus) tcell.Color {
+	switch health {
+	case nodev1.NodeHealthStatus_NODE_HEALTH_HEALTHY:
+		return tcell.NewRGBColor(80, 200, 100) // green
+	case nodev1.NodeHealthStatus_NODE_HEALTH_CONNECTING:
+		return tcell.NewRGBColor(180, 180, 60) // dim yellow
+	case nodev1.NodeHealthStatus_NODE_HEALTH_DEGRADED,
+		nodev1.NodeHealthStatus_NODE_HEALTH_DRAINING:
+		return tcell.NewRGBColor(220, 180, 60) // amber
+	case nodev1.NodeHealthStatus_NODE_HEALTH_OFFLINE,
+		nodev1.NodeHealthStatus_NODE_HEALTH_STOPPED:
+		return tcell.NewRGBColor(220, 60, 60) // red
+	default:
+		return tcell.NewRGBColor(100, 100, 120) // gray
+	}
+}
