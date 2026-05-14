@@ -1,0 +1,26 @@
+# Binaries and build outputs
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.test
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# Go workspace file (per-developer, not shared)
+go.work
+go.work.sum
+
+# Editor / debug
+__debug*
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
