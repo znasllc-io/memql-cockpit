@@ -6,7 +6,7 @@ require (
 	github.com/gdamore/tcell/v2 v2.13.8
 	github.com/go-vgo/robotgo v1.0.2
 	github.com/google/uuid v1.6.0
-	github.com/visionarys-io/memql v0.0.0-00010101000000-000000000000
+	github.com/visionarys-io/memql v0.1.0
 	golang.org/x/sys v0.42.0
 	golang.org/x/term v0.41.0
 	google.golang.org/grpc v1.79.3
