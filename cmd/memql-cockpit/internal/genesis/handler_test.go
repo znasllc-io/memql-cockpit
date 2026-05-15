@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/visionarys-io/memql/component/secret"
 )
 
 func TestParseEnvFile_Basic(t *testing.T) {
@@ -232,5 +234,177 @@ func TestWriteGenesisAtomic_MissingDirFails(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "nope", "genesis.znas")
 	if err := writeGenesisAtomic(out, []byte("x")); err == nil {
 		t.Fatalf("expected error when parent dir is missing")
+	}
+}
+
+func TestReconcileMasterKey_AlreadyMatches(t *testing.T) {
+	entries := []EnvEntry{
+		{Name: "FOO", Value: "1"},
+		{Name: secret.EnvMasterKey, Value: "abc123"},
+		{Name: "BAR", Value: "2"},
+	}
+	got, action := reconcileMasterKey(entries, "abc123")
+	if action != reconcileNoop {
+		t.Fatalf("action: got %v want reconcileNoop", action)
+	}
+	if !reflect.DeepEqual(got, entries) {
+		t.Fatalf("entries mutated unexpectedly: %+v", got)
+	}
+}
+
+func TestReconcileMasterKey_ReplacesMismatch(t *testing.T) {
+	entries := []EnvEntry{
+		{Name: "FOO", Value: "1"},
+		{Name: secret.EnvMasterKey, Value: "stale"},
+		{Name: "BAR", Value: "2"},
+	}
+	got, action := reconcileMasterKey(entries, "fresh")
+	if action != reconcileReplaced {
+		t.Fatalf("action: got %v want reconcileReplaced", action)
+	}
+	if len(got) != 3 {
+		t.Fatalf("len: got %d want 3", len(got))
+	}
+	if got[1].Name != secret.EnvMasterKey || got[1].Value != "fresh" {
+		t.Fatalf("master-key entry not updated in place: %+v", got[1])
+	}
+	if got[0].Name != "FOO" || got[2].Name != "BAR" {
+		t.Fatalf("order disrupted: %+v", got)
+	}
+}
+
+func TestReconcileMasterKey_AppendsWhenAbsent(t *testing.T) {
+	entries := []EnvEntry{
+		{Name: "FOO", Value: "1"},
+		{Name: "BAR", Value: "2"},
+	}
+	got, action := reconcileMasterKey(entries, "fresh")
+	if action != reconcileAdded {
+		t.Fatalf("action: got %v want reconcileAdded", action)
+	}
+	if len(got) != 3 {
+		t.Fatalf("len: got %d want 3", len(got))
+	}
+	last := got[len(got)-1]
+	if last.Name != secret.EnvMasterKey || last.Value != "fresh" {
+		t.Fatalf("appended entry wrong: %+v", last)
+	}
+}
+
+func TestRewriteMasterKeyAssignment_ReplacesPlainAssignment(t *testing.T) {
+	in := []byte("FOO=1\nMEMQL_MASTER_KEY=oldkey\nBAR=2\n")
+	out, replaced, appended := RewriteMasterKeyAssignment(in, "newkey")
+	if !replaced || appended {
+		t.Fatalf("flags: got replaced=%v appended=%v; want replaced=true appended=false", replaced, appended)
+	}
+	want := "FOO=1\nMEMQL_MASTER_KEY=newkey\nBAR=2\n"
+	if string(out) != want {
+		t.Fatalf("content:\n got %q\nwant %q", out, want)
+	}
+}
+
+func TestRewriteMasterKeyAssignment_PreservesExportPrefix(t *testing.T) {
+	in := []byte("export MEMQL_MASTER_KEY=oldkey\n")
+	out, _, _ := RewriteMasterKeyAssignment(in, "newkey")
+	want := "export MEMQL_MASTER_KEY=newkey\n"
+	if string(out) != want {
+		t.Fatalf("got %q want %q", out, want)
+	}
+}
+
+func TestRewriteMasterKeyAssignment_PreservesIndent(t *testing.T) {
+	in := []byte("\t  MEMQL_MASTER_KEY=oldkey\n")
+	out, _, _ := RewriteMasterKeyAssignment(in, "newkey")
+	want := "\t  MEMQL_MASTER_KEY=newkey\n"
+	if string(out) != want {
+		t.Fatalf("got %q want %q", out, want)
+	}
+}
+
+func TestRewriteMasterKeyAssignment_IgnoresCommentedLine(t *testing.T) {
+	in := []byte("# MEMQL_MASTER_KEY=oldsample\nFOO=1\n")
+	out, replaced, appended := RewriteMasterKeyAssignment(in, "newkey")
+	if replaced || !appended {
+		t.Fatalf("expected replaced=false appended=true (commented line shouldn't count); got replaced=%v appended=%v", replaced, appended)
+	}
+	want := "# MEMQL_MASTER_KEY=oldsample\nFOO=1\nMEMQL_MASTER_KEY=newkey\n"
+	if string(out) != want {
+		t.Fatalf("got %q want %q", out, want)
+	}
+}
+
+func TestRewriteMasterKeyAssignment_AppendsWhenAbsent(t *testing.T) {
+	in := []byte("FOO=1\nBAR=2\n")
+	out, replaced, appended := RewriteMasterKeyAssignment(in, "newkey")
+	if replaced || !appended {
+		t.Fatalf("flags: got replaced=%v appended=%v; want replaced=false appended=true", replaced, appended)
+	}
+	want := "FOO=1\nBAR=2\nMEMQL_MASTER_KEY=newkey\n"
+	if string(out) != want {
+		t.Fatalf("content:\n got %q\nwant %q", out, want)
+	}
+}
+
+func TestRewriteMasterKeyAssignment_AppendsAddsTrailingNewlineWhenMissing(t *testing.T) {
+	in := []byte("FOO=1") // no trailing newline
+	out, _, appended := RewriteMasterKeyAssignment(in, "newkey")
+	if !appended {
+		t.Fatal("expected appended=true")
+	}
+	want := "FOO=1\nMEMQL_MASTER_KEY=newkey\n"
+	if string(out) != want {
+		t.Fatalf("got %q want %q", out, want)
+	}
+}
+
+func TestRewriteMasterKeyAssignment_OnlyFirstAssignmentReplaced(t *testing.T) {
+	in := []byte("MEMQL_MASTER_KEY=first\nMEMQL_MASTER_KEY=second\n")
+	out, replaced, _ := RewriteMasterKeyAssignment(in, "newkey")
+	if !replaced {
+		t.Fatal("expected replaced=true")
+	}
+	want := "MEMQL_MASTER_KEY=newkey\nMEMQL_MASTER_KEY=second\n"
+	if string(out) != want {
+		t.Fatalf("got %q want %q", out, want)
+	}
+}
+
+func TestRewriteMasterKeyAssignment_PreservesCommentsAndBlankLines(t *testing.T) {
+	in := []byte("# comment line\n\nFOO=1\nMEMQL_MASTER_KEY=old\n\n# trailing\n")
+	out, _, _ := RewriteMasterKeyAssignment(in, "new")
+	want := "# comment line\n\nFOO=1\nMEMQL_MASTER_KEY=new\n\n# trailing\n"
+	if string(out) != want {
+		t.Fatalf("got %q want %q", out, want)
+	}
+}
+
+func TestValidateMasterKeyHex_Accepts64HexChars(t *testing.T) {
+	good := "4aa756c6346279c7d766407e411676b0082d0ea2598be0f05683616c7644f09f"
+	if err := validateMasterKeyHex(good); err != nil {
+		t.Fatalf("expected nil err for valid 64-hex string, got %v", err)
+	}
+}
+
+func TestValidateMasterKeyHex_RejectsShort(t *testing.T) {
+	if err := validateMasterKeyHex("deadbeef"); err == nil {
+		t.Fatal("expected error for short input")
+	}
+}
+
+func TestValidateMasterKeyHex_RejectsNonHex(t *testing.T) {
+	// 64 chars but contains non-hex 'z'.
+	bad := "zaa756c6346279c7d766407e411676b0082d0ea2598be0f05683616c7644f09f"
+	if err := validateMasterKeyHex(bad); err == nil {
+		t.Fatal("expected error for non-hex input")
+	}
+}
+
+func TestReconcileMasterKey_EmptyEntries(t *testing.T) {
+	got, action := reconcileMasterKey(nil, "fresh")
+	if action != reconcileAdded {
+		t.Fatalf("action: got %v want reconcileAdded", action)
+	}
+	if len(got) != 1 || got[0].Name != secret.EnvMasterKey || got[0].Value != "fresh" {
+		t.Fatalf("appended entry wrong: %+v", got)
 	}
 }
