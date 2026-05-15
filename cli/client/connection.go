@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	memqlv1 "github.com/visionarys-io/memql/component/grpc/gen"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 )
@@ -37,12 +38,37 @@ type ConnectConfig struct {
 
 // Connect dials the gRPC endpoint, opens a bidirectional stream,
 // and performs the ClientHello/ServerHello handshake.
+//
+// The endpoint may be a bare host:port (plaintext gRPC), or carry
+// an explicit scheme: http://, grpc:// (plaintext), https://,
+// grpcs:// (TLS). When TLS is selected the client uses the system
+// trust store -- mkcert-issued dev certs are trusted automatically
+// once `make setup-tls` has installed the local root CA, so
+// https://bff.local.znas.io Just Works against the canonical local
+// stack. See ParseClusterEndpoint for the full grammar.
 func Connect(ctx context.Context, cfg ConnectConfig) (*Connection, error) {
-	conn, err := grpc.NewClient(cfg.Endpoint,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-	)
+	dial, useTLS, err := ParseClusterEndpoint(cfg.Endpoint)
 	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", cfg.Endpoint, err)
+		return nil, fmt.Errorf("endpoint %s: %w", cfg.Endpoint, err)
+	}
+	var transport grpc.DialOption
+	if useTLS {
+		// nil tls.Config -> use system trust store + ServerName from
+		// the dial target. The cockpit talks to a public-looking name
+		// (bff.${DOMAIN}) so SNI / verify-hostname work out of the box.
+		transport = grpc.WithTransportCredentials(credentials.NewTLS(nil))
+	} else {
+		transport = grpc.WithTransportCredentials(insecure.NewCredentials())
+	}
+	if cfg.Logger != nil {
+		cfg.Logger.Info("cockpit dialing cluster",
+			"endpoint", dial,
+			"tls", useTLS,
+		)
+	}
+	conn, err := grpc.NewClient(dial, transport)
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", dial, err)
 	}
 
 	// The stream context must outlive the connect timeout.
@@ -87,7 +113,7 @@ func (c *Connection) handshake(ctx context.Context) error {
 		Payload: &memqlv1.MemqlClientMessage_ClientHello{
 			ClientHello: &memqlv1.ClientHello{
 				ClientId:   "memql-cockpit",
-				SdkName:    "memql",
+				SdkName:    "memql-cockpit",
 				SdkVersion: "0.1.0",
 			},
 		},
