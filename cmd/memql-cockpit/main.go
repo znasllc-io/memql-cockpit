@@ -34,7 +34,6 @@ import (
 	"github.com/visionarys-io/memql-cockpit/cli"
 	"github.com/visionarys-io/memql-cockpit/cli/auth"
 	"github.com/visionarys-io/memql-cockpit/cli/config"
-	"github.com/visionarys-io/memql-cockpit/cmd/memql-cockpit/internal/genesis"
 	"github.com/visionarys-io/memql-cockpit/cmd/memql-cockpit/internal/lint"
 	"github.com/visionarys-io/memql-cockpit/cmd/memql-cockpit/internal/worker"
 )
@@ -58,7 +57,13 @@ func main() {
 			worker.HandleCommand(os.Args[2:])
 			return
 		case "genesis":
-			os.Exit(genesis.HandleCommand(os.Args[2:]))
+			// Removed: genesis setup lives in the TUI's first-launch
+			// wizard now. Catch the legacy invocation so anyone with
+			// muscle memory or a stale script gets a one-line pointer.
+			fmt.Fprintln(os.Stderr, "memql-cockpit genesis has moved into the TUI.")
+			fmt.Fprintln(os.Stderr, "Launch `memql-cockpit`. If genesis.znas is missing, the")
+			fmt.Fprintln(os.Stderr, "setup wizard will walk you through creating it.")
+			os.Exit(1)
 		case "lint":
 			os.Exit(lint.HandleCommand(os.Args[2:]))
 		case "help":
@@ -336,13 +341,17 @@ func printUsage() {
 	fmt.Println("memql-cockpit — memQL Cockpit -- terminal-native IDE and operations console")
 	fmt.Println("")
 	fmt.Println("USAGE")
-	fmt.Println("  memql-cockpit [flags]                  Launch the TUI (default cluster: local)")
+	fmt.Println("  memql-cockpit [flags]                  Launch the TUI")
 	fmt.Println("  memql-cockpit cluster <subcommand>     List or remove saved clusters")
 	fmt.Println("  memql-cockpit login <cluster>          Re-authenticate an existing cluster")
 	fmt.Println("  memql-cockpit logout <cluster>         Remove cached credentials")
 	fmt.Println("  memql-cockpit worker <subcommand>      Run as a memql worker (computer-use)")
-	fmt.Println("  memql-cockpit genesis init [--from .env]  Create / update ~/.memql/genesis.znas")
 	fmt.Println("  memql-cockpit lint [path]              Validate a .memql file or DSL tree")
+	fmt.Println("")
+	fmt.Println("FIRST-TIME SETUP")
+	fmt.Println("  Launching the TUI on a machine with no ~/.memql/genesis.znas runs")
+	fmt.Println("  the setup wizard: pick a .env, validate it, generate the master key,")
+	fmt.Println("  seal the envelope. No CLI dance required.")
 	fmt.Println("")
 	fmt.Println("TUI FLAGS")
 	fmt.Println("  --cluster <name>    Connect to a named cluster")

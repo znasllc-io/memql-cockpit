@@ -6,6 +6,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -21,7 +23,11 @@ import (
 	"github.com/visionarys-io/memql-cockpit/cli/editor"
 	"github.com/visionarys-io/memql-cockpit/cli/explorer"
 	"github.com/visionarys-io/memql-cockpit/cli/settings"
+	"github.com/visionarys-io/memql-cockpit/cli/splash"
 	"github.com/visionarys-io/memql-cockpit/cli/ui"
+	genesiswizard "github.com/visionarys-io/memql-cockpit/cli/wizard/genesis"
+	"github.com/visionarys-io/memql-cockpit/cli/wizard/runlocal"
+	corgenesis "github.com/visionarys-io/memql/component/genesis"
 	memqlv1 "github.com/visionarys-io/memql/component/grpc/gen"
 	"github.com/visionarys-io/memql/component/node"
 	nodev1 "github.com/visionarys-io/memql/component/node/gen"
@@ -121,6 +127,18 @@ func NewApp(cfg AppConfig) *App {
 }
 
 // Run starts the TUI event loop. Blocks until Quit() is called or the user exits.
+//
+// Launch sequence:
+//  1. Pre-flight wizard -- if ~/.memql/genesis.znas is missing,
+//     the first-launch wizard runs and seals an envelope. User
+//     can cancel out, in which case Run returns without entering
+//     the IDE.
+//  2. Launch splash -- numbered options to pick the entry mode.
+//     '1' = operating console (multi-tab IDE), '2' = run-local
+//     placeholder, 'Q' = quit.
+//  3. Operating console -- the multi-tab IDE. Connection
+//     goroutines start here, not before, so the wizard / splash
+//     run on a quiet screen.
 func (a *App) Run() error {
 	screen, err := ui.NewScreen()
 	if err != nil {
@@ -128,9 +146,33 @@ func (a *App) Run() error {
 	}
 	a.screen = screen
 	defer a.screen.Fini()
+	a.screen.EnableInteraction()
+
+	if a.shouldRunGenesisWizard() {
+		switch genesiswizard.Run(a.screen, a.theme) {
+		case genesiswizard.ResultCanceled, genesiswizard.ResultError:
+			return nil
+		}
+	}
+
+	switch splash.Run(a.screen, a.theme) {
+	case splash.ChoiceQuit:
+		return nil
+	case splash.ChoiceRunLocalCluster:
+		runlocal.Run(a.screen, a.theme)
+		return nil
+	case splash.ChoiceOperatingConsole:
+		// fall through
+	}
+
+	// Auto-seed the local cluster from genesis.znas before the
+	// operating console mounts. Best-effort: failure to seed (no
+	// master key in env, bad envelope, etc.) leaves the local row
+	// in its needs-auth state and the user authorizes by hand.
+	a.autoSeedLocalFromGenesis()
+	a.refreshClusterList()
 
 	a.draw()
-	a.screen.EnableInteraction()
 
 	// Force a second draw after a brief delay. tcell's first Sync() after
 	// Init() consistently produces incomplete terminal output regardless of
@@ -488,6 +530,100 @@ func (a *App) replaceEntry(cfg config.ClusterConfig) {
 		old.Close()
 	}
 	a.openEntry(cfg)
+}
+
+// shouldRunGenesisWizard reports whether the first-launch genesis
+// wizard should fire. The cockpit treats absence of the envelope as
+// the trigger -- presence (even with an outdated content) is treated
+// as "operator has already set up; do not re-prompt".
+func (a *App) shouldRunGenesisWizard() bool {
+	path := genesisFilePath()
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return os.IsNotExist(err)
+}
+
+// genesisFilePath returns the absolute path of the operator's
+// genesis envelope, mirroring memql's resolution rules.
+// $MEMQL_GENESIS_PATH wins; otherwise ~/.memql/genesis.znas. Empty
+// string when the home dir can't be resolved (degenerate; treated as
+// "no wizard" by callers).
+func genesisFilePath() string {
+	if p := strings.TrimSpace(os.Getenv("MEMQL_GENESIS_PATH")); p != "" {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".memql", "genesis.znas")
+}
+
+// autoSeedLocalFromGenesis is the bridge between the sealed envelope
+// and the operating-console's clusters.yaml. Called once on
+// operating-console entry. If clusters.yaml already carries a local
+// row with a non-empty endpoint, this is a no-op. Otherwise the
+// function attempts to open genesis.znas (requires MEMQL_MASTER_KEY
+// in the environment), extracts IDENTITY_BOOTSTRAP_DOMAIN, and
+// writes a local row of the form `https://bff.<domain>`.
+//
+// Failure is silent on purpose: the user can authorize the local
+// row by hand from inside the TUI if the auto-seed didn't run. The
+// caller refreshes the cluster list after this returns so any seed
+// is visible to the first draw.
+func (a *App) autoSeedLocalFromGenesis() {
+	clusters, err := config.LoadClusters()
+	if err != nil {
+		if a.logger != nil {
+			a.logger.Warn("auto-seed: load clusters.yaml", "error", err)
+		}
+		return
+	}
+	if existing, ok := clusters.Get("local"); ok && existing.Endpoint != "" {
+		return // already configured -- nothing to do
+	}
+
+	gpath := genesisFilePath()
+	if gpath == "" {
+		return
+	}
+	if _, err := os.Stat(gpath); err != nil {
+		return // no envelope -- wizard wasn't completed; nothing to seed from
+	}
+
+	entries, err := corgenesis.OpenFile(gpath)
+	if err != nil {
+		if a.logger != nil {
+			a.logger.Warn("auto-seed: open genesis", "error", err)
+		}
+		return
+	}
+	domain, ok := corgenesis.LookupEnv(entries, "IDENTITY_BOOTSTRAP_DOMAIN")
+	if !ok || strings.TrimSpace(domain) == "" {
+		return
+	}
+	endpoint := "https://bff." + strings.TrimSpace(domain)
+
+	replaced := false
+	for i := range clusters.Clusters {
+		if clusters.Clusters[i].Name != "local" {
+			continue
+		}
+		clusters.Clusters[i].Endpoint = endpoint
+		replaced = true
+		break
+	}
+	if !replaced {
+		clusters.Clusters = append(clusters.Clusters, config.ClusterConfig{
+			Name:     "local",
+			Endpoint: endpoint,
+		})
+	}
+	if err := config.SaveClusters(clusters); err != nil && a.logger != nil {
+		a.logger.Warn("auto-seed: save clusters.yaml", "error", err)
+	}
 }
 
 // openEntry adds an entry for cfg to the pool if not already present,
