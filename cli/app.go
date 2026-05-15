@@ -563,22 +563,34 @@ func (a *App) wireExplorer() {
 	}
 	ctx := context.Background()
 
-	// Load file listing from concepts.
+	// Load file listing from concepts + the agents listing from the
+	// connected cluster's v1:agents:agent rows. Both populate the
+	// explorer tree in one SetFiles call so a partial failure (e.g.
+	// cluster has no queryAllAgents loaded) doesn't blow the whole
+	// pane away.
 	go func() {
 		q := getQueries()
 		if q == nil { return }
-		concepts, err := q.ListConcepts(ctx)
-		if err != nil {
-			return
-		}
 		fileMap := make(map[string][]explorer.FileEntry)
-		for _, c := range concepts {
-			category := conceptKindToCategory(c.GetDomain())
-			fileMap[category] = append(fileMap[category], explorer.FileEntry{
-				Name: c.GetEntity(),
-				Path: c.GetId(),
-			})
+
+		concepts, err := q.ListConcepts(ctx)
+		if err == nil {
+			for _, c := range concepts {
+				category := conceptKindToCategory(c.GetDomain())
+				fileMap[category] = append(fileMap[category], explorer.FileEntry{
+					Name: c.GetEntity(),
+					Path: c.GetId(),
+				})
+			}
+		} else if a.logger != nil {
+			a.logger.Warn("explorer: ListConcepts failed", "error", err)
 		}
+
+		agents, entries := a.loadAgents(ctx, q)
+		if len(entries) > 0 {
+			fileMap["Agents"] = append(fileMap["Agents"], entries...)
+		}
+		a.explorerView.SetAgents(agents)
 		a.explorerView.SetFiles(fileMap)
 		if a.screen != nil {
 			a.screen.PostEvent(tcell.NewEventInterrupt(nil))
@@ -603,13 +615,234 @@ func (a *App) wireExplorer() {
 		return ""
 	}
 
-	// Wire file loading.
-	// TODO: Create a proper query function for retrieving .memql file source.
-	// Files are embedded in the server binary — need a dedicated query or
-	// integration capability to serve them to the CLI.
+	// Wire file loading. Agent rows render from the cached AgentEntry
+	// (no extra round-trip); on-disk .memql source loading remains
+	// unimplemented -- the server hasn't grown a DSL-source query yet.
 	a.explorerView.OnFileOpen = func(path string) (string, error) {
+		if id, ok := explorer.AgentIDFromPath(path); ok {
+			if a, found := a.explorerView.AgentByID(id); found {
+				return explorer.RenderAgent(a), nil
+			}
+			return "", fmt.Errorf("agent %s not in cache", id)
+		}
 		return "", fmt.Errorf("file loading not yet implemented for %s", path)
 	}
+}
+
+// loadAgents pulls v1:agents:agent rows for the active partition via
+// queryAllAgents and parses them into FileEntry items + an id-keyed
+// AgentEntry cache the explorer uses for the detail pane. Returns
+// (nil, nil) when the query is unavailable or fails -- the caller
+// treats that as "no agents listed" without blowing the rest of the
+// explorer away.
+//
+// queryAllAgents lives in copresent's DSL tree today; clusters running
+// just memql-core won't have it loaded and this call returns nothing.
+// That's fine -- the Agents category renders empty and the rest of
+// the tree is unaffected.
+func (a *App) loadAgents(ctx context.Context, q *client.QueryClient) (map[string]explorer.AgentEntry, []explorer.FileEntry) {
+	if q == nil {
+		return nil, nil
+	}
+	result, err := q.Execute(ctx, `queryAllAgents({})`)
+	if err != nil {
+		if a.logger != nil {
+			a.logger.Debug("explorer: queryAllAgents unavailable", "error", err)
+		}
+		return nil, nil
+	}
+	rows := extractAgentRows(result)
+	if len(rows) == 0 {
+		return nil, nil
+	}
+
+	cache := make(map[string]explorer.AgentEntry, len(rows))
+	entries := make([]explorer.FileEntry, 0, len(rows))
+	for _, m := range rows {
+		ent := parseAgentRow(m)
+		if ent.ID == "" {
+			continue
+		}
+		cache[ent.ID] = ent
+		display := ent.Name
+		if display == "" {
+			display = ent.RoleSlug
+		}
+		if display == "" {
+			display = ent.ID
+		}
+		entries = append(entries, explorer.FileEntry{
+			Name: display,
+			Path: explorer.AgentPathForID(ent.ID),
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
+	return cache, entries
+}
+
+// extractAgentRows pulls the agent records out of a queryAllAgents
+// response. Reuses the nested-wrapper unwinding extractNodeArray does
+// for cluster/partition queries so the parser is consistent across
+// all queries; a fresh structure here would diverge on the first
+// engine response-shape tweak.
+func extractAgentRows(result any) []map[string]any {
+	if result == nil {
+		return nil
+	}
+	var items []any
+	switch v := result.(type) {
+	case []any:
+		items = v
+	case map[string]any:
+		items = extractNodeArray(v)
+		if items == nil {
+			items = []any{v}
+		}
+	default:
+		return nil
+	}
+
+	type rowWithTime struct {
+		row     map[string]any
+		created string
+	}
+	latest := make(map[string]rowWithTime)
+	for _, item := range items {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		id := firstNonEmpty(getString(m, "id"))
+		if id == "" {
+			if p, ok := m["payload"].(map[string]any); ok {
+				id = getString(p, "id")
+			}
+		}
+		if id == "" {
+			continue
+		}
+		createdAt := firstNonEmpty(
+			getString(m, "createdAt"),
+			getString(m, "created_at"),
+		)
+		if existing, found := latest[id]; found && createdAt <= existing.created {
+			continue
+		}
+		latest[id] = rowWithTime{row: m, created: createdAt}
+	}
+	out := make([]map[string]any, 0, len(latest))
+	for _, r := range latest {
+		out = append(out, r.row)
+	}
+	return out
+}
+
+// parseAgentRow maps a single agent row map to an AgentEntry. Reads
+// fields out of the top-level row first, then falls back to a nested
+// "payload" object -- queryAllAgents under shape agentFull renders
+// the payload fields flat at the row top level, but a bare
+// concept-row response keeps them nested, so we accept both.
+func parseAgentRow(m map[string]any) explorer.AgentEntry {
+	payload := m
+	if p, ok := m["payload"].(map[string]any); ok && p != nil {
+		payload = p
+	}
+	pick := func(key string) string {
+		if v := getString(payload, key); v != "" {
+			return v
+		}
+		return getString(m, key)
+	}
+	pickBool := func(key string, def bool) bool {
+		if v, ok := payload[key].(bool); ok {
+			return v
+		}
+		if v, ok := m[key].(bool); ok {
+			return v
+		}
+		return def
+	}
+
+	caps, _ := payload["capabilities"].(map[string]any)
+	if caps == nil {
+		caps, _ = m["capabilities"].(map[string]any)
+	}
+	provider, _ := payload["providerConfig"].(map[string]any)
+	if provider == nil {
+		provider, _ = m["providerConfig"].(map[string]any)
+	}
+	var llm map[string]any
+	if provider != nil {
+		llm, _ = provider["llm"].(map[string]any)
+	}
+	trigger, _ := payload["triggerBehavior"].(map[string]any)
+	if trigger == nil {
+		trigger, _ = m["triggerBehavior"].(map[string]any)
+	}
+
+	ent := explorer.AgentEntry{
+		ID:           getString(m, "id"),
+		Name:         pick("name"),
+		Description:  pick("description"),
+		Role:         pick("role"),
+		RoleSlug:     pick("roleSlug"),
+		Gender:       pick("gender"),
+		Personality:  pick("personality"),
+		OwnerUserId:  pick("ownerUserId"),
+		Active:       pickBool("active", true),
+		Deleted:      pickBool("deleted", false),
+		AudioControl: pick("audioControl"),
+		VideoControl: pick("videoControl"),
+		GroupIds:     stringSlice(payload, "groupIds"),
+	}
+	if ent.ID == "" {
+		ent.ID = getString(payload, "id")
+	}
+	if llm != nil {
+		ent.LLMPolicyName = getString(llm, "policyName")
+		ent.LLMProvider = getString(llm, "provider")
+		ent.LLMModel = getString(llm, "model")
+	}
+	if caps != nil {
+		if v, ok := caps["avatar"].(bool); ok { ent.CapAvatar = v }
+		if v, ok := caps["lipSync"].(bool); ok { ent.CapLipSync = v }
+		if v, ok := caps["vision"].(bool); ok { ent.CapVision = v }
+		if v, ok := caps["voiceToVoice"].(bool); ok { ent.CapVoiceToVoice = v }
+		if v, ok := caps["claw"].(bool); ok { ent.CapClaw = v }
+		ent.Tools = stringSlice(caps, "tools")
+		ent.Domains = stringSlice(caps, "domains")
+		ent.Keywords = stringSlice(caps, "keywords")
+	}
+	if trigger != nil {
+		if v, ok := trigger["autoJoin"].(bool); ok { ent.AutoJoin = v }
+		if v, ok := trigger["greetOnJoin"].(bool); ok { ent.GreetOnJoin = v }
+		ent.SpeakWhen = getString(trigger, "speakWhen")
+	}
+	return ent
+}
+
+// stringSlice pulls a key out of a map as []string when the engine
+// returns it as []any (the JSON shape). Returns nil for missing /
+// non-array values rather than empty slices so the renderer can skip
+// the field entirely instead of printing an empty list.
+func stringSlice(m map[string]any, key string) []string {
+	if m == nil {
+		return nil
+	}
+	raw, ok := m[key].([]any)
+	if !ok || len(raw) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		if s, ok := v.(string); ok && s != "" {
+			out = append(out, s)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // wireAutomations connects the Automations tab's callbacks to the gRPC client.
@@ -1100,6 +1333,8 @@ func getString(m map[string]any, key string) string {
 
 func conceptKindToCategory(domain string) string {
 	switch domain {
+	case "agents":
+		return "Agents"
 	case "cognition":
 		return "Queries" // Most cognition concepts are query-accessible
 	case "cluster":
