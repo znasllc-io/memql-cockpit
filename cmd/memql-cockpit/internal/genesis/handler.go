@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/visionarys-io/memql-cockpit/cli/config"
 	"github.com/visionarys-io/memql/component/secret"
 )
 
@@ -259,6 +260,12 @@ func handleInit(args []string) int {
 		syncShellRCs(masterKeyHex)
 	}
 
+	// Seed the cockpit's `local` cluster row from IDENTITY_BOOTSTRAP_DOMAIN
+	// so a fresh install opens the TUI with an Endpoint already filled in.
+	// Failure is non-fatal -- the envelope is the real artifact; the
+	// clusters.yaml convenience can be re-derived by re-running.
+	seedLocalCluster(entries)
+
 	extras := len(entries) - len(required)
 	verb := "Wrote"
 	if !firstTime {
@@ -267,6 +274,70 @@ func handleInit(args []string) int {
 	fmt.Fprintf(os.Stdout, "%s %d entries to %s (%d manifest, %d extras; manifest source: %s).\n",
 		verb, len(entries), outPath, len(required), extras, manifest.Source)
 	return 0
+}
+
+// seedLocalCluster looks for IDENTITY_BOOTSTRAP_DOMAIN in the just-
+// sealed entries and writes (or updates) the `local` row in
+// ~/.memql/clusters.yaml so the TUI carries no hardcoded domain.
+// Endpoint is set to https://bff.<domain>; Issuer / ClientId are
+// left blank for the user to fill via the L:Authorize flow.
+//
+// Best-effort: every failure path prints a hint to stderr but
+// returns normally, since the genesis envelope is the artifact
+// callers actually care about. The operator can press L in the
+// TUI to fill in the same fields by hand if this never runs.
+func seedLocalCluster(entries []EnvEntry) {
+	var domain string
+	for _, e := range entries {
+		if e.Name == "IDENTITY_BOOTSTRAP_DOMAIN" {
+			domain = strings.TrimSpace(e.Value)
+			break
+		}
+	}
+	if domain == "" {
+		fmt.Fprintln(os.Stderr, "genesis init: IDENTITY_BOOTSTRAP_DOMAIN not set in .env; skipping clusters.yaml seed -- press L in the TUI to authorize a cluster manually.")
+		return
+	}
+	endpoint := "https://bff." + domain
+
+	clusters, err := config.LoadClusters()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "genesis init: load %s: %v (skipping cluster seed).\n", filepath.Join(config.ConfigDir(), "clusters.yaml"), err)
+		return
+	}
+	if clusters == nil {
+		clusters = &config.ClustersFile{}
+	}
+
+	replaced := false
+	for i := range clusters.Clusters {
+		if clusters.Clusters[i].Name != "local" {
+			continue
+		}
+		if clusters.Clusters[i].Endpoint == endpoint {
+			// Idempotent: nothing to update.
+			return
+		}
+		clusters.Clusters[i].Endpoint = endpoint
+		replaced = true
+		break
+	}
+	if !replaced {
+		clusters.Clusters = append(clusters.Clusters, config.ClusterConfig{
+			Name:     "local",
+			Endpoint: endpoint,
+		})
+	}
+
+	if err := config.SaveClusters(clusters); err != nil {
+		fmt.Fprintf(os.Stderr, "genesis init: save clusters.yaml: %v (cluster seed not applied).\n", err)
+		return
+	}
+	verb := "Updated"
+	if !replaced {
+		verb = "Seeded"
+	}
+	fmt.Fprintf(os.Stderr, "genesis init: %s local cluster endpoint to %s.\n", verb, endpoint)
 }
 
 // syncSourceEnvFile rewrites path so its MEMQL_MASTER_KEY line

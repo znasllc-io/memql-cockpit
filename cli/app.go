@@ -12,10 +12,12 @@ import (
 	"time"
 
 	"github.com/gdamore/tcell/v2"
+	"github.com/visionarys-io/memql-cockpit/cli/auth"
 	"github.com/visionarys-io/memql-cockpit/cli/automations"
 	"github.com/visionarys-io/memql-cockpit/cli/client"
 	"github.com/visionarys-io/memql-cockpit/cli/cluster"
 	"github.com/visionarys-io/memql-cockpit/cli/config"
+	"github.com/visionarys-io/memql-cockpit/cli/discovery"
 	"github.com/visionarys-io/memql-cockpit/cli/editor"
 	"github.com/visionarys-io/memql-cockpit/cli/explorer"
 	"github.com/visionarys-io/memql-cockpit/cli/settings"
@@ -363,10 +365,141 @@ func (a *App) persistSelected(name string) {
 	}
 }
 
+// runAuthorizeFlow is the OnAuthorize goroutine body. Reports
+// progress + outcome through the notifications center so the UI
+// thread sees status updates without blocking. The notification id
+// is keyed on the cluster being authorized so successive runs
+// against the same cluster replace each other instead of stacking.
+//
+// existingName is the row currently being edited (empty for Add).
+// Used to resolve "what is the row name now?" when the discovery
+// doc disagrees: edit mode keeps the existing name (the user is
+// updating credentials for THIS slot, not renaming), Add mode
+// trusts the discovery doc.
+func (a *App) runAuthorizeFlow(discoveryURL, existingName string) {
+	notifId := "cluster:authorize"
+	if existingName != "" {
+		notifId = "cluster:authorize:" + existingName
+	}
+	a.notifications.SyncMeta(notifId, ui.SeverityInfo,
+		fmt.Sprintf("Fetching discovery from %s ...", discoveryURL))
+	a.postRedraw()
+
+	doc, err := discovery.Fetch(discoveryURL)
+	if err != nil {
+		a.notifications.SyncMeta(notifId, ui.SeverityError,
+			fmt.Sprintf("Discovery failed: %v", err))
+		a.postRedraw()
+		return
+	}
+
+	name := strings.TrimSpace(existingName)
+	if name == "" {
+		name = strings.TrimSpace(doc.ClusterName)
+	}
+	if name == "" {
+		name = discovery.HostFromURL(discoveryURL)
+	}
+	if name == "" {
+		a.notifications.SyncMeta(notifId, ui.SeverityError,
+			"Discovery response did not include a cluster name -- cannot continue.")
+		a.postRedraw()
+		return
+	}
+
+	cfg := config.ClusterConfig{
+		Name:     name,
+		Endpoint: strings.TrimSpace(doc.GRPCEndpoint),
+		Issuer:   strings.TrimSpace(doc.IdentityURL),
+		ClientId: strings.TrimSpace(doc.ClientId),
+	}
+
+	// Persist (replace-in-place for existing rows, append for new ones).
+	clusters, err := config.LoadClusters()
+	if err != nil {
+		a.notifications.SyncMeta(notifId, ui.SeverityError,
+			fmt.Sprintf("Load clusters config: %v", err))
+		a.postRedraw()
+		return
+	}
+	replaced := false
+	for i := range clusters.Clusters {
+		if clusters.Clusters[i].Name == cfg.Name {
+			// Preserve user-set sticky bits (selected partition, PAT)
+			// when overwriting the auth-relevant fields.
+			cfg.SelectedPartition = clusters.Clusters[i].SelectedPartition
+			cfg.PAT = clusters.Clusters[i].PAT
+			clusters.Clusters[i] = cfg
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		clusters.Clusters = append(clusters.Clusters, cfg)
+	}
+	if err := config.SaveClusters(clusters); err != nil {
+		a.notifications.SyncMeta(notifId, ui.SeverityError,
+			fmt.Sprintf("Save clusters config: %v", err))
+		a.postRedraw()
+		return
+	}
+
+	// Refresh the cluster list view so the user sees the new Endpoint
+	// / Issuer / ClientId values immediately. The pool entry is left
+	// in stateNeedsConfig (its config is still the pre-authorize one)
+	// until after the token is minted -- otherwise the lifecycle
+	// would race the browser flow, exhaust its 3 dials with "no
+	// authorization header" before the user even sees the magic
+	// link, and the cluster would surface as unreachable while the
+	// user is still typing their email.
+	a.refreshClusterList()
+
+	a.notifications.SyncMeta(notifId, ui.SeverityInfo,
+		fmt.Sprintf("Opening browser to authenticate with %q ...", cfg.Name))
+	a.postRedraw()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	if _, err := auth.EnsureValidToken(ctx, cfg); err != nil {
+		a.notifications.SyncMeta(notifId, ui.SeverityError,
+			fmt.Sprintf("Authorization failed for %q: %v", cfg.Name, err))
+		a.postRedraw()
+		return
+	}
+
+	a.notifications.SyncMeta(notifId, ui.SeverityInfo,
+		fmt.Sprintf("Authorized %q -- connecting...", cfg.Name))
+	a.postRedraw()
+
+	// Token is cached; recreate the pool entry with the new config
+	// so a fresh dial cycle starts with the bearer in place.
+	a.replaceEntry(cfg)
+}
+
+// replaceEntry closes any existing pool entry for cfg.Name and opens
+// a fresh one with the new config. Used by the authorize flow to
+// pick up new credentials without leaking the old connection.
+func (a *App) replaceEntry(cfg config.ClusterConfig) {
+	a.poolMu.Lock()
+	old := a.pool[cfg.Name]
+	delete(a.pool, cfg.Name)
+	a.poolMu.Unlock()
+	if old != nil {
+		old.Close()
+	}
+	a.openEntry(cfg)
+}
+
 // openEntry adds an entry for cfg to the pool if not already present,
 // and starts its lifecycle goroutine. Returns immediately -- the dial
 // and retries run in the background. If an entry for cfg.Name already
 // exists, this is a no-op (let the existing lifecycle own it).
+//
+// Rows that haven't been authorized yet (no endpoint, or no PAT and
+// no Issuer+ClientId pair) skip the lifecycle entirely: the entry is
+// parked in stateNeedsConfig and the row picks up an `L:Authorize`
+// hint instead of burning 90 seconds on dials the BFF would reject
+// for "authorization header missing".
 func (a *App) openEntry(cfg config.ClusterConfig) {
 	a.poolMu.Lock()
 	if a.pool == nil {
@@ -379,6 +512,12 @@ func (a *App) openEntry(cfg config.ClusterConfig) {
 	entry := newConnEntry(a, cfg)
 	a.pool[cfg.Name] = entry
 	a.poolMu.Unlock()
+
+	if cfg.NeedsAuth() {
+		entry.setStateAttempt(stateNeedsConfig, 0, time.Time{})
+		a.postRedraw()
+		return
+	}
 
 	// The lifecycle goroutine drives the state machine: attempts a
 	// bounded number of dials, sleeps backoff between them, handles
@@ -1412,6 +1551,17 @@ func (a *App) wireClustersCallbacks() {
 		return state.String(), attempt, nextStr, true
 	}
 
+	// OnAuthorize fires when the user submits the Add/Edit form with
+	// the Discovery URL field filled. The whole pipeline runs off the
+	// UI thread so the screen stays responsive while the browser flow
+	// is open: discover the well-known doc, persist the resolved
+	// cluster row, mint a token via OAuth (browser), cache the token,
+	// and finally restart the pool entry so the new credentials get
+	// picked up by a fresh dial cycle.
+	a.clustersView.OnAuthorize = func(discoveryURL, existingName string) {
+		go a.runAuthorizeFlow(discoveryURL, existingName)
+	}
+
 	// Add a new cluster, save, auto-open its pool entry. No
 	// "auto-connect via OnConnect" dance -- openEntry handles it.
 	//
@@ -1980,6 +2130,10 @@ func (a *App) syncConnectionNotifications() {
 		case stateFailed:
 			a.notifications.Sync(id, ui.SeverityError,
 				fmt.Sprintf("%q is unreachable -- press R on its row to retry.",
+					entry.Config.Name))
+		case stateNeedsConfig:
+			a.notifications.Sync(id, ui.SeverityWarning,
+				fmt.Sprintf("%q is not configured -- press L on its row to authorize.",
 					entry.Config.Name))
 		default:
 			// Connected / Idle -- the cluster is fine, clear its slot.
