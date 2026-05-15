@@ -22,6 +22,13 @@ type View struct {
 	// so there's nothing meaningful for the Explorer to show.
 	GatedMessage string
 
+	// Agents caches the materialized v1:agents:agent rows from the
+	// connected cluster, keyed by id. The app layer populates this via
+	// SetAgents whenever queryAllAgents resolves; OnFileOpen for an
+	// agent path renders the cached entry instead of round-tripping
+	// to the server again. nil/empty -> no agents listed yet.
+	agents map[string]AgentEntry
+
 	// Callbacks for loading file content and Sense operations.
 	// These are set by the app layer to call gRPC.
 	OnFileOpen       func(path string) (source string, err error)
@@ -48,6 +55,24 @@ func (v *View) SetFiles(files map[string][]FileEntry) {
 	roots := BuildTree(DefaultCategories(), files)
 	v.Tree = NewTree(v.Theme, roots)
 	v.Tree.OnSelect = v.handleFileSelect
+}
+
+// SetAgents replaces the cached agent rows. The app layer calls this
+// after queryAllAgents resolves. RenderAgent uses the cache; nil/empty
+// just means "no agents listed yet" -- not an error condition.
+func (v *View) SetAgents(agents map[string]AgentEntry) {
+	v.agents = agents
+}
+
+// AgentByID returns a cached agent row by id, ok=false when missing.
+// Exposed so the app layer can render the same entry without keeping
+// its own copy.
+func (v *View) AgentByID(id string) (AgentEntry, bool) {
+	if v.agents == nil {
+		return AgentEntry{}, false
+	}
+	a, ok := v.agents[id]
+	return a, ok
 }
 
 // Draw renders the Explorer tab.
