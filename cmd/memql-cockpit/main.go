@@ -34,6 +34,7 @@ import (
 	"github.com/visionarys-io/memql-cockpit/cli/auth"
 	"github.com/visionarys-io/memql-cockpit/cli/config"
 	"github.com/visionarys-io/memql-cockpit/cmd/memql-cockpit/internal/authorize"
+	"github.com/visionarys-io/memql-cockpit/cmd/memql-cockpit/internal/genesis"
 	"github.com/visionarys-io/memql-cockpit/cmd/memql-cockpit/internal/lint"
 	"github.com/visionarys-io/memql-cockpit/cmd/memql-cockpit/internal/worker"
 )
@@ -59,6 +60,8 @@ func main() {
 		case "worker":
 			worker.HandleCommand(os.Args[2:])
 			return
+		case "genesis":
+			os.Exit(genesis.HandleCommand(os.Args[2:]))
 		case "lint":
 			os.Exit(lint.HandleCommand(os.Args[2:]))
 		case "help":
@@ -368,6 +371,7 @@ func printUsage() {
 	fmt.Println("  memql-cockpit login <cluster>          Re-authenticate an existing cluster")
 	fmt.Println("  memql-cockpit logout <cluster>         Remove cached credentials")
 	fmt.Println("  memql-cockpit worker <subcommand>      Run as a memql worker (computer-use)")
+	fmt.Println("  memql-cockpit genesis init [--from .env]  Create / update ~/.memql/genesis.znas")
 	fmt.Println("  memql-cockpit lint [path]              Validate a .memql file or DSL tree")
 	fmt.Println("")
 	fmt.Println("TUI FLAGS")
