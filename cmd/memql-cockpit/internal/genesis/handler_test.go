@@ -171,3 +171,66 @@ func TestFindMissing_AllPresent(t *testing.T) {
 		t.Fatalf("expected no missing, got %v", got)
 	}
 }
+
+func TestWriteGenesisAtomic_Fresh(t *testing.T) {
+	tmp := t.TempDir()
+	out := filepath.Join(tmp, "genesis.znas")
+	payload := []byte("hello-genesis")
+	if err := writeGenesisAtomic(out, payload); err != nil {
+		t.Fatalf("writeGenesisAtomic: %v", err)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("content mismatch: got %q want %q", got, payload)
+	}
+	st, err := os.Stat(out)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if st.Mode().Perm() != 0o600 {
+		t.Fatalf("perm: got %o want 0600", st.Mode().Perm())
+	}
+	// No tmp leftovers in the directory.
+	matches, err := filepath.Glob(filepath.Join(tmp, "genesis.znas.tmp.*"))
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("temp files leaked: %v", matches)
+	}
+}
+
+func TestWriteGenesisAtomic_ReplacesExisting(t *testing.T) {
+	tmp := t.TempDir()
+	out := filepath.Join(tmp, "genesis.znas")
+	if err := os.WriteFile(out, []byte("old"), 0o600); err != nil {
+		t.Fatalf("seed old: %v", err)
+	}
+	if err := writeGenesisAtomic(out, []byte("new")); err != nil {
+		t.Fatalf("writeGenesisAtomic: %v", err)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if string(got) != "new" {
+		t.Fatalf("content: got %q want %q", got, "new")
+	}
+	matches, err := filepath.Glob(filepath.Join(tmp, "genesis.znas.tmp.*"))
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("temp files leaked: %v", matches)
+	}
+}
+
+func TestWriteGenesisAtomic_MissingDirFails(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "nope", "genesis.znas")
+	if err := writeGenesisAtomic(out, []byte("x")); err == nil {
+		t.Fatalf("expected error when parent dir is missing")
+	}
+}

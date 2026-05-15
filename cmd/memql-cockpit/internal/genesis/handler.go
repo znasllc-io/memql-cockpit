@@ -36,7 +36,7 @@ func HandleCommand(args []string) int {
 }
 
 func printUsage() {
-	fmt.Fprintln(os.Stderr, `Usage:
+	fmt.Fprint(os.Stderr, `Usage:
   memql-cockpit genesis init [--from <env-file>] [--manifest <path>]
                              [--out <path>] [--no-tui]
 
@@ -192,7 +192,7 @@ func handleInit(args []string) int {
 		fmt.Fprintf(os.Stderr, "genesis init: mkdir %s: %v\n", filepath.Dir(outPath), err)
 		return 1
 	}
-	if err := os.WriteFile(outPath, envelope, 0o600); err != nil {
+	if err := writeGenesisAtomic(outPath, envelope); err != nil {
 		fmt.Fprintf(os.Stderr, "genesis init: write %s: %v\n", outPath, err)
 		return 1
 	}
@@ -227,6 +227,49 @@ func generateMasterKey() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(raw[:]), nil
+}
+
+// writeGenesisAtomic writes envelope to outPath without leaving the
+// destination in a half-written state if anything goes wrong. The
+// temp file is created in the same directory as outPath so the
+// final os.Rename is a same-filesystem move (atomic on POSIX). On
+// any error before the rename, the previous genesis.znas at outPath
+// is untouched; on a rename failure the temp file is removed.
+func writeGenesisAtomic(outPath string, envelope []byte) error {
+	dir := filepath.Dir(outPath)
+	tmp, err := os.CreateTemp(dir, filepath.Base(outPath)+".tmp.*")
+	if err != nil {
+		return fmt.Errorf("create temp: %w", err)
+	}
+	tmpName := tmp.Name()
+	// Remove the temp file on any error path. Once Rename succeeds,
+	// the temp name no longer exists so this is a no-op.
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return fmt.Errorf("chmod %s: %w", tmpName, err)
+	}
+	if _, err := tmp.Write(envelope); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write %s: %w", tmpName, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("sync %s: %w", tmpName, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", tmpName, err)
+	}
+	if err := os.Rename(tmpName, outPath); err != nil {
+		return fmt.Errorf("rename %s -> %s: %w", tmpName, outPath, err)
+	}
+	cleanup = false
+	return nil
 }
 
 // findMissing returns the required names not present in entries,
