@@ -109,11 +109,20 @@ type addFormState struct {
 // The preset has NO auth shortcut. Local-dev runs the identity
 // service via docker compose and uses the same OAuth flow as any
 // other cluster -- the user runs `memql-cockpit authorize
-// http://localhost:8081` (or wherever identity is reachable) to
-// wire issuer + client_id, then `login local` to mint a token.
+// https://identity.local.znas.io` to wire issuer + client_id, then
+// `login local` to mint a token.
+//
+// Endpoint targets the canonical NGINX-fronted gRPC entry point
+// surfaced by docker-compose.full.yml: `bff.${DOMAIN}:443` with TLS
+// terminated at the load balancer. ${DOMAIN} defaults to
+// `local.znas.io` in the memql repo (see IDENTITY_BOOTSTRAP_DOMAIN
+// in docker-compose.full.yml + the mkcert dev wildcard cert). A
+// developer running the cluster-mode compose with plaintext gRPC on
+// localhost:50050 can edit this entry through the Add/Edit form
+// without losing the default.
 var defaultLocalClusterConfig = config.ClusterConfig{
 	Name:     "local",
-	Endpoint: "localhost:50052",
+	Endpoint: "https://bff.local.znas.io",
 }
 
 // LocalClusterConfig returns the active local-cluster default. Exposed as
@@ -122,25 +131,45 @@ func LocalClusterConfig() config.ClusterConfig {
 	return defaultLocalClusterConfig
 }
 
-// splitEndpoint parses a "host:port" string into its two parts, falling
-// back gracefully when the input is incomplete. Empty port is allowed
-// (validated on save).
+// splitEndpoint parses an endpoint string into its host + port parts
+// for the Add/Edit form. Accepts three shapes:
+//
+//	"host:port"               -> ("host", "port")    -- bare gRPC, plaintext
+//	"scheme://host[:port]"    -> ("scheme://host", "port_or_empty")
+//	""                        -> ("", "")
+//
+// When the user pastes a full URL (https://bff.local.znas.io), the
+// scheme stays on the Host field so joinEndpoint round-trips it back
+// to a working endpoint that ParseClusterEndpoint in cli/client can
+// resolve. Empty port is allowed; validated on save.
 func splitEndpoint(endpoint string) (host, port string) {
 	endpoint = strings.TrimSpace(endpoint)
 	if endpoint == "" {
 		return "", ""
 	}
-	// Use LastIndex so IPv6 literals with brackets (future-proofing) work.
-	idx := strings.LastIndex(endpoint, ":")
-	if idx < 0 {
-		return endpoint, ""
+	if i := strings.Index(endpoint, "://"); i >= 0 {
+		schemePrefix := endpoint[:i+3]
+		rest := endpoint[i+3:]
+		hostPart, portPart := splitHostPort(rest)
+		return schemePrefix + hostPart, portPart
 	}
-	return endpoint[:idx], endpoint[idx+1:]
+	return splitHostPort(endpoint)
 }
 
-// joinEndpoint combines host + port into the single "host:port" form
-// stored on ClusterConfig. The connection layer still receives one
-// string; splitting is a UI concern only.
+func splitHostPort(s string) (host, port string) {
+	idx := strings.LastIndex(s, ":")
+	if idx < 0 {
+		return s, ""
+	}
+	return s[:idx], s[idx+1:]
+}
+
+// joinEndpoint combines host + port back into the single string stored
+// on ClusterConfig.Endpoint. Preserves a scheme prefix on host: a
+// user editing "https://bff.local.znas.io" with empty port saves the
+// URL as-is; a user editing "localhost" + "50050" saves
+// "localhost:50050". The connection layer's ParseClusterEndpoint
+// handles both.
 func joinEndpoint(host, port string) string {
 	host = strings.TrimSpace(host)
 	port = strings.TrimSpace(port)
@@ -612,8 +641,8 @@ func (v *ClustersView) drawAddForm(screen *ui.Screen, x, y, maxW int, bounds ui.
 	}
 	placeholders := [formFieldCount]string{
 		formFieldName:     "my-cluster",
-		formFieldHost:     "localhost",
-		formFieldPort:     "50052",
+		formFieldHost:     "https://bff.local.znas.io",
+		formFieldPort:     "(blank for URLs)",
 		formFieldIssuer:   "(optional)",
 		formFieldClientId: "(optional)",
 	}
