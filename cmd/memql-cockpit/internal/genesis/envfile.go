@@ -87,3 +87,107 @@ func SerializeEntries(entries []EnvEntry) []byte {
 	}
 	return []byte(sb.String())
 }
+
+// RewriteMasterKeyAssignment rewrites raw so the first uncommented
+// MEMQL_MASTER_KEY assignment carries newValue, preserving any
+// leading whitespace and optional `export ` prefix. When no
+// uncommented assignment exists, a fresh `MEMQL_MASTER_KEY=<value>`
+// line is appended. Returns the rewritten bytes and the action
+// taken (rcNoop / rcUpdated / rcAppended-equivalent expressed via
+// `replaced`/`appended` bools). Comments and blank lines are
+// preserved verbatim.
+//
+// Only the FIRST matching assignment is rewritten; duplicates lower
+// in the file are left alone. Multiple assignments are a pre-existing
+// authoring smell -- the bash semantics of "last write wins" still
+// holds for `set -a; . file` callers, so the operator's intent for a
+// duplicated key is already ambiguous before we touch it.
+func RewriteMasterKeyAssignment(raw []byte, newValue string) (out []byte, replaced, appended bool) {
+	lines := splitLinesPreservingTerminator(raw)
+	for i, line := range lines {
+		if !lineAssignsMasterKey(line.content) {
+			continue
+		}
+		lines[i].content = rebuildMasterKeyLine(line.content, newValue)
+		replaced = true
+		break
+	}
+	if !replaced {
+		// Append. Ensure a leading newline if the file didn't end
+		// with one so the appended line doesn't get concatenated
+		// onto the last existing line.
+		needSep := len(raw) > 0 && raw[len(raw)-1] != '\n'
+		if needSep {
+			lines = append(lines, envLine{content: "", terminator: "\n"})
+		}
+		lines = append(lines, envLine{content: "MEMQL_MASTER_KEY=" + newValue, terminator: "\n"})
+		appended = true
+	}
+	var b strings.Builder
+	for _, l := range lines {
+		b.WriteString(l.content)
+		b.WriteString(l.terminator)
+	}
+	return []byte(b.String()), replaced, appended
+}
+
+type envLine struct {
+	content    string
+	terminator string // "\n" or "" for a file that doesn't end with newline.
+}
+
+// splitLinesPreservingTerminator splits raw into lines and remembers
+// whether each was terminated with "\n" so we can reassemble the
+// file byte-for-byte modulo the targeted edit.
+func splitLinesPreservingTerminator(raw []byte) []envLine {
+	if len(raw) == 0 {
+		return nil
+	}
+	s := string(raw)
+	var out []envLine
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\n' {
+			out = append(out, envLine{content: s[start:i], terminator: "\n"})
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		out = append(out, envLine{content: s[start:], terminator: ""})
+	}
+	return out
+}
+
+// lineAssignsMasterKey reports whether line is an uncommented
+// assignment to MEMQL_MASTER_KEY, tolerating leading whitespace and
+// an optional `export ` prefix.
+func lineAssignsMasterKey(line string) bool {
+	s := strings.TrimLeft(line, " \t")
+	if strings.HasPrefix(s, "#") {
+		return false
+	}
+	s = strings.TrimPrefix(s, "export ")
+	s = strings.TrimLeft(s, " \t")
+	eq := strings.IndexByte(s, '=')
+	if eq < 0 {
+		return false
+	}
+	return strings.TrimSpace(s[:eq]) == "MEMQL_MASTER_KEY"
+}
+
+// rebuildMasterKeyLine returns a replacement for the original line
+// that keeps any leading whitespace and optional `export ` prefix
+// but writes the new value as `MEMQL_MASTER_KEY=<newValue>` (no
+// quoting -- generated master keys are 64-char hex, never need it).
+func rebuildMasterKeyLine(line, newValue string) string {
+	trimmed := strings.TrimLeft(line, " \t")
+	indent := line[:len(line)-len(trimmed)]
+	prefix := ""
+	if strings.HasPrefix(trimmed, "export ") {
+		prefix = "export "
+		trimmed = strings.TrimPrefix(trimmed, "export ")
+		trimmed = strings.TrimLeft(trimmed, " \t")
+	}
+	_ = trimmed
+	return indent + prefix + "MEMQL_MASTER_KEY=" + newValue
+}
