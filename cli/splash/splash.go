@@ -78,8 +78,8 @@ func draw(screen *ui.Screen, theme ui.Theme) {
 	screen.DrawText(px+(panelW-len(subtitle))/2, titleY+1, len(subtitle), subtitle, theme.SubtleStyle())
 
 	options := []string{
-		"  1   Open operating console",
-		"  2   Set up local cluster   (coming soon)",
+		"  1   Take the controls",
+		"  2   Set up local cluster",
 		"  Q   Quit",
 	}
 	optY := titleY + 4
