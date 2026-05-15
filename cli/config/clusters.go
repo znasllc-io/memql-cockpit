@@ -42,6 +42,28 @@ type ClustersFile struct {
 	SelectedCluster string          `yaml:"selected_cluster,omitempty"`
 }
 
+// NeedsAuth reports whether the cluster lacks enough credentials to
+// dial. Callers use this to short-circuit the connection lifecycle
+// (no point retrying for 90 seconds against a server we have no
+// bearer for) and to drive the "not configured" state in the TUI.
+//
+// A cluster is "configured" when it has BOTH an endpoint AND one of:
+//   - a PAT (the token IS the credential, no OIDC dance needed)
+//   - an OIDC issuer + client_id pair (cockpit can run the auth-code
+//     flow against them and produce a token)
+//
+// An empty endpoint also counts as not-configured: even with auth
+// fields set, there's nowhere to dial.
+func (c ClusterConfig) NeedsAuth() bool {
+	if c.Endpoint == "" {
+		return true
+	}
+	if c.PAT != "" {
+		return false
+	}
+	return c.Issuer == "" || c.ClientId == ""
+}
+
 // Get returns the cluster config with the given name.
 func (f *ClustersFile) Get(name string) (ClusterConfig, bool) {
 	for _, c := range f.Clusters {

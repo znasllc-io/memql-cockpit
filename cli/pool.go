@@ -32,11 +32,12 @@ import (
 type entryState int
 
 const (
-	stateIdle       entryState = iota // brand-new entry, goroutine hasn't started
-	stateConnecting                   // dial in flight
-	stateConnected                    // live stream, subscriber + monitor running
-	stateBackoff                      // waiting between failed attempts
-	stateFailed                       // all retries exhausted, awaiting manual retry
+	stateIdle        entryState = iota // brand-new entry, goroutine hasn't started
+	stateConnecting                    // dial in flight
+	stateConnected                     // live stream, subscriber + monitor running
+	stateBackoff                       // waiting between failed attempts
+	stateFailed                        // all retries exhausted, awaiting manual retry
+	stateNeedsConfig                   // missing endpoint/auth; no dial attempted, waiting for L:Authorize
 )
 
 func (s entryState) String() string {
@@ -51,6 +52,8 @@ func (s entryState) String() string {
 		return "backoff"
 	case stateFailed:
 		return "failed"
+	case stateNeedsConfig:
+		return "needs-auth"
 	default:
 		return "unknown"
 	}
@@ -856,6 +859,8 @@ func (a *App) refreshPartitionsView() {
 			msg = fmt.Sprintf("Connecting to %q -- partitions will appear once connected.", name)
 		case stateFailed:
 			msg = fmt.Sprintf("%q is unreachable. Press R on its row to retry.", name)
+		case stateNeedsConfig:
+			msg = fmt.Sprintf("%q is not configured. Press L on its row to authorize.", name)
 		default:
 			msg = fmt.Sprintf("Cluster %q is not connected.", name)
 		}
@@ -925,6 +930,8 @@ func (a *App) syncRowStatus(name string, s entryState) {
 		status = "connecting"
 	case stateFailed:
 		status = "unreachable"
+	case stateNeedsConfig:
+		status = "needs-auth"
 	default:
 		status = "unknown"
 	}
