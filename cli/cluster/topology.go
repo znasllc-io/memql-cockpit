@@ -458,22 +458,47 @@ func clipText(s string, maxW int) string {
 
 // buildEdges creates connections between nodes.
 // BFF connects to all other nodes in the mesh topology.
+// edgeRelations is the static service-relationship map that drives
+// topology connections. Each entry is (parent type) -> (child type).
+// An edge appears in the diagram only when BOTH endpoints are
+// actually present in v.Nodes -- so missing services (e.g. polyphon
+// overlay not running) drop their edges silently. The list captures
+// the live request flow through the local cluster, not every
+// possible communication path.
+var edgeRelations = [][2]string{
+	// Entry point fronts the public-facing services.
+	{"lb", "bff"},
+	{"lb", "identity"},
+	// BFF dispatches to workers + persistence layer.
+	{"bff", "cognition"},
+	{"bff", "agent"},
+	{"bff", "planner"},
+	{"bff", "voice"},
+	{"bff", "database"},
+	// Voice node uses the polyphon overlay services when they're up.
+	{"voice", "livekit"},
+	{"voice", "redis"},
+}
+
 func (v *View) buildEdges() {
 	v.Edges = nil
-	bffIdx := -1
+	// First index per type (multiple BFFs in the cluster: edges
+	// fan out from the first one; the others render side-by-side
+	// in the same row but don't double-up the line drawing).
+	firstByType := make(map[string]int, len(v.Nodes))
 	for i, n := range v.Nodes {
-		if n.Type == "bff" {
-			bffIdx = i
-			break
+		if _, exists := firstByType[n.Type]; !exists {
+			firstByType[n.Type] = i
 		}
 	}
-	if bffIdx < 0 {
-		return
-	}
-	for i := range v.Nodes {
-		if i != bffIdx {
-			v.Edges = append(v.Edges, [2]int{bffIdx, i})
+
+	for _, rel := range edgeRelations {
+		parentIdx, hasParent := firstByType[rel[0]]
+		childIdx, hasChild := firstByType[rel[1]]
+		if !hasParent || !hasChild {
+			continue // drop the edge if one side is missing
 		}
+		v.Edges = append(v.Edges, [2]int{parentIdx, childIdx})
 	}
 }
 
@@ -496,15 +521,47 @@ func (v *View) healthCounts() (healthy, degraded, offline int) {
 	return
 }
 
-// buildTypeOrder returns the row order for drawTopology. NodeTypes is
-// the authoritative source (seeded from v1:cluster:nodeType); any type
-// present on a registered node but not in NodeTypes is appended at the
-// end in first-seen order so a brand-new node type renders immediately
-// even before the seed catches up.
-func (v *View) buildTypeOrder(groups map[string][]int) []string {
-	seen := make(map[string]bool, len(v.NodeTypes)+len(groups))
-	order := make([]string, 0, len(v.NodeTypes)+len(groups))
+// preferredTypeOrder is the tier ordering the topology renders
+// top-to-bottom when types are present. Captures the request flow
+// through a local cluster: LB at the top, services it fronts on the
+// next row, workers BFF dispatches to, the data layer, then any
+// external clients. Types not in this list fall through to the
+// gRPC-seed and first-seen heuristics so unrecognized services
+// still appear at the bottom rather than being dropped.
+var preferredTypeOrder = []string{
+	"lb",
+	"bff",
+	"identity",
+	"cognition",
+	"agent",
+	"planner",
+	"voice",
+	"database",
+	"redis",
+	"livekit",
+	"voice-agent",
+}
 
+// buildTypeOrder returns the row order for drawTopology. The static
+// preferredTypeOrder list comes first so well-known services land in
+// the expected tiers; NodeTypes (seeded from v1:cluster:nodeType)
+// follows so unknown-to-the-cockpit registered types still render
+// in seed order; v.Nodes fills the rest in first-seen insertion
+// order so a brand-new docker service shows up without a Go change.
+func (v *View) buildTypeOrder(groups map[string][]int) []string {
+	seen := make(map[string]bool, len(preferredTypeOrder)+len(v.NodeTypes)+len(groups))
+	order := make([]string, 0, len(preferredTypeOrder)+len(v.NodeTypes)+len(groups))
+
+	for _, name := range preferredTypeOrder {
+		if _, present := groups[name]; !present {
+			continue
+		}
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		order = append(order, name)
+	}
 	for _, t := range v.NodeTypes {
 		name := strings.TrimSpace(t.Name)
 		if name == "" || seen[name] {

@@ -14,10 +14,11 @@
 //	memql-cockpit logout <cluster>                  Remove cached credentials
 //	memql-cockpit --version                         Print version
 //
-// The built-in "local" cluster points at https://bff.local.znas.io -- the
-// nginx :443 entry point in docker-compose.full.yml. nginx terminates TLS
-// (mkcert-issued cert; root CA in the system trust store) and forwards
-// gRPC to bff:50051 inside the docker network.
+// The built-in "local" cluster is a name slot with no baked-in
+// endpoint. `genesis init` reads IDENTITY_BOOTSTRAP_DOMAIN from the
+// operator's .env and seeds the local row in ~/.memql/clusters.yaml
+// with `https://bff.${DOMAIN}`. The TUI shows "not configured" until
+// that bootstrap (or an explicit `L:Authorize`) has happened.
 package main
 
 import (
@@ -33,8 +34,6 @@ import (
 	"github.com/visionarys-io/memql-cockpit/cli"
 	"github.com/visionarys-io/memql-cockpit/cli/auth"
 	"github.com/visionarys-io/memql-cockpit/cli/config"
-	"github.com/visionarys-io/memql-cockpit/cmd/memql-cockpit/internal/authorize"
-	"github.com/visionarys-io/memql-cockpit/cmd/memql-cockpit/internal/genesis"
 	"github.com/visionarys-io/memql-cockpit/cmd/memql-cockpit/internal/lint"
 	"github.com/visionarys-io/memql-cockpit/cmd/memql-cockpit/internal/worker"
 )
@@ -45,9 +44,6 @@ func main() {
 	// Check for subcommands before parsing flags.
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
-		case "authorize":
-			authorize.HandleCommand(os.Args[2:])
-			return
 		case "cluster":
 			handleClusterCmd(os.Args[2:])
 			return
@@ -61,12 +57,28 @@ func main() {
 			worker.HandleCommand(os.Args[2:])
 			return
 		case "genesis":
-			os.Exit(genesis.HandleCommand(os.Args[2:]))
+			// Removed: genesis setup lives in the TUI's first-launch
+			// wizard now. Catch the legacy invocation so anyone with
+			// muscle memory or a stale script gets a one-line pointer.
+			fmt.Fprintln(os.Stderr, "memql-cockpit genesis has moved into the TUI.")
+			fmt.Fprintln(os.Stderr, "Launch `memql-cockpit`. If genesis.znas is missing, the")
+			fmt.Fprintln(os.Stderr, "setup wizard will walk you through creating it.")
+			os.Exit(1)
 		case "lint":
 			os.Exit(lint.HandleCommand(os.Args[2:]))
 		case "help":
 			printUsage()
 			return
+		case "authorize":
+			// Removed: authorization lives in the TUI now (press L
+			// on a cluster row + paste the discovery URL into the
+			// form). Trap the old invocation so anyone with muscle
+			// memory or a stale install script gets a one-line
+			// pointer instead of the TUI swallowing their URL.
+			fmt.Fprintln(os.Stderr, "memql-cockpit authorize has moved into the TUI.")
+			fmt.Fprintln(os.Stderr, "Launch `memql-cockpit`, highlight the cluster row, press L,")
+			fmt.Fprintln(os.Stderr, "and paste the discovery URL into the form.")
+			os.Exit(1)
 		}
 	}
 
@@ -126,8 +138,6 @@ func handleClusterCmd(args []string) {
 	}
 
 	switch args[0] {
-	case "add":
-		handleClusterAdd(args[1:])
 	case "list", "ls":
 		handleClusterList()
 	case "remove", "rm":
@@ -139,72 +149,6 @@ func handleClusterCmd(args []string) {
 	}
 }
 
-func handleClusterAdd(args []string) {
-	// Extract the name (first non-flag arg) before parsing flags.
-	// This allows: cluster add local --endpoint ... OR cluster add --endpoint ... local
-	var name string
-	var flagArgs []string
-	for _, a := range args {
-		if strings.HasPrefix(a, "-") {
-			flagArgs = append(flagArgs, a)
-		} else if name == "" {
-			name = a
-		} else {
-			flagArgs = append(flagArgs, a)
-		}
-	}
-
-	fs := flag.NewFlagSet("cluster add", flag.ExitOnError)
-	endpoint := fs.String("endpoint", "", "gRPC endpoint (host:port) [required]")
-	issuer := fs.String("issuer", "", "OIDC issuer URL")
-	clientId := fs.String("client-id", "", "OAuth2 client ID")
-	patToken := fs.String("pat", "", "Personal Access Token (mql_pat_...) -- bypasses OIDC")
-	fs.Parse(flagArgs)
-
-	if name == "" {
-		fmt.Fprintln(os.Stderr, "ERROR: cluster name is required")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Usage: memql-cockpit cluster add <name> --endpoint <host:port> --issuer <url> --client-id <id> [--pat <token>]")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "TIP: prefer `memql-cockpit authorize <url>` -- it discovers")
-		fmt.Fprintln(os.Stderr, "issuer + client_id from the cluster's well-known endpoint and")
-		fmt.Fprintln(os.Stderr, "runs the OAuth login in one step.")
-		os.Exit(1)
-	}
-
-	if *endpoint == "" {
-		fmt.Fprintln(os.Stderr, "ERROR: --endpoint is required")
-		os.Exit(1)
-	}
-
-	clusters, err := config.LoadClusters()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Check for duplicate.
-	if _, exists := clusters.Get(name); exists {
-		fmt.Fprintf(os.Stderr, "ERROR: cluster %q already exists (use 'cluster remove' first)\n", name)
-		os.Exit(1)
-	}
-
-	clusters.Clusters = append(clusters.Clusters, config.ClusterConfig{
-		Name:     name,
-		Endpoint: *endpoint,
-		Issuer:   *issuer,
-		ClientId: *clientId,
-		PAT:      *patToken,
-	})
-
-	if err := config.SaveClusters(clusters); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("Cluster %q added (%s)\n", name, *endpoint)
-}
-
 func handleClusterList() {
 	clusters, err := config.LoadClusters()
 	if err != nil {
@@ -212,25 +156,50 @@ func handleClusterList() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("%-15s %-35s %-8s %s\n", "NAME", "ENDPOINT", "AUTH", "ISSUER")
-	fmt.Printf("%-15s %-35s %-8s %s\n", "----", "--------", "----", "------")
+	fmt.Printf("%-15s %-35s %-15s %s\n", "NAME", "ENDPOINT", "AUTH", "ISSUER")
+	fmt.Printf("%-15s %-35s %-15s %s\n", "----", "--------", "----", "------")
 
-	// Always show local first.
-	fmt.Printf("%-15s %-35s %-8s %s\n", "local", "https://bff.local.znas.io", "none", "-")
-
+	// `local` is rendered first whether or not it lives in clusters.yaml.
+	// When the yaml has no entry (fresh install, no `genesis init` yet)
+	// the endpoint is blank and auth shows "not configured" -- same as
+	// what the TUI surfaces.
+	local, hasLocal := clusters.Get("local")
+	if !hasLocal {
+		local = config.ClusterConfig{Name: "local"}
+	}
+	printClusterRow(local)
 	for _, c := range clusters.Clusters {
 		if c.Name == "local" {
-			continue // Already shown above.
+			continue
 		}
-		authStr := "OIDC"
-		if c.PAT != "" {
-			authStr = "PAT"
-		}
-		issuer := c.Issuer
-		if issuer == "" {
-			issuer = "-"
-		}
-		fmt.Printf("%-15s %-35s %-8s %s\n", c.Name, c.Endpoint, authStr, issuer)
+		printClusterRow(c)
+	}
+}
+
+func printClusterRow(c config.ClusterConfig) {
+	endpoint := c.Endpoint
+	if endpoint == "" {
+		endpoint = "-"
+	}
+	issuer := c.Issuer
+	if issuer == "" {
+		issuer = "-"
+	}
+	fmt.Printf("%-15s %-35s %-15s %s\n", c.Name, endpoint, clusterAuthLabel(c), issuer)
+}
+
+// clusterAuthLabel returns a human-readable description of what kind
+// of credential is configured for a cluster. Kept here (instead of on
+// ClusterConfig) so the CLI label stays in sync with what the TUI
+// detail panel renders -- both call into the same logic.
+func clusterAuthLabel(c config.ClusterConfig) string {
+	switch {
+	case c.PAT != "":
+		return "PAT"
+	case c.Issuer != "" && c.ClientId != "":
+		return "OIDC"
+	default:
+		return "not configured"
 	}
 }
 
@@ -350,53 +319,63 @@ func resolveCluster(clusterName, endpoint string) (config.ClusterConfig, error) 
 		}
 		c, ok := clusters.Get(clusterName)
 		if !ok {
-			return config.ClusterConfig{}, fmt.Errorf("cluster %q not found in ~/.memql/clusters.yaml -- run `memql-cockpit authorize <url>` first", clusterName)
+			return config.ClusterConfig{}, fmt.Errorf("cluster %q not found in ~/.memql/clusters.yaml -- launch the TUI and press A to add one, or L on the row to authorize it", clusterName)
 		}
 		return c, nil
 	}
 
-	return config.ClusterConfig{
-		Name:     "local",
-		Endpoint: "https://bff.local.znas.io",
-	}, nil
+	// No --cluster, no --endpoint: fall back to whatever clusters.yaml
+	// says about "local" (typically seeded by `genesis init`). If the
+	// yaml has nothing for local, return the empty default so the TUI
+	// can surface the "needs-auth" state instead of dialing thin air.
+	clusters, err := config.LoadClusters()
+	if err == nil {
+		if local, ok := clusters.Get("local"); ok {
+			return local, nil
+		}
+	}
+	return config.ClusterConfig{Name: "local"}, nil
 }
 
 func printUsage() {
 	fmt.Println("memql-cockpit — memQL Cockpit -- terminal-native IDE and operations console")
 	fmt.Println("")
 	fmt.Println("USAGE")
-	fmt.Println("  memql-cockpit authorize <url>          Register + log into a cluster (one-shot)")
 	fmt.Println("  memql-cockpit [flags]                  Launch the TUI")
-	fmt.Println("  memql-cockpit cluster <subcommand>     Manage cluster configurations (advanced)")
+	fmt.Println("  memql-cockpit cluster <subcommand>     List or remove saved clusters")
 	fmt.Println("  memql-cockpit login <cluster>          Re-authenticate an existing cluster")
 	fmt.Println("  memql-cockpit logout <cluster>         Remove cached credentials")
 	fmt.Println("  memql-cockpit worker <subcommand>      Run as a memql worker (computer-use)")
-	fmt.Println("  memql-cockpit genesis init [--from .env]  Create / update ~/.memql/genesis.znas")
 	fmt.Println("  memql-cockpit lint [path]              Validate a .memql file or DSL tree")
+	fmt.Println("")
+	fmt.Println("FIRST-TIME SETUP")
+	fmt.Println("  Launching the TUI on a machine with no ~/.memql/genesis.znas runs")
+	fmt.Println("  the setup wizard: pick a .env, validate it, generate the master key,")
+	fmt.Println("  seal the envelope. No CLI dance required.")
 	fmt.Println("")
 	fmt.Println("TUI FLAGS")
 	fmt.Println("  --cluster <name>    Connect to a named cluster")
 	fmt.Println("  --endpoint <addr>   Connect to a specific gRPC endpoint")
 	fmt.Println("  --version           Print version and exit")
 	fmt.Println("")
-	fmt.Println("CLUSTER MANAGEMENT")
-	fmt.Println("  authorize <url>                           One-shot register + OAuth login (preferred)")
-	fmt.Println("  cluster add <name> --endpoint <host:port> --issuer <url> --client-id <id>")
-	fmt.Println("  cluster list                              List clusters (\"local\" is always present)")
-	fmt.Println("  cluster remove <name>                     Remove a cluster (\"local\" cannot be removed)")
+	fmt.Println("ADDING / AUTHORIZING CLUSTERS")
+	fmt.Println("  Both flows live in the TUI: press A to add a new cluster,")
+	fmt.Println("  or L on a row to (re-)authorize it. Type a discovery URL")
+	fmt.Println("  in the form -- cockpit reads /.well-known/memql-config.json")
+	fmt.Println("  and runs the OAuth login in the same keypress.")
 	fmt.Println("")
 	fmt.Println("EXAMPLES")
-	fmt.Println("  memql-cockpit authorize http://localhost:8081      # local-dev (full identity flow)")
-	fmt.Println("  memql-cockpit authorize https://copresent.acme.com  # production")
-	fmt.Println("  memql-cockpit login staging")
-	fmt.Println("  memql-cockpit --cluster staging")
+	fmt.Println("  memql-cockpit                                       # open the TUI")
+	fmt.Println("  memql-cockpit login staging                         # re-auth a saved cluster")
+	fmt.Println("  memql-cockpit --cluster staging                     # launch into staging")
 }
 
 func printClusterUsage() {
 	fmt.Println("Usage: memql-cockpit cluster <subcommand>")
 	fmt.Println("")
 	fmt.Println("Subcommands:")
-	fmt.Println("  add <name> --endpoint <host:port>   Add a cluster configuration")
 	fmt.Println("  list                                List clusters (local is always present)")
 	fmt.Println("  remove <name>                       Remove a cluster (local cannot be removed)")
+	fmt.Println("")
+	fmt.Println("To add or authorize a cluster, launch the TUI and press A or L.")
 }

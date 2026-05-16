@@ -19,7 +19,7 @@ type PartitionInfo struct {
 
 // PartitionsView renders the partition list that lives in the bottom
 // half of the Clusters tab's left pane. Mirrors ClustersView's row
-// rendering: status icon, name, ◆ marker for the selected partition,
+// rendering: status icon, name, `*` marker for the selected partition,
 // detail block under the highlighted row, footer hints. No state
 // machine -- partitions don't dial anything.
 type PartitionsView struct {
@@ -30,7 +30,7 @@ type PartitionsView struct {
 
 	Partitions   []PartitionInfo
 	Selected     int    // highlight index
-	Active       string // "selected" partition name (Enter-pressed) -- gets the ◆ marker
+	Active       string // "selected" partition name (Enter-pressed) -- gets the `*` marker
 	scrollOffset int    // first visible row index inside the scrollable viewport
 
 	// Add/edit form state.
@@ -202,11 +202,11 @@ func (v *PartitionsView) Draw(screen *ui.Screen, bounds ui.Rect) {
 
 	// Each row lays out as:
 	//
-	//   ▸ name                 [type]  ◆
+	//   ▸ name                 [type]  *
 	//
 	// Partitions don't have an online/offline lifecycle the way
 	// cluster nodes do, so no status circle -- the row is just the
-	// name, the type label right-aligned in Subtle, and the ◆
+	// name, the type label right-aligned in Subtle, and the `*`
 	// marker for the active partition. Draining rows filter out at
 	// snapshot time; nothing that shows up here needs a color.
 	const nameCol = 2 // one blank after the selection arrow
@@ -248,7 +248,10 @@ func (v *PartitionsView) Draw(screen *ui.Screen, bounds ui.Rect) {
 		}
 
 		if p.Name == v.Active {
-			screen.SetCell(markerCol, rowY, '◆', rowStyle.Foreground(v.Theme.Accent).Bold(true))
+			// Single-cell ASCII marker -- see cli/CLAUDE.md "Layout-
+			// edge glyph rule". `◆` here would render as 2 cells on
+			// some terminals and push the right-pane divider over.
+			screen.SetCell(markerCol, rowY, '*', rowStyle.Foreground(v.Theme.Accent).Bold(true))
 		}
 	}
 
