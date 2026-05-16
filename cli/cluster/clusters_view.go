@@ -488,8 +488,13 @@ func (v *ClustersView) drawManagement(screen *ui.Screen, bounds ui.Rect) {
 		screen.DrawText(x+4, rowY, maxW-5, cs.Config.Display(), nameStyle)
 
 		if cs.Config.Name == v.SelectedCluster {
+			// `*` is strictly single-cell. The previous `◆` glyph
+			// renders as East Asian Ambiguous (2 cells wide on many
+			// terminal/font combos) and its overflow column nudged
+			// the right-pane divider one cell over on selected rows.
+			// See cli/CLAUDE.md "Layout-edge glyph rule".
 			markerX := bounds.X + bounds.Width - 2
-			screen.SetCell(markerX, rowY, '◆', rowStyle.Foreground(v.Theme.Accent).Bold(true))
+			screen.SetCell(markerX, rowY, '*', rowStyle.Foreground(v.Theme.Accent).Bold(true))
 		}
 	}
 
