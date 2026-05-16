@@ -214,7 +214,7 @@ func (v *View) drawKeyBindings(screen *ui.Screen, bounds ui.Rect) {
 			Bindings: []keyBinding{
 				{"F1 / " + alt + "+1", "Clusters tab"},
 				{"F2 / " + alt + "+2", "Explorer tab"},
-				{"F3 / " + alt + "+3", "Automations tab"},
+				{"F3 / " + alt + "+3", "Agents tab"},
 				{"F4 / " + alt + "+4", "Settings tab"},
 				{"Tab", "Switch focus between panes"},
 				{"Ctrl+Y", "Copy header notification to clipboard"},

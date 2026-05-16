@@ -17,7 +17,7 @@ import (
 
 // entryState is the single source of truth for one pool entry's
 // connection lifecycle. The state drives the cluster-list row icon,
-// the detail-pane retry display, and whether the Explorer/Automations
+// the detail-pane retry display, and whether the Explorer/Agents
 // tabs are usable (gated on the selected cluster being Connected).
 //
 // Transitions:
@@ -834,7 +834,7 @@ func (a *App) isSelectedCluster(name string) bool {
 // cluster's latest partition snapshot into the PartitionsView. The
 // pane mirrors whichever cluster the user is looking at -- same
 // semantics as the topology pane on the right. The working (selected)
-// cluster is a separate concept that drives Explorer / Automations
+// cluster is a separate concept that drives Explorer / Agents
 // and is NOT what the partitions pane follows.
 //
 // States:

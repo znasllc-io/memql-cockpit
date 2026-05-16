@@ -36,7 +36,7 @@ register a LaunchAgent (macOS) or systemd user service (Linux).
 - `cmd/memql-cockpit/` -- binary entry point + per-subcommand internals
   (`internal/authorize/`, `internal/lint/`, `internal/worker/`).
 - `cli/` -- TUI primitives (`ui/`, `canvas/`) + product views
-  (`auth/`, `automations/`, `client/`, `cluster/`, `config/`,
+  (`agents/`, `auth/`, `client/`, `cluster/`, `config/`,
   `editor/`, `explorer/`, `settings/`).
 - `scripts/install/` -- platform installers.
 

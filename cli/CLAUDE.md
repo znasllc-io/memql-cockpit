@@ -1,7 +1,7 @@
 # CLI Directory
 
 **Purpose:** memQL Cockpit -- a tcell-based TUI for managing clusters,
-exploring concepts, editing automations, authoring MemQL, and every
+exploring concepts, browsing agents, authoring MemQL, and every
 other interactive flow shipped from `memql-cockpit`.
 
 **Binary:** `memql-cockpit` (built from `cmd/memql-cockpit/`).
@@ -25,7 +25,7 @@ The rule covers two layout patterns:
 ### 1. Multi-tab IDE (the operations console)
 
 The original `memql-cockpit` invocation -- launches `cli.App`, mounts
-the Clusters / Explorer / Automations / Settings tabs, full F1..F4
+the Clusters / Explorer / Agents / Settings tabs, full F1..F4
 navigation. This is what `app.go` orchestrates today; documented in
 the rest of this file.
 
@@ -84,10 +84,10 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
 
 1. **Clusters (F1)** -- cluster manager + partition manager + topology
 2. **Explorer (F2)** -- concept tree + MemQL source editor
-3. **Automations (F3)** -- automation editor with Sense diagnostics
+3. **Agents (F3)** -- materialized `v1:agents:agent` directory
 4. **Settings (F4)** -- credentials, theme, version
 
-Explorer / Automations are gated on a connected, selected cluster --
+Explorer / Agents are gated on a connected, selected cluster --
 they show a placeholder message until the user presses Enter on a
 cluster row in the Clusters tab.
 
@@ -235,7 +235,7 @@ pane still shows the full topology and the full partition list.
 | Key   | Action                                              |
 |-------|-----------------------------------------------------|
 | ↑/↓   | Move highlight (also moves topology view)           |
-| Enter | Select cluster (drives Explorer/Automations)        |
+| Enter | Select cluster (drives Explorer/Agents)             |
 | A     | Add a new cluster                                   |
 | E     | Edit highlighted cluster                            |
 | D     | Delete highlighted cluster (not "local")            |
@@ -299,7 +299,7 @@ collects the slug + type and hands them off.
 | `client/queries.go`      | `QueryClient` (also runs mutations via ExecuteQuery)          |
 | `config/clusters.go`     | `~/.memql/clusters.yaml` load/save                            |
 | `explorer/`              | Explorer tab (concept tree + editor)                          |
-| `automations/`           | Automations tab (editor + diagnostics)                        |
+| `agents/`                | Agents tab (list + RenderAgent detail block)                  |
 | `editor/`                | Reusable text editor with Sense integration                   |
 | `settings/`              | Settings tab                                                  |
 | `ui/`                    | Theme, screen, tab bar, layout primitives                     |
