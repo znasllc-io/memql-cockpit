@@ -30,6 +30,8 @@ import (
 	"strings"
 	"syscall"
 
+	coregenesis "github.com/visionarys-io/memql/component/genesis"
+
 	"github.com/visionarys-io/memql-cockpit/cli"
 	"github.com/visionarys-io/memql-cockpit/cli/auth"
 	"github.com/visionarys-io/memql-cockpit/cli/config"
@@ -42,6 +44,17 @@ import (
 const version = "0.1.0"
 
 func main() {
+	// Repo-root .env override sits above whatever genesis sealed in,
+	// matching the contract documented in memql/component/genesis/
+	// localenv.go. Errors here are warnings: the cockpit can run
+	// without a local .env (production case) and shouldn't refuse to
+	// launch just because the file has a stray syntax error.
+	if overridden, err := coregenesis.ApplyLocalOverride("."); err != nil {
+		fmt.Fprintf(os.Stderr, "memql-cockpit: warning: local .env override failed: %v\n", err)
+	} else if len(overridden) > 0 {
+		fmt.Fprintf(os.Stderr, "memql-cockpit: local .env override applied: %v\n", overridden)
+	}
+
 	// Check for subcommands before parsing flags.
 	if len(os.Args) > 1 {
 		switch os.Args[1] {

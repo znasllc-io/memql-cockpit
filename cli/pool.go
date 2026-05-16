@@ -887,7 +887,30 @@ func (a *App) onEntryConnected(e *connEntry) {
 		a.clustersView.Topology.SetNodes(e.snapshotNodes())
 		a.clustersView.Topology.SetDisconnected(false)
 		a.refreshPartitionsView()
+		// One-shot observability overlay fetch -- best-effort. The
+		// Architecture navigator picks up the result on its next
+		// draw; transient query failures leave the previous overlay
+		// in place. A periodic refresh ticker is a follow-up
+		// enhancement that can hang off this same fetcher.
+		go a.refreshArchMetrics(e)
 	}
+}
+
+// refreshArchMetrics issues a single codeMetric query and hands the
+// result to the architecture navigator. Runs off the connection-up
+// callback in a goroutine so the connect path stays non-blocking;
+// errors are swallowed (the navigator simply keeps its previous
+// overlay, or shows none).
+func (a *App) refreshArchMetrics(e *connEntry) {
+	if e == nil || e.Conn == nil || a.clustersView == nil ||
+		a.clustersView.Topology == nil || a.clustersView.Topology.Arch == nil {
+		return
+	}
+	qc := client.NewQueryClient(e.Conn.Dispatcher())
+	fetcher := &cluster.QueryClientMetricsFetcher{Client: qc}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	a.clustersView.Topology.Arch.RefreshMetrics(ctx, fetcher)
 }
 
 // onEntryDisconnected is called when an entry's stream drops
