@@ -513,6 +513,14 @@ func (e *connEntry) initialLoad(ctx context.Context) []cluster.NodeInfo {
 			Health:  nodev1.NodeHealthStatus_NODE_HEALTH_HEALTHY,
 		})
 	}
+	// Local cluster: probe docker for the infrastructure containers
+	// (LB, DB, IDENTITY, REDIS, LIVEKIT, voice-agent) that aren't
+	// registered as memQL nodes via v1:cluster:node. Skipped for
+	// non-local clusters -- docker on this machine has no
+	// relationship to a remote cluster's topology.
+	if e.Config.Name == "local" {
+		allNodes = mergeInfraFromDocker(allNodes)
+	}
 	return allNodes
 }
 
