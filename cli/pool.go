@@ -912,6 +912,19 @@ func (a *App) onEntryConnected(e *connEntry) {
 		// enhancement that can hang off this same fetcher.
 		go a.refreshArchMetrics(e)
 	}
+
+	// If this entry IS the user's persisted working cluster
+	// (selected on a prior session and restored from clusters.yaml),
+	// re-fetch the Explorer + Agents data now that the dispatcher is
+	// live. setSelected has the same hook for the manual-Enter path,
+	// but the auto-connect-at-boot path never calls setSelected --
+	// the selection field is filled in directly from yaml during
+	// connect(). Without this call the Agents tab stays empty on
+	// every fresh launch even though queryAllAgents would return
+	// rows the moment we ask.
+	if a.isSelectedCluster(e.Config.Name) {
+		go a.refreshExplorerData(context.Background())
+	}
 }
 
 // refreshArchMetrics issues a single codeMetric query and hands the
