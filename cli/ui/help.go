@@ -58,7 +58,7 @@ func (h *HelpOverlay) Draw(screen *Screen, bounds Rect) {
 		{section: "TABS"},
 		{key: "F1 / " + alt + "+1", desc: "Clusters"},
 		{key: "F2 / " + alt + "+2", desc: "Explorer"},
-		{key: "F3 / " + alt + "+3", desc: "Automations"},
+		{key: "F3 / " + alt + "+3", desc: "Agents"},
 		{key: "F4 / " + alt + "+4", desc: "Settings"},
 		{},
 		{section: "NAVIGATION"},

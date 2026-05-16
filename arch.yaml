@@ -5,7 +5,7 @@ service: memql-cockpit
 display_name: "memQL Cockpit"
 description: |
   Terminal-native IDE and operations console. Multi-tab TUI built on
-  tcell, with cluster topology, MemQL explorer, automation editor,
+  tcell, with cluster topology, MemQL explorer, agents directory,
   and the architecture navigator that consumes the model emitted by
   memql-arch.
 
