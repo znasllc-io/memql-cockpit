@@ -29,8 +29,19 @@ import (
 	"github.com/visionarys-io/memql/component/secret"
 )
 
+// Choice is what the wizard's Run returns when it terminates. Esc
+// goes back to the splash; Q / Ctrl+Q quit the whole app.
+type Choice int
+
+const (
+	ChoiceBack Choice = iota // Esc -- return to the splash menu
+	ChoiceQuit               // Q / Ctrl+Q / Ctrl+C -- exit the cockpit
+)
+
 // Run renders the wizard and blocks until the user dismisses it.
-func Run(screen *ui.Screen, theme ui.Theme) {
+// Returns ChoiceBack so the caller can re-show the splash, or
+// ChoiceQuit to exit the app.
+func Run(screen *ui.Screen, theme ui.Theme) Choice {
 	w := &state{screen: screen, theme: theme}
 	w.refresh()
 	for {
@@ -42,16 +53,16 @@ func Run(screen *ui.Screen, theme ui.Theme) {
 			screen.Sync()
 		case *tcell.EventKey:
 			if ev.Key() == tcell.KeyCtrlC || ev.Key() == tcell.KeyCtrlQ {
-				return
+				return ChoiceQuit
 			}
 			if ev.Key() == tcell.KeyEscape {
-				return
+				return ChoiceBack
 			}
 			switch ev.Rune() {
 			case 'r', 'R':
 				w.refresh()
 			case 'q', 'Q':
-				return
+				return ChoiceQuit
 			}
 		}
 	}
@@ -71,14 +82,16 @@ type state struct {
 	screen *ui.Screen
 	theme  ui.Theme
 
-	mode       mode
-	containers []dockerprobe.Container
-	checks     []*check
+	mode        mode
+	containers  []dockerprobe.Container
+	checks      []*check
+	lastRefresh time.Time // stamped on every refresh so the user can see R is doing something
 }
 
 // refresh polls docker. If any container is up, we render the
 // running-status panel. Otherwise we run the dep-check probe.
 func (s *state) refresh() {
+	s.lastRefresh = time.Now()
 	running, containers, _ := dockerprobe.ClusterRunning()
 	s.containers = containers
 	if running {
@@ -172,9 +185,10 @@ func (s *state) drawRunning(px, py, panelW, panelH int) {
 	summary := fmt.Sprintf("%d running   %d degraded   %d stopped", running, degraded, stopped)
 	s.screen.DrawText(px+4, row, panelW-8, summary, theme.BaseStyle())
 
-	hint := "R:Re-probe   Esc:Back"
+	s.drawRefreshStamp(px, py, panelW, panelH)
+	hint := "R:Re-probe   Esc:Back   Q:Quit"
 	if stopped > 0 || degraded > 0 {
-		hint = "R:Re-probe   Esc:Back   (stopped / degraded containers: investigate with `docker logs <name>`)"
+		hint = "R:Re-probe   Esc:Back   Q:Quit   (stopped / degraded containers: investigate with `docker logs <name>`)"
 	}
 	s.screen.DrawText(px+4, py+panelH-2, panelW-8, hint, theme.SubtleStyle())
 }
@@ -223,8 +237,25 @@ func (s *state) drawDepsCheck(px, py, panelW, panelH int) {
 		summary = "All checks passed. Bring the stack up with:  docker compose -f docker/docker-compose.full.yml up -d"
 	}
 	s.screen.DrawText(px+4, py+panelH-3, panelW-8, summary, theme.BaseStyle())
-	hint := "R:Re-probe   Esc:Back"
+	s.drawRefreshStamp(px, py, panelW, panelH)
+	hint := "R:Re-probe   Esc:Back   Q:Quit"
 	s.screen.DrawText(px+4, py+panelH-2, panelW-8, hint, theme.SubtleStyle())
+}
+
+// drawRefreshStamp renders "Refreshed at HH:MM:SS" right-aligned on
+// the same row as the hint strip. Updates on every R press so the
+// user can see the probe ran even when docker's "Up X minutes"
+// status string is unchanged between rapid re-probes.
+func (s *state) drawRefreshStamp(px, py, panelW, panelH int) {
+	if s.lastRefresh.IsZero() {
+		return
+	}
+	stamp := "Refreshed at " + s.lastRefresh.Format("15:04:05")
+	stampX := px + panelW - 4 - len(stamp)
+	if stampX < px+4 {
+		return // panel too narrow; drop the stamp rather than overlap the hint
+	}
+	s.screen.DrawText(stampX, py+panelH-2, len(stamp), stamp, s.theme.SubtleStyle())
 }
 
 // iconForContainer maps a probed container to (glyph, colour,

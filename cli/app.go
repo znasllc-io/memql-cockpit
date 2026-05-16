@@ -155,14 +155,24 @@ func (a *App) Run() error {
 		}
 	}
 
-	switch splash.Run(a.screen, a.theme) {
-	case splash.ChoiceQuit:
-		return nil
-	case splash.ChoiceRunLocalCluster:
-		runlocal.Run(a.screen, a.theme)
-		return nil
-	case splash.ChoiceOperatingConsole:
-		// fall through
+	// Splash is the home base for the launch sequence. The user can
+	// dip into a wizard and come back; only picking the operating
+	// console transitions the session into the multi-tab IDE.
+	enterOperatingConsole := false
+	for !enterOperatingConsole {
+		switch splash.Run(a.screen, a.theme) {
+		case splash.ChoiceQuit:
+			return nil
+		case splash.ChoiceRunLocalCluster:
+			switch runlocal.Run(a.screen, a.theme) {
+			case runlocal.ChoiceQuit:
+				return nil
+			case runlocal.ChoiceBack:
+				// loop back to splash
+			}
+		case splash.ChoiceOperatingConsole:
+			enterOperatingConsole = true
+		}
 	}
 
 	// Auto-seed the local cluster from genesis.znas before the
