@@ -1,13 +1,15 @@
 // Package runlocal is the "Set up local cluster" wizard reached
-// from the launch splash. It probes the machine for the
-// dependencies the local memQL cluster needs (genesis envelope,
-// docker, docker compose, mkcert, free ports), reports pass/fail
-// per check, and renders remediation hints for the failures so
-// the operator can fix them and re-probe.
+// from the launch splash. Two modes:
 //
-// The wizard is read-only today: it diagnoses, it doesn't auto-
-// install. Auto-fixers (e.g. running `mkcert -install`) and the
-// actual `docker compose up` invocation are scoped to a follow-up.
+//   1. running -- when the local memQL cluster is already up,
+//      shows the service inventory + status so the operator can
+//      see what's online without running irrelevant port checks.
+//   2. deps-check -- when nothing is running, probes the machine
+//      for prerequisites (docker, mkcert, free ports, etc.) and
+//      surfaces remediation hints for each failure.
+//
+// The wizard decides which mode to enter by asking
+// dockerprobe.ClusterRunning at entry + on every R re-probe.
 package runlocal
 
 import (
@@ -21,38 +23,16 @@ import (
 	"time"
 
 	"github.com/gdamore/tcell/v2"
+	"github.com/visionarys-io/memql-cockpit/cli/dockerprobe"
 	"github.com/visionarys-io/memql-cockpit/cli/ui"
 	corgenesis "github.com/visionarys-io/memql/component/genesis"
 	"github.com/visionarys-io/memql/component/secret"
 )
 
-// checkStatus is the per-row outcome on the probe screen.
-type checkStatus int
-
-const (
-	statusPending checkStatus = iota // not yet evaluated this round
-	statusRunning                    // currently probing
-	statusPass
-	statusFail
-)
-
-// check is one row on the probe panel.
-type check struct {
-	label     string
-	status    checkStatus
-	detail    string // pass: short success info; fail: short failure reason
-	hint      string // remediation guidance shown when status==statusFail
-	runFn     func() (ok bool, detail string, hint string)
-}
-
 // Run renders the wizard and blocks until the user dismisses it.
 func Run(screen *ui.Screen, theme ui.Theme) {
-	w := &state{
-		screen: screen,
-		theme:  theme,
-		checks: newChecks(),
-	}
-	w.runAll()
+	w := &state{screen: screen, theme: theme}
+	w.refresh()
 	for {
 		w.draw()
 		ev := screen.PollEvent()
@@ -69,7 +49,7 @@ func Run(screen *ui.Screen, theme ui.Theme) {
 			}
 			switch ev.Rune() {
 			case 'r', 'R':
-				w.runAll()
+				w.refresh()
 			case 'q', 'Q':
 				return
 			}
@@ -77,10 +57,213 @@ func Run(screen *ui.Screen, theme ui.Theme) {
 	}
 }
 
+// mode is the panel the wizard renders right now. Settled by
+// refresh() based on whether docker reports any running cluster
+// containers.
+type mode int
+
+const (
+	modeRunning   mode = iota // cluster up -- show status list
+	modeDepsCheck             // cluster down -- run prerequisite probe
+)
+
 type state struct {
 	screen *ui.Screen
 	theme  ui.Theme
-	checks []*check
+
+	mode       mode
+	containers []dockerprobe.Container
+	checks     []*check
+}
+
+// refresh polls docker. If any container is up, we render the
+// running-status panel. Otherwise we run the dep-check probe.
+func (s *state) refresh() {
+	running, containers, _ := dockerprobe.ClusterRunning()
+	s.containers = containers
+	if running {
+		s.mode = modeRunning
+		return
+	}
+	s.mode = modeDepsCheck
+	s.checks = newChecks()
+	s.draw() // paint pending rows before the first probe so the panel doesn't blink
+	for _, c := range s.checks {
+		c.status = statusRunning
+		s.draw()
+		ok, detail, hint := c.runFn()
+		if ok {
+			c.status = statusPass
+		} else {
+			c.status = statusFail
+		}
+		c.detail = detail
+		c.hint = hint
+	}
+}
+
+// draw paints whichever panel mode says is current.
+func (s *state) draw() {
+	screen := s.screen
+	theme := s.theme
+	screen.Clear(theme.BaseStyle())
+	sw, sh := screen.Size()
+
+	panelW := 78
+	panelH := 26
+	if panelW > sw-4 {
+		panelW = sw - 4
+	}
+	if panelH > sh-4 {
+		panelH = sh - 4
+	}
+	px := (sw - panelW) / 2
+	py := (sh - panelH) / 2
+	screen.DrawBox(px, py, panelW, panelH, theme.SubtleStyle())
+
+	switch s.mode {
+	case modeRunning:
+		s.drawRunning(px, py, panelW, panelH)
+	case modeDepsCheck:
+		s.drawDepsCheck(px, py, panelW, panelH)
+	}
+	screen.Show()
+}
+
+func (s *state) drawRunning(px, py, panelW, panelH int) {
+	theme := s.theme
+	title := " Local cluster -- running "
+	s.screen.DrawText(px+(panelW-len(title))/2, py+1, len(title), title, theme.AccentStyle().Bold(true))
+
+	subtitle := fmt.Sprintf("%d service(s) reported by docker compose project %q.", len(s.containers), dockerprobe.ProjectName)
+	s.screen.DrawText(px+4, py+3, panelW-8, subtitle, theme.SubtleStyle())
+
+	row := py + 5
+	running, degraded, stopped := 0, 0, 0
+	for _, c := range s.containers {
+		icon, color, classBucket := iconForContainer(c, theme)
+		switch classBucket {
+		case "running":
+			running++
+		case "degraded":
+			degraded++
+		default:
+			stopped++
+		}
+		s.screen.SetCell(px+4, row, icon, theme.BaseStyle().Foreground(color))
+
+		nameLabel := fmt.Sprintf("%-20s %-20s", c.Service, c.Name)
+		s.screen.DrawText(px+6, row, panelW-10, nameLabel, theme.BaseStyle())
+		status := c.Status
+		if c.HealthHint != "" && !strings.Contains(status, "("+c.HealthHint+")") {
+			status += " (" + c.HealthHint + ")"
+		}
+		statusX := px + 6 + 42
+		s.screen.DrawText(statusX, row, panelW-(statusX-px)-4, status, theme.SubtleStyle())
+		row++
+	}
+
+	if len(s.containers) == 0 {
+		s.screen.DrawText(px+4, row, panelW-8, "No containers found for project "+dockerprobe.ProjectName+".", theme.BaseStyle().Foreground(theme.Warning))
+		row++
+	}
+
+	row++
+	summary := fmt.Sprintf("%d running   %d degraded   %d stopped", running, degraded, stopped)
+	s.screen.DrawText(px+4, row, panelW-8, summary, theme.BaseStyle())
+
+	hint := "R:Re-probe   Esc:Back"
+	if stopped > 0 || degraded > 0 {
+		hint = "R:Re-probe   Esc:Back   (stopped / degraded containers: investigate with `docker logs <name>`)"
+	}
+	s.screen.DrawText(px+4, py+panelH-2, panelW-8, hint, theme.SubtleStyle())
+}
+
+func (s *state) drawDepsCheck(px, py, panelW, panelH int) {
+	theme := s.theme
+	title := " Set up local cluster -- dependency check "
+	s.screen.DrawText(px+(panelW-len(title))/2, py+1, len(title), title, theme.AccentStyle().Bold(true))
+
+	subtitle := "This machine needs the following to host a local memQL cluster:"
+	s.screen.DrawText(px+4, py+3, panelW-8, subtitle, theme.SubtleStyle())
+
+	row := py + 5
+	pass, fail := 0, 0
+	for _, c := range s.checks {
+		icon, color := iconFor(c.status, theme)
+		s.screen.SetCell(px+4, row, icon, theme.BaseStyle().Foreground(color))
+		labelStyle := theme.BaseStyle()
+		if c.status == statusFail {
+			labelStyle = theme.BaseStyle().Foreground(theme.Error)
+		}
+		s.screen.DrawText(px+6, row, panelW-10, c.label, labelStyle)
+		if c.detail != "" {
+			detailX := px + 6 + len(c.label) + 2
+			s.screen.DrawText(detailX, row, panelW-(detailX-px)-4, c.detail, theme.SubtleStyle())
+		}
+		switch c.status {
+		case statusPass:
+			pass++
+		case statusFail:
+			fail++
+		}
+		row++
+	}
+
+	if hint := firstFailHint(s.checks); hint != "" {
+		row++
+		for _, ln := range ui.WrapText("Next step: "+hint, panelW-8) {
+			s.screen.DrawText(px+4, row, panelW-8, ln, theme.BaseStyle().Foreground(theme.Warning))
+			row++
+		}
+	}
+
+	summary := fmt.Sprintf("%d / %d checks passing", pass, len(s.checks))
+	if fail == 0 && pass == len(s.checks) {
+		summary = "All checks passed. Bring the stack up with:  docker compose -f docker/docker-compose.full.yml up -d"
+	}
+	s.screen.DrawText(px+4, py+panelH-3, panelW-8, summary, theme.BaseStyle())
+	hint := "R:Re-probe   Esc:Back"
+	s.screen.DrawText(px+4, py+panelH-2, panelW-8, hint, theme.SubtleStyle())
+}
+
+// iconForContainer maps a probed container to (glyph, colour,
+// coarse-bucket). The bucket drives the summary counters.
+func iconForContainer(c dockerprobe.Container, theme ui.Theme) (rune, tcell.Color, string) {
+	switch c.State {
+	case "running":
+		if c.HealthHint == "unhealthy" {
+			return '●', theme.Error, "degraded"
+		}
+		if c.HealthHint == "starting" {
+			return '◌', theme.Warning, "degraded"
+		}
+		return '●', theme.Success, "running"
+	case "paused", "restarting", "created":
+		return '◌', theme.Warning, "degraded"
+	default:
+		// exited / dead / removing / unknown
+		return '○', theme.Error, "stopped"
+	}
+}
+
+// ----- dependency probe (unchanged from previous round) ----------------------
+
+type checkStatus int
+
+const (
+	statusPending checkStatus = iota
+	statusRunning
+	statusPass
+	statusFail
+)
+
+type check struct {
+	label  string
+	status checkStatus
+	detail string
+	hint   string
+	runFn  func() (ok bool, detail string, hint string)
 }
 
 func newChecks() []*check {
@@ -128,98 +311,6 @@ func newChecks() []*check {
 	}
 }
 
-// runAll runs every check in sequence, redrawing between each so
-// the panel feels alive. Each runFn is expected to complete in
-// well under a second (no blocking network).
-func (w *state) runAll() {
-	for _, c := range w.checks {
-		c.status = statusPending
-		c.detail = ""
-		c.hint = ""
-	}
-	w.draw()
-	for _, c := range w.checks {
-		c.status = statusRunning
-		w.draw()
-		ok, detail, hint := c.runFn()
-		if ok {
-			c.status = statusPass
-		} else {
-			c.status = statusFail
-		}
-		c.detail = detail
-		c.hint = hint
-	}
-}
-
-func (w *state) draw() {
-	screen := w.screen
-	theme := w.theme
-	screen.Clear(theme.BaseStyle())
-	sw, sh := screen.Size()
-
-	panelW := 78
-	panelH := 26
-	if panelW > sw-4 {
-		panelW = sw - 4
-	}
-	if panelH > sh-4 {
-		panelH = sh - 4
-	}
-	px := (sw - panelW) / 2
-	py := (sh - panelH) / 2
-	screen.DrawBox(px, py, panelW, panelH, theme.SubtleStyle())
-
-	title := " Set up local cluster -- dependency check "
-	screen.DrawText(px+(panelW-len(title))/2, py+1, len(title), title, theme.AccentStyle().Bold(true))
-
-	subtitle := "This machine needs the following to host a local memQL cluster:"
-	screen.DrawText(px+4, py+3, panelW-8, subtitle, theme.SubtleStyle())
-
-	row := py + 5
-	pass, fail := 0, 0
-	for _, c := range w.checks {
-		icon, color := iconFor(c.status, theme)
-		screen.SetCell(px+4, row, icon, theme.BaseStyle().Foreground(color))
-		labelStyle := theme.BaseStyle()
-		if c.status == statusFail {
-			labelStyle = theme.BaseStyle().Foreground(theme.Error)
-		}
-		screen.DrawText(px+6, row, panelW-10, c.label, labelStyle)
-		if c.detail != "" {
-			detailX := px + 6 + len(c.label) + 2
-			screen.DrawText(detailX, row, panelW-(detailX-px)-4, c.detail, theme.SubtleStyle())
-		}
-		switch c.status {
-		case statusPass:
-			pass++
-		case statusFail:
-			fail++
-		}
-		row++
-	}
-
-	// First failing check's hint, rendered just above the action bar.
-	if hint := firstFailHint(w.checks); hint != "" {
-		row++
-		for _, ln := range ui.WrapText("Next step: "+hint, panelW-8) {
-			screen.DrawText(px+4, row, panelW-8, ln, theme.BaseStyle().Foreground(theme.Warning))
-			row++
-		}
-	}
-
-	// Summary + hint strip.
-	summary := fmt.Sprintf("%d / %d checks passing", pass, len(w.checks))
-	if fail == 0 && pass == len(w.checks) {
-		summary = "All checks passed. Bring the stack up with:  docker compose -f docker/docker-compose.full.yml up -d"
-	}
-	screen.DrawText(px+4, py+panelH-3, panelW-8, summary, theme.BaseStyle())
-	hint := "R:Re-probe   Esc:Back"
-	screen.DrawText(px+4, py+panelH-2, panelW-8, hint, theme.SubtleStyle())
-
-	screen.Show()
-}
-
 func iconFor(s checkStatus, theme ui.Theme) (rune, tcell.Color) {
 	switch s {
 	case statusPass:
@@ -242,8 +333,6 @@ func firstFailHint(checks []*check) string {
 	return ""
 }
 
-// ----- individual probes -----------------------------------------------------
-
 func checkGenesisExists() (bool, string, string) {
 	path := genesisPath()
 	if path == "" {
@@ -259,7 +348,7 @@ func checkMasterKeyInEnv() (bool, string, string) {
 	if v := strings.TrimSpace(os.Getenv(secret.EnvMasterKey)); v != "" {
 		return true, "set", ""
 	}
-	return false, "", "Export MEMQL_MASTER_KEY in your shell (cockpit added an `export` line to your ~/.bashrc / ~/.zshrc during first-launch setup — start a new shell so it's picked up)."
+	return false, "", "Export MEMQL_MASTER_KEY in your shell (cockpit added an `export` line to your ~/.bashrc / ~/.zshrc during first-launch setup -- start a new shell so it's picked up)."
 }
 
 func checkMasterKeyOpensGenesis() (bool, string, string) {
@@ -274,7 +363,7 @@ func checkMasterKeyOpensGenesis() (bool, string, string) {
 		return false, "no key", "Export MEMQL_MASTER_KEY in your shell."
 	}
 	if _, err := corgenesis.OpenFile(path); err != nil {
-		return false, "decrypt failed", "The key in your environment doesn't open the envelope on disk. Either you're using the wrong key, or the envelope was sealed under a different key — re-create the envelope, or update MEMQL_MASTER_KEY."
+		return false, "decrypt failed", "The key in your environment doesn't open the envelope on disk. Either you're using the wrong key, or the envelope was sealed under a different key -- re-create the envelope, or update MEMQL_MASTER_KEY."
 	}
 	return true, "ok", ""
 }
@@ -346,8 +435,6 @@ func checkMemqlRepoLocatable() (bool, string, string) {
 	if env := strings.TrimSpace(os.Getenv("MEMQL_REPO")); env != "" {
 		candidates = append(candidates, env)
 	}
-	// Common sibling locations relative to where cockpit is typically checked
-	// out (e.g. ~/projects/memql/memql). Best-effort; failure is non-blocking.
 	if cwd, err := os.Getwd(); err == nil {
 		candidates = append(candidates,
 			filepath.Join(cwd, "..", "memql"),
