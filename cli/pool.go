@@ -32,11 +32,13 @@ import (
 type entryState int
 
 const (
-	stateIdle       entryState = iota // brand-new entry, goroutine hasn't started
-	stateConnecting                   // dial in flight
-	stateConnected                    // live stream, subscriber + monitor running
-	stateBackoff                      // waiting between failed attempts
-	stateFailed                       // all retries exhausted, awaiting manual retry
+	stateIdle        entryState = iota // brand-new entry, goroutine hasn't started
+	stateConnecting                    // dial in flight
+	stateConnected                     // live stream, subscriber + monitor running
+	stateBackoff                       // waiting between failed attempts
+	stateFailed                        // all retries exhausted, awaiting manual retry
+	stateNeedsConfig                   // missing endpoint/auth; no dial attempted, waiting for L:Authorize
+	stateNeedsToken                    // fully configured but no cached token; waiting for L:Login
 )
 
 func (s entryState) String() string {
@@ -51,6 +53,10 @@ func (s entryState) String() string {
 		return "backoff"
 	case stateFailed:
 		return "failed"
+	case stateNeedsConfig:
+		return "needs-auth"
+	case stateNeedsToken:
+		return "needs-login"
 	default:
 		return "unknown"
 	}
@@ -507,6 +513,14 @@ func (e *connEntry) initialLoad(ctx context.Context) []cluster.NodeInfo {
 			Health:  nodev1.NodeHealthStatus_NODE_HEALTH_HEALTHY,
 		})
 	}
+	// Local cluster: probe docker for the infrastructure containers
+	// (LB, DB, IDENTITY, REDIS, LIVEKIT, voice-agent) that aren't
+	// registered as memQL nodes via v1:cluster:node. Skipped for
+	// non-local clusters -- docker on this machine has no
+	// relationship to a remote cluster's topology.
+	if e.Config.Name == "local" {
+		allNodes = mergeInfraFromDocker(allNodes)
+	}
 	return allNodes
 }
 
@@ -856,6 +870,10 @@ func (a *App) refreshPartitionsView() {
 			msg = fmt.Sprintf("Connecting to %q -- partitions will appear once connected.", name)
 		case stateFailed:
 			msg = fmt.Sprintf("%q is unreachable. Press R on its row to retry.", name)
+		case stateNeedsConfig:
+			msg = fmt.Sprintf("%q is not configured. Press L on its row to authorize.", name)
+		case stateNeedsToken:
+			msg = fmt.Sprintf("%q needs a login. Press L on its row to authenticate.", name)
 		default:
 			msg = fmt.Sprintf("Cluster %q is not connected.", name)
 		}
@@ -948,6 +966,10 @@ func (a *App) syncRowStatus(name string, s entryState) {
 		status = "connecting"
 	case stateFailed:
 		status = "unreachable"
+	case stateNeedsConfig:
+		status = "needs-auth"
+	case stateNeedsToken:
+		status = "needs-login"
 	default:
 		status = "unknown"
 	}

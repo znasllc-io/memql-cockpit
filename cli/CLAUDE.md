@@ -99,7 +99,7 @@ cluster row in the Clusters tab.
 ┌──────────────────────────┬───────────────────────────────────┐
 │ CLUSTERS                 │ TOPOLOGY                          │
 │  CLUSTER MANAGER         │                                   │
-│   ▸ ● local       ◆      │   [bff] -- [cognition]            │
+│   ▸ ● local       *      │   [bff] -- [cognition]            │
 │     ○ acme               │       \                           │
 │   ─────                  │        [agent]                    │
 │   Endpoint  ...          │                                   │
@@ -108,7 +108,7 @@ cluster row in the Clusters tab.
 │  Tab:Partitions          │                                   │
 │ ─────────────────────────│                                   │
 │  PARTITION MANAGER       │                                   │
-│   ▸ ● default     ◆      │                                   │
+│   ▸ ● default     *      │                                   │
 │     ● acme               │                                   │
 │   A:Add E:Edit Enter:Sel │                                   │
 └──────────────────────────┴───────────────────────────────────┘
@@ -314,8 +314,9 @@ keybinding hints stay consistent and predictable:
 
 - **Highlight vs selection are two axes.** The "highlight" is the
   cursor — moves with arrow keys, never persists. The "selection"
-  (or "active") is the chosen item — marked with `◆`, persists in
-  config, drives downstream behavior (working cluster / active
+  (or "active") is the chosen item — marked with `*` (strict
+  single-cell ASCII, see "Layout-edge glyph rule" below), persists
+  in config, drives downstream behavior (working cluster / active
   partition / etc.).
 - **`Enter` always means "promote highlighted to selected".** Never
   overload it with secondary behavior like "and also retry". Other
@@ -342,6 +343,59 @@ keybinding hints stay consistent and predictable:
 When you add a new list-bearing pane, copy these conventions.
 Existing implementations: `cli/cluster/clusters_view.go` and
 `cli/cluster/partitions_view.go`.
+
+---
+
+## Layout-edge glyph rule
+
+**Cells adjacent to a pane border (left or right edge, divider
+columns, scroll-bar tracks) must use strictly single-width
+glyphs.** Anything else risks the terminal rendering the glyph
+as 2 cells, overflowing into the border column, and visually
+shifting the divider by one position on that row -- which then
+cascades into the right-pane content rendering as broken.
+
+The trap is Unicode's **East Asian Ambiguous Width** category.
+Glyphs like `◆`, `◇`, `●`, `○`, `◌`, `◯`, `▸`, `▼`, `★`, `•`
+have width "Ambiguous" per Unicode; many Linux/macOS terminal +
+font combinations render them as 2 cells wide even though they
+look 1-wide in some IDEs. tcell tracks them as 1 cell, the
+terminal paints 2, and the next character you placed gets
+visually consumed.
+
+**Safe at the edge** -- strictly Narrow (EAW=Na or N):
+  - ASCII printables (`*`, `>`, `+`, `=`, letters, digits)
+  - Box-drawing characters `─ │ ┌ ┐ └ ┘ ├ ┤ ┬ ┴ ┼` and their
+    heavy / double variants (single-line family is EAW=Na)
+
+**Unsafe at the edge** -- known Ambiguous, avoid:
+  - Diamonds: `◆ ◇ ◈ ◊ ♦`
+  - Filled circles: `● ○ ◌ ◍ ◎ ◯`
+  - Arrows: `→ ← ↑ ↓ ▸ ▶ ▼ ▲`
+  - Stars / bullets: `★ ☆ • ◦ ◉`
+  - Most Geometric Shapes block (U+25xx)
+
+**Where the rule applies:**
+  - The "active row" marker on `ClustersView` / `PartitionsView`
+    (right-edge, two cells from the divider).
+  - Scroll-bar thumb / track glyphs (right-edge of any scrollable
+    pane).
+  - The leftmost cell of any pane that has a left border drawn
+    by a sibling pane.
+
+**Where it's relaxed:**
+  - Interior cells that have at least 2 cells of buffer to any
+    border. The status icon at column 3 of a 30-wide pane is
+    fine; if it doubles to 2 wide, the buffer absorbs it.
+  - Notification icons in the header (no adjacent border).
+  - File-tree icons inside the explorer (interior).
+
+When introducing a new edge-adjacent glyph, default to ASCII or
+verify the codepoint is `EAW=Na` (see
+https://www.unicode.org/Public/UCD/latest/ucd/EastAsianWidth.txt).
+A comment near the call site referencing this rule is good
+practice so the next refactor doesn't quietly reintroduce the
+bug.
 
 ---
 
