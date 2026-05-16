@@ -73,6 +73,12 @@ type App struct {
 	clustersView *cluster.ClustersView
 	settingsView *settings.View
 
+	// getQueries returns a QueryClient bound to the currently active
+	// cluster's dispatcher, or nil if none is connected. Cached by
+	// wireExplorer so setSelected can re-trigger refreshExplorerData
+	// on connect.
+	getQueries func() *client.QueryClient
+
 	// Overlays
 	helpOverlay *ui.HelpOverlay
 }
@@ -937,7 +943,57 @@ func (a *App) setSelected(name string) {
 	// Refresh the Settings tab's "My Access" block with the new
 	// cluster's access record. Async so the UI stays responsive.
 	a.refreshMyAccess(name, conn)
+
+	// Refresh the Explorer tree + Agents tab against the newly-
+	// connected cluster. wireExplorer fires its first call at app-
+	// init when no cluster is connected yet, so without this re-
+	// trigger the Agents tab stays empty even though
+	// queryAllAgents would return data the moment we ask.
+	go a.refreshExplorerData(context.Background())
+
 	a.postRedraw()
+}
+
+// refreshExplorerData fetches the connected cluster's concept list +
+// agents and pushes them into the Explorer + Agents views. Safe to
+// call when no cluster is connected (it no-ops on a nil
+// getQueries result). Called once at app init (mostly a no-op then)
+// + every time the selected cluster transitions into stateConnected
+// via setSelected.
+func (a *App) refreshExplorerData(ctx context.Context) {
+	if a.getQueries == nil {
+		return
+	}
+	q := a.getQueries()
+	if q == nil {
+		return
+	}
+
+	fileMap := make(map[string][]explorer.FileEntry)
+
+	concepts, err := q.ListConcepts(ctx)
+	if err == nil {
+		for _, c := range concepts {
+			category := conceptKindToCategory(c.GetDomain())
+			fileMap[category] = append(fileMap[category], explorer.FileEntry{
+				Name: c.GetEntity(),
+				Path: c.GetId(),
+			})
+		}
+	} else if a.logger != nil {
+		a.logger.Warn("explorer: ListConcepts failed", "error", err)
+	}
+
+	agentCache, entries := a.loadAgents(ctx, q)
+	if len(entries) > 0 {
+		fileMap["Agents"] = append(fileMap["Agents"], entries...)
+	}
+	a.explorerView.SetAgents(agentCache)
+	a.explorerView.SetFiles(fileMap)
+	a.agentsView.SetAgents(agentCache)
+	if a.screen != nil {
+		a.screen.PostEvent(tcell.NewEventInterrupt(nil))
+	}
 }
 
 // refreshMyAccess fetches the caller's AccessContext from the given
@@ -988,40 +1044,16 @@ func (a *App) wireExplorer() {
 	}
 	ctx := context.Background()
 
-	// Load file listing from concepts + the agents listing from the
-	// connected cluster's v1:agents:agent rows. Both populate the
-	// explorer tree in one SetFiles call so a partial failure (e.g.
-	// cluster has no queryAllAgents loaded) doesn't blow the whole
-	// pane away.
-	go func() {
-		q := getQueries()
-		if q == nil { return }
-		fileMap := make(map[string][]explorer.FileEntry)
+	// Cache the queries-getter closure so refreshExplorerData (called
+	// from setSelected when a cluster connects) can use the same
+	// fresh-on-each-call dispatcher resolution.
+	a.getQueries = getQueries
 
-		concepts, err := q.ListConcepts(ctx)
-		if err == nil {
-			for _, c := range concepts {
-				category := conceptKindToCategory(c.GetDomain())
-				fileMap[category] = append(fileMap[category], explorer.FileEntry{
-					Name: c.GetEntity(),
-					Path: c.GetId(),
-				})
-			}
-		} else if a.logger != nil {
-			a.logger.Warn("explorer: ListConcepts failed", "error", err)
-		}
-
-		agentCache, entries := a.loadAgents(ctx, q)
-		if len(entries) > 0 {
-			fileMap["Agents"] = append(fileMap["Agents"], entries...)
-		}
-		a.explorerView.SetAgents(agentCache)
-		a.explorerView.SetFiles(fileMap)
-		a.agentsView.SetAgents(agentCache)
-		if a.screen != nil {
-			a.screen.PostEvent(tcell.NewEventInterrupt(nil))
-		}
-	}()
+	// Fire an initial fetch. Usually a no-op at this point in boot
+	// (no cluster connected yet), but kept for the case where an
+	// auto-connected cluster (e.g. local) is already in
+	// stateConnected by the time wireExplorer runs.
+	go a.refreshExplorerData(ctx)
 
 	// Wire Sense callbacks — use fresh client each call.
 	a.explorerView.OnRequestTokens = func(source string) []editor.SenseToken {
