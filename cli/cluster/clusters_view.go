@@ -78,6 +78,11 @@ type ClustersView struct {
 	// goroutine and reports progress via notifications. existingName
 	// is the row being edited (empty when this is a fresh Add).
 	OnAuthorize func(discoveryURL, existingName string)
+	// OnLogin runs the OAuth / magic-link browser flow against a
+	// fully-configured cluster (one that already has Issuer +
+	// ClientId, or a PAT). Used when the user presses L on a row
+	// that doesn't need to be reconfigured -- only re-authenticated.
+	OnLogin func(clusterName string)
 	// OnEntryState returns the pool-entry state for rendering row
 	// details (retry attempt, next-try countdown). Returns false when
 	// no entry exists yet. Called only during Draw, from the UI thread.
@@ -480,7 +485,7 @@ func (v *ClustersView) drawManagement(screen *ui.Screen, bounds ui.Rect) {
 		if cs.Config.Name == v.SelectedCluster {
 			nameStyle = rowStyle.Foreground(v.Theme.Accent).Bold(true)
 		}
-		screen.DrawText(x+4, rowY, maxW-5, cs.Config.Name, nameStyle)
+		screen.DrawText(x+4, rowY, maxW-5, cs.Config.Display(), nameStyle)
 
 		if cs.Config.Name == v.SelectedCluster {
 			markerX := bounds.X + bounds.Width - 2
@@ -592,7 +597,12 @@ func (v *ClustersView) drawManagement(screen *ui.Screen, bounds ui.Rect) {
 	subtle := v.Theme.SubtleStyle()
 	warnStyle := tcell.StyleDefault.Foreground(v.Theme.Warning).Background(v.Theme.BG)
 	canDelete := v.Selected >= 0 && v.Selected < len(v.Clusters) && v.Clusters[v.Selected].Config.Name != "local"
-	hint := "A:Add  E:Edit"
+	// Action hints. E:Edit is hidden on the local row -- local's
+	// config comes from the genesis envelope, not the form.
+	hint := "A:Add"
+	if v.Selected >= 0 && v.Selected < len(v.Clusters) && v.Clusters[v.Selected].Config.Name != "local" {
+		hint += "  E:Edit"
+	}
 	if v.OnEntryState != nil && v.Selected >= 0 && v.Selected < len(v.Clusters) {
 		name := v.Clusters[v.Selected].Config.Name
 		alreadySelected := name == v.SelectedCluster
@@ -611,6 +621,11 @@ func (v *ClustersView) drawManagement(screen *ui.Screen, bounds ui.Rect) {
 				// unconfigured row -- Enter:Select / R:Retry would
 				// both fail until issuer+client_id are wired.
 				hint += "  L:Authorize"
+			case "needs-login":
+				// Row is configured; only the token is missing.
+				// L triggers the OAuth flow directly (no form),
+				// distinct from needs-auth's L:Authorize.
+				hint += "  L:Login"
 			}
 		}
 		// No state at all (no pool entry yet, e.g. for a row added
@@ -821,10 +836,13 @@ func (v *ClustersView) HandleEvent(ev tcell.Event) bool {
 			v.addForm = addFormState{}
 			return true
 		case 'e', 'E':
-			// Open the form in edit mode, pre-populated from the selected
-			// cluster. Works for every cluster including "local" -- the
-			// save path persists local overrides in clusters.yaml.
+			// Open the form in edit mode, pre-populated from the
+			// selected cluster. Blocked for "local" -- its config
+			// comes from the genesis envelope, not the form.
 			if v.Selected >= 0 && v.Selected < len(v.Clusters) {
+				if v.Clusters[v.Selected].Config.Name == "local" {
+					return true // swallow silently; hint never advertised E for local
+				}
 				v.showAddForm = true
 				v.addForm = formStateFromConfig(v.Clusters[v.Selected].Config)
 			}
@@ -845,17 +863,43 @@ func (v *ClustersView) HandleEvent(ev tcell.Event) bool {
 			}
 			return true
 		case 'l', 'L':
-			// Authorize the highlighted cluster -- opens the Add
-			// form in edit mode pre-focused on the Discovery URL
-			// field. The bottom hint advertises this key only when
-			// the row is in stateNeedsConfig, but the action is
-			// harmless against configured rows too (the form just
-			// opens with Discovery focused; user can Esc out or
-			// fill it to re-authorize).
-			if v.Selected >= 0 && v.Selected < len(v.Clusters) {
+			// L's behavior depends on what the row needs:
+			//
+			//   - "local" row -- ALWAYS triggers OnLogin. local's
+			//     config comes from the genesis envelope, so the
+			//     form path doesn't apply. If genesis didn't seed
+			//     issuer/clientId, OnLogin's error path surfaces a
+			//     useful notification instead.
+			//   - Other rows in stateNeedsConfig -- open the form
+			//     prefocused on Discovery URL, so the user can
+			//     paste a URL and authorize from scratch.
+			//   - All other states (needs-login, connected,
+			//     failed, ...) -- run OAuth via OnLogin to mint or
+			//     refresh a token.
+			if v.Selected < 0 || v.Selected >= len(v.Clusters) {
+				return true
+			}
+			name := v.Clusters[v.Selected].Config.Name
+			if name == "local" {
+				if v.OnLogin != nil {
+					v.OnLogin(name)
+				}
+				return true
+			}
+			rowState := ""
+			if v.OnEntryState != nil {
+				if s, _, _, ok := v.OnEntryState(name); ok {
+					rowState = s
+				}
+			}
+			if rowState == "needs-auth" {
 				v.showAddForm = true
 				v.addForm = formStateFromConfig(v.Clusters[v.Selected].Config)
 				v.addForm.cursor = formFieldDiscovery
+				return true
+			}
+			if v.OnLogin != nil {
+				v.OnLogin(name)
 			}
 			return true
 		}
@@ -1039,6 +1083,12 @@ func clusterStatusIcon(status string, theme ui.Theme) (rune, tcell.Color) {
 		// "you haven't set this up yet" state can't be confused with
 		// the "set up but down" red dot.
 		return '◇', theme.Warning
+	case "needs-login":
+		// Hollow circle -- closer to "connected" than "needs-auth"
+		// because the row IS configured; only the token is missing.
+		// Coloured warning, not error, since a login fixes it
+		// without any reconfiguration.
+		return '◯', theme.Warning
 	default:
 		return '○', theme.Subtle
 	}
