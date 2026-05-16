@@ -118,10 +118,33 @@ The left column splits 50/50 vertically when a cluster is connected:
 
 - **Top half**: cluster manager (list + detail + add/edit form).
 - **Bottom half**: partition manager for the connected cluster.
-- **Right pane**: topology diagram (current cluster's nodes + health).
+- **Right pane**: topology diagram (current cluster's nodes + health), or
+  the architecture-model drill-down navigator when toggled with `X`.
 
 When the add/edit form opens it takes the full left column for typing
 room; the partition pane re-appears on save/cancel.
+
+### Architecture navigator (the `X` toggle)
+
+The Topology pane has a second mode driven by the embedded
+architecture model (`memql/component/architecture/embedded/`). Press
+`X` (or `x`) from the live-topology view to switch in; press `X` /
+`Esc` to switch back. While active:
+
+- `Up` / `Down` move the row highlight.
+- `Enter` zooms into the highlighted node (cluster -> service ->
+  package -> type -> method).
+- `Backspace` zooms out one level.
+- Rows render as `[kind] name observable observe=level n=N p95=Xms err=Y% (count)`.
+  The observability triple comes from `v1:observability:codeMetric`
+  rows fetched by `QueryClientMetricsFetcher` on connection-up;
+  count is the number of children inside the row's node.
+
+Source: `cli/cluster/architecture.go` (`ArchView`),
+`cli/cluster/metrics_fetcher.go` (`QueryClientMetricsFetcher`).
+The live-topology grid stays the source of truth for red/green
+health; the navigator is a *static + per-FQN-metrics* overlay on
+the same pane, not a replacement.
 
 ---
 
@@ -244,6 +267,21 @@ collects the slug + type and hands them off.
 | Esc       | Cancel                              |
 | Ctrl+N    | Toggle "No Auth" (cluster form)     |
 
+### Clusters tab (Topology pane focus)
+| Key         | Action                                              |
+|-------------|-----------------------------------------------------|
+| WASD        | Pan the live-topology grid                          |
+| R           | Reset pan to origin                                 |
+| X           | Toggle Architecture navigator (drill-down)          |
+
+### Architecture navigator (X-toggled)
+| Key         | Action                                              |
+|-------------|-----------------------------------------------------|
+| ↑/↓         | Move highlight                                      |
+| Enter       | Zoom into highlighted node                          |
+| Backspace   | Zoom out one level                                  |
+| Esc / X     | Return to live topology                             |
+
 ---
 
 ## Files
@@ -254,7 +292,9 @@ collects the slug + type and hands them off.
 | `pool.go`                | Per-cluster `connEntry` + lifecycle state machine             |
 | `cluster/clusters_view.go` | Clusters tab layout, focus, cluster manager                |
 | `cluster/partitions_view.go` | Partition manager (bottom-left pane)                     |
-| `cluster/view.go`        | Topology diagram (right pane)                                 |
+| `cluster/topology.go`    | Live cluster topology grid (right pane) + Architecture toggle |
+| `cluster/architecture.go`| `ArchView`: drill-down navigator over `topology.model.json`   |
+| `cluster/metrics_fetcher.go` | `QueryClientMetricsFetcher`: codeMetric overlay fetch      |
 | `client/dispatcher.go`   | Multiplexed gRPC stream, partition auto-stamping              |
 | `client/queries.go`      | `QueryClient` (also runs mutations via ExecuteQuery)          |
 | `config/clusters.go`     | `~/.memql/clusters.yaml` load/save                            |

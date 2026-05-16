@@ -1,0 +1,17 @@
+# Architecture-model declaration for the memql-cockpit module.
+# Schema: memql/component/architecture/extract/archyaml.go
+
+service: memql-cockpit
+display_name: "memQL Cockpit"
+description: |
+  Terminal-native IDE and operations console. Multi-tab TUI built on
+  tcell, with cluster topology, MemQL explorer, automation editor,
+  and the architecture navigator that consumes the model emitted by
+  memql-arch.
+
+depends_on:
+  - memql
+
+entrypoints:
+  - func: "main.main"
+    label: "TUI launch"

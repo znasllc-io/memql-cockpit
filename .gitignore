@@ -24,3 +24,9 @@ __debug*
 
 # macOS
 .DS_Store
+
+# Local env override (see memql/component/genesis/localenv.go).
+# Each developer's values are theirs; production binaries don't
+# carry a .env at all.
+.env
+.env.local
