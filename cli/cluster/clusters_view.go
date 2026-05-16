@@ -821,7 +821,7 @@ func (v *ClustersView) HandleEvent(ev tcell.Event) bool {
 		return true
 	case tcell.KeyEnter:
 		// Pick the highlighted cluster as the user's "working
-		// cluster" (drives Explorer / Automations). If the entry is
+		// cluster" (drives Explorer / Agents). If the entry is
 		// in stateFailed, the app layer's OnEnter handler also kicks
 		// a manual Retry.
 		if v.Selected >= 0 && v.Selected < len(v.Clusters) && v.OnEnter != nil {

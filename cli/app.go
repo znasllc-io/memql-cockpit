@@ -14,8 +14,8 @@ import (
 	"time"
 
 	"github.com/gdamore/tcell/v2"
+	"github.com/visionarys-io/memql-cockpit/cli/agents"
 	"github.com/visionarys-io/memql-cockpit/cli/auth"
-	"github.com/visionarys-io/memql-cockpit/cli/automations"
 	"github.com/visionarys-io/memql-cockpit/cli/client"
 	"github.com/visionarys-io/memql-cockpit/cli/cluster"
 	"github.com/visionarys-io/memql-cockpit/cli/config"
@@ -61,17 +61,17 @@ type App struct {
 	// viewed is the cluster the topology pane is currently rendering
 	// (follows arrow-key highlight).
 	// selected is the cluster the user has chosen as their "working
-	// cluster" via Enter. Drives the Explorer / Automations tabs.
+	// cluster" via Enter. Drives the Explorer / Agents tabs.
 	// Auto-set to the first cluster that successfully connects on
 	// startup (typically "local").
 	viewed   string
 	selected string
 
 	// Tab views
-	explorerView    *explorer.View
-	automationsView *automations.View
-	clustersView    *cluster.ClustersView
-	settingsView    *settings.View
+	explorerView *explorer.View
+	agentsView   *agents.View
+	clustersView *cluster.ClustersView
+	settingsView *settings.View
 
 	// Overlays
 	helpOverlay *ui.HelpOverlay
@@ -84,33 +84,33 @@ func NewApp(cfg AppConfig) *App {
 	settingsView := settings.NewView(theme, cfg.Version)
 
 	explorerView := explorer.NewView(theme)
-	automationsView := automations.NewView(theme)
+	agentsView := agents.NewView(theme)
 	clustersView := cluster.NewClustersView(theme)
 
 	// Clusters comes first -- it's the starting context for the session.
 	tabBar := ui.NewTabBar(theme,
 		ui.Tab{Name: "Clusters", Content: clustersView},
 		ui.Tab{Name: "Explorer", Content: explorerView},
-		ui.Tab{Name: "Automations", Content: automationsView},
+		ui.Tab{Name: "Agents", Content: agentsView},
 		ui.Tab{Name: "Settings", Content: settingsView},
 	)
 	tabBar.SetActive(0)
 
 	notifications := ui.NewNotifications()
 	app := &App{
-		config:          cfg,
-		theme:           theme,
-		notifications:   notifications,
-		header:          ui.NewHeader(theme, notifications),
-		tabBar:          tabBar,
-		logger:          cfg.Logger,
-		quitCh:          make(chan struct{}),
-		pool:            make(map[string]*connEntry),
-		explorerView:    explorerView,
-		automationsView: automationsView,
-		clustersView:    clustersView,
-		settingsView:    settingsView,
-		helpOverlay:     ui.NewHelpOverlay(theme),
+		config:        cfg,
+		theme:         theme,
+		notifications: notifications,
+		header:        ui.NewHeader(theme, notifications),
+		tabBar:        tabBar,
+		logger:        cfg.Logger,
+		quitCh:        make(chan struct{}),
+		pool:          make(map[string]*connEntry),
+		explorerView:  explorerView,
+		agentsView:    agentsView,
+		clustersView:  clustersView,
+		settingsView:  settingsView,
+		helpOverlay:   ui.NewHelpOverlay(theme),
 	}
 	// A notifications change (sync from a background goroutine, or a
 	// dismiss) should trigger a redraw so the user sees it immediately.
@@ -383,7 +383,6 @@ func (a *App) connect() {
 	// Auto-wire the UI glue so the tabs have their callbacks set even
 	// before the first successful dial lands.
 	a.wireExplorer()
-	a.wireAutomations()
 	a.wireCluster()
 
 	for _, cfg := range configs {
@@ -843,7 +842,7 @@ func (a *App) viewedEntry() *connEntry {
 
 // setViewed updates which cluster the topology + partitions panes
 // render. Called by OnHighlight (arrow keys). No side effects on the
-// Explorer / Automations workspace -- those follow a.selected, which
+// Explorer / Agents workspace -- those follow a.selected, which
 // is a separate concept changed by OnEnter, not arrow keys.
 func (a *App) setViewed(name string) {
 	a.poolMu.Lock()
@@ -882,14 +881,14 @@ func (a *App) setViewed(name string) {
 }
 
 // setSelected promotes a cluster to "my working cluster" -- drives
-// Explorer/Automations. Called by OnEnter. If the entry is in
+// Explorer/Agents. Called by OnEnter. If the entry is in
 // stateFailed, also kicks a manual Retry so Enter on a dead cluster
 // means "I want this to come back". Persists the choice to
 // clusters.yaml so the next launch restores it.
 func (a *App) setSelected(name string) {
 	// Only CONNECTED clusters can become the working cluster.
 	// Selecting a still-dialing or unreachable cluster has no useful
-	// effect (Explorer/Automations are gated on a connected
+	// effect (Explorer/Agents are gated on a connected
 	// dispatcher anyway), so Enter is a no-op for those rows. The
 	// hint strip already hides "Enter:Select" in those states; this
 	// is the matching guard at the action layer.
@@ -1012,12 +1011,13 @@ func (a *App) wireExplorer() {
 			a.logger.Warn("explorer: ListConcepts failed", "error", err)
 		}
 
-		agents, entries := a.loadAgents(ctx, q)
+		agentCache, entries := a.loadAgents(ctx, q)
 		if len(entries) > 0 {
 			fileMap["Agents"] = append(fileMap["Agents"], entries...)
 		}
-		a.explorerView.SetAgents(agents)
+		a.explorerView.SetAgents(agentCache)
 		a.explorerView.SetFiles(fileMap)
+		a.agentsView.SetAgents(agentCache)
 		if a.screen != nil {
 			a.screen.PostEvent(tcell.NewEventInterrupt(nil))
 		}
@@ -1269,27 +1269,6 @@ func stringSlice(m map[string]any, key string) []string {
 		return nil
 	}
 	return out
-}
-
-// wireAutomations connects the Automations tab's callbacks to the gRPC client.
-func (a *App) wireAutomations() {
-	getSense := func() *client.SenseClient {
-		d := a.activeDispatcher()
-		if d == nil {
-			return nil
-		}
-		return client.NewSenseClient(d)
-	}
-	ctx := context.Background()
-
-	a.automationsView.OnRequestTokens = func(source string) []editor.SenseToken {
-		if s := getSense(); s != nil { return s.Tokenize(ctx, source) }
-		return nil
-	}
-	a.automationsView.OnRequestDiags = func(source string) []editor.SenseDiagnostic {
-		if s := getSense(); s != nil { return s.Diagnose(ctx, source) }
-		return nil
-	}
 }
 
 // wireCluster wires the topology pane's OnInitialLoad callback to the
@@ -1784,7 +1763,7 @@ func (a *App) wireClustersCallbacks() {
 	}
 
 	// OnEnter fires when the user presses Enter on a row. Promotes
-	// that cluster to "selected" (drives Explorer / Automations) and,
+	// that cluster to "selected" (drives Explorer / Agents) and,
 	// if its pool entry is in stateFailed, kicks a manual retry.
 	a.clustersView.OnEnter = func(clusterName string) {
 		a.setSelected(clusterName)
@@ -2268,7 +2247,7 @@ func (a *App) persistSelectedPartition(clusterName, partition string) {
 	}
 }
 
-// updateTabGating sets the GatedMessage on Explorer / Automations
+// updateTabGating sets the GatedMessage on Explorer / Agents
 // based on whether the user's selected cluster has a live connection.
 // Called from draw() so state changes show up on the next repaint.
 func (a *App) updateTabGating() {
@@ -2276,7 +2255,7 @@ func (a *App) updateTabGating() {
 	if name == "" {
 		msg := "No cluster selected. Switch to the Clusters tab (F1) and press Enter on a cluster."
 		a.explorerView.GatedMessage = msg
-		a.automationsView.GatedMessage = msg
+		a.agentsView.GatedMessage = msg
 		return
 	}
 	a.poolMu.RLock()
@@ -2284,13 +2263,13 @@ func (a *App) updateTabGating() {
 	a.poolMu.RUnlock()
 	if entry == nil {
 		a.explorerView.GatedMessage = fmt.Sprintf("Selected cluster %q is not open. Switch to the Clusters tab (F1) and press Enter on its row.", name)
-		a.automationsView.GatedMessage = a.explorerView.GatedMessage
+		a.agentsView.GatedMessage = a.explorerView.GatedMessage
 		return
 	}
 	state, _, _ := entry.stateSnapshot()
 	if state == stateConnected {
 		a.explorerView.GatedMessage = ""
-		a.automationsView.GatedMessage = ""
+		a.agentsView.GatedMessage = ""
 		return
 	}
 	var why string
@@ -2304,7 +2283,7 @@ func (a *App) updateTabGating() {
 	}
 	msg := fmt.Sprintf("Selected cluster %q is %s. Available again once it reaches a connected state.", name, why)
 	a.explorerView.GatedMessage = msg
-	a.automationsView.GatedMessage = msg
+	a.agentsView.GatedMessage = msg
 }
 
 // backoffRedrawLoop schedules periodic redraws while any pool entry
@@ -2478,7 +2457,7 @@ func (a *App) draw() {
 	contentHeight := h - 4
 
 	contentBounds := ui.Rect{X: 0, Y: 2, Width: w, Height: contentHeight}
-	// Gate Explorer / Automations on the selected cluster being
+	// Gate Explorer / Agents on the selected cluster being
 	// connected. When it isn't, those views render a centered
 	// "not available" message instead of their usual content.
 	a.updateTabGating()
