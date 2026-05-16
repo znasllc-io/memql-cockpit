@@ -72,6 +72,13 @@ type View struct {
 	// CLUSTER TOPOLOGY") so the user always knows which cluster the
 	// diagram represents. Empty renders as just "CLUSTER TOPOLOGY".
 	ClusterName string
+
+	// Arch is the architecture-model navigator, layered on top of the
+	// live topology. Toggled with 'X' (or 'x'); when active, this
+	// pane renders the embedded architecture model's drill-down
+	// instead of the live grid. The navigator owns its own keys
+	// (arrows, Enter, Backspace, Esc); HandleEvent routes accordingly.
+	Arch *ArchView
 }
 
 // SetDisconnected toggles the "stream lost" rendering override. Does not
@@ -88,9 +95,14 @@ const (
 	panStepY = 2
 )
 
-// NewView creates an empty topology view.
+// NewView creates an empty topology view. The ArchView is wired
+// eagerly so the embedded model is decoded once and the toggle key
+// produces an instant response (no first-touch latency).
 func NewView(theme ui.Theme) *View {
-	return &View{Theme: theme}
+	return &View{
+		Theme: theme,
+		Arch:  NewArchView(theme),
+	}
 }
 
 // SetNodes updates the cluster topology data.
@@ -187,6 +199,15 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 		screen.DrawText(bounds.X+2, bounds.Y, bounds.Width-3, v.ClusterName, nameStyle)
 	}
 
+	// Architecture navigator: when toggled, owns the whole drawing
+	// area below the cluster-name title; the status bar below still
+	// reflects the live topology (since that's the system-state truth
+	// the navigator is layered over).
+	if v.Arch.Active() {
+		v.Arch.Draw(screen, bounds)
+		return
+	}
+
 	if len(v.Nodes) > 0 {
 		v.drawTopology(screen, bounds)
 	}
@@ -225,7 +246,7 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 	// Right-align: pan/reset hints. The "live" indicator was redundant
 	// (a healthy stream is the implicit default); only the "stale"
 	// warning surfaces, and only when we've actually lost the stream.
-	hints := "WASD:Pan  R:Reset View"
+	hints := "WASD:Pan  R:Reset View  X:Architecture"
 	if v.disconnected {
 		hints += "  stale"
 	}
@@ -422,6 +443,13 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 	if !ok {
 		return false
 	}
+	// Architecture navigator: when active, it claims all keys --
+	// including the 'X' toggle (so the user can press X again to
+	// leave). When inactive, the live topology's WASD pan + 'X'
+	// toggle apply.
+	if v.Arch.Active() {
+		return v.Arch.HandleEvent(ev)
+	}
 	if keyEv.Key() != tcell.KeyRune {
 		return false
 	}
@@ -440,6 +468,9 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 		return true
 	case 'r', 'R':
 		v.panX, v.panY = 0, 0
+		return true
+	case 'x', 'X':
+		v.Arch.Toggle()
 		return true
 	}
 	return false
