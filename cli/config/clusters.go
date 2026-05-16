@@ -50,7 +50,7 @@ func (c ClusterConfig) Display() string {
 //
 // SelectedCluster persists which cluster the user had picked as their
 // "working cluster" (via Enter). The CLI restores this selection on
-// next launch so Explorer / Automations resume where they left off,
+// next launch so Explorer / Agents resume where they left off,
 // rather than defaulting to whichever cluster happened to connect
 // first. Absent on first run, when it defaults to "local".
 type ClustersFile struct {

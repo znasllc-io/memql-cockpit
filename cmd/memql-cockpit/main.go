@@ -1,6 +1,6 @@
 // memql-cockpit is a memQL Cockpit -- terminal-native IDE and operations console.
 // It provides a multi-tab TUI with an editor (Sense integration), cluster
-// topology viewer (pixel canvas), and automation flow diagrams.
+// topology viewer (pixel canvas), and an agents directory.
 //
 // Usage:
 //

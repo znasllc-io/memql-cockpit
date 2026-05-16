@@ -112,7 +112,7 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 	treeBounds.Width--
 
 	// Tree title (gray when unfocused, accent when focused -- matches the
-	// pane-title convention used in Clusters and Automations).
+	// pane-title convention used in Clusters and Agents).
 	treeTitleStyle := v.Theme.SubtleStyle().Bold(true)
 	if v.FocusTree {
 		treeTitleStyle = v.Theme.AccentStyle().Bold(true)
