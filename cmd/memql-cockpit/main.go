@@ -23,6 +23,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -48,8 +49,18 @@ func main() {
 	// localenv.go. Errors here are warnings: the cockpit can run
 	// without a local .env (production case) and shouldn't refuse to
 	// launch just because the file has a stray syntax error.
+	//
+	// Suppress the warning for the "file doesn't exist" case -- it's
+	// the common case for cockpit launches outside a memql checkout
+	// and there's nothing for the user to do about it. The check uses
+	// errors.Is (vs the older os.IsNotExist) because the genesis
+	// package wraps with `%w` and a non-unwrapping check returns
+	// false, which is what was producing the noisy warning every
+	// single boot.
 	if overridden, err := coregenesis.ApplyLocalOverride("."); err != nil {
-		fmt.Fprintf(os.Stderr, "memql-cockpit: warning: local .env override failed: %v\n", err)
+		if !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(os.Stderr, "memql-cockpit: warning: local .env override failed: %v\n", err)
+		}
 	} else if len(overridden) > 0 {
 		fmt.Fprintf(os.Stderr, "memql-cockpit: local .env override applied: %v\n", overridden)
 	}
