@@ -357,13 +357,17 @@ func (a *App) connect() {
 	a.viewed = selected
 	a.poolMu.Unlock()
 	a.clustersView.SelectedCluster = selected
-	a.clustersView.Topology.ClusterName = selected
 	// Highlight the selected cluster so the initial draw matches.
+	// Topology header uses the display name (e.g. "local.znas.io").
 	for i, cs := range a.clustersView.Clusters {
 		if cs.Config.Name == selected {
 			a.clustersView.Selected = i
+			a.clustersView.Topology.ClusterName = cs.Config.Display()
 			break
 		}
+	}
+	if a.clustersView.Topology.ClusterName == "" {
+		a.clustersView.Topology.ClusterName = selected
 	}
 
 	// Auto-wire the UI glue so the tabs have their callbacks set even
@@ -518,6 +522,68 @@ func (a *App) runAuthorizeFlow(discoveryURL, existingName string) {
 	a.replaceEntry(cfg)
 }
 
+// runLoginFlow runs the OAuth / magic-link browser flow against an
+// already-configured cluster (Issuer + ClientId present in
+// clusters.yaml, or PAT). On success the minted token gets cached
+// via auth.EnsureValidToken's internal write path and the pool
+// entry is restarted so a fresh dial cycle picks up the bearer.
+//
+// Used by L:Login on the cluster list; distinct from
+// runAuthorizeFlow which discovers a brand-new cluster from a URL.
+//
+// Progress + outcome travel through the notifications center under
+// id "cluster:login:<name>" so the user sees what's happening
+// without the UI thread blocking on the browser flow.
+func (a *App) runLoginFlow(clusterName string) {
+	notifId := "cluster:login:" + clusterName
+
+	clusters, err := config.LoadClusters()
+	if err != nil {
+		a.notifications.SyncMeta(notifId, ui.SeverityError,
+			fmt.Sprintf("Load clusters config: %v", err))
+		a.postRedraw()
+		return
+	}
+	cfg, ok := clusters.Get(clusterName)
+	if !ok {
+		a.notifications.SyncMeta(notifId, ui.SeverityError,
+			fmt.Sprintf("Cluster %q not found in clusters.yaml.", clusterName))
+		a.postRedraw()
+		return
+	}
+	if cfg.NeedsAuth() {
+		// Local-row edge case: genesis didn't seed Issuer / ClientId.
+		// Other rows would have hit the form path; the only way we
+		// land here for them is a race.
+		a.notifications.SyncMeta(notifId, ui.SeverityError,
+			fmt.Sprintf("%q has no issuer / client_id wired up; re-run the setup wizard or authorize via discovery URL.", cfg.Display()))
+		a.postRedraw()
+		return
+	}
+
+	a.notifications.SyncMeta(notifId, ui.SeverityInfo,
+		fmt.Sprintf("Opening browser to authenticate with %q ...", cfg.Display()))
+	a.postRedraw()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	if _, err := auth.EnsureValidToken(ctx, cfg); err != nil {
+		a.notifications.SyncMeta(notifId, ui.SeverityError,
+			fmt.Sprintf("Login failed for %q: %v", cfg.Display(), err))
+		a.postRedraw()
+		return
+	}
+
+	a.notifications.SyncMeta(notifId, ui.SeverityInfo,
+		fmt.Sprintf("Authenticated with %q -- connecting...", cfg.Display()))
+	a.postRedraw()
+
+	// Token cached; restart the pool entry so the fresh dial cycle
+	// sees the bearer. replaceEntry will see the now-valid cached
+	// token and skip stateNeedsToken -- straight to lifecycle.
+	a.replaceEntry(cfg)
+}
+
 // replaceEntry closes any existing pool entry for cfg.Name and opens
 // a fresh one with the new config. Used by the authorize flow to
 // pick up new credentials without leaking the old connection.
@@ -563,28 +629,36 @@ func genesisFilePath() string {
 
 // autoSeedLocalFromGenesis is the bridge between the sealed envelope
 // and the operating-console's clusters.yaml. Called once on
-// operating-console entry. If clusters.yaml already carries a local
-// row with a non-empty endpoint, this is a no-op. Otherwise the
-// function attempts to open genesis.znas (requires MEMQL_MASTER_KEY
-// in the environment), extracts IDENTITY_BOOTSTRAP_DOMAIN, and
-// writes a local row of the form `https://bff.<domain>`.
+// operating-console entry. Decrypts genesis.znas (requires
+// MEMQL_MASTER_KEY in the environment), reads
+// IDENTITY_BOOTSTRAP_DOMAIN, and writes a fully-configured local
+// row to clusters.yaml:
 //
-// Failure is silent on purpose: the user can authorize the local
-// row by hand from inside the TUI if the auto-seed didn't run. The
-// caller refreshes the cluster list after this returns so any seed
-// is visible to the first draw.
+//   DisplayName = <domain>                  (e.g. local.znas.io)
+//   Endpoint    = https://bff.<domain>      (NGINX LB entry)
+//   Issuer      = https://identity.<domain> (OIDC issuer)
+//   ClientId    = cockpit                   (registered cockpit client)
+//
+// The Name slot stays "local" -- it's the config key, used by yaml
+// lookup, token cache filenames, etc. DisplayName is the
+// human-readable label shown in the row list.
+//
+// The Issuer / ClientId / DisplayName values rely on the convention
+// the local stack ships with (NGINX server_name `identity.${DOMAIN}`
+// terminating TLS for the identity service; cockpit client_id
+// registered in identity bootstrap). If the user's local stack
+// deviates, they can edit clusters.yaml or re-run authorize via
+// the TUI on a non-local cluster slot.
+//
+// Re-runs idempotently: if the persisted local row already carries
+// the values genesis would produce, nothing is written. If genesis
+// changes (different domain), the row gets refreshed.
+//
+// Failure is silent on purpose: the user can still authorize a
+// cluster by hand from inside the TUI if the auto-seed didn't run.
+// The caller refreshes the cluster list after this returns so any
+// seed is visible to the first draw.
 func (a *App) autoSeedLocalFromGenesis() {
-	clusters, err := config.LoadClusters()
-	if err != nil {
-		if a.logger != nil {
-			a.logger.Warn("auto-seed: load clusters.yaml", "error", err)
-		}
-		return
-	}
-	if existing, ok := clusters.Get("local"); ok && existing.Endpoint != "" {
-		return // already configured -- nothing to do
-	}
-
 	gpath := genesisFilePath()
 	if gpath == "" {
 		return
@@ -604,22 +678,60 @@ func (a *App) autoSeedLocalFromGenesis() {
 	if !ok || strings.TrimSpace(domain) == "" {
 		return
 	}
-	endpoint := "https://bff." + strings.TrimSpace(domain)
+	domain = strings.TrimSpace(domain)
+	seed := config.ClusterConfig{
+		Name:        "local",
+		DisplayName: domain,
+		Endpoint:    "https://bff." + domain,
+		Issuer:      "https://identity." + domain,
+		ClientId:    "cockpit",
+	}
+
+	clusters, err := config.LoadClusters()
+	if err != nil {
+		if a.logger != nil {
+			a.logger.Warn("auto-seed: load clusters.yaml", "error", err)
+		}
+		return
+	}
 
 	replaced := false
+	dirty := false
 	for i := range clusters.Clusters {
 		if clusters.Clusters[i].Name != "local" {
 			continue
 		}
-		clusters.Clusters[i].Endpoint = endpoint
+		// Merge genesis-derived fields onto whatever was there. Preserve
+		// sticky bits (selected partition, optional PAT, etc.) so
+		// re-seeding doesn't wipe operator-set state.
+		existing := clusters.Clusters[i]
+		merged := existing
+		if merged.DisplayName != seed.DisplayName {
+			merged.DisplayName = seed.DisplayName
+			dirty = true
+		}
+		if merged.Endpoint != seed.Endpoint {
+			merged.Endpoint = seed.Endpoint
+			dirty = true
+		}
+		if merged.Issuer != seed.Issuer {
+			merged.Issuer = seed.Issuer
+			dirty = true
+		}
+		if merged.ClientId != seed.ClientId {
+			merged.ClientId = seed.ClientId
+			dirty = true
+		}
+		clusters.Clusters[i] = merged
 		replaced = true
 		break
 	}
 	if !replaced {
-		clusters.Clusters = append(clusters.Clusters, config.ClusterConfig{
-			Name:     "local",
-			Endpoint: endpoint,
-		})
+		clusters.Clusters = append(clusters.Clusters, seed)
+		dirty = true
+	}
+	if !dirty {
+		return
 	}
 	if err := config.SaveClusters(clusters); err != nil && a.logger != nil {
 		a.logger.Warn("auto-seed: save clusters.yaml", "error", err)
@@ -631,11 +743,18 @@ func (a *App) autoSeedLocalFromGenesis() {
 // and retries run in the background. If an entry for cfg.Name already
 // exists, this is a no-op (let the existing lifecycle own it).
 //
-// Rows that haven't been authorized yet (no endpoint, or no PAT and
-// no Issuer+ClientId pair) skip the lifecycle entirely: the entry is
-// parked in stateNeedsConfig and the row picks up an `L:Authorize`
-// hint instead of burning 90 seconds on dials the BFF would reject
-// for "authorization header missing".
+// Two states short-circuit the lifecycle:
+//
+//   - stateNeedsConfig: row has no endpoint, or no PAT + no
+//     Issuer+ClientId pair. Nothing to dial against. Row picks up
+//     an `L:Authorize` hint.
+//   - stateNeedsToken: row is fully configured but no cached OAuth
+//     token. Avoids popping a browser the moment cockpit launches;
+//     instead the row picks up an `L:Login` hint and the user
+//     explicitly initiates the magic-link flow.
+//
+// PAT-authenticated rows skip the token check (the PAT is itself
+// the credential; no minting needed).
 func (a *App) openEntry(cfg config.ClusterConfig) {
 	a.poolMu.Lock()
 	if a.pool == nil {
@@ -654,6 +773,11 @@ func (a *App) openEntry(cfg config.ClusterConfig) {
 		a.postRedraw()
 		return
 	}
+	if cfg.PAT == "" && !hasValidCachedToken(cfg.Name) {
+		entry.setStateAttempt(stateNeedsToken, 0, time.Time{})
+		a.postRedraw()
+		return
+	}
 
 	// The lifecycle goroutine drives the state machine: attempts a
 	// bounded number of dials, sleeps backoff between them, handles
@@ -661,6 +785,18 @@ func (a *App) openEntry(cfg config.ClusterConfig) {
 	// cancel / close signals.
 	go entry.runLifecycle()
 	a.postRedraw()
+}
+
+// hasValidCachedToken reports whether a usable token is on disk for
+// clusterName. "Usable" = present + not expired. Any error reading
+// or parsing the token is treated as "no token" so the user lands
+// in stateNeedsToken instead of the silent-fail dial cycle.
+func hasValidCachedToken(clusterName string) bool {
+	stored, err := config.LoadToken(clusterName)
+	if err != nil || stored == nil {
+		return false
+	}
+	return !stored.IsExpired()
 }
 
 // activeDispatcher returns the gRPC dispatcher of the cluster the
@@ -706,8 +842,13 @@ func (a *App) setViewed(name string) {
 	a.poolMu.Unlock()
 
 	// Keep the topology header labeled with the viewed cluster so
-	// the user always knows which cluster the diagram is for.
-	a.clustersView.Topology.ClusterName = name
+	// the user always knows which cluster the diagram is for. Prefer
+	// the display name (e.g. "local.znas.io") over the slot key.
+	display := name
+	if entry != nil {
+		display = entry.Config.Display()
+	}
+	a.clustersView.Topology.ClusterName = display
 
 	if entry != nil {
 		a.clustersView.Topology.SetNodeTypes(entry.snapshotNodeTypes())
@@ -1698,6 +1839,15 @@ func (a *App) wireClustersCallbacks() {
 		go a.runAuthorizeFlow(discoveryURL, existingName)
 	}
 
+	// OnLogin fires when L is pressed on a fully-configured row
+	// (or on the local row, regardless of state). Runs OAuth
+	// against the row's cached Issuer + ClientId, caches the
+	// resulting token, then restarts the pool entry so the dial
+	// cycle picks up the bearer.
+	a.clustersView.OnLogin = func(clusterName string) {
+		go a.runLoginFlow(clusterName)
+	}
+
 	// Add a new cluster, save, auto-open its pool entry. No
 	// "auto-connect via OnConnect" dance -- openEntry handles it.
 	//
@@ -2270,7 +2420,11 @@ func (a *App) syncConnectionNotifications() {
 		case stateNeedsConfig:
 			a.notifications.Sync(id, ui.SeverityWarning,
 				fmt.Sprintf("%q is not configured -- press L on its row to authorize.",
-					entry.Config.Name))
+					entry.Config.Display()))
+		case stateNeedsToken:
+			a.notifications.Sync(id, ui.SeverityWarning,
+				fmt.Sprintf("%q needs a login -- press L on its row to authenticate.",
+					entry.Config.Display()))
 		default:
 			// Connected / Idle -- the cluster is fine, clear its slot.
 			a.notifications.Clear(id)

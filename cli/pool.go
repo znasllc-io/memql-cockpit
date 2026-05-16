@@ -38,6 +38,7 @@ const (
 	stateBackoff                       // waiting between failed attempts
 	stateFailed                        // all retries exhausted, awaiting manual retry
 	stateNeedsConfig                   // missing endpoint/auth; no dial attempted, waiting for L:Authorize
+	stateNeedsToken                    // fully configured but no cached token; waiting for L:Login
 )
 
 func (s entryState) String() string {
@@ -54,6 +55,8 @@ func (s entryState) String() string {
 		return "failed"
 	case stateNeedsConfig:
 		return "needs-auth"
+	case stateNeedsToken:
+		return "needs-login"
 	default:
 		return "unknown"
 	}
@@ -861,6 +864,8 @@ func (a *App) refreshPartitionsView() {
 			msg = fmt.Sprintf("%q is unreachable. Press R on its row to retry.", name)
 		case stateNeedsConfig:
 			msg = fmt.Sprintf("%q is not configured. Press L on its row to authorize.", name)
+		case stateNeedsToken:
+			msg = fmt.Sprintf("%q needs a login. Press L on its row to authenticate.", name)
 		default:
 			msg = fmt.Sprintf("Cluster %q is not connected.", name)
 		}
@@ -932,6 +937,8 @@ func (a *App) syncRowStatus(name string, s entryState) {
 		status = "unreachable"
 	case stateNeedsConfig:
 		status = "needs-auth"
+	case stateNeedsToken:
+		status = "needs-login"
 	default:
 		status = "unknown"
 	}

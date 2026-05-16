@@ -12,12 +12,19 @@ import (
 
 // ClusterConfig describes a single memQL cluster connection.
 //
+// Name is the slot key used in clusters.yaml lookups (e.g. "local",
+// "staging"). DisplayName is what the row list renders -- typically
+// a human-friendly cluster name like "local.znas.io" derived from
+// IDENTITY_BOOTSTRAP_DOMAIN, or the `clusterName` returned by a
+// discovery doc. Falls back to Name when empty.
+//
 // SelectedPartition persists which partition the user picked the last
 // time they used this cluster. When empty (first-time or never set),
 // the CLI defaults to "default". Saved per-cluster so SaaS engineers
 // working on staging/acme and prod/acme don't fight the tooling.
 type ClusterConfig struct {
 	Name              string `yaml:"name"`
+	DisplayName       string `yaml:"display_name,omitempty"`        // Human-friendly name; falls back to Name when empty
 	Endpoint          string `yaml:"endpoint"`                      // gRPC address (host:port)
 	Issuer            string `yaml:"issuer,omitempty"`              // OIDC issuer URL
 	ClientId          string `yaml:"client_id,omitempty"`           // OAuth2 client ID
@@ -28,6 +35,15 @@ type ClusterConfig struct {
 	// flow -- the token IS the credential. Generate one at
 	// /me/tokens on the identity binary.
 	PAT string `yaml:"pat,omitempty"`
+}
+
+// Display returns DisplayName if set, otherwise Name. Use this for
+// any UI surface that shows the cluster's human-readable label.
+func (c ClusterConfig) Display() string {
+	if c.DisplayName != "" {
+		return c.DisplayName
+	}
+	return c.Name
 }
 
 // ClustersFile is the top-level structure of ~/.memql/clusters.yaml.
