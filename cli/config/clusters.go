@@ -12,12 +12,19 @@ import (
 
 // ClusterConfig describes a single memQL cluster connection.
 //
+// Name is the slot key used in clusters.yaml lookups (e.g. "local",
+// "staging"). DisplayName is what the row list renders -- typically
+// a human-friendly cluster name like "local.znas.io" derived from
+// IDENTITY_BOOTSTRAP_DOMAIN, or the `clusterName` returned by a
+// discovery doc. Falls back to Name when empty.
+//
 // SelectedPartition persists which partition the user picked the last
 // time they used this cluster. When empty (first-time or never set),
 // the CLI defaults to "default". Saved per-cluster so SaaS engineers
 // working on staging/acme and prod/acme don't fight the tooling.
 type ClusterConfig struct {
 	Name              string `yaml:"name"`
+	DisplayName       string `yaml:"display_name,omitempty"`        // Human-friendly name; falls back to Name when empty
 	Endpoint          string `yaml:"endpoint"`                      // gRPC address (host:port)
 	Issuer            string `yaml:"issuer,omitempty"`              // OIDC issuer URL
 	ClientId          string `yaml:"client_id,omitempty"`           // OAuth2 client ID
@@ -30,6 +37,15 @@ type ClusterConfig struct {
 	PAT string `yaml:"pat,omitempty"`
 }
 
+// Display returns DisplayName if set, otherwise Name. Use this for
+// any UI surface that shows the cluster's human-readable label.
+func (c ClusterConfig) Display() string {
+	if c.DisplayName != "" {
+		return c.DisplayName
+	}
+	return c.Name
+}
+
 // ClustersFile is the top-level structure of ~/.memql/clusters.yaml.
 //
 // SelectedCluster persists which cluster the user had picked as their
@@ -40,6 +56,28 @@ type ClusterConfig struct {
 type ClustersFile struct {
 	Clusters        []ClusterConfig `yaml:"clusters"`
 	SelectedCluster string          `yaml:"selected_cluster,omitempty"`
+}
+
+// NeedsAuth reports whether the cluster lacks enough credentials to
+// dial. Callers use this to short-circuit the connection lifecycle
+// (no point retrying for 90 seconds against a server we have no
+// bearer for) and to drive the "not configured" state in the TUI.
+//
+// A cluster is "configured" when it has BOTH an endpoint AND one of:
+//   - a PAT (the token IS the credential, no OIDC dance needed)
+//   - an OIDC issuer + client_id pair (cockpit can run the auth-code
+//     flow against them and produce a token)
+//
+// An empty endpoint also counts as not-configured: even with auth
+// fields set, there's nowhere to dial.
+func (c ClusterConfig) NeedsAuth() bool {
+	if c.Endpoint == "" {
+		return true
+	}
+	if c.PAT != "" {
+		return false
+	}
+	return c.Issuer == "" || c.ClientId == ""
 }
 
 // Get returns the cluster config with the given name.

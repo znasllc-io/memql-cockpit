@@ -72,6 +72,17 @@ type ClustersView struct {
 	OnHighlight func(clusterName string)     // Arrow keys moved highlight -- topology view should follow
 	OnCancel    func(clusterName string)     // Esc on a row -- cancel its retry cycle if any
 	OnRetry     func(clusterName string)     // R on a row -- manually retry after the 3-attempt cycle failed
+	// OnAuthorize is invoked when the user presses Enter on the Add /
+	// Edit form with the Discovery URL field filled. The app layer
+	// runs the well-known fetch + OAuth + save sequence in a
+	// goroutine and reports progress via notifications. existingName
+	// is the row being edited (empty when this is a fresh Add).
+	OnAuthorize func(discoveryURL, existingName string)
+	// OnLogin runs the OAuth / magic-link browser flow against a
+	// fully-configured cluster (one that already has Issuer +
+	// ClientId, or a PAT). Used when the user presses L on a row
+	// that doesn't need to be reconfigured -- only re-authenticated.
+	OnLogin func(clusterName string)
 	// OnEntryState returns the pool-entry state for rendering row
 	// details (retry attempt, next-try countdown). Returns false when
 	// no entry exists yet. Called only during Draw, from the UI thread.
@@ -79,12 +90,17 @@ type ClustersView struct {
 }
 
 // formFieldCount is the number of editable rows in the add/edit form.
-const formFieldCount = 5
+const formFieldCount = 6
 
 // Field indices for the add/edit form. Keep this consistent with the
 // `labels` / `placeholders` arrays in drawAddForm.
+//
+// Discovery sits at the top so a paste-the-URL flow naturally lands
+// the cursor there first. Filling it is optional -- empty Discovery
+// + manually-filled Host/Port/Issuer/ClientId is also a valid path.
 const (
-	formFieldName = iota
+	formFieldDiscovery = iota
+	formFieldName
 	formFieldHost
 	formFieldPort
 	formFieldIssuer
@@ -102,27 +118,15 @@ type addFormState struct {
 	formError string
 }
 
-// defaultLocalClusterConfig is the seed used when no user override exists
-// in clusters.yaml. The user can edit "local" through the Edit form; the
-// override is persisted and takes precedence on load.
-//
-// The preset has NO auth shortcut. Local-dev runs the identity
-// service via docker compose and uses the same OAuth flow as any
-// other cluster -- the user runs `memql-cockpit authorize
-// https://identity.local.znas.io` to wire issuer + client_id, then
-// `login local` to mint a token.
-//
-// Endpoint targets the canonical NGINX-fronted gRPC entry point
-// surfaced by docker-compose.full.yml: `bff.${DOMAIN}:443` with TLS
-// terminated at the load balancer. ${DOMAIN} defaults to
-// `local.znas.io` in the memql repo (see IDENTITY_BOOTSTRAP_DOMAIN
-// in docker-compose.full.yml + the mkcert dev wildcard cert). A
-// developer running the cluster-mode compose with plaintext gRPC on
-// localhost:50050 can edit this entry through the Add/Edit form
-// without losing the default.
+// defaultLocalClusterConfig is the seed used when no user override
+// exists in clusters.yaml. The name slot is always "local"; the
+// endpoint is intentionally blank so the binary carries no
+// domain-specific assumption. `genesis init` populates the endpoint
+// from IDENTITY_BOOTSTRAP_DOMAIN at bootstrap; if the user hasn't
+// run it yet, the row shows up as "needs-auth" and the TUI surfaces
+// `L:Authorize` for them to wire up a cluster.
 var defaultLocalClusterConfig = config.ClusterConfig{
-	Name:     "local",
-	Endpoint: "https://bff.local.znas.io",
+	Name: "local",
 }
 
 // LocalClusterConfig returns the active local-cluster default. Exposed as
@@ -184,17 +188,26 @@ func joinEndpoint(host, port string) string {
 
 // formStateFromConfig builds an addFormState pre-populated from an
 // existing ClusterConfig. Used when opening the form in edit mode.
+// Discovery URL is always blank when re-entering -- it's an input
+// channel (paste a URL, fetch metadata), not a stored field.
 func formStateFromConfig(c config.ClusterConfig) addFormState {
 	host, port := splitEndpoint(c.Endpoint)
+	cursor := formFieldHost // jump straight to the most-edited field
+	if c.NeedsAuth() {
+		// Row was opened from the L:Authorize affordance -- the
+		// natural next action is to type a discovery URL.
+		cursor = formFieldDiscovery
+	}
 	return addFormState{
 		fields: [formFieldCount]string{
-			formFieldName:     c.Name,
-			formFieldHost:     host,
-			formFieldPort:     port,
-			formFieldIssuer:   c.Issuer,
-			formFieldClientId: c.ClientId,
+			formFieldDiscovery: "",
+			formFieldName:      c.Name,
+			formFieldHost:      host,
+			formFieldPort:      port,
+			formFieldIssuer:    c.Issuer,
+			formFieldClientId:  c.ClientId,
 		},
-		cursor:   formFieldHost, // jump straight to the most-edited field
+		cursor:   cursor,
 		editMode: true,
 		editName: c.Name,
 	}
@@ -472,11 +485,16 @@ func (v *ClustersView) drawManagement(screen *ui.Screen, bounds ui.Rect) {
 		if cs.Config.Name == v.SelectedCluster {
 			nameStyle = rowStyle.Foreground(v.Theme.Accent).Bold(true)
 		}
-		screen.DrawText(x+4, rowY, maxW-5, cs.Config.Name, nameStyle)
+		screen.DrawText(x+4, rowY, maxW-5, cs.Config.Display(), nameStyle)
 
 		if cs.Config.Name == v.SelectedCluster {
+			// `*` is strictly single-cell. The previous `◆` glyph
+			// renders as East Asian Ambiguous (2 cells wide on many
+			// terminal/font combos) and its overflow column nudged
+			// the right-pane divider one cell over on selected rows.
+			// See cli/CLAUDE.md "Layout-edge glyph rule".
 			markerX := bounds.X + bounds.Width - 2
-			screen.SetCell(markerX, rowY, '◆', rowStyle.Foreground(v.Theme.Accent).Bold(true))
+			screen.SetCell(markerX, rowY, '*', rowStyle.Foreground(v.Theme.Accent).Bold(true))
 		}
 	}
 
@@ -526,12 +544,9 @@ func (v *ClustersView) drawManagement(screen *ui.Screen, bounds ui.Rect) {
 		screen.DrawText(x+12, dy, maxW-13, cs.Config.Endpoint, detailStyle)
 		dy++
 
-		authStr := "OIDC"
-		if cs.Config.PAT != "" {
-			authStr = "PAT"
-		}
+		authStr, authColor := authLabel(cs.Config, v.Theme)
 		screen.DrawText(x+1, dy, 10, "Auth", subtleDetail)
-		screen.DrawText(x+12, dy, maxW-13, authStr, detailStyle)
+		screen.DrawText(x+12, dy, maxW-13, authStr, detailStyle.Foreground(authColor))
 		dy++
 
 		screen.DrawText(x+1, dy, 10, "Status", subtleDetail)
@@ -587,7 +602,12 @@ func (v *ClustersView) drawManagement(screen *ui.Screen, bounds ui.Rect) {
 	subtle := v.Theme.SubtleStyle()
 	warnStyle := tcell.StyleDefault.Foreground(v.Theme.Warning).Background(v.Theme.BG)
 	canDelete := v.Selected >= 0 && v.Selected < len(v.Clusters) && v.Clusters[v.Selected].Config.Name != "local"
-	hint := "A:Add  E:Edit"
+	// Action hints. E:Edit is hidden on the local row -- local's
+	// config comes from the genesis envelope, not the form.
+	hint := "A:Add"
+	if v.Selected >= 0 && v.Selected < len(v.Clusters) && v.Clusters[v.Selected].Config.Name != "local" {
+		hint += "  E:Edit"
+	}
 	if v.OnEntryState != nil && v.Selected >= 0 && v.Selected < len(v.Clusters) {
 		name := v.Clusters[v.Selected].Config.Name
 		alreadySelected := name == v.SelectedCluster
@@ -601,6 +621,16 @@ func (v *ClustersView) drawManagement(screen *ui.Screen, bounds ui.Rect) {
 				hint += "  Esc:Cancel"
 			case "failed":
 				hint += "  R:Retry"
+			case "needs-auth":
+				// Authorize is the only useful next action on an
+				// unconfigured row -- Enter:Select / R:Retry would
+				// both fail until issuer+client_id are wired.
+				hint += "  L:Authorize"
+			case "needs-login":
+				// Row is configured; only the token is missing.
+				// L triggers the OAuth flow directly (no form),
+				// distinct from needs-auth's L:Authorize.
+				hint += "  L:Login"
 			}
 		}
 		// No state at all (no pool entry yet, e.g. for a row added
@@ -633,18 +663,20 @@ func (v *ClustersView) drawAddForm(screen *ui.Screen, x, y, maxW int, bounds ui.
 	// one place stays consistent. Host + Port are split for clarity --
 	// the connection layer sees them joined on save.
 	labels := [formFieldCount]string{
-		formFieldName:     "Name",
-		formFieldHost:     "Host",
-		formFieldPort:     "Port",
-		formFieldIssuer:   "Issuer",
-		formFieldClientId: "Client ID",
+		formFieldDiscovery: "Discovery",
+		formFieldName:      "Name",
+		formFieldHost:      "Host",
+		formFieldPort:      "Port",
+		formFieldIssuer:    "Issuer",
+		formFieldClientId:  "Client ID",
 	}
 	placeholders := [formFieldCount]string{
-		formFieldName:     "my-cluster",
-		formFieldHost:     "https://bff.local.znas.io",
-		formFieldPort:     "(blank for URLs)",
-		formFieldIssuer:   "(optional)",
-		formFieldClientId: "(optional)",
+		formFieldDiscovery: "https://identity.<domain> (optional)",
+		formFieldName:      "my-cluster",
+		formFieldHost:      "https://bff.<domain>",
+		formFieldPort:      "(blank for URLs)",
+		formFieldIssuer:    "(optional)",
+		formFieldClientId:  "(optional)",
 	}
 
 	for i := 0; i < formFieldCount; i++ {
@@ -809,10 +841,13 @@ func (v *ClustersView) HandleEvent(ev tcell.Event) bool {
 			v.addForm = addFormState{}
 			return true
 		case 'e', 'E':
-			// Open the form in edit mode, pre-populated from the selected
-			// cluster. Works for every cluster including "local" -- the
-			// save path persists local overrides in clusters.yaml.
+			// Open the form in edit mode, pre-populated from the
+			// selected cluster. Blocked for "local" -- its config
+			// comes from the genesis envelope, not the form.
 			if v.Selected >= 0 && v.Selected < len(v.Clusters) {
+				if v.Clusters[v.Selected].Config.Name == "local" {
+					return true // swallow silently; hint never advertised E for local
+				}
 				v.showAddForm = true
 				v.addForm = formStateFromConfig(v.Clusters[v.Selected].Config)
 			}
@@ -830,6 +865,46 @@ func (v *ClustersView) HandleEvent(ev tcell.Event) bool {
 			// it's in stateFailed; OnRetry short-circuits if not.
 			if v.Selected >= 0 && v.Selected < len(v.Clusters) && v.OnRetry != nil {
 				v.OnRetry(v.Clusters[v.Selected].Config.Name)
+			}
+			return true
+		case 'l', 'L':
+			// L's behavior depends on what the row needs:
+			//
+			//   - "local" row -- ALWAYS triggers OnLogin. local's
+			//     config comes from the genesis envelope, so the
+			//     form path doesn't apply. If genesis didn't seed
+			//     issuer/clientId, OnLogin's error path surfaces a
+			//     useful notification instead.
+			//   - Other rows in stateNeedsConfig -- open the form
+			//     prefocused on Discovery URL, so the user can
+			//     paste a URL and authorize from scratch.
+			//   - All other states (needs-login, connected,
+			//     failed, ...) -- run OAuth via OnLogin to mint or
+			//     refresh a token.
+			if v.Selected < 0 || v.Selected >= len(v.Clusters) {
+				return true
+			}
+			name := v.Clusters[v.Selected].Config.Name
+			if name == "local" {
+				if v.OnLogin != nil {
+					v.OnLogin(name)
+				}
+				return true
+			}
+			rowState := ""
+			if v.OnEntryState != nil {
+				if s, _, _, ok := v.OnEntryState(name); ok {
+					rowState = s
+				}
+			}
+			if rowState == "needs-auth" {
+				v.showAddForm = true
+				v.addForm = formStateFromConfig(v.Clusters[v.Selected].Config)
+				v.addForm.cursor = formFieldDiscovery
+				return true
+			}
+			if v.OnLogin != nil {
+				v.OnLogin(name)
 			}
 			return true
 		}
@@ -876,10 +951,21 @@ func (v *ClustersView) handleAddFormEvent(ev *tcell.EventKey) bool {
 		v.addForm.cursor = v.nextFormCursor(v.addForm.cursor, -1)
 		return true
 	case tcell.KeyEnter:
-		// Validate every field (name shape/length, host, port range,
-		// issuer URL, client id). The first failure is surfaced inline
-		// below the form fields; the next keystroke clears it so the
-		// user can retry without an explicit dismiss.
+		// Discovery URL takes priority: when filled, the app layer
+		// fetches the well-known doc + runs OAuth in the background
+		// and the rest of the form (Host/Port/Issuer/ClientId) is
+		// ignored. This is the "paste one URL, done" path.
+		discovery := strings.TrimSpace(v.addForm.fields[formFieldDiscovery])
+		if discovery != "" && v.OnAuthorize != nil {
+			v.OnAuthorize(discovery, v.addForm.editName)
+			v.showAddForm = false
+			return true
+		}
+		// Manual path: validate every field (name shape/length, host,
+		// port range, issuer URL, client id). The first failure is
+		// surfaced inline below the form fields; the next keystroke
+		// clears it so the user can retry without an explicit
+		// dismiss.
 		normName, err := ui.ValidateName(v.addForm.fields[formFieldName])
 		if err != nil {
 			v.addForm.formError = "Name: " + err.Error()
@@ -932,6 +1018,10 @@ func (v *ClustersView) handleAddFormEvent(ev *tcell.EventKey) bool {
 		var allowed bool
 		var cap int
 		switch i {
+		case formFieldDiscovery:
+			// Discovery is a URL paste target -- any printable char.
+			allowed = r >= 0x20 && r != 0x7f
+			cap = ui.MaxURLLen
 		case formFieldName:
 			allowed = ui.IsNameChar(r)
 			cap = ui.MaxNameLen
@@ -993,8 +1083,34 @@ func clusterStatusIcon(status string, theme ui.Theme) (rune, tcell.Color) {
 		return '●', theme.Error
 	case "connecting":
 		return '◌', theme.Warning
+	case "needs-auth":
+		// Empty diamond -- distinct shape from the dot family so the
+		// "you haven't set this up yet" state can't be confused with
+		// the "set up but down" red dot.
+		return '◇', theme.Warning
+	case "needs-login":
+		// Hollow circle -- closer to "connected" than "needs-auth"
+		// because the row IS configured; only the token is missing.
+		// Coloured warning, not error, since a login fixes it
+		// without any reconfiguration.
+		return '◯', theme.Warning
 	default:
 		return '○', theme.Subtle
+	}
+}
+
+// authLabel renders the Auth field in the cluster detail panel.
+// Returns both the human-readable string and the colour to paint
+// it -- "not configured" is a real state the user needs to action,
+// so it gets the warning colour rather than the muted text style.
+func authLabel(c config.ClusterConfig, theme ui.Theme) (string, tcell.Color) {
+	switch {
+	case c.PAT != "":
+		return "PAT", theme.FG
+	case c.Issuer != "" && c.ClientId != "":
+		return "OIDC", theme.FG
+	default:
+		return "not configured", theme.Warning
 	}
 }
 
