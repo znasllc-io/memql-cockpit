@@ -2331,16 +2331,20 @@ func (a *App) draw() {
 	// positioned at the bottom-right corner (causing the stray '{').
 	a.screen.Inner().ShowCursor(0, 0)
 	a.screen.Inner().HideCursor()
-	// Sync() re-emits every cell unconditionally. We KEEP it (over the
-	// theoretically-cheaper Show()) until we've tracked down the
-	// ghosting bug that surfaces when only diffs are emitted: switching
-	// to Show() leaves "No nodes. Waiting for cluster data..."
-	// visible AT THE SAME TIME as "Nodes: 12 Online:12" because two
-	// frames' worth of cells leak through. Until we identify which
-	// component(s) draw inconsistent state across consecutive frames
-	// (likely a background-goroutine refresh that mutates view state
-	// mid-draw), Sync() is the safer primitive even at the cost of
-	// minor flicker.
-	a.screen.Sync()
+	// Show() emits ONLY cells that changed since the previous frame
+	// (tcell diffs the back buffer vs visible state). Cheap, no flicker.
+	//
+	// Originally swapped Sync() -> Show() to kill per-frame flicker but
+	// had to revert when the diff-only emit exposed a state-coherence
+	// bug: background subscribers (runSubscriber +
+	// runPartitionsSubscriber in pool.go, refreshMyAccess in app.go)
+	// were mutating view state from goroutines while Draw read it
+	// from the event loop, leaving torn cells visible across frames.
+	// Now that Topology + PartitionsView + ClustersView + Settings.View
+	// all use sync.RWMutex (mutators Lock, Draw RLock), each frame's
+	// back buffer is internally consistent and Show()'s diff is safe.
+	// Sync() in the resize handler stays (correct primitive after
+	// terminal geometry changes).
+	a.screen.Show()
 }
 
