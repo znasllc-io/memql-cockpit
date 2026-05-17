@@ -492,7 +492,7 @@ func (v *View) refreshRowsFromCurrent() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
-	res, err := qc.Execute(ctx, fmt.Sprintf("node(concept==%s)", conceptId))
+	res, err := qc.Execute(ctx, fmt.Sprintf("concept==%s", conceptId))
 	if err != nil {
 		if v.OnStatus != nil {
 			v.OnStatus(fmt.Sprintf("rows load failed: %v", err))
@@ -541,7 +541,7 @@ func (v *View) openVersions() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
-	res, err := qc.Execute(ctx, fmt.Sprintf("node(concept==%s;id==%s)", conceptId, rowId))
+	res, err := qc.Execute(ctx, fmt.Sprintf("concept==%s;id==%s", conceptId, rowId))
 	if err != nil {
 		if v.OnStatus != nil {
 			v.OnStatus(fmt.Sprintf("version history failed: %v", err))
@@ -648,33 +648,52 @@ func shortenTimestamp(ts string) string {
 }
 
 // extractRows pulls a flat slice of row maps out of a MemQL query
-// response. Mirrors the unwinding logic in app.go's extractAgentRows
-// but kept inline so this package stays self-contained.
+// response. The engine returns one of several wrapper shapes
+// depending on which read path produced the result; we walk a fixed
+// list of well-known wrappers + finally fall through to "treat the
+// map as a single row".
 func extractRows(result any) []map[string]any {
 	if result == nil {
 		return nil
 	}
-	switch v := result.(type) {
-	case []any:
-		out := make([]map[string]any, 0, len(v))
-		for _, item := range v {
+	toRowSlice := func(arr []any) []map[string]any {
+		out := make([]map[string]any, 0, len(arr))
+		for _, item := range arr {
 			if m, ok := item.(map[string]any); ok {
 				out = append(out, m)
 			}
 		}
 		return out
+	}
+	switch v := result.(type) {
+	case []any:
+		return toRowSlice(v)
 	case map[string]any:
-		if arr, ok := v["nodes"].([]any); ok {
-			out := make([]map[string]any, 0, len(arr))
-			for _, item := range arr {
-				if m, ok := item.(map[string]any); ok {
-					out = append(out, m)
+		// Direct array keys the engine commonly returns.
+		for _, key := range []string{"nodes", "items", "results", "data"} {
+			if arr, ok := v[key].([]any); ok {
+				return toRowSlice(arr)
+			}
+		}
+		// Nested: { bundle: { nodes: [...] } }
+		if bundle, ok := v["bundle"].(map[string]any); ok {
+			if arr, ok := bundle["nodes"].([]any); ok {
+				return toRowSlice(arr)
+			}
+		}
+		// Nested: { result: { bundle: { nodes: [...] } } }
+		if rs, ok := v["result"].(map[string]any); ok {
+			if bundle, ok := rs["bundle"].(map[string]any); ok {
+				if arr, ok := bundle["nodes"].([]any); ok {
+					return toRowSlice(arr)
 				}
 			}
-			return out
 		}
-		// Single row -- wrap.
-		return []map[string]any{v}
+		// Top-level map looks like a single row (has id/concept) --
+		// wrap. Otherwise we don't know what this is.
+		if _, hasId := v["id"]; hasId {
+			return []map[string]any{v}
+		}
 	}
 	return nil
 }
