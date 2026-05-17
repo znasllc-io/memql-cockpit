@@ -895,6 +895,11 @@ func (a *App) openEntry(cfg config.ClusterConfig) {
 	// reconnects after an unexpected stream close, and responds to
 	// cancel / close signals.
 	go entry.runLifecycle()
+	// The token refresher silently rolls the cached OIDC token
+	// forward before it expires, so a future reconnect never has
+	// to fall through to the browser flow. PAT clusters short-
+	// circuit inside runTokenRefresher.
+	go entry.runTokenRefresher()
 	a.postRedraw()
 }
 

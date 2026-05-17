@@ -99,8 +99,10 @@ specific rendering, just a recursive walk of the row's payload +
 provenance + intrinsics. New concepts work the day they're declared
 without a renderer update. Press `v` on a selected row to swap the
 detail pane to the time-series version history; `Esc` returns.
-`/` jumps to the search box (filters the row list in-memory). Tab
-cycles focus between the three panes.
+`:` jumps to the search box (filters the row list in-memory). The
+prompt + active query render in the pane's bottom chrome band -- never
+as a strip below the title -- per the [Panel chrome contract](#panel-
+chrome-contract) below. Tab cycles focus between the three panes.
 
 ---
 
@@ -353,6 +355,120 @@ keybinding hints stay consistent and predictable:
 When you add a new list-bearing pane, copy these conventions.
 Existing implementations: `cli/cluster/clusters_view.go` and
 `cli/cluster/partitions_view.go`.
+
+---
+
+## Panel chrome contract
+
+**Every interactive pane shipped by the cockpit follows the same
+chrome layout, no exceptions.** This is the contract reviewers should
+point at when something else gets added. It exists because the
+Clusters tab established a pattern the rest of the UI quietly drifted
+away from -- search strips below titles, count footers stuck at the
+bottom row, ad-hoc hint formats. Anything that diverges is a
+regression.
+
+### The bands (top -> bottom)
+
+```
+[title]      Pane title + meta. One row. Counts/positions go here,
+             NOT in a separate bottom footer. Examples:
+                " CLUSTERS "
+                " PARTITIONS "
+                " ROWS: v1:platform:partition (3/12) "
+                " DETAIL (line 4/27) "
+             When a form is open, the title rewrites in place
+             (" ADD CLUSTER ", " EDIT PARTITION ") -- no second
+             title stacked inside the form.
+
+[content]    The scrollable list / detail / form body. Whatever
+             vertical space remains after subtracting the title +
+             optional detail + chrome bands.
+
+[detail]     (optional) Pinned detail block for the highlighted row
+             -- Endpoint/Auth/Status/Node for clusters, etc. Lives
+             ABOVE the chrome with a one-row gap; rows that have
+             nothing to show stay blank so the list viewport keeps
+             a stable height as the user arrows around.
+
+[chrome]     Anchored to the LAST row(s) of the pane via
+             `ui.DrawBottom` / `ui.DrawBottomBlocks`. Holds action
+             hints, search input when active, or a confirmation
+             prompt (delete / discard / etc.). NEVER a count
+             footer -- that lives in the title.
+```
+
+### Action-hint format
+
+Hints in the chrome band are a single line of `Key:Label` chips
+joined by **two spaces** (no commas, no pipes, no "Press X to Y"
+prose):
+
+```
+A:Add  E:Edit  Enter:Select  D:Del
+↑/↓:Move  Enter:Open  :Search  v:Versions  Tab:Cycle
+```
+
+Rules:
+- **`Key:Label`** -- no space around the colon. `Key` is the literal
+  key (or key combo) the user presses; `Label` is a single
+  whitespace-free verb or noun (use CamelCase for compounds:
+  `Esc:ClearSearch`, `Esc:CloseVersions`). `Enter:Save` not
+  `Enter: Save` and not `Enter (Save)`.
+- **Two-space separator** between chips. Single space would visually
+  merge into the labels; commas/pipes have been tried and read worse.
+- **Context-aware.** A chip only appears when the action it
+  advertises is currently available -- `Enter:Select` only on
+  not-already-selected rows, `D:Del` only when the row is deletable,
+  `Esc:Clear search` only when a filter is active. Hints that lie
+  rot trust.
+- **No `Tab:Switch panes` duplication.** Tab cycling is universal
+  and lives in the top-of-screen header chrome
+  (`cli/ui/header.go`); pane-local hints can still echo
+  `Tab:Next pane` when there's room, but don't treat it as
+  mandatory or as the first chip.
+
+### Search input
+
+Panes that filter their content use a single, consistent invocation:
+
+- **Trigger key: `:`** (colon). NOT `/`. The colon convention
+  threads through the same `Key:Label` grammar action hints use --
+  the bottom-band chip reads `:Search`, and pressing colon enters
+  the input. `/` is reserved (and not currently bound) so future
+  surfaces can repurpose it without colliding with the search
+  mental model.
+- **Render location: the chrome band, never a strip under the
+  title.** When the user presses `:`, the bottom band swaps from
+  action hints to a vim-style prompt:
+
+  ```
+  :search <query>_
+  ```
+
+  rendered in the accent style so it's clear input is being
+  captured. `Esc` or `Enter` exits the input; `Esc` on the rows
+  pane with a non-empty filter clears the filter (advertised as
+  `Esc:Clear search`).
+- **Don't reserve a permanent search row.** Painting "/search:"
+  below the title before the user has asked to search wastes a
+  row, breaks the chrome contract, and trains the user to look
+  for search in the wrong place.
+
+Reference implementation: `cli/concepts/view.go`
+(`drawBottomHints` + `hintsForRows`).
+
+### When you add a new pane
+
+1. Title shows pane name + counts/positions.
+2. Action hints render via `ui.DrawBottom(screen, bounds,
+   subtle, 1, hint)` anchored to the last row.
+3. If the pane filters content, search is invoked by `:` and the
+   prompt renders inline in the chrome band.
+4. Add a regression test in `cli/concepts/chrome_contract_test.go`
+   style: instantiate the pane, render against a
+   `tcell.NewSimulationScreen`, assert hint text lands in the last
+   row and search behaves as specified.
 
 ---
 
