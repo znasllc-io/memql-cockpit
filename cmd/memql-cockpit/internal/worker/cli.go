@@ -11,8 +11,8 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/visionarys-io/memql-cockpit/cli/config"
-	"github.com/visionarys-io/memql-cockpit/cmd/memql-cockpit/internal/worker/tools"
+	"github.com/znasllc-io/memql-cockpit/cli/config"
+	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/internal/worker/tools"
 )
 
 // HandleCommand dispatches `memql-cockpit worker <subcommand>`.

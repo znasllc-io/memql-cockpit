@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/visionarys-io/memql/component/architecture/model"
+	"github.com/znasllc-io/memql/component/architecture/model"
 
-	"github.com/visionarys-io/memql-cockpit/cli/client"
+	"github.com/znasllc-io/memql-cockpit/cli/client"
 )
 
 // QueryClientMetricsFetcher is the production MetricsFetcher

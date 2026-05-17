@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/visionarys-io/memql-cockpit/cli/config"
+	"github.com/znasllc-io/memql-cockpit/cli/config"
 )
 
 // EnsureValidToken loads a cached token for the cluster, checks expiry,

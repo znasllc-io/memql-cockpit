@@ -5,7 +5,7 @@ package tools
 import (
 	"context"
 
-	memqlv1 "github.com/visionarys-io/memql/component/grpc/gen"
+	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 )
 
 // dispatchComputer on the default (non-gui) build returns
