@@ -919,11 +919,11 @@ func (a *App) onEntryConnected(e *connEntry) {
 	// live. setSelected has the same hook for the manual-Enter path,
 	// but the auto-connect-at-boot path never calls setSelected --
 	// the selection field is filled in directly from yaml during
-	// connect(). Without this call the Agents tab stays empty on
-	// every fresh launch even though queryAllAgents would return
-	// rows the moment we ask.
+	// connect(). Without this call the Concepts tab stays empty on
+	// every fresh launch even though ListConcepts would return
+	// concepts the moment we ask.
 	if a.isSelectedCluster(e.Config.Name) {
-		go a.refreshExplorerData(context.Background())
+		go a.refreshConcepts(context.Background())
 	}
 }
 

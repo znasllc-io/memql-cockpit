@@ -25,9 +25,10 @@ The rule covers two layout patterns:
 ### 1. Multi-tab IDE (the operations console)
 
 The original `memql-cockpit` invocation -- launches `cli.App`, mounts
-the Clusters / Explorer / Agents / Settings tabs, full F1..F4
-navigation. This is what `app.go` orchestrates today; documented in
-the rest of this file.
+the Clusters / Concepts / Settings tabs, full F1..F3 navigation. This
+is what `app.go` orchestrates today; documented in the rest of this
+file. (Previous Explorer + Agents tabs were folded into the unified
+Concepts tab on 2026-05-16 -- the generic row browser supersedes both.)
 
 ### 2. Single-panel wizard
 
@@ -83,13 +84,23 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
 "connect to a cluster" is the first thing the user sees:
 
 1. **Clusters (F1)** -- cluster manager + partition manager + topology
-2. **Explorer (F2)** -- concept tree + MemQL source editor
-3. **Agents (F3)** -- materialized `v1:agents:agent` directory
-4. **Settings (F4)** -- credentials, theme, version
+2. **Concepts (F2)** -- generic browser for every registered concept
+3. **Settings (F3)** -- credentials, theme, version
 
-Explorer / Agents are gated on a connected, selected cluster --
-they show a placeholder message until the user presses Enter on a
-cluster row in the Clusters tab.
+Concepts is gated on a connected, selected cluster -- it shows a
+placeholder message until the user presses Enter on a cluster row in
+the Clusters tab.
+
+### Concepts tab layout
+
+Three panes (left -> right): concept picker, row list with search,
+generic detail renderer. The detail pane is "Hybrid C" -- no concept-
+specific rendering, just a recursive walk of the row's payload +
+provenance + intrinsics. New concepts work the day they're declared
+without a renderer update. Press `v` on a selected row to swap the
+detail pane to the time-series version history; `Esc` returns.
+`/` jumps to the search box (filters the row list in-memory). Tab
+cycles focus between the three panes.
 
 ---
 
@@ -227,7 +238,7 @@ pane still shows the full topology and the full partition list.
 ### Global
 | Key      | Action                              |
 |----------|-------------------------------------|
-| F1..F4   | Switch tab                          |
+| F1..F3   | Switch tab                          |
 | Ctrl+Q   | Quit                                |
 | Ctrl+T   | Cycle theme                         |
 
@@ -298,8 +309,7 @@ collects the slug + type and hands them off.
 | `client/dispatcher.go`   | Multiplexed gRPC stream, partition auto-stamping              |
 | `client/queries.go`      | `QueryClient` (also runs mutations via ExecuteQuery)          |
 | `config/clusters.go`     | `~/.memql/clusters.yaml` load/save                            |
-| `explorer/`              | Explorer tab (concept tree + editor)                          |
-| `agents/`                | Agents tab (list + RenderAgent detail block)                  |
+| `concepts/`              | Concepts tab (concept picker + row list + generic renderer)   |
 | `editor/`                | Reusable text editor with Sense integration                   |
 | `settings/`              | Settings tab                                                  |
 | `ui/`                    | Theme, screen, tab bar, layout primitives                     |

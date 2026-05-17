@@ -57,9 +57,8 @@ func (h *HelpOverlay) Draw(screen *Screen, bounds Rect) {
 	entries := []helpEntry{
 		{section: "TABS"},
 		{key: "F1 / " + alt + "+1", desc: "Clusters"},
-		{key: "F2 / " + alt + "+2", desc: "Explorer"},
-		{key: "F3 / " + alt + "+3", desc: "Agents"},
-		{key: "F4 / " + alt + "+4", desc: "Settings"},
+		{key: "F2 / " + alt + "+2", desc: "Concepts"},
+		{key: "F3 / " + alt + "+3", desc: "Settings"},
 		{},
 		{section: "NAVIGATION"},
 		{key: "Tab", desc: "Cycle focus between panes"},
