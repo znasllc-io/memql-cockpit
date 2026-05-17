@@ -864,10 +864,23 @@ func (e *connEntry) Close() {
 
 // postRedraw triggers a screen redraw via the main event loop. Safe
 // to call from any goroutine.
+//
+// Coalesces bursts via redrawPending: only the first caller in a
+// quiet window actually posts an EventInterrupt. The event loop
+// clears the flag right before draw() runs, so a postRedraw arriving
+// while draw is mid-flight queues a fresh frame for the next tick
+// (no missed updates). Callsites that fire dozens of times per
+// second -- subscriber demuxes, lifecycle state machines, the
+// backoff redraw loop -- collapse into one draw per quiet window
+// instead of one draw per call.
 func (a *App) postRedraw() {
-	if a.screen != nil {
-		a.screen.PostEvent(tcell.NewEventInterrupt(nil))
+	if a.screen == nil {
+		return
 	}
+	if a.redrawPending.Swap(true) {
+		return
+	}
+	a.screen.PostEvent(tcell.NewEventInterrupt(nil))
 }
 
 // isViewed reports whether the given cluster name is the one currently

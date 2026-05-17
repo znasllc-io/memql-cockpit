@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
@@ -50,6 +51,20 @@ type App struct {
 	logger        *slog.Logger
 	quitCh        chan struct{}
 	quitOnce      sync.Once
+
+	// redrawPending coalesces postRedraw bursts. The first caller in a
+	// quiet window posts an EventInterrupt and flips the flag true;
+	// subsequent callers find it already true and skip the post. The
+	// event-loop's EventInterrupt branch clears the flag right before
+	// draw() runs, so a state change THAT ARRIVES while draw is in
+	// flight still posts a fresh interrupt and gets its own frame.
+	//
+	// Without this, ~40 postRedraw callsites across the codebase plus
+	// the per-cluster subscriber bursts would queue dozens of identical
+	// "please redraw" events for tcell to process serially -- each one
+	// triggering a full draw() + Sync() / Show(). The user sees that
+	// as per-frame flicker even when the underlying data hasn't changed.
+	redrawPending atomic.Bool
 
 	// Connection pool. Each cluster the user has opened this session
 	// holds its own entry keyed by cluster Name. Switching clusters
@@ -277,7 +292,11 @@ func (a *App) dispatchEvent(ev tcell.Event) bool {
 	switch ev := ev.(type) {
 	case *tcell.EventInterrupt:
 		// Background goroutines (connect, probe) post interrupts to trigger redraws.
+		// Clear the pending flag BEFORE drawing so any postRedraw that
+		// arrives while draw is still running queues a fresh interrupt
+		// instead of being silently dropped.
 		_ = ev
+		a.redrawPending.Store(false)
 		a.draw()
 
 	case *tcell.EventResize:
