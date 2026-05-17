@@ -2331,20 +2331,18 @@ func (a *App) draw() {
 	// positioned at the bottom-right corner (causing the stray '{').
 	a.screen.Inner().ShowCursor(0, 0)
 	a.screen.Inner().HideCursor()
-	// Show() emits ONLY cells that changed since the previous frame
-	// (tcell diffs the back buffer vs visible state). Cheap, no flicker.
-	//
-	// Originally swapped Sync() -> Show() to kill per-frame flicker but
-	// had to revert when the diff-only emit exposed a state-coherence
-	// bug: background subscribers (runSubscriber +
-	// runPartitionsSubscriber in pool.go, refreshMyAccess in app.go)
-	// were mutating view state from goroutines while Draw read it
-	// from the event loop, leaving torn cells visible across frames.
-	// Now that Topology + PartitionsView + ClustersView + Settings.View
-	// all use sync.RWMutex (mutators Lock, Draw RLock), each frame's
-	// back buffer is internally consistent and Show()'s diff is safe.
-	// Sync() in the resize handler stays (correct primitive after
-	// terminal geometry changes).
-	a.screen.Show()
+	// IMPORTANT: keep Sync() here. Two Sync->Show() experiments both
+	// produced a 1-row-offset ghost frame on the user's terminal
+	// (Pop_OS, screenshots Screenshot_2026-05-17_11-32-12.png and
+	// Screenshot_2026-05-17_11-54-02.png). State-coherence locks on
+	// every racing view (topology / partitions / clusters / settings)
+	// did NOT fix the ghosting, which means the issue isn't a
+	// background-mutator race -- it's something specific to tcell's
+	// diff emission on that terminal, or to how our layout interacts
+	// with it. Until we can reproduce locally + diagnose, Sync()
+	// stays. Per-frame flicker is annoying but the diff-emission
+	// duplication is worse. Investigation thread: revisit when we
+	// have a repro that isn't user-specific.
+	a.screen.Sync()
 }
 
