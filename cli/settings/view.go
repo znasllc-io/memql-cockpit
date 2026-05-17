@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/visionarys-io/memql-cockpit/cli/ui"
@@ -12,7 +13,13 @@ import (
 )
 
 // View renders the Settings tab — version info, MY ACCESS, and keyboard shortcuts.
+//
+// Thread-safety: SetMyAccess / ClearMyAccess are called from the
+// app-layer refreshMyAccess goroutine when the active cluster
+// changes. The tcell event loop concurrently calls Draw. mu
+// serializes them.
 type View struct {
+	mu     sync.RWMutex
 	Theme  ui.Theme
 	CLIVer string
 
@@ -35,6 +42,8 @@ func NewView(theme ui.Theme, cliVersion string) *View {
 // clusterName is shown alongside the data so the user knows which
 // cluster's access is being rendered.
 func (v *View) SetMyAccess(clusterName string, access *memqlv1.MyAccessResult) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	v.access = access
 	v.accessCluster = clusterName
 }
@@ -42,12 +51,17 @@ func (v *View) SetMyAccess(clusterName string, access *memqlv1.MyAccessResult) {
 // ClearMyAccess wipes the current access record. Called when the
 // active cluster goes away (disconnect, cluster deleted).
 func (v *View) ClearMyAccess() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	v.access = nil
 	v.accessCluster = ""
 }
 
-// Draw renders the Settings tab.
+// Draw renders the Settings tab. Read lock for the full frame so
+// SetMyAccess from refreshMyAccess can't tear access mid-render.
 func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, v.Theme.BaseStyle())
 
 	// Top-level tab title. Matches the focus-accent blue used on other

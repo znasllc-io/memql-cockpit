@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/visionarys-io/memql-cockpit/cli/config"
@@ -34,7 +35,17 @@ const (
 // ClusterStatus, "selected" marker via SelectedCluster, retry/backoff
 // details pulled via OnEntryState. No global Busy modal; all keys
 // remain responsive while dials happen in the background.
+//
+// Thread-safety: SetClusters / SetConnected / SetRowStatus are called
+// from pool-lifecycle goroutines whenever a cluster's dial state
+// changes; the tcell event loop concurrently calls Draw + HandleEvent.
+// mu serializes writers (Lock) against Draw (RLock). The embedded
+// Topology + Partitions views own their own mu, so locking here is
+// per-row state only (Clusters slice, Selected, SelectedCluster,
+// form state) -- nested re-entry through Topology.Draw etc. happens
+// outside this view's lock.
 type ClustersView struct {
+	mu         sync.RWMutex
 	Theme      ui.Theme
 	Focus      FocusPane
 	Topology   *View           // node topology diagram (right pane)
@@ -233,6 +244,8 @@ func NewClustersView(theme ui.Theme) *ClustersView {
 // SetClusters updates the cluster list, ensuring "local" is always first.
 // Preserves "connecting" status for any cluster currently being connected to.
 func (v *ClustersView) SetClusters(clusters []ClusterStatus) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	// Build a map of current statuses to preserve.
 	oldStatus := make(map[string]ClusterStatus)
 	for _, c := range v.Clusters {
@@ -301,6 +314,8 @@ func (v *ClustersView) fireOnHighlight() {
 // SetConnected marks a cluster as connected / unreachable in the row
 // list. Called by the app layer from a pool entry's lifecycle.
 func (v *ClustersView) SetConnected(name string, connected bool, nodeId, nodeVer string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	v.ActiveCluster = name
 	v.Connected = connected
 	for i := range v.Clusters {
@@ -320,6 +335,8 @@ func (v *ClustersView) SetConnected(name string, connected bool, nodeId, nodeVer
 // Used by the pool lifecycle to reflect connecting / backoff / failed
 // transitions without touching NodeId / NodeVer.
 func (v *ClustersView) SetRowStatus(name, status string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	for i := range v.Clusters {
 		if v.Clusters[i].Config.Name == name {
 			v.Clusters[i].Status = status
@@ -327,8 +344,13 @@ func (v *ClustersView) SetRowStatus(name, status string) {
 	}
 }
 
-// Draw renders the Clusters tab.
+// Draw renders the Clusters tab. Holds the read lock for the full
+// frame so a concurrent pool-lifecycle mutator (SetClusters /
+// SetConnected / SetRowStatus) can't tear the Clusters slice or
+// per-row Status mid-render.
 func (v *ClustersView) Draw(screen *ui.Screen, bounds ui.Rect) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, v.Theme.BaseStyle())
 
 	panes := ui.FlexColumn(bounds, []ui.FlexItem{
@@ -763,7 +785,14 @@ func (v *ClustersView) FormOpen() bool {
 	return false
 }
 
+// HandleEvent processes keys. Takes the write lock for the duration
+// so a concurrent pool-lifecycle SetX call can't race row-level
+// state. Sub-views (Topology, Partitions) own their own locks and
+// are dispatched without this lock held -- the routing fan-out is
+// state-free.
 func (v *ClustersView) HandleEvent(ev tcell.Event) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	keyEv, ok := ev.(*tcell.EventKey)
 	if !ok {
 		return false
