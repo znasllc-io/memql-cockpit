@@ -2331,13 +2331,16 @@ func (a *App) draw() {
 	// positioned at the bottom-right corner (causing the stray '{').
 	a.screen.Inner().ShowCursor(0, 0)
 	a.screen.Inner().HideCursor()
-	// Show() emits ONLY the cells that changed since the last frame
-	// (tcell diffs the back buffer against the visible state).
-	// Sync() re-emits every cell unconditionally -- correct after a
-	// terminal resize or visible corruption, but called every frame
-	// it produces a full-screen repaint that the terminal renders
-	// as a visible flash. The post-resize Sync() call in Run() is
-	// the legitimate use of that primitive.
-	a.screen.Show()
+	// Sync() re-emits every cell unconditionally. We KEEP it (over the
+	// theoretically-cheaper Show()) until we've tracked down the
+	// ghosting bug that surfaces when only diffs are emitted: switching
+	// to Show() leaves "No nodes. Waiting for cluster data..."
+	// visible AT THE SAME TIME as "Nodes: 12 Online:12" because two
+	// frames' worth of cells leak through. Until we identify which
+	// component(s) draw inconsistent state across consecutive frames
+	// (likely a background-goroutine refresh that mutates view state
+	// mid-draw), Sync() is the safer primitive even at the cost of
+	// minor flicker.
+	a.screen.Sync()
 }
 
