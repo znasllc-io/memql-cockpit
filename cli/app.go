@@ -14,14 +14,12 @@ import (
 	"time"
 
 	"github.com/gdamore/tcell/v2"
-	"github.com/visionarys-io/memql-cockpit/cli/agents"
 	"github.com/visionarys-io/memql-cockpit/cli/auth"
 	"github.com/visionarys-io/memql-cockpit/cli/client"
 	"github.com/visionarys-io/memql-cockpit/cli/cluster"
+	"github.com/visionarys-io/memql-cockpit/cli/concepts"
 	"github.com/visionarys-io/memql-cockpit/cli/config"
 	"github.com/visionarys-io/memql-cockpit/cli/discovery"
-	"github.com/visionarys-io/memql-cockpit/cli/editor"
-	"github.com/visionarys-io/memql-cockpit/cli/explorer"
 	"github.com/visionarys-io/memql-cockpit/cli/settings"
 	"github.com/visionarys-io/memql-cockpit/cli/splash"
 	"github.com/visionarys-io/memql-cockpit/cli/ui"
@@ -68,14 +66,13 @@ type App struct {
 	selected string
 
 	// Tab views
-	explorerView *explorer.View
-	agentsView   *agents.View
+	conceptsView *concepts.View
 	clustersView *cluster.ClustersView
 	settingsView *settings.View
 
 	// getQueries returns a QueryClient bound to the currently active
 	// cluster's dispatcher, or nil if none is connected. Cached by
-	// wireExplorer so setSelected can re-trigger refreshExplorerData
+	// wireConcepts so setSelected can re-trigger refreshConcepts
 	// on connect.
 	getQueries func() *client.QueryClient
 
@@ -89,15 +86,13 @@ func NewApp(cfg AppConfig) *App {
 
 	settingsView := settings.NewView(theme, cfg.Version)
 
-	explorerView := explorer.NewView(theme)
-	agentsView := agents.NewView(theme)
+	conceptsView := concepts.NewView(theme)
 	clustersView := cluster.NewClustersView(theme)
 
 	// Clusters comes first -- it's the starting context for the session.
 	tabBar := ui.NewTabBar(theme,
 		ui.Tab{Name: "Clusters", Content: clustersView},
-		ui.Tab{Name: "Explorer", Content: explorerView},
-		ui.Tab{Name: "Agents", Content: agentsView},
+		ui.Tab{Name: "Concepts", Content: conceptsView},
 		ui.Tab{Name: "Settings", Content: settingsView},
 	)
 	tabBar.SetActive(0)
@@ -112,8 +107,7 @@ func NewApp(cfg AppConfig) *App {
 		logger:        cfg.Logger,
 		quitCh:        make(chan struct{}),
 		pool:          make(map[string]*connEntry),
-		explorerView:  explorerView,
-		agentsView:    agentsView,
+		conceptsView:  conceptsView,
 		clustersView:  clustersView,
 		settingsView:  settingsView,
 		helpOverlay:   ui.NewHelpOverlay(theme),
@@ -388,7 +382,7 @@ func (a *App) connect() {
 
 	// Auto-wire the UI glue so the tabs have their callbacks set even
 	// before the first successful dial lands.
-	a.wireExplorer()
+	a.wireConcepts()
 	a.wireCluster()
 
 	for _, cfg := range configs {
@@ -944,23 +938,21 @@ func (a *App) setSelected(name string) {
 	// cluster's access record. Async so the UI stays responsive.
 	a.refreshMyAccess(name, conn)
 
-	// Refresh the Explorer tree + Agents tab against the newly-
-	// connected cluster. wireExplorer fires its first call at app-
-	// init when no cluster is connected yet, so without this re-
-	// trigger the Agents tab stays empty even though
-	// queryAllAgents would return data the moment we ask.
-	go a.refreshExplorerData(context.Background())
+	// Refresh the Concepts tab against the newly-connected cluster.
+	// wireConcepts fires its first call at app-init when no cluster is
+	// connected yet, so without this re-trigger the Concepts tab stays
+	// empty even though ListConcepts would return data the moment we ask.
+	go a.refreshConcepts(context.Background())
 
 	a.postRedraw()
 }
 
-// refreshExplorerData fetches the connected cluster's concept list +
-// agents and pushes them into the Explorer + Agents views. Safe to
-// call when no cluster is connected (it no-ops on a nil
-// getQueries result). Called once at app init (mostly a no-op then)
-// + every time the selected cluster transitions into stateConnected
-// via setSelected.
-func (a *App) refreshExplorerData(ctx context.Context) {
+// refreshConcepts fetches the connected cluster's concept registry
+// and pushes it into the Concepts view. Safe to call when no cluster
+// is connected (it no-ops on a nil getQueries result). Called once at
+// app init (mostly a no-op then) + every time the selected cluster
+// transitions into stateConnected via setSelected.
+func (a *App) refreshConcepts(ctx context.Context) {
 	if a.getQueries == nil {
 		return
 	}
@@ -968,29 +960,14 @@ func (a *App) refreshExplorerData(ctx context.Context) {
 	if q == nil {
 		return
 	}
-
-	fileMap := make(map[string][]explorer.FileEntry)
-
 	concepts, err := q.ListConcepts(ctx)
-	if err == nil {
-		for _, c := range concepts {
-			category := conceptKindToCategory(c.GetDomain())
-			fileMap[category] = append(fileMap[category], explorer.FileEntry{
-				Name: c.GetEntity(),
-				Path: c.GetId(),
-			})
+	if err != nil {
+		if a.logger != nil {
+			a.logger.Warn("concepts: ListConcepts failed", "error", err)
 		}
-	} else if a.logger != nil {
-		a.logger.Warn("explorer: ListConcepts failed", "error", err)
+		return
 	}
-
-	agentCache, entries := a.loadAgents(ctx, q)
-	if len(entries) > 0 {
-		fileMap["Agents"] = append(fileMap["Agents"], entries...)
-	}
-	a.explorerView.SetAgents(agentCache)
-	a.explorerView.SetFiles(fileMap)
-	a.agentsView.SetAgents(agentCache)
+	a.conceptsView.SetConcepts(concepts)
 	if a.screen != nil {
 		a.screen.PostEvent(tcell.NewEventInterrupt(nil))
 	}
@@ -1023,18 +1000,11 @@ func (a *App) refreshMyAccess(clusterName string, conn *client.Connection) {
 	}()
 }
 
-// wireExplorer connects the Explorer tab's callbacks to the gRPC client.
-func (a *App) wireExplorer() {
-	// Helper to get current sense/query clients (not stale references).
-	// Reads the active-cluster dispatcher fresh on every invocation, so
-	// switching active clusters transparently retargets these calls.
-	getSense := func() *client.SenseClient {
-		d := a.activeDispatcher()
-		if d == nil {
-			return nil
-		}
-		return client.NewSenseClient(d)
-	}
+// wireConcepts connects the Concepts tab's callbacks to the gRPC
+// client. Wires the QueryClient closure (fresh on each call so cluster
+// switches transparently retarget) and the status callback so the view
+// can surface errors via the notification bar.
+func (a *App) wireConcepts() {
 	getQueries := func() *client.QueryClient {
 		d := a.activeDispatcher()
 		if d == nil {
@@ -1042,265 +1012,20 @@ func (a *App) wireExplorer() {
 		}
 		return client.NewQueryClient(d)
 	}
-	ctx := context.Background()
 
-	// Cache the queries-getter closure so refreshExplorerData (called
-	// from setSelected when a cluster connects) can use the same
-	// fresh-on-each-call dispatcher resolution.
 	a.getQueries = getQueries
-
-	// Fire an initial fetch. Usually a no-op at this point in boot
-	// (no cluster connected yet), but kept for the case where an
-	// auto-connected cluster (e.g. local) is already in
-	// stateConnected by the time wireExplorer runs.
-	go a.refreshExplorerData(ctx)
-
-	// Wire Sense callbacks — use fresh client each call.
-	a.explorerView.OnRequestTokens = func(source string) []editor.SenseToken {
-		if s := getSense(); s != nil { return s.Tokenize(ctx, source) }
-		return nil
-	}
-	a.explorerView.OnRequestDiags = func(source string) []editor.SenseDiagnostic {
-		if s := getSense(); s != nil { return s.Diagnose(ctx, source) }
-		return nil
-	}
-	a.explorerView.OnRequestComplete = func(source string, line, col int) []editor.CompletionItem {
-		if s := getSense(); s != nil { return s.Complete(ctx, source, line, col) }
-		return nil
-	}
-	a.explorerView.OnRequestHover = func(source string, line, col int) string {
-		if s := getSense(); s != nil { return s.Hover(ctx, source, line, col) }
-		return ""
+	a.conceptsView.QueryClient = getQueries
+	a.conceptsView.OnStatus = func(msg string) {
+		if a.notifications != nil {
+			a.notifications.Sync("concepts", ui.SeverityWarning, msg)
+		}
 	}
 
-	// Wire file loading. Agent rows render from the cached AgentEntry
-	// (no extra round-trip); on-disk .memql source loading remains
-	// unimplemented -- the server hasn't grown a DSL-source query yet.
-	a.explorerView.OnFileOpen = func(path string) (string, error) {
-		if id, ok := explorer.AgentIDFromPath(path); ok {
-			if a, found := a.explorerView.AgentByID(id); found {
-				return explorer.RenderAgent(a), nil
-			}
-			return "", fmt.Errorf("agent %s not in cache", id)
-		}
-		return "", fmt.Errorf("file loading not yet implemented for %s", path)
-	}
-}
-
-// loadAgents pulls v1:agents:agent rows for the active partition via
-// queryAllAgents and parses them into FileEntry items + an id-keyed
-// AgentEntry cache the explorer uses for the detail pane. Returns
-// (nil, nil) when the query is unavailable or fails -- the caller
-// treats that as "no agents listed" without blowing the rest of the
-// explorer away.
-//
-// queryAllAgents lives in copresent's DSL tree today; clusters running
-// just memql-core won't have it loaded and this call returns nothing.
-// That's fine -- the Agents category renders empty and the rest of
-// the tree is unaffected.
-func (a *App) loadAgents(ctx context.Context, q *client.QueryClient) (map[string]explorer.AgentEntry, []explorer.FileEntry) {
-	if q == nil {
-		return nil, nil
-	}
-	result, err := q.Execute(ctx, `queryAllAgents({})`)
-	if err != nil {
-		if a.logger != nil {
-			a.logger.Debug("explorer: queryAllAgents unavailable", "error", err)
-		}
-		return nil, nil
-	}
-	rows := extractAgentRows(result)
-	if len(rows) == 0 {
-		return nil, nil
-	}
-
-	cache := make(map[string]explorer.AgentEntry, len(rows))
-	entries := make([]explorer.FileEntry, 0, len(rows))
-	for _, m := range rows {
-		ent := parseAgentRow(m)
-		if ent.ID == "" {
-			continue
-		}
-		cache[ent.ID] = ent
-		display := ent.Name
-		if display == "" {
-			display = ent.RoleSlug
-		}
-		if display == "" {
-			display = ent.ID
-		}
-		entries = append(entries, explorer.FileEntry{
-			Name: display,
-			Path: explorer.AgentPathForID(ent.ID),
-		})
-	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
-	return cache, entries
-}
-
-// extractAgentRows pulls the agent records out of a queryAllAgents
-// response. Reuses the nested-wrapper unwinding extractNodeArray does
-// for cluster/partition queries so the parser is consistent across
-// all queries; a fresh structure here would diverge on the first
-// engine response-shape tweak.
-func extractAgentRows(result any) []map[string]any {
-	if result == nil {
-		return nil
-	}
-	var items []any
-	switch v := result.(type) {
-	case []any:
-		items = v
-	case map[string]any:
-		items = extractNodeArray(v)
-		if items == nil {
-			items = []any{v}
-		}
-	default:
-		return nil
-	}
-
-	type rowWithTime struct {
-		row     map[string]any
-		created string
-	}
-	latest := make(map[string]rowWithTime)
-	for _, item := range items {
-		m, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		id := firstNonEmpty(getString(m, "id"))
-		if id == "" {
-			if p, ok := m["payload"].(map[string]any); ok {
-				id = getString(p, "id")
-			}
-		}
-		if id == "" {
-			continue
-		}
-		createdAt := firstNonEmpty(
-			getString(m, "createdAt"),
-			getString(m, "created_at"),
-		)
-		if existing, found := latest[id]; found && createdAt <= existing.created {
-			continue
-		}
-		latest[id] = rowWithTime{row: m, created: createdAt}
-	}
-	out := make([]map[string]any, 0, len(latest))
-	for _, r := range latest {
-		out = append(out, r.row)
-	}
-	return out
-}
-
-// parseAgentRow maps a single agent row map to an AgentEntry. Reads
-// fields out of the top-level row first, then falls back to a nested
-// "payload" object -- queryAllAgents under shape agentFull renders
-// the payload fields flat at the row top level, but a bare
-// concept-row response keeps them nested, so we accept both.
-func parseAgentRow(m map[string]any) explorer.AgentEntry {
-	payload := m
-	if p, ok := m["payload"].(map[string]any); ok && p != nil {
-		payload = p
-	}
-	pick := func(key string) string {
-		if v := getString(payload, key); v != "" {
-			return v
-		}
-		return getString(m, key)
-	}
-	pickBool := func(key string, def bool) bool {
-		if v, ok := payload[key].(bool); ok {
-			return v
-		}
-		if v, ok := m[key].(bool); ok {
-			return v
-		}
-		return def
-	}
-
-	caps, _ := payload["capabilities"].(map[string]any)
-	if caps == nil {
-		caps, _ = m["capabilities"].(map[string]any)
-	}
-	provider, _ := payload["providerConfig"].(map[string]any)
-	if provider == nil {
-		provider, _ = m["providerConfig"].(map[string]any)
-	}
-	var llm map[string]any
-	if provider != nil {
-		llm, _ = provider["llm"].(map[string]any)
-	}
-	trigger, _ := payload["triggerBehavior"].(map[string]any)
-	if trigger == nil {
-		trigger, _ = m["triggerBehavior"].(map[string]any)
-	}
-
-	ent := explorer.AgentEntry{
-		ID:           getString(m, "id"),
-		Name:         pick("name"),
-		Description:  pick("description"),
-		Role:         pick("role"),
-		RoleSlug:     pick("roleSlug"),
-		Gender:       pick("gender"),
-		Personality:  pick("personality"),
-		OwnerUserId:  pick("ownerUserId"),
-		Active:       pickBool("active", true),
-		Deleted:      pickBool("deleted", false),
-		AudioControl: pick("audioControl"),
-		VideoControl: pick("videoControl"),
-		GroupIds:     stringSlice(payload, "groupIds"),
-	}
-	if ent.ID == "" {
-		ent.ID = getString(payload, "id")
-	}
-	if llm != nil {
-		ent.LLMPolicyName = getString(llm, "policyName")
-		ent.LLMProvider = getString(llm, "provider")
-		ent.LLMModel = getString(llm, "model")
-	}
-	if caps != nil {
-		if v, ok := caps["avatar"].(bool); ok { ent.CapAvatar = v }
-		if v, ok := caps["lipSync"].(bool); ok { ent.CapLipSync = v }
-		if v, ok := caps["vision"].(bool); ok { ent.CapVision = v }
-		if v, ok := caps["voiceToVoice"].(bool); ok { ent.CapVoiceToVoice = v }
-		if v, ok := caps["claw"].(bool); ok { ent.CapClaw = v }
-		ent.Tools = stringSlice(caps, "tools")
-		ent.Domains = stringSlice(caps, "domains")
-		ent.Keywords = stringSlice(caps, "keywords")
-	}
-	if trigger != nil {
-		if v, ok := trigger["autoJoin"].(bool); ok { ent.AutoJoin = v }
-		if v, ok := trigger["greetOnJoin"].(bool); ok { ent.GreetOnJoin = v }
-		ent.SpeakWhen = getString(trigger, "speakWhen")
-	}
-	return ent
-}
-
-// stringSlice pulls a key out of a map as []string when the engine
-// returns it as []any (the JSON shape). Returns nil for missing /
-// non-array values rather than empty slices so the renderer can skip
-// the field entirely instead of printing an empty list.
-func stringSlice(m map[string]any, key string) []string {
-	if m == nil {
-		return nil
-	}
-	raw, ok := m[key].([]any)
-	if !ok || len(raw) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(raw))
-	for _, v := range raw {
-		if s, ok := v.(string); ok && s != "" {
-			out = append(out, s)
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
+	// Fire an initial fetch. Usually a no-op at app-init (no cluster
+	// connected yet), but kept for the case where an auto-connected
+	// cluster (e.g. local) is already in stateConnected by the time
+	// wireConcepts runs.
+	go a.refreshConcepts(context.Background())
 }
 
 // wireCluster wires the topology pane's OnInitialLoad callback to the
@@ -1766,23 +1491,6 @@ func getString(m map[string]any, key string) string {
 		return v
 	}
 	return ""
-}
-
-func conceptKindToCategory(domain string) string {
-	switch domain {
-	case "agents":
-		return "Agents"
-	case "cognition":
-		return "Queries" // Most cognition concepts are query-accessible
-	case "cluster":
-		return "Concepts"
-	case "data":
-		return "Concepts"
-	case "platform":
-		return "Concepts"
-	default:
-		return "Concepts"
-	}
 }
 
 // wireClustersCallbacks hooks the cluster list's callbacks into the
@@ -2279,29 +1987,25 @@ func (a *App) persistSelectedPartition(clusterName, partition string) {
 	}
 }
 
-// updateTabGating sets the GatedMessage on Explorer / Agents
-// based on whether the user's selected cluster has a live connection.
-// Called from draw() so state changes show up on the next repaint.
+// updateTabGating sets the GatedMessage on the Concepts tab based on
+// whether the user's selected cluster has a live connection. Called
+// from draw() so state changes show up on the next repaint.
 func (a *App) updateTabGating() {
 	name := a.selectedName()
 	if name == "" {
-		msg := "No cluster selected. Switch to the Clusters tab (F1) and press Enter on a cluster."
-		a.explorerView.GatedMessage = msg
-		a.agentsView.GatedMessage = msg
+		a.conceptsView.GatedMessage = "No cluster selected. Switch to the Clusters tab (F1) and press Enter on a cluster."
 		return
 	}
 	a.poolMu.RLock()
 	entry := a.pool[name]
 	a.poolMu.RUnlock()
 	if entry == nil {
-		a.explorerView.GatedMessage = fmt.Sprintf("Selected cluster %q is not open. Switch to the Clusters tab (F1) and press Enter on its row.", name)
-		a.agentsView.GatedMessage = a.explorerView.GatedMessage
+		a.conceptsView.GatedMessage = fmt.Sprintf("Selected cluster %q is not open. Switch to the Clusters tab (F1) and press Enter on its row.", name)
 		return
 	}
 	state, _, _ := entry.stateSnapshot()
 	if state == stateConnected {
-		a.explorerView.GatedMessage = ""
-		a.agentsView.GatedMessage = ""
+		a.conceptsView.GatedMessage = ""
 		return
 	}
 	var why string
@@ -2313,9 +2017,7 @@ func (a *App) updateTabGating() {
 	default:
 		why = state.String()
 	}
-	msg := fmt.Sprintf("Selected cluster %q is %s. Available again once it reaches a connected state.", name, why)
-	a.explorerView.GatedMessage = msg
-	a.agentsView.GatedMessage = msg
+	a.conceptsView.GatedMessage = fmt.Sprintf("Selected cluster %q is %s. Available again once it reaches a connected state.", name, why)
 }
 
 // backoffRedrawLoop schedules periodic redraws while any pool entry
