@@ -9,7 +9,7 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
-	memqlv1 "github.com/visionarys-io/memql/component/grpc/gen"
+	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 )
 
 // Dispatcher handles message multiplexing over a single gRPC stream.

@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/visionarys-io/memql-cockpit/cli/config"
+	"github.com/znasllc-io/memql-cockpit/cli/config"
 )
 
 // TestRefresh_Success exercises the happy path: identity rotates the

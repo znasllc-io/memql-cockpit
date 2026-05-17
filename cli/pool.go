@@ -12,12 +12,12 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/visionarys-io/memql-cockpit/cli/auth"
-	"github.com/visionarys-io/memql-cockpit/cli/client"
-	"github.com/visionarys-io/memql-cockpit/cli/cluster"
-	"github.com/visionarys-io/memql-cockpit/cli/config"
-	memqlv1 "github.com/visionarys-io/memql/component/grpc/gen"
-	nodev1 "github.com/visionarys-io/memql/component/node/gen"
+	"github.com/znasllc-io/memql-cockpit/cli/auth"
+	"github.com/znasllc-io/memql-cockpit/cli/client"
+	"github.com/znasllc-io/memql-cockpit/cli/cluster"
+	"github.com/znasllc-io/memql-cockpit/cli/config"
+	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
+	nodev1 "github.com/znasllc-io/memql/component/node/gen"
 )
 
 // entryState is the single source of truth for one pool entry's
