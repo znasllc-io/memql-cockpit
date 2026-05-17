@@ -222,6 +222,114 @@ type callbackResult struct {
 	err  error
 }
 
+// ErrInvalidGrant is the sentinel returned by Refresh when identity
+// has rejected the cached refresh token (revoked, expired absolute
+// lifetime, or rotated). Callers should react by deleting the
+// cached credential and falling through to a fresh interactive
+// Login -- there's no way to recover the session without user
+// re-consent. Anything else (network error, 5xx) is a transient
+// failure and should NOT trigger the browser flow on its own.
+var ErrInvalidGrant = errors.New("auth: refresh token rejected (invalid_grant)")
+
+// Refresh exchanges a cached refresh token for a new access +
+// refresh token pair against identity's /auth/refresh endpoint.
+// Returns a LoginResult with the same shape Login emits, so the
+// SaveToken / dispatcher-bearer call sites don't have to branch.
+//
+// The identity service's refresh endpoint reads the token from one
+// of three places: the httpOnly memql_refresh cookie (browser-only),
+// the JSON body, or the Authorization: Bearer header. We use the
+// body so the call works regardless of cookie jar state -- the
+// cockpit doesn't ride a browser session.
+//
+// On a server-side rejection (HTTP 4xx with error="invalid_grant"),
+// returns ErrInvalidGrant so the caller can distinguish "user must
+// sign in again" from "network blip, try later." Other failures
+// (5xx, transport error, unparseable response) come back as wrapped
+// errors and should be treated as transient by the caller.
+func Refresh(ctx context.Context, issuer, refreshToken string) (*LoginResult, error) {
+	issuer = strings.TrimRight(strings.TrimSpace(issuer), "/")
+	if issuer == "" {
+		return nil, errors.New("auth: issuer is required")
+	}
+	refreshToken = strings.TrimSpace(refreshToken)
+	if refreshToken == "" {
+		return nil, errors.New("auth: refresh token is required")
+	}
+
+	payload, err := json.Marshal(map[string]string{"refresh_token": refreshToken})
+	if err != nil {
+		return nil, fmt.Errorf("marshal refresh request: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, issuer+"/auth/refresh", bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("build refresh request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("refresh exchange: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read refresh response: %w", err)
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		// invalid_grant terminal -- session is gone server-side; the
+		// caller must sign in again. We surface the sentinel even when
+		// the body doesn't parse, because a 401 from /auth/refresh has
+		// only one cause in identity's contract: the presented refresh
+		// token is no longer valid (see refresh.go switch on
+		// ErrSession{NotFound,Revoked,Expired} / ErrTokenMismatch).
+		var errBody errorResponse
+		_ = json.Unmarshal(body, &errBody) // best-effort
+		if errBody.Error == "" {
+			errBody.Error = "invalid_grant"
+		}
+		return nil, fmt.Errorf("%w: %s: %s", ErrInvalidGrant, errBody.Error, errBody.ErrorDescription)
+	}
+	if resp.StatusCode != http.StatusOK {
+		var errBody errorResponse
+		if json.Unmarshal(body, &errBody) == nil && errBody.Error != "" {
+			return nil, fmt.Errorf("refresh exchange: HTTP %d: %s: %s", resp.StatusCode, errBody.Error, errBody.ErrorDescription)
+		}
+		return nil, fmt.Errorf("refresh exchange: HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	var tok tokenResponse
+	if err := json.Unmarshal(body, &tok); err != nil {
+		return nil, fmt.Errorf("decode refresh response: %w", err)
+	}
+	if tok.AccessToken == "" {
+		return nil, errors.New("refresh exchange: response missing access_token")
+	}
+	expiry := time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
+	if tok.ExpiresIn <= 0 {
+		// Same defensive default Login uses. A future identity build
+		// that stops populating ExpiresIn shouldn't translate into an
+		// effectively-immortal token in our cache.
+		expiry = time.Now().Add(15 * time.Minute)
+	}
+	// Identity rotates the refresh token on every successful refresh
+	// (see http/refresh.go:setRefreshCookie + refresh.Rotator). The
+	// response body MAY echo the new value back -- if it does, persist
+	// it; if it doesn't (operator chose cookie-only rotation), reuse
+	// the caller's existing refresh token so we still have something
+	// to present on the next call.
+	rotated := tok.RefreshToken
+	if rotated == "" {
+		rotated = refreshToken
+	}
+	return &LoginResult{
+		AccessToken:  tok.AccessToken,
+		RefreshToken: rotated,
+		Expiry:       expiry,
+	}, nil
+}
+
 // randomString generates a random URL-safe string of the given byte
 // length. Currently unused by the OAuth flow (identity supplies state)
 // but kept as a public helper for future token-id generation.
