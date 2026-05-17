@@ -76,7 +76,6 @@ type View struct {
 	// Focus + transient flags.
 	Focus     FocusPane
 	submitErr string
-	lastFetch time.Time
 	fetching  bool
 
 	// Plumbing.
@@ -174,7 +173,6 @@ func (v *View) RefreshPlans() {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.plans = rows
-	v.lastFetch = time.Now()
 	if v.planSelected >= len(v.plans) {
 		v.planSelected = 0
 		v.planScrollY = 0
@@ -402,9 +400,14 @@ func (v *View) drawGoalPane(screen *ui.Screen, bounds ui.Rect) {
 			fmt.Sprintf("error: %s", v.submitErr), v.Theme.ErrorStyle())
 	}
 
-	// Hint footer.
+	// Action hints, anchored to the bottom row per the panel chrome
+	// contract (cli/CLAUDE.md "Panel chrome contract"). Same
+	// `Key:Label` grammar (two-space chip separator, CamelCase
+	// labels, no space after colon) that Clusters / Concepts use.
+	// `Tab:Cycle` rather than the earlier `Tab:Focus` to match the
+	// contract's vocabulary.
 	ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1,
-		"Enter:Submit  Esc:Clear  Tab:Focus")
+		"Enter:Submit  Esc:Clear  Tab:Cycle")
 }
 
 func (v *View) drawPlanList(screen *ui.Screen, bounds ui.Rect) {
@@ -414,20 +417,29 @@ func (v *View) drawPlanList(screen *ui.Screen, bounds ui.Rect) {
 	if v.Focus == FocusPlans {
 		titleStyle = v.Theme.AccentStyle().Bold(true)
 	}
-	title := fmt.Sprintf(" PLANS (%d) ", len(v.plans))
+	// Counts ride the title bar per the panel chrome contract --
+	// the bottom row is reserved for action hints, never a duplicate
+	// `n/m` strip.
+	title := " PLANS "
+	if n := len(v.plans); n > 0 {
+		title = fmt.Sprintf(" PLANS (%d/%d) ", v.planSelected+1, n)
+	}
 	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, titleStyle)
 
 	if len(v.plans) == 0 {
 		drawCentered(screen, v.Theme, bounds, "No plans yet -- submit a goal above.")
 		ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1,
-			"R:Refresh  Tab:Focus")
+			"R:Refresh  Tab:Cycle")
 		return
 	}
 
+	// Reserve one bottom row for the action-hint chrome band per the
+	// panel chrome contract.
+	const chromeH = 1
 	listTop := bounds.Y + 2
-	listH := bounds.Height - 3
+	listH := bounds.Height - 2 - chromeH
 	if listH < 1 {
-		return
+		listH = 1
 	}
 
 	v.clampPlanScroll(listH)
@@ -457,11 +469,8 @@ func (v *View) drawPlanList(screen *ui.Screen, bounds ui.Rect) {
 		screen.DrawText(bounds.X+2, y+1, bounds.Width-3, sub, dimify(style, v.Theme.Subtle))
 	}
 
-	footer := fmt.Sprintf(" %d/%d  ", v.planSelected+1, len(v.plans))
-	if !v.lastFetch.IsZero() {
-		footer += fmt.Sprintf("updated %s", v.lastFetch.Format("15:04:05"))
-	}
-	screen.DrawText(bounds.X+1, bounds.Y+bounds.Height-1, bounds.Width-2, footer, v.Theme.SubtleStyle())
+	ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1,
+		"↑/↓:Move  Enter:Tasks  R:Refresh  Tab:Cycle")
 }
 
 func (v *View) drawPlanDetail(screen *ui.Screen, bounds ui.Rect) {
@@ -511,18 +520,25 @@ func (v *View) drawTaskList(screen *ui.Screen, bounds ui.Rect) {
 	if v.Focus == FocusTasks {
 		titleStyle = v.Theme.AccentStyle().Bold(true)
 	}
-	title := fmt.Sprintf(" TASKS (%d) ", len(v.tasks))
+	// Position count rides the title bar per the chrome contract.
+	title := " TASKS "
+	if n := len(v.tasks); n > 0 {
+		title = fmt.Sprintf(" TASKS (%d/%d) ", v.taskSelected+1, n)
+	}
 	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, titleStyle)
 
 	if len(v.tasks) == 0 {
 		drawCentered(screen, v.Theme, bounds, "No tasks for this plan.")
+		ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1,
+			"R:Refresh  Tab:Cycle")
 		return
 	}
 
+	const chromeH = 1
 	listTop := bounds.Y + 2
-	listH := bounds.Height - 3
+	listH := bounds.Height - 2 - chromeH
 	if listH < 1 {
-		return
+		listH = 1
 	}
 	v.clampTaskScroll(listH)
 
@@ -544,8 +560,8 @@ func (v *View) drawTaskList(screen *ui.Screen, bounds ui.Rect) {
 		screen.DrawText(bounds.X+2, y, bounds.Width-3, label, style)
 	}
 
-	footer := fmt.Sprintf(" %d/%d ", v.taskSelected+1, len(v.tasks))
-	screen.DrawText(bounds.X+1, bounds.Y+bounds.Height-1, bounds.Width-2, footer, v.Theme.SubtleStyle())
+	ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1,
+		"↑/↓:Move  Esc:Plans  R:Refresh  Tab:Cycle")
 }
 
 func (v *View) drawTaskDetail(screen *ui.Screen, bounds ui.Rect) {
