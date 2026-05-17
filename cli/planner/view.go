@@ -375,6 +375,20 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 		return
 	}
 
+	// Three panes mirroring the Clusters tab's visual structure
+	// (CLUSTERS top-left, PARTITIONS bottom-left, TOPOLOGY right):
+	//
+	//   GOAL    (top-left, fixed 9 rows for the input chrome)
+	//   PLANS   (bottom-left, flex)
+	//   TASKS   (right, full height -- shows tasks for the
+	//            highlighted plan)
+	//
+	// The earlier 5-pane layout (Goal / Plans on the left, Plan
+	// Detail / Tasks / Task Detail stacked on the right) packed too
+	// many vertical splits into the right column without horizontal
+	// dividers, so the boundaries between sub-panes weren't visible.
+	// Folding detail back into list rows keeps the screen readable as
+	// panes instead of one mushy column.
 	panes := ui.FlexColumn(bounds, []ui.FlexItem{
 		{Flex: 0.40, MinSize: 32},
 		{Flex: 0.60, MinSize: 40},
@@ -382,30 +396,34 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 	leftBounds := panes[0]
 	rightBounds := panes[1]
 
-	// Vertical divider (single-cell box-drawing char, safe at the edge).
+	// Vertical divider between the left and right columns. Mirrors
+	// cluster_view.go's divider drawing: single box-drawing char,
+	// safe at the layout edge.
 	divStyle := v.Theme.SubtleStyle()
 	for y := bounds.Y; y < bounds.Y+bounds.Height; y++ {
 		screen.SetCell(leftBounds.X+leftBounds.Width-1, y, '│', divStyle)
 	}
 	leftBounds.Width--
 
-	// Left column: goal input (top) + plan list (bottom).
-	leftRows := ui.FlexRow(leftBounds, []ui.FlexItem{
-		{Fixed: 9},
-		{Flex: 1.0, MinSize: 6},
-	})
-	v.drawGoalPane(screen, leftRows[0])
-	v.drawPlanList(screen, leftRows[1])
+	// Left column: GOAL on top (fixed height for the input chrome),
+	// PLANS below (flex). Horizontal divider between them so the two
+	// panes visually separate -- same convention the Clusters tab uses
+	// between its CLUSTERS and PARTITIONS panes.
+	const goalH = 9
+	goalBounds := ui.Rect{X: leftBounds.X, Y: leftBounds.Y, Width: leftBounds.Width, Height: goalH}
+	v.drawGoalPane(screen, goalBounds)
+	screen.DrawHLine(leftBounds.X, leftBounds.Y+goalH, leftBounds.Width-1, '─', v.Theme.SubtleStyle())
+	plansBounds := ui.Rect{
+		X:      leftBounds.X,
+		Y:      leftBounds.Y + goalH + 1,
+		Width:  leftBounds.Width,
+		Height: leftBounds.Height - goalH - 1,
+	}
+	v.drawPlanList(screen, plansBounds)
 
-	// Right column: plan detail (top) + task list (middle) + task detail (bottom).
-	rightRows := ui.FlexRow(rightBounds, []ui.FlexItem{
-		{Fixed: 8},
-		{Flex: 0.55, MinSize: 6},
-		{Flex: 0.45, MinSize: 6},
-	})
-	v.drawPlanDetail(screen, rightRows[0])
-	v.drawTaskList(screen, rightRows[1])
-	v.drawTaskDetail(screen, rightRows[2])
+	// Right column: TASKS, full height. Shows the task list for
+	// whichever plan is currently highlighted in PLANS.
+	v.drawTaskList(screen, rightBounds)
 }
 
 // drawGated renders the centered "tab unavailable" layout with the
@@ -547,46 +565,6 @@ func (v *View) drawPlanList(screen *ui.Screen, bounds ui.Rect) {
 		"↑/↓:Move  Enter:Tasks  R:Refresh  Tab:Cycle")
 }
 
-func (v *View) drawPlanDetail(screen *ui.Screen, bounds ui.Rect) {
-	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, v.Theme.BaseStyle())
-
-	title := " PLAN DETAIL "
-	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, v.Theme.SubtleStyle().Bold(true))
-
-	if v.planSelected < 0 || v.planSelected >= len(v.plans) {
-		drawCentered(screen, v.Theme, bounds, "Select a plan to see its detail.")
-		return
-	}
-	p := v.plans[v.planSelected]
-
-	lines := []string{
-		fmt.Sprintf("id:      %s", getString(p, "id")),
-		fmt.Sprintf("goal:    %s", getString(p, "goal")),
-		fmt.Sprintf("status:  %s", statusLabel(getString(p, "status"))),
-		fmt.Sprintf("kind:    %s   space: %s", getString(p, "kind"), getString(p, "spaceId")),
-		fmt.Sprintf("owner:   %s   by: %s",
-			orDash(getString(p, "ownerAgentId")), getString(p, "requestedBy")),
-		fmt.Sprintf("created: %s   started: %s   done: %s",
-			shortenTimestamp(getString(p, "createdAt")),
-			shortenTimestamp(getString(p, "startedAt")),
-			shortenTimestamp(getString(p, "completedAt"))),
-	}
-	if errMsg := getString(p, "errorMessage"); errMsg != "" {
-		lines = append(lines, fmt.Sprintf("error:   %s", errMsg))
-	}
-
-	for i, line := range lines {
-		if i+1 >= bounds.Height-1 {
-			break
-		}
-		style := v.Theme.BaseStyle()
-		if strings.HasPrefix(line, "error:") {
-			style = v.Theme.ErrorStyle()
-		}
-		screen.DrawText(bounds.X+1, bounds.Y+1+i, bounds.Width-2, line, style)
-	}
-}
-
 func (v *View) drawTaskList(screen *ui.Screen, bounds ui.Rect) {
 	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, v.Theme.BaseStyle())
 
@@ -636,55 +614,6 @@ func (v *View) drawTaskList(screen *ui.Screen, bounds ui.Rect) {
 
 	ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1,
 		"↑/↓:Move  Esc:Plans  R:Refresh  Tab:Cycle")
-}
-
-func (v *View) drawTaskDetail(screen *ui.Screen, bounds ui.Rect) {
-	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, v.Theme.BaseStyle())
-
-	title := " SELECTED TASK "
-	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, v.Theme.SubtleStyle().Bold(true))
-
-	if v.taskSelected < 0 || v.taskSelected >= len(v.tasks) {
-		drawCentered(screen, v.Theme, bounds, "Select a task to see its result.")
-		return
-	}
-	t := v.tasks[v.taskSelected]
-
-	contentTop := bounds.Y + 1
-	contentH := bounds.Height - 1
-	if contentH < 1 {
-		return
-	}
-
-	lines := []string{
-		fmt.Sprintf("kind:    %s", getString(t, "kind")),
-		fmt.Sprintf("status:  %s", statusLabel(getString(t, "status"))),
-		fmt.Sprintf("started: %s   done: %s",
-			shortenTimestamp(getString(t, "startedAt")),
-			shortenTimestamp(getString(t, "completedAt"))),
-	}
-	if errMsg := getString(t, "errorMessage"); errMsg != "" {
-		lines = append(lines, fmt.Sprintf("error:   %s", errMsg))
-	}
-	lines = append(lines, "")
-	lines = append(lines, "input:")
-	lines = append(lines, prettyJSONLines(t["input"], bounds.Width-3)...)
-	if out, ok := t["output"]; ok && out != nil {
-		lines = append(lines, "")
-		lines = append(lines, "output:")
-		lines = append(lines, prettyJSONLines(out, bounds.Width-3)...)
-	}
-
-	for i, line := range lines {
-		if i >= contentH {
-			break
-		}
-		style := v.Theme.BaseStyle()
-		if strings.HasPrefix(line, "error:") {
-			style = v.Theme.ErrorStyle()
-		}
-		screen.DrawText(bounds.X+1, contentTop+i, bounds.Width-2, line, style)
-	}
 }
 
 // ---------------------------------------------------------------------------
