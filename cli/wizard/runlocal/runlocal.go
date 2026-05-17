@@ -23,10 +23,10 @@ import (
 	"time"
 
 	"github.com/gdamore/tcell/v2"
-	"github.com/visionarys-io/memql-cockpit/cli/dockerprobe"
-	"github.com/visionarys-io/memql-cockpit/cli/ui"
-	corgenesis "github.com/visionarys-io/memql/component/genesis"
-	"github.com/visionarys-io/memql/component/secret"
+	"github.com/znasllc-io/memql-cockpit/cli/dockerprobe"
+	"github.com/znasllc-io/memql-cockpit/cli/ui"
+	corgenesis "github.com/znasllc-io/memql/component/genesis"
+	"github.com/znasllc-io/memql/component/secret"
 )
 
 // Choice is what the wizard's Run returns when it terminates. Esc

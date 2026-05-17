@@ -4,8 +4,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/visionarys-io/memql-cockpit/cli/ui"
-	nodev1 "github.com/visionarys-io/memql/component/node/gen"
+	"github.com/znasllc-io/memql-cockpit/cli/ui"
+	nodev1 "github.com/znasllc-io/memql/component/node/gen"
 )
 
 // TestTopology_NoRaceUnderConcurrentMutate exercises the race the

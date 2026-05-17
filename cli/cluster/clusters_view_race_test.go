@@ -5,8 +5,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/visionarys-io/memql-cockpit/cli/config"
-	"github.com/visionarys-io/memql-cockpit/cli/ui"
+	"github.com/znasllc-io/memql-cockpit/cli/config"
+	"github.com/znasllc-io/memql-cockpit/cli/ui"
 )
 
 // TestClustersView_NoRaceUnderConcurrentMutate exercises every

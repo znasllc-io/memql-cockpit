@@ -32,14 +32,14 @@ import (
 	"strings"
 	"syscall"
 
-	coregenesis "github.com/visionarys-io/memql/component/genesis"
+	coregenesis "github.com/znasllc-io/memql/component/genesis"
 
-	"github.com/visionarys-io/memql-cockpit/cli"
-	"github.com/visionarys-io/memql-cockpit/cli/auth"
-	"github.com/visionarys-io/memql-cockpit/cli/config"
-	"github.com/visionarys-io/memql-cockpit/cli/crash"
-	"github.com/visionarys-io/memql-cockpit/cmd/memql-cockpit/internal/lint"
-	"github.com/visionarys-io/memql-cockpit/cmd/memql-cockpit/internal/worker"
+	"github.com/znasllc-io/memql-cockpit/cli"
+	"github.com/znasllc-io/memql-cockpit/cli/auth"
+	"github.com/znasllc-io/memql-cockpit/cli/config"
+	"github.com/znasllc-io/memql-cockpit/cli/crash"
+	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/internal/lint"
+	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/internal/worker"
 )
 
 const version = "0.1.0"

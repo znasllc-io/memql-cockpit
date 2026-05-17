@@ -1,4 +1,4 @@
-module github.com/visionarys-io/memql-cockpit
+module github.com/znasllc-io/memql-cockpit
 
 go 1.26.1
 
@@ -6,7 +6,7 @@ require (
 	github.com/gdamore/tcell/v2 v2.13.8
 	github.com/go-vgo/robotgo v1.0.2
 	github.com/google/uuid v1.6.0
-	github.com/visionarys-io/memql v0.1.0
+	github.com/znasllc-io/memql v0.1.1-0.20260517203123-4404049730d3
 	golang.org/x/sys v0.42.0
 	golang.org/x/term v0.41.0
 	google.golang.org/grpc v1.79.3
@@ -29,6 +29,7 @@ require (
 	github.com/jezek/xgb v1.3.0 // indirect
 	github.com/jezek/xgbutil v0.0.0-20260124183602-9fd151d6a51a // indirect
 	github.com/jinzhu/inflection v1.0.0 // indirect
+	github.com/kr/pretty v0.3.1 // indirect
 	github.com/lib/pq v1.10.9 // indirect
 	github.com/lucasb-eyer/go-colorful v1.3.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20260324052639-156f7da3f749 // indirect
@@ -37,6 +38,7 @@ require (
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
 	github.com/puzpuzpuz/xsync/v3 v3.5.1 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
+	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	github.com/santhosh-tekuri/jsonschema/v5 v5.3.1 // indirect
 	github.com/sashabaranov/go-openai v1.41.2 // indirect
 	github.com/shirou/gopsutil/v4 v4.26.2 // indirect
@@ -69,6 +71,8 @@ require (
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/text v0.35.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260203192932-546029d2fa20 // indirect
+	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
+	gopkg.in/yaml.v2 v2.4.0 // indirect
 	mellium.im/sasl v0.3.2 // indirect
 )
 
@@ -78,4 +82,4 @@ require (
 // against a real remote OR a replace pointing at a local path.
 // Once memql is published as a tagged version, drop this replace
 // and pin a real version in the require block above.
-replace github.com/visionarys-io/memql => ../memql
+replace github.com/znasllc-io/memql => ../memql

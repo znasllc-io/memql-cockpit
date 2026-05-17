@@ -24,8 +24,8 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 
-	"github.com/visionarys-io/memql-cockpit/cli/client"
-	"github.com/visionarys-io/memql-cockpit/cli/ui"
+	"github.com/znasllc-io/memql-cockpit/cli/client"
+	"github.com/znasllc-io/memql-cockpit/cli/ui"
 )
 
 // FocusPane identifies which of the three keyboard-focus regions is
