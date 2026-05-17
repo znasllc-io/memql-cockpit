@@ -6,6 +6,7 @@ package cluster
 import (
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/visionarys-io/memql-cockpit/cli/ui"
@@ -43,7 +44,18 @@ type NodeTypeInfo struct {
 }
 
 // View renders the Cluster topology using tcell box-drawing characters.
+//
+// Thread-safety: cluster-node + nodeType events arrive on the
+// per-cluster runSubscriber goroutine (see pool.go) and mutate
+// this view via ApplyNodeUpdate / SetNodes / SetNodeTypes /
+// SetDisconnected. The tcell event loop concurrently calls Draw +
+// HandleEvent. Without locking, Draw can see torn state (e.g. a
+// half-populated Nodes slice or an ApplyNodeUpdate mid-write),
+// which surfaces visually as ghosting once the per-frame paint
+// uses Show()-style diff emission. mu serializes both writers
+// (Lock) and Draw (RLock).
 type View struct {
+	mu        sync.RWMutex
 	Theme     ui.Theme
 	Nodes     []NodeInfo
 	NodeTypes []NodeTypeInfo // seed order from v1:cluster:nodeType, drives row layout
@@ -85,6 +97,8 @@ type View struct {
 // mutate node data; when the stream recovers the existing Health values
 // resume display.
 func (v *View) SetDisconnected(disconnected bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	v.disconnected = disconnected
 }
 
@@ -107,8 +121,10 @@ func NewView(theme ui.Theme) *View {
 
 // SetNodes updates the cluster topology data.
 func (v *View) SetNodes(nodes []NodeInfo) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	v.Nodes = nodes
-	v.buildEdges()
+	v.buildEdgesLocked()
 }
 
 // SetNodeTypes stores the ordered nodeType list (from
@@ -117,6 +133,8 @@ func (v *View) SetNodes(nodes []NodeInfo) {
 // rest in sequence. When empty, drawTopology falls back to the order
 // in which types appear on registered nodes.
 func (v *View) SetNodeTypes(types []NodeTypeInfo) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	v.NodeTypes = types
 }
 
@@ -131,10 +149,12 @@ func (v *View) ApplyNodeUpdate(incoming NodeInfo) {
 	if incoming.Type == "" && incoming.ID == "" {
 		return
 	}
-	idx := v.findNodeIndex(incoming)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	idx := v.findNodeIndexLocked(incoming)
 	if idx < 0 {
 		v.Nodes = append(v.Nodes, incoming)
-		v.buildEdges()
+		v.buildEdgesLocked()
 		return
 	}
 	// Preserve any fields the subscription payload didn't carry.
@@ -160,10 +180,15 @@ func (v *View) ApplyNodeUpdate(incoming NodeInfo) {
 	if incoming.Labels != nil {
 		existing.Labels = incoming.Labels
 	}
-	v.buildEdges()
+	v.buildEdgesLocked()
 }
 
-func (v *View) findNodeIndex(target NodeInfo) int {
+// findNodeIndexLocked is the lock-internal flavor of findNodeIndex;
+// caller MUST hold v.mu (read or write). Renamed (vs. just adding a
+// lock at the entry) because the function is called from
+// ApplyNodeUpdate which already holds the write lock; re-entering a
+// non-recursive RWMutex would deadlock.
+func (v *View) findNodeIndexLocked(target NodeInfo) int {
 	if target.ID != "" {
 		for i, n := range v.Nodes {
 			if n.ID == target.ID {
@@ -183,8 +208,13 @@ func (v *View) findNodeIndex(target NodeInfo) int {
 	return -1
 }
 
-// Draw renders the topology view.
+// Draw renders the topology view. Holds the read lock for the full
+// frame so a concurrent runSubscriber goroutine can't tear v.Nodes /
+// v.NodeTypes / v.Edges mid-render. The ArchView overlay also reads
+// state inside the lock when it's active.
 func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, v.Theme.BaseStyle())
 
 	// Title. Just the cluster name in Info (lighter blue) -- the outer
@@ -438,7 +468,12 @@ func (v *View) drawNodeBox(screen *ui.Screen, x, y, w, h int, area ui.Rect, node
 // HandleEvent processes keyboard input. The topology view is driven by
 // gRPC event subscriptions -- there is no manual refresh key. WASD pans
 // the diagram within the pane so the user can inspect off-screen nodes.
+//
+// Takes the write lock for the duration -- pan keys mutate v.panX /
+// v.panY which Draw reads under the read lock.
 func (v *View) HandleEvent(ev tcell.Event) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	keyEv, ok := ev.(*tcell.EventKey)
 	if !ok {
 		return false
@@ -511,7 +546,11 @@ var edgeRelations = [][2]string{
 	{"voice", "redis"},
 }
 
-func (v *View) buildEdges() {
+// buildEdgesLocked rebuilds v.Edges from v.Nodes. Caller MUST hold
+// v.mu (write). Renamed to *Locked to make the contract obvious;
+// every caller in this file is inside a mutator that already holds
+// the lock.
+func (v *View) buildEdgesLocked() {
 	v.Edges = nil
 	// First index per type (multiple BFFs in the cluster: edges
 	// fan out from the first one; the others render side-by-side
