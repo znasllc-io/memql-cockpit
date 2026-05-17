@@ -78,6 +78,16 @@ type View struct {
 	submitErr string
 	fetching  bool
 
+	// dslMissing latches when the cluster's BFF returns
+	// "function not found" for a Planner query. Once set, the
+	// refresher stops issuing the failing call -- no point making
+	// a fresh RTT every 3s -- and Draw renders an explanatory
+	// gated screen instead of the empty layout. Cleared by
+	// pressing R (manual refresh) so a re-deploy of the BFF that
+	// loads the Planner DSL picks back up without restarting
+	// the cockpit. See cli/planner/view.go isPlannerDSLMissing.
+	dslMissing bool
+
 	// Plumbing.
 	//
 	// QueryClient returns a client bound to the active cluster's
@@ -145,6 +155,13 @@ func (v *View) RefreshPlans() {
 		v.mu.Unlock()
 		return
 	}
+	if v.dslMissing {
+		// Cluster's BFF doesn't have the Planner DSL loaded. Don't
+		// burn an RTT every refresh tick re-confirming. The user can
+		// press R to retry (handlePlanListKey clears the latch).
+		v.mu.Unlock()
+		return
+	}
 	v.fetching = true
 	v.mu.Unlock()
 
@@ -159,6 +176,10 @@ func (v *View) RefreshPlans() {
 
 	res, err := qc.Execute(ctx, "queryAllPlans({})")
 	if err != nil {
+		if isPlannerDSLMissing(err) {
+			v.markDSLMissing()
+			return
+		}
 		if v.OnStatus != nil {
 			v.OnStatus(fmt.Sprintf("planner: queryAllPlans failed: %v", err))
 		}
@@ -205,11 +226,22 @@ func (v *View) RefreshTasksForSelected() {
 		return
 	}
 
+	v.mu.RLock()
+	missing := v.dslMissing
+	v.mu.RUnlock()
+	if missing {
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 
 	res, err := qc.Execute(ctx, fmt.Sprintf(`queryTasksForPlan({"planId": %q})`, planID))
 	if err != nil {
+		if isPlannerDSLMissing(err) {
+			v.markDSLMissing()
+			return
+		}
 		if v.OnStatus != nil {
 			v.OnStatus(fmt.Sprintf("planner: queryTasksForPlan failed: %v", err))
 		}
@@ -288,6 +320,14 @@ func (v *View) submitGoal() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if _, err := qc.Execute(ctx, call); err != nil {
+		if isPlannerDSLMissing(err) {
+			// Same root cause as the read-side: the BFF doesn't
+			// have the Planner DSL loaded. Latch dslMissing so the
+			// gated screen surfaces instead of a stale goal-input
+			// pane, and suppress the notification spam.
+			v.markDSLMissing()
+			return
+		}
 		v.mu.Lock()
 		v.submitErr = err.Error()
 		v.mu.Unlock()
@@ -317,7 +357,21 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 	defer v.mu.RUnlock()
 
 	if v.GatedMessage != "" {
-		v.drawGated(screen, bounds)
+		v.drawGated(screen, bounds, v.GatedMessage)
+		return
+	}
+	// DSL-missing precedence: the outer "cluster not connected" path
+	// (GatedMessage) is fixed first, so it wins above. Only when the
+	// cluster IS connected and the BFF rejected our query as
+	// "function not found" do we surface this gating. R:Refresh
+	// clears the latch (see handlePlanListKey).
+	if v.dslMissing {
+		v.drawGated(screen, bounds,
+			"Planner DSL not loaded on this cluster. The Planner tab "+
+				"requires queryAllPlans / queryTasksForPlan / "+
+				"mutationCreatePlan to be registered with the BFF "+
+				"engine (the copresent DSL tree provides them). "+
+				"Press R to retry once the BFF has been redeployed.")
 		return
 	}
 
@@ -354,16 +408,36 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 	v.drawTaskDetail(screen, rightRows[2])
 }
 
-func (v *View) drawGated(screen *ui.Screen, bounds ui.Rect) {
+// drawGated renders the centered "tab unavailable" layout with the
+// supplied message. Used for two distinct cases: the outer
+// GatedMessage (cluster not connected, set by app.go's
+// updateTabGating) and the planner-specific dslMissing latch (BFF
+// doesn't have the Planner queries loaded). Message text drives the
+// rendering; the layout is identical.
+func (v *View) drawGated(screen *ui.Screen, bounds ui.Rect, msg string) {
 	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, v.Theme.BaseStyle())
 	title := " PLANNER "
 	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, v.Theme.SubtleStyle().Bold(true))
-	midY := bounds.Y + bounds.Height/2
-	lineX := bounds.X + (bounds.Width-len(v.GatedMessage))/2
-	if lineX < bounds.X+1 {
-		lineX = bounds.X + 1
+	// Wrap long messages -- the dslMissing explanation is long enough
+	// that it would overflow a narrow Planner tab width.
+	wrapped := ui.WrapText(msg, bounds.Width-4)
+	if len(wrapped) == 0 {
+		wrapped = []string{msg}
 	}
-	screen.DrawText(lineX, midY, bounds.Width-1, v.GatedMessage, v.Theme.SubtleStyle())
+	startY := bounds.Y + bounds.Height/2 - len(wrapped)/2
+	if startY < bounds.Y+1 {
+		startY = bounds.Y + 1
+	}
+	for i, line := range wrapped {
+		if startY+i >= bounds.Y+bounds.Height {
+			break
+		}
+		lineX := bounds.X + (bounds.Width-len(line))/2
+		if lineX < bounds.X+1 {
+			lineX = bounds.X + 1
+		}
+		screen.DrawText(lineX, startY+i, bounds.Width-1, line, v.Theme.SubtleStyle())
+	}
 }
 
 func (v *View) drawGoalPane(screen *ui.Screen, bounds ui.Rect) {
@@ -635,9 +709,15 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 	}
 
 	// R refreshes plans + tasks, except while typing in the goal box
-	// (where r should mean a literal 'r').
+	// (where r should mean a literal 'r'). Also clears the
+	// dslMissing latch so a redeployed BFF that now carries the
+	// Planner DSL gets retried -- without this the gated screen
+	// would be sticky until cockpit restart.
 	if v.Focus != FocusGoal && keyEv.Key() == tcell.KeyRune &&
 		(keyEv.Rune() == 'r' || keyEv.Rune() == 'R') {
+		v.mu.Lock()
+		v.dslMissing = false
+		v.mu.Unlock()
 		go func() {
 			v.RefreshPlans()
 			v.RefreshTasksForSelected()
@@ -898,6 +978,43 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return s[:max-1] + "…"
+}
+
+// isPlannerDSLMissing classifies an Execute error as "the BFF's
+// memQL engine doesn't have the Planner queries / mutations
+// registered" vs. anything else. The engine surfaces missing
+// functions as `function "<name>" not found` (see
+// component/memql/engine.go's resolver). Matching on that exact
+// shape avoids tripping on unrelated errors that happen to contain
+// the word "function" -- a permission denial, a parser failure, or
+// a partition-ACL reject all use different verbs.
+//
+// The check is intentionally loose on the function name -- we want
+// the same code path to fire for queryAllPlans, queryTasksForPlan,
+// and mutationCreatePlan since all three live in the same DSL tree
+// (memql-bff-copresent/dsl/copresent/{queries,mutations}.memql).
+func isPlannerDSLMissing(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "not found") &&
+		(strings.Contains(msg, `function "queryAllPlans"`) ||
+			strings.Contains(msg, `function "queryTasksForPlan"`) ||
+			strings.Contains(msg, `function "mutationCreatePlan"`))
+}
+
+// markDSLMissing latches the dslMissing flag and clears any
+// pending error message so the gated screen has a clean slate to
+// render against. Notifications are deliberately NOT fired -- the
+// "function not found" condition is a deploy-time capability gap,
+// not a transient failure, and surfacing it on every 3s refresh
+// tick was exactly the bug that prompted this fix.
+func (v *View) markDSLMissing() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.dslMissing = true
+	v.submitErr = ""
 }
 
 func prettyJSONLines(v any, maxWidth int) []string {
