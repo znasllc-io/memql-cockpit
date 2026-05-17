@@ -2353,17 +2353,17 @@ func (a *App) draw() {
 	// positioned at the bottom-right corner (causing the stray '{').
 	a.screen.Inner().ShowCursor(0, 0)
 	a.screen.Inner().HideCursor()
-	// IMPORTANT: keep Sync() here. Two Sync->Show() experiments both
-	// produced a 1-row-offset ghost frame on the user's terminal
-	// (Pop_OS, screenshots Screenshot_2026-05-17_11-32-12.png and
-	// Screenshot_2026-05-17_11-54-02.png). State-coherence locks on
-	// every racing view (topology / partitions / clusters / settings)
-	// did NOT fix the ghosting, which means the issue isn't a
-	// background-mutator race -- it's something specific to tcell's
-	// diff emission on that terminal, or to how our layout interacts
-	// with it. Until we can reproduce locally + diagnose, Sync()
-	// stays. Per-frame flicker is annoying but the diff-emission
-	// duplication is worse. Investigation thread: revisit when we
-	// have a repro that isn't user-specific.
-	a.screen.Sync()
+	// Show() emits a cell-level diff against the previous frame --
+	// tcell only writes ANSI for cells whose content or style
+	// actually changed. That's the no-flicker path.
+	//
+	// History: two prior Show() attempts were reverted because a
+	// Pop_OS user reported a 1-row-offset ghost. Since that report
+	// we've landed (a) state-coherence locks on every racing view,
+	// (b) the layout-edge-glyph rule documented in CLAUDE.md, and
+	// (c) the postRedraw coalescer that eliminates per-event burst
+	// repaints -- any of which could have masked the underlying
+	// cause. User can no longer reproduce the ghost. Going back to
+	// Show(); revert just this hunk (Show -> Sync) if it returns.
+	a.screen.Show()
 }
