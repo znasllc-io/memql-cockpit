@@ -351,19 +351,34 @@ func (a *App) dispatchEvent(ev tcell.Event) bool {
 		// nonsense; the key no-ops to match the hint strip.
 		if ev.Key() == tcell.KeyCtrlY {
 			if note, ok := a.notifications.Current(); ok && !note.NoCopy {
-				if err := ui.CopyToClipboard(note.Message); err != nil {
-					// A copy FAILURE is not a meta-ack -- the user
-					// may well want to copy the error text to
-					// investigate it. Use regular Sync.
-					a.notifications.Sync("clipboard", ui.SeverityError,
-						"Copy failed: "+err.Error())
-				} else {
-					// Success ack is meta -- hide the Copy hint on
-					// it via SyncMeta. Dismiss (Ctrl+K) still works.
-					a.notifications.SyncMeta("clipboard", ui.SeverityInfo,
-						"Message copied to clipboard.")
-				}
-				a.draw()
+				// Fork the copy into a goroutine so the event loop
+				// never blocks on the clipboard tool. On Linux/X11
+				// xclip's input mode runs a background "selection
+				// owner" subprocess; even with clipboard.go's
+				// Stdout/Stderr-nil fix, the kernel + X server are
+				// involved and an unresponsive X display can stall
+				// xclip's parent process briefly. The TUI must keep
+				// processing keys (Ctrl+Q, tab switches, scroll)
+				// while that happens. The redraw is posted after
+				// the goroutine resolves so the success/failure ack
+				// shows up the next time the event loop ticks.
+				note := note
+				go func() {
+					if err := ui.CopyToClipboard(note.Message); err != nil {
+						// A copy FAILURE is not a meta-ack -- the
+						// user may well want to copy the error text
+						// to investigate it. Use regular Sync.
+						a.notifications.Sync("clipboard", ui.SeverityError,
+							"Copy failed: "+err.Error())
+					} else {
+						// Success ack is meta -- hide the Copy hint
+						// on it via SyncMeta. Dismiss (Ctrl+K) still
+						// works.
+						a.notifications.SyncMeta("clipboard", ui.SeverityInfo,
+							"Message copied to clipboard.")
+					}
+					a.postRedraw()
+				}()
 			}
 			return false
 		}

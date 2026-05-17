@@ -16,6 +16,25 @@ import (
 // and why it didn't work. Callers should surface the error to the
 // notifications feed so the user sees why copy failed (missing tool,
 // no display, etc.) rather than silently no-op.
+//
+// CRITICAL: do NOT capture stdout / stderr via exec.Cmd's pipe
+// mechanism (CombinedOutput, Output, c.Stdout = &buf). On Linux/X11,
+// xclip's input mode forks a background "selection owner" child so
+// the X clipboard remains populated after the parent process exits.
+// That forked child inherits any pipe FD we set up to capture
+// stdout/stderr; cmd.Wait() then blocks until ALL writers close the
+// pipe, which only happens when another X client takes the selection
+// (i.e. potentially never). The cockpit's Ctrl+Y handler runs in the
+// tcell event loop -- a blocked Wait() freezes the whole TUI, no
+// keys respond (Ctrl+Q included), and the user has to kill -9 the
+// process. Leaving Stdout/Stderr nil routes them to /dev/null; the
+// forked child inherits the null FDs, has nothing to keep open, and
+// cmd.Wait() returns as soon as the parent xclip exits. Trade-off:
+// we lose detailed stderr capture, so on failure we surface only
+// the exit-code error -- worth it; a hung TUI is much worse than
+// a less-detailed error message. The LookPath pre-check above
+// distinguishes "tool not installed" from "tool failed at runtime",
+// which covers the two cases that actually need different remediation.
 func CopyToClipboard(text string) error {
 	cmd, arg, env := clipboardCommand()
 	if cmd == "" {
@@ -29,12 +48,10 @@ func CopyToClipboard(text string) error {
 	c := exec.Command(cmd, arg...)
 	c.Env = append(c.Env, env...)
 	c.Stdin = strings.NewReader(text)
-	if out, err := c.CombinedOutput(); err != nil {
-		msg := strings.TrimSpace(string(out))
-		if msg == "" {
-			msg = err.Error()
-		}
-		return errors.New(cmd + ": " + msg)
+	// Stdout / Stderr deliberately left nil -- see the comment above
+	// for the xclip-fork-child rationale.
+	if err := c.Run(); err != nil {
+		return errors.New(cmd + ": " + err.Error())
 	}
 	return nil
 }
