@@ -345,6 +345,43 @@ func (e *connEntry) runTokenRefresher() {
 				"cluster", e.Config.Name,
 				"expiresIn", time.Until(result.Expiry).Round(time.Second))
 		}
+
+		// In-stream rotation: ask the server to swap the bearer on the
+		// live stream so admin-side revocation / partition-grant
+		// changes propagate to the in-flight session in O(seconds)
+		// rather than waiting for the next stream drop. The stream's
+		// gRPC metadata is fixed at open time, so without RotateAuth
+		// the server keeps verifying envelopes against the original
+		// token until reconnect. With RotateAuth the server re-verifies
+		// the new token and swaps streamSession.identity + .access.
+		//
+		// Failure is non-fatal: the on-disk credential is fresh, so
+		// any subsequent reconnect still lands on the rotated pair.
+		// A rejected rotate (ErrRotateAuthRejected) typically means
+		// the server's verifier doesn't know about the new token yet
+		// (JWKS-refresh lag) or the user's access changed in a way
+		// that's incompatible with the live stream's partition stamp.
+		e.mu.Lock()
+		conn := e.Conn
+		e.mu.Unlock()
+		if conn != nil {
+			rotateCtx, rotateCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			rotateErr := conn.Dispatcher().RotateAuth(rotateCtx, result.AccessToken)
+			rotateCancel()
+			if rotateErr != nil && e.app.logger != nil {
+				switch {
+				case errors.Is(rotateErr, client.ErrRotateAuthRejected):
+					e.app.logger.Warn("auth refresher: in-stream rotate rejected; on-disk token still rolled",
+						"cluster", e.Config.Name, "error", rotateErr)
+				default:
+					e.app.logger.Warn("auth refresher: in-stream rotate transport failure; on-disk token still rolled",
+						"cluster", e.Config.Name, "error", rotateErr)
+				}
+			} else if e.app.logger != nil {
+				e.app.logger.Info("auth refresher: in-stream bearer rotated",
+					"cluster", e.Config.Name)
+			}
+		}
 	}
 }
 
