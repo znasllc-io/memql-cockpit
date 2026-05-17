@@ -19,6 +19,7 @@ import (
 	"github.com/visionarys-io/memql-cockpit/cli/cluster"
 	"github.com/visionarys-io/memql-cockpit/cli/concepts"
 	"github.com/visionarys-io/memql-cockpit/cli/config"
+	"github.com/visionarys-io/memql-cockpit/cli/crash"
 	"github.com/visionarys-io/memql-cockpit/cli/discovery"
 	"github.com/visionarys-io/memql-cockpit/cli/settings"
 	"github.com/visionarys-io/memql-cockpit/cli/splash"
@@ -78,6 +79,16 @@ type App struct {
 
 	// Overlays
 	helpOverlay *ui.HelpOverlay
+
+	// tabCrashes is the sticky per-tab crash state. When a tab's
+	// Draw or HandleEvent panics, the crash.Report goes here keyed
+	// by the tab's name. Subsequent draws skip the tab's own Draw
+	// and render the inline error placeholder instead, so the
+	// broken pane doesn't keep re-panicking every frame and
+	// flooding the crash log. Cleared when the user switches AWAY
+	// and then BACK to the tab (gives them a one-press way to
+	// retry without leaving the cockpit).
+	tabCrashes map[string]*crash.Report
 }
 
 // NewApp creates a new CLI application instance.
@@ -111,6 +122,7 @@ func NewApp(cfg AppConfig) *App {
 		clustersView:  clustersView,
 		settingsView:  settingsView,
 		helpOverlay:   ui.NewHelpOverlay(theme),
+		tabCrashes:    make(map[string]*crash.Report),
 	}
 	// A notifications change (sync from a background goroutine, or a
 	// dismiss) should trigger a redraw so the user sees it immediately.
@@ -198,7 +210,15 @@ func (a *App) Run() error {
 	go a.connect()
 	go a.backoffRedrawLoop()
 
-	// Event loop.
+	// Event loop. Each iteration body runs under a panic catcher
+	// (crash.Catch) so a panic ANYWHERE outside the per-tab Draw /
+	// HandleEvent wrappers -- chrome rendering, dispatch wiring,
+	// redraw scheduling, future additions -- gets logged + surfaced
+	// to the notification bar and the loop continues instead of
+	// killing the whole app. The outermost defer-recover in main()
+	// catches anything that escapes even this (e.g. a panic inside
+	// the recover itself, or a panic in the controlled shutdown
+	// path on the way out of Run).
 	for {
 		ev := a.screen.PollEvent()
 
@@ -207,6 +227,48 @@ func (a *App) Run() error {
 			return nil
 		default:
 		}
+
+		// Wrap the per-iteration switch in crash.Catch so a panic in
+		// any non-tab handler (chrome render, dispatch wiring, etc.)
+		// gets logged + surfaced as a notification, and the loop
+		// keeps running.
+		var quit bool
+		report := crash.Catch("main-loop", func() {
+			quit = a.dispatchEvent(ev)
+		})
+		if report != nil {
+			if a.logger != nil {
+				a.logger.Error("main loop iteration panicked",
+					"code", report.Code,
+					"logPath", report.LogPath,
+				)
+			}
+			if a.notifications != nil {
+				msg := fmt.Sprintf(
+					"Cockpit hit an unexpected error (code %s). Please contact support.",
+					report.Code,
+				)
+				a.notifications.Sync("crash", ui.SeverityError, msg)
+			}
+			// Try to redraw so the notification surfaces. Wrapped in
+			// its own Catch in case draw() itself is the panic source.
+			_ = crash.Catch("post-crash-draw", func() { a.draw() })
+		}
+		if quit {
+			return nil
+		}
+	}
+}
+
+// dispatchEvent handles a single tcell event. Returns true when the
+// user has requested quit (Ctrl+Q / Ctrl+C). Hoisted out of Run()
+// so the entire dispatch body can be wrapped in crash.Catch as one
+// unit; `continue` in the original loop becomes a no-op return here
+// (the loop iteration is already "done with this event" the moment
+// dispatchEvent returns).
+func (a *App) dispatchEvent(ev tcell.Event) bool {
+	{
+		_ = ev // placeholder so the original switch can be lifted in
 
 		switch ev := ev.(type) {
 		case *tcell.EventInterrupt:
@@ -221,7 +283,7 @@ func (a *App) Run() error {
 		case *tcell.EventKey:
 			// Ctrl+Q or Ctrl+C to quit.
 			if ev.Key() == tcell.KeyCtrlC || ev.Key() == tcell.KeyCtrlQ {
-				return nil
+				return true
 			}
 
 			// Help overlay toggle (Ctrl+?). F1 is dedicated to the
@@ -230,7 +292,7 @@ func (a *App) Run() error {
 			if ev.Key() == tcell.KeyRune && ev.Rune() == '?' && ev.Modifiers()&tcell.ModCtrl != 0 {
 				a.helpOverlay.Toggle()
 				a.draw()
-				continue
+				return false
 			}
 
 			// Ctrl+K dismisses the currently-shown notification in the
@@ -239,7 +301,7 @@ func (a *App) Run() error {
 			if ev.Key() == tcell.KeyCtrlK {
 				a.notifications.DismissCurrent()
 				a.draw()
-				continue
+				return false
 			}
 
 			// Ctrl+Y copies the current notification's message to the
@@ -268,7 +330,7 @@ func (a *App) Run() error {
 					}
 					a.draw()
 				}
-				continue
+				return false
 			}
 
 			// Help overlay consumes Escape when visible.
@@ -277,19 +339,41 @@ func (a *App) Run() error {
 					a.helpOverlay.Visible = false
 				}
 				a.draw()
-				continue
+				return false
 			}
 
-			// Tab switching.
+			// Tab switching. Clears the new tab's sticky crash state
+			// (if any) so switching away + back gives the broken tab
+			// a fresh try -- the user's only built-in "retry this
+			// pane" gesture.
 			if newTab := a.tabBar.HandleKey(ev); newTab >= 0 {
 				a.tabBar.SetActive(newTab)
+				if t := a.tabBar.ActiveTab(); t != nil {
+					delete(a.tabCrashes, t.Name)
+				}
 				a.draw()
-				continue
+				return false
 			}
 
-			// Forward to active tab.
+			// Forward to active tab. Wrapped in crash.Catch so a
+			// panic in the tab's HandleEvent doesn't kill the loop;
+			// the tab's draw will surface the placeholder next frame.
 			if tab := a.tabBar.ActiveTab(); tab != nil && tab.Content != nil {
-				if tab.Content.HandleEvent(ev) {
+				var handled bool
+				if report := crash.Catch("event:"+tab.Name, func() {
+					handled = tab.Content.HandleEvent(ev)
+				}); report != nil {
+					a.tabCrashes[tab.Name] = report
+					if a.logger != nil {
+						a.logger.Error("tab handle-event panicked",
+							"tab", tab.Name,
+							"code", report.Code,
+							"logPath", report.LogPath,
+						)
+					}
+					handled = true
+				}
+				if handled {
 					a.draw()
 				}
 			}
@@ -297,12 +381,27 @@ func (a *App) Run() error {
 		case *tcell.EventMouse:
 			// Forward to active tab if needed.
 			if tab := a.tabBar.ActiveTab(); tab != nil && tab.Content != nil {
-				if tab.Content.HandleEvent(ev) {
+				var handled bool
+				if report := crash.Catch("mouse:"+tab.Name, func() {
+					handled = tab.Content.HandleEvent(ev)
+				}); report != nil {
+					a.tabCrashes[tab.Name] = report
+					if a.logger != nil {
+						a.logger.Error("tab handle-mouse panicked",
+							"tab", tab.Name,
+							"code", report.Code,
+							"logPath", report.LogPath,
+						)
+					}
+					handled = true
+				}
+				if handled {
 					a.draw()
 				}
 			}
 		}
 	}
+	return false
 }
 
 // Quit signals the application to shut down. Closes every pool
@@ -2197,7 +2296,29 @@ func (a *App) draw() {
 	a.updateTabGating()
 
 	if tab := a.tabBar.ActiveTab(); tab != nil && tab.Content != nil {
-		tab.Content.Draw(a.screen, contentBounds)
+		// Sticky per-tab crash state: if THIS tab previously panicked
+		// (either here in Draw or in HandleEvent), render the inline
+		// "something went wrong" placeholder instead of re-invoking
+		// the broken Draw -- avoids a panic-per-frame loop that
+		// would flood the crash log. Clears when the user switches
+		// away and back.
+		if report := a.tabCrashes[tab.Name]; report != nil {
+			crash.DrawInline(a.screen, contentBounds, a.theme, report)
+		} else if report := crash.Catch("draw:"+tab.Name, func() {
+			tab.Content.Draw(a.screen, contentBounds)
+		}); report != nil {
+			// Tab's Draw panicked this frame. Stash the report, render
+			// the placeholder over whatever partial paint landed.
+			a.tabCrashes[tab.Name] = report
+			crash.DrawInline(a.screen, contentBounds, a.theme, report)
+			if a.logger != nil {
+				a.logger.Error("tab draw panicked",
+					"tab", tab.Name,
+					"code", report.Code,
+					"logPath", report.LogPath,
+				)
+			}
+		}
 	}
 
 	// Help overlay on top of everything.
