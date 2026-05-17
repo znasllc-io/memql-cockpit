@@ -15,9 +15,27 @@ type StoredToken struct {
 	Expiry       time.Time `json:"expiry"`
 }
 
-// IsExpired returns true if the token has expired or will expire within 5 minutes.
+// expiryBuffer is the slack window IsExpired enforces ahead of the
+// actual Expiry timestamp. Treating tokens as "expired" a bit early
+// keeps us from handing out an access token that will be rejected by
+// the server seconds later (clock skew + in-flight latency). 60s is
+// generous enough to absorb both while remaining small enough to be
+// shorter than the smallest TTL operators are likely to set: the
+// identity service caps the access TTL at 60s on the low end
+// (MinAccessTokenTTLSeconds in memql core), so anything tighter would
+// make every cached token look expired the moment it's saved.
+//
+// History: this used to be 5 minutes, which silently broke the
+// refresh path under short-TTL test configs (3-min access tokens
+// would always look expired, and pre-refresh-wiring that meant the
+// browser flow fired on every dial). When we ship the refresh path,
+// the buffer needs to be < TTL or refresh never runs proactively.
+const expiryBuffer = 60 * time.Second
+
+// IsExpired returns true if the token has expired or will expire
+// within expiryBuffer.
 func (t *StoredToken) IsExpired() bool {
-	return time.Now().Add(5 * time.Minute).After(t.Expiry)
+	return time.Now().Add(expiryBuffer).After(t.Expiry)
 }
 
 // credentialsDir returns the path to ~/.memql/credentials/.
