@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	memqlv1 "github.com/visionarys-io/memql/component/grpc/gen"
+	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 )
 
 // Runner owns the worker's main loop: reconnect-with-backoff, the

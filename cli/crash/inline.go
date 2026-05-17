@@ -7,7 +7,7 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 
-	"github.com/visionarys-io/memql-cockpit/cli/ui"
+	"github.com/znasllc-io/memql-cockpit/cli/ui"
 )
 
 // DrawInline renders an in-pane error placeholder inside bounds when

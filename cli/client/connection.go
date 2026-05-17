@@ -9,7 +9,7 @@ import (
 	"log/slog"
 
 	"github.com/google/uuid"
-	memqlv1 "github.com/visionarys-io/memql/component/grpc/gen"
+	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"

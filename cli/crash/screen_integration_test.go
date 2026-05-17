@@ -27,8 +27,8 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 
-	"github.com/visionarys-io/memql-cockpit/cli/crash"
-	"github.com/visionarys-io/memql-cockpit/cli/ui"
+	"github.com/znasllc-io/memql-cockpit/cli/crash"
+	"github.com/znasllc-io/memql-cockpit/cli/ui"
 )
 
 // TestCrashIntegration_EndToEnd is the headline test: simulates a

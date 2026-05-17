@@ -15,22 +15,22 @@ import (
 	"time"
 
 	"github.com/gdamore/tcell/v2"
-	"github.com/visionarys-io/memql-cockpit/cli/auth"
-	"github.com/visionarys-io/memql-cockpit/cli/client"
-	"github.com/visionarys-io/memql-cockpit/cli/cluster"
-	"github.com/visionarys-io/memql-cockpit/cli/concepts"
-	"github.com/visionarys-io/memql-cockpit/cli/config"
-	"github.com/visionarys-io/memql-cockpit/cli/crash"
-	"github.com/visionarys-io/memql-cockpit/cli/discovery"
-	"github.com/visionarys-io/memql-cockpit/cli/settings"
-	"github.com/visionarys-io/memql-cockpit/cli/splash"
-	"github.com/visionarys-io/memql-cockpit/cli/ui"
-	genesiswizard "github.com/visionarys-io/memql-cockpit/cli/wizard/genesis"
-	"github.com/visionarys-io/memql-cockpit/cli/wizard/runlocal"
-	corgenesis "github.com/visionarys-io/memql/component/genesis"
-	memqlv1 "github.com/visionarys-io/memql/component/grpc/gen"
-	"github.com/visionarys-io/memql/component/node"
-	nodev1 "github.com/visionarys-io/memql/component/node/gen"
+	"github.com/znasllc-io/memql-cockpit/cli/auth"
+	"github.com/znasllc-io/memql-cockpit/cli/client"
+	"github.com/znasllc-io/memql-cockpit/cli/cluster"
+	"github.com/znasllc-io/memql-cockpit/cli/concepts"
+	"github.com/znasllc-io/memql-cockpit/cli/config"
+	"github.com/znasllc-io/memql-cockpit/cli/crash"
+	"github.com/znasllc-io/memql-cockpit/cli/discovery"
+	"github.com/znasllc-io/memql-cockpit/cli/settings"
+	"github.com/znasllc-io/memql-cockpit/cli/splash"
+	"github.com/znasllc-io/memql-cockpit/cli/ui"
+	genesiswizard "github.com/znasllc-io/memql-cockpit/cli/wizard/genesis"
+	"github.com/znasllc-io/memql-cockpit/cli/wizard/runlocal"
+	corgenesis "github.com/znasllc-io/memql/component/genesis"
+	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
+	"github.com/znasllc-io/memql/component/node"
+	nodev1 "github.com/znasllc-io/memql/component/node/gen"
 )
 
 // AppConfig holds initialization parameters for the application.
@@ -914,6 +914,11 @@ func (a *App) openEntry(cfg config.ClusterConfig) {
 	// reconnects after an unexpected stream close, and responds to
 	// cancel / close signals.
 	go entry.runLifecycle()
+	// The token refresher silently rolls the cached OIDC token
+	// forward before it expires, so a future reconnect never has
+	// to fall through to the browser flow. PAT clusters short-
+	// circuit inside runTokenRefresher.
+	go entry.runTokenRefresher()
 	a.postRedraw()
 }
 

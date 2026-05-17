@@ -13,7 +13,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/visionarys-io/memql-cockpit/cli/crash"
+	"github.com/znasllc-io/memql-cockpit/cli/crash"
 )
 
 // tabSim mimics the app.tabCrashes sticky-state pattern. Tests check

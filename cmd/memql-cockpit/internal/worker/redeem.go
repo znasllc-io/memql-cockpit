@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/visionarys-io/memql/component/identity/workerpairing"
+	"github.com/znasllc-io/memql/component/identity/workerpairing"
 )
 
 // RedeemResult captures the credentials returned by a successful
