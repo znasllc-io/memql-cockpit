@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -11,12 +12,12 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/visionarys-io/memql-cockpit/cli/auth"
-	"github.com/visionarys-io/memql-cockpit/cli/client"
-	"github.com/visionarys-io/memql-cockpit/cli/cluster"
-	"github.com/visionarys-io/memql-cockpit/cli/config"
-	memqlv1 "github.com/visionarys-io/memql/component/grpc/gen"
-	nodev1 "github.com/visionarys-io/memql/component/node/gen"
+	"github.com/znasllc-io/memql-cockpit/cli/auth"
+	"github.com/znasllc-io/memql-cockpit/cli/client"
+	"github.com/znasllc-io/memql-cockpit/cli/cluster"
+	"github.com/znasllc-io/memql-cockpit/cli/config"
+	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
+	nodev1 "github.com/znasllc-io/memql/component/node/gen"
 )
 
 // entryState is the single source of truth for one pool entry's
@@ -232,6 +233,176 @@ func (e *connEntry) runLifecycle() {
 	}
 }
 
+// refresherTickFloor is the minimum sleep between consecutive refresh
+// attempts. Floor exists so a bug that mints a too-short TTL (or a
+// clock-skew window where Expiry has already passed by the time we
+// wake up) can't spin the refresher into a tight loop.
+const refresherTickFloor = 30 * time.Second
+
+// refresherLeadTime is how far ahead of Expiry the refresher fires.
+// Picked > expiryBuffer (cli/config/credentials.go) so a freshly-
+// rolled token always lands BEFORE IsExpired flips true -- otherwise
+// any dial that interleaves with the refresher would see the cached
+// token as already-expired and race the refresher instead of using
+// it.
+const refresherLeadTime = 90 * time.Second
+
+// runTokenRefresher silently rolls the cached OIDC token forward
+// before it expires, so a reconnect never has to fall through to the
+// browser flow. The contract:
+//
+//   - PAT clusters and clusters with no cached token / no refresh
+//     token exit immediately. The refresher only owns the
+//     OAuth-with-refresh case.
+//   - Wakes ~refresherLeadTime before the cached Expiry. Calls
+//     auth.Refresh; on success saves the rolled pair and loops.
+//   - On invalid_grant: stops. The next dial will discover the
+//     dead refresh token and prompt the user. Spawning a browser
+//     from the background would surprise the user mid-task.
+//   - On transient error: backs off refresherTickFloor and retries.
+//   - On e.done: exits cleanly.
+//
+// Note: the live gRPC stream's bearer was set at stream-open time
+// and is not rotated by this refresher. The point of the refresher
+// is keeping the ON-DISK credential fresh so that ANY reconnect
+// (stream drop, sleep/wake, server restart) finds a usable token
+// without a browser round-trip. Rotating the in-flight bearer would
+// require a re-handshake message the server doesn't yet support.
+func (e *connEntry) runTokenRefresher() {
+	if e.Config.PAT != "" {
+		// PATs don't expire client-side. Server-side revocation is the
+		// only kill switch; nothing for the refresher to do.
+		return
+	}
+	if e.Config.Issuer == "" || e.Config.ClientId == "" {
+		// stateNeedsConfig path. No identity to refresh against.
+		return
+	}
+	for {
+		stored, err := config.LoadToken(e.Config.Name)
+		if err != nil || stored == nil || stored.RefreshToken == "" {
+			// Nothing to refresh yet. Wait for the foreground Login to
+			// drop a token on disk, then pick up on the next tick.
+			if e.sleepRefresher(refresherTickFloor) {
+				return
+			}
+			continue
+		}
+
+		// How long until we should fire? "Now - lead" can be negative
+		// when the cached token is already past its lead window; floor
+		// to refresherTickFloor so we don't hammer identity in a tight
+		// loop if the server hands us a too-short TTL.
+		wait := time.Until(stored.Expiry) - refresherLeadTime
+		if wait < refresherTickFloor {
+			wait = refresherTickFloor
+		}
+		if e.sleepRefresher(wait) {
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		result, err := auth.Refresh(ctx, e.Config.Issuer, stored.RefreshToken)
+		cancel()
+		if err != nil {
+			if errors.Is(err, auth.ErrInvalidGrant) {
+				// Refresh token is gone server-side. Don't pop a
+				// browser; the next dial owns that decision. The
+				// stream we're currently on (if any) keeps working
+				// until it eventually drops -- at which point the
+				// pool's reconnect cycle will hit EnsureValidToken
+				// and surface the re-login affordance.
+				if e.app.logger != nil {
+					e.app.logger.Info("auth refresher: refresh token rejected, stopping background refresher",
+						"cluster", e.Config.Name, "error", err)
+				}
+				return
+			}
+			// Transient: log + retry on next tick.
+			if e.app.logger != nil {
+				e.app.logger.Warn("auth refresher: transient refresh failure",
+					"cluster", e.Config.Name, "error", err)
+			}
+			if e.sleepRefresher(refresherTickFloor) {
+				return
+			}
+			continue
+		}
+
+		if err := config.SaveToken(e.Config.Name, &config.StoredToken{
+			AccessToken:  result.AccessToken,
+			RefreshToken: result.RefreshToken,
+			Expiry:       result.Expiry,
+		}); err != nil {
+			if e.app.logger != nil {
+				e.app.logger.Warn("auth refresher: rolled token but cache write failed",
+					"cluster", e.Config.Name, "error", err)
+			}
+			// Keep looping -- the in-memory result is gone but the
+			// next iteration will reload + retry.
+		} else if e.app.logger != nil {
+			e.app.logger.Info("auth refresher: rolled access token",
+				"cluster", e.Config.Name,
+				"expiresIn", time.Until(result.Expiry).Round(time.Second))
+		}
+
+		// In-stream rotation: ask the server to swap the bearer on the
+		// live stream so admin-side revocation / partition-grant
+		// changes propagate to the in-flight session in O(seconds)
+		// rather than waiting for the next stream drop. The stream's
+		// gRPC metadata is fixed at open time, so without RotateAuth
+		// the server keeps verifying envelopes against the original
+		// token until reconnect. With RotateAuth the server re-verifies
+		// the new token and swaps streamSession.identity + .access.
+		//
+		// Failure is non-fatal: the on-disk credential is fresh, so
+		// any subsequent reconnect still lands on the rotated pair.
+		// A rejected rotate (ErrRotateAuthRejected) typically means
+		// the server's verifier doesn't know about the new token yet
+		// (JWKS-refresh lag) or the user's access changed in a way
+		// that's incompatible with the live stream's partition stamp.
+		e.mu.Lock()
+		conn := e.Conn
+		e.mu.Unlock()
+		if conn != nil {
+			rotateCtx, rotateCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			rotateErr := conn.Dispatcher().RotateAuth(rotateCtx, result.AccessToken)
+			rotateCancel()
+			if rotateErr != nil && e.app.logger != nil {
+				switch {
+				case errors.Is(rotateErr, client.ErrRotateAuthRejected):
+					e.app.logger.Warn("auth refresher: in-stream rotate rejected; on-disk token still rolled",
+						"cluster", e.Config.Name, "error", rotateErr)
+				default:
+					e.app.logger.Warn("auth refresher: in-stream rotate transport failure; on-disk token still rolled",
+						"cluster", e.Config.Name, "error", rotateErr)
+				}
+			} else if e.app.logger != nil {
+				e.app.logger.Info("auth refresher: in-stream bearer rotated",
+					"cluster", e.Config.Name)
+			}
+		}
+	}
+}
+
+// sleepRefresher blocks for d or until the entry shuts down. Returns
+// true when the caller should exit (e.done fired).
+func (e *connEntry) sleepRefresher(d time.Duration) bool {
+	if d <= 0 {
+		d = refresherTickFloor
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return false
+	case <-e.done:
+		return true
+	case <-e.app.quitCh:
+		return true
+	}
+}
+
 // cancelWatch returns the current cancelCh under lock. Needed because
 // Retry() swaps the channel out.
 func (e *connEntry) cancelWatch() <-chan struct{} {
@@ -392,7 +563,12 @@ func (e *connEntry) watchConnection() bool {
 // dialOnce performs a single connect + subscribe + initial-load. On
 // success the entry's Conn/SubMgr/Events/Nodes are populated.
 func (e *connEntry) dialOnce(ctx context.Context) error {
-	token, err := auth.EnsureValidToken(ctx, e.Config)
+	// EnsureValidTokenWithLogger so refresh-path activity ("refreshing
+	// access token", "refresh token rejected") lands in the same log
+	// stream as the surrounding dial events. Without the logger the
+	// silent refresh would be impossible to observe when something
+	// goes wrong.
+	token, err := auth.EnsureValidTokenWithLogger(ctx, e.Config, e.app.logger)
 	if err != nil && e.app.logger != nil {
 		e.app.logger.Warn("auth failed, connecting without token", "cluster", e.Config.Name, "error", err)
 	}

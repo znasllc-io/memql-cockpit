@@ -2,7 +2,7 @@ package editor
 
 import (
 	"github.com/gdamore/tcell/v2"
-	"github.com/visionarys-io/memql-cockpit/cli/ui"
+	"github.com/znasllc-io/memql-cockpit/cli/ui"
 )
 
 // StyledSpan maps a character range within a line to a tcell style.

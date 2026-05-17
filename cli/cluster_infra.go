@@ -3,9 +3,9 @@ package cli
 import (
 	"strings"
 
-	"github.com/visionarys-io/memql-cockpit/cli/cluster"
-	"github.com/visionarys-io/memql-cockpit/cli/dockerprobe"
-	nodev1 "github.com/visionarys-io/memql/component/node/gen"
+	"github.com/znasllc-io/memql-cockpit/cli/cluster"
+	"github.com/znasllc-io/memql-cockpit/cli/dockerprobe"
+	nodev1 "github.com/znasllc-io/memql/component/node/gen"
 )
 
 // memqlServiceNames is the set of docker compose service names that

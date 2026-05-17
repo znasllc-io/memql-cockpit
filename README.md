@@ -2,7 +2,7 @@
 
 Terminal-native IDE and operations console for memQL clusters.
 
-Lifted from `github.com/visionarys-io/memql` on 2026-05-14 as part
+Lifted from `github.com/znasllc-io/memql` on 2026-05-14 as part
 of the monorepo carve-up. The cockpit communicates with memQL
 clusters over gRPC (`MemqlService.Stream` and `NodeService.Stream`)
 and does not embed the memQL engine.
@@ -42,7 +42,7 @@ register a LaunchAgent (macOS) or systemd user service (Linux).
 
 ## memQL core dependency
 
-This module depends on `github.com/visionarys-io/memql` for:
+This module depends on `github.com/znasllc-io/memql` for:
 - `component/grpc/gen` -- generated proto types (wire surface)
 - `component/node/gen` -- generated node proto types
 - `component/node` -- node client / connection primitives

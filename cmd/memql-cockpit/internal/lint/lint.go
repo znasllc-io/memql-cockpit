@@ -15,7 +15,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/visionarys-io/memql/component/memql/dslimports"
+	"github.com/znasllc-io/memql/component/memql/dslimports"
 )
 
 // HandleCommand is the entry point the cockpit binary calls when the

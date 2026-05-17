@@ -22,10 +22,10 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 
-	archembed "github.com/visionarys-io/memql/component/architecture/embedded"
-	"github.com/visionarys-io/memql/component/architecture/model"
+	archembed "github.com/znasllc-io/memql/component/architecture/embedded"
+	"github.com/znasllc-io/memql/component/architecture/model"
 
-	"github.com/visionarys-io/memql-cockpit/cli/ui"
+	"github.com/znasllc-io/memql-cockpit/cli/ui"
 )
 
 // MetricSummary is the row-level observability overlay populated by
