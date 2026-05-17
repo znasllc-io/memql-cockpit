@@ -9,8 +9,8 @@ import (
 	"sync"
 
 	"github.com/gdamore/tcell/v2"
-	"github.com/visionarys-io/memql-cockpit/cli/ui"
-	nodev1 "github.com/visionarys-io/memql/component/node/gen"
+	"github.com/znasllc-io/memql-cockpit/cli/ui"
+	nodev1 "github.com/znasllc-io/memql/component/node/gen"
 )
 
 // NodeInfo describes a cluster node for rendering. The Health field is the
@@ -222,7 +222,7 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 	// "CLUSTER TOPOLOGY" subtitle was redundant noise.
 	//
 	// Cluster name is rendered VERBATIM -- no auto-title-casing. The
-	// user's chosen capitalization in clusters.yaml (e.g. "Visionarys",
+	// user's chosen capitalization in clusters.yaml (e.g. "Znasllc",
 	// "local") is the source of truth.
 	if v.ClusterName != "" {
 		nameStyle := tcell.StyleDefault.Foreground(v.Theme.Info).Background(v.Theme.BG).Bold(true)

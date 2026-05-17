@@ -16,10 +16,10 @@ import (
 	"time"
 
 	"github.com/gdamore/tcell/v2"
-	memqlv1 "github.com/visionarys-io/memql/component/grpc/gen"
+	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 
-	"github.com/visionarys-io/memql-cockpit/cli/client"
-	"github.com/visionarys-io/memql-cockpit/cli/ui"
+	"github.com/znasllc-io/memql-cockpit/cli/client"
+	"github.com/znasllc-io/memql-cockpit/cli/ui"
 )
 
 // FocusPane identifies which pane has keyboard focus.

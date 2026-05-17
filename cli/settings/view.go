@@ -8,8 +8,8 @@ import (
 	"sync"
 
 	"github.com/gdamore/tcell/v2"
-	"github.com/visionarys-io/memql-cockpit/cli/ui"
-	memqlv1 "github.com/visionarys-io/memql/component/grpc/gen"
+	"github.com/znasllc-io/memql-cockpit/cli/ui"
+	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 )
 
 // View renders the Settings tab — version info, MY ACCESS, and keyboard shortcuts.
