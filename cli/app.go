@@ -2210,6 +2210,13 @@ func (a *App) draw() {
 	// positioned at the bottom-right corner (causing the stray '{').
 	a.screen.Inner().ShowCursor(0, 0)
 	a.screen.Inner().HideCursor()
-	a.screen.Sync()
+	// Show() emits ONLY the cells that changed since the last frame
+	// (tcell diffs the back buffer against the visible state).
+	// Sync() re-emits every cell unconditionally -- correct after a
+	// terminal resize or visible corruption, but called every frame
+	// it produces a full-screen repaint that the terminal renders
+	// as a visible flash. The post-resize Sync() call in Run() is
+	// the legitimate use of that primitive.
+	a.screen.Show()
 }
 
