@@ -47,9 +47,9 @@ type App struct {
 	notifications *ui.Notifications
 	tabBar        *ui.TabBar
 	theme         ui.Theme
-	logger   *slog.Logger
-	quitCh   chan struct{}
-	quitOnce sync.Once
+	logger        *slog.Logger
+	quitCh        chan struct{}
+	quitOnce      sync.Once
 
 	// Connection pool. Each cluster the user has opened this session
 	// holds its own entry keyed by cluster Name. Switching clusters
@@ -88,6 +88,13 @@ type App struct {
 	// flooding the crash log. Cleared when the user switches AWAY
 	// and then BACK to the tab (gives them a one-press way to
 	// retry without leaving the cockpit).
+	//
+	// Concurrency: accessed only from the tcell event-loop
+	// goroutine (read inside draw(), written inside dispatchEvent).
+	// No mutex needed; both run serially on the same goroutine.
+	// If a future contributor mutates tabCrashes from a background
+	// goroutine (preemptive panic injection for testing, etc.),
+	// this assumption breaks and the map needs locking.
 	tabCrashes map[string]*crash.Report
 }
 
@@ -263,141 +270,137 @@ func (a *App) Run() error {
 // dispatchEvent handles a single tcell event. Returns true when the
 // user has requested quit (Ctrl+Q / Ctrl+C). Hoisted out of Run()
 // so the entire dispatch body can be wrapped in crash.Catch as one
-// unit; `continue` in the original loop becomes a no-op return here
-// (the loop iteration is already "done with this event" the moment
-// dispatchEvent returns).
+// unit; `continue` in the original loop body became `return false`
+// here (the loop iteration is already "done with this event" the
+// moment dispatchEvent returns).
 func (a *App) dispatchEvent(ev tcell.Event) bool {
-	{
-		_ = ev // placeholder so the original switch can be lifted in
+	switch ev := ev.(type) {
+	case *tcell.EventInterrupt:
+		// Background goroutines (connect, probe) post interrupts to trigger redraws.
+		_ = ev
+		a.draw()
 
-		switch ev := ev.(type) {
-		case *tcell.EventInterrupt:
-			// Background goroutines (connect, probe) post interrupts to trigger redraws.
-			_ = ev
+	case *tcell.EventResize:
+		a.screen.Sync()
+		a.draw()
+
+	case *tcell.EventKey:
+		// Ctrl+Q or Ctrl+C to quit.
+		if ev.Key() == tcell.KeyCtrlC || ev.Key() == tcell.KeyCtrlQ {
+			return true
+		}
+
+		// Help overlay toggle (Ctrl+?). F1 is dedicated to the
+		// Clusters tab now; toggling help on Settings-tab F1 would
+		// conflict with users who just pressed F1 to switch tabs.
+		if ev.Key() == tcell.KeyRune && ev.Rune() == '?' && ev.Modifiers()&tcell.ModCtrl != 0 {
+			a.helpOverlay.Toggle()
 			a.draw()
+			return false
+		}
 
-		case *tcell.EventResize:
-			a.screen.Sync()
+		// Ctrl+K dismisses the currently-shown notification in the
+		// header feed (if any). Dismissal suppresses the exact same
+		// message from re-appearing; a state change re-surfaces it.
+		if ev.Key() == tcell.KeyCtrlK {
+			a.notifications.DismissCurrent()
 			a.draw()
+			return false
+		}
 
-		case *tcell.EventKey:
-			// Ctrl+Q or Ctrl+C to quit.
-			if ev.Key() == tcell.KeyCtrlC || ev.Key() == tcell.KeyCtrlQ {
-				return true
-			}
-
-			// Help overlay toggle (Ctrl+?). F1 is dedicated to the
-			// Clusters tab now; toggling help on Settings-tab F1 would
-			// conflict with users who just pressed F1 to switch tabs.
-			if ev.Key() == tcell.KeyRune && ev.Rune() == '?' && ev.Modifiers()&tcell.ModCtrl != 0 {
-				a.helpOverlay.Toggle()
-				a.draw()
-				return false
-			}
-
-			// Ctrl+K dismisses the currently-shown notification in the
-			// header feed (if any). Dismissal suppresses the exact same
-			// message from re-appearing; a state change re-surfaces it.
-			if ev.Key() == tcell.KeyCtrlK {
-				a.notifications.DismissCurrent()
-				a.draw()
-				return false
-			}
-
-			// Ctrl+Y copies the current notification's message to the
-			// system clipboard. Uses Y (yank) because Ctrl+C is bound
-			// to quit (standard terminal convention). Errors from the
-			// copy tool itself (missing pbcopy/xclip, no display, etc.)
-			// surface to the feed under id clipboard so the user sees
-			// why it didn't work instead of silently failing.
-			//
-			// Meta-acks (NoCopy) ignore Ctrl+Y -- copying the "Message
-			// copied to clipboard." ack back to the clipboard is
-			// nonsense; the key no-ops to match the hint strip.
-			if ev.Key() == tcell.KeyCtrlY {
-				if note, ok := a.notifications.Current(); ok && !note.NoCopy {
-					if err := ui.CopyToClipboard(note.Message); err != nil {
-						// A copy FAILURE is not a meta-ack -- the user
-						// may well want to copy the error text to
-						// investigate it. Use regular Sync.
-						a.notifications.Sync("clipboard", ui.SeverityError,
-							"Copy failed: "+err.Error())
-					} else {
-						// Success ack is meta -- hide the Copy hint on
-						// it via SyncMeta. Dismiss (Ctrl+K) still works.
-						a.notifications.SyncMeta("clipboard", ui.SeverityInfo,
-							"Message copied to clipboard.")
-					}
-					a.draw()
-				}
-				return false
-			}
-
-			// Help overlay consumes Escape when visible.
-			if a.helpOverlay.Visible {
-				if ev.Key() == tcell.KeyEscape {
-					a.helpOverlay.Visible = false
+		// Ctrl+Y copies the current notification's message to the
+		// system clipboard. Uses Y (yank) because Ctrl+C is bound
+		// to quit (standard terminal convention). Errors from the
+		// copy tool itself (missing pbcopy/xclip, no display, etc.)
+		// surface to the feed under id clipboard so the user sees
+		// why it didn't work instead of silently failing.
+		//
+		// Meta-acks (NoCopy) ignore Ctrl+Y -- copying the "Message
+		// copied to clipboard." ack back to the clipboard is
+		// nonsense; the key no-ops to match the hint strip.
+		if ev.Key() == tcell.KeyCtrlY {
+			if note, ok := a.notifications.Current(); ok && !note.NoCopy {
+				if err := ui.CopyToClipboard(note.Message); err != nil {
+					// A copy FAILURE is not a meta-ack -- the user
+					// may well want to copy the error text to
+					// investigate it. Use regular Sync.
+					a.notifications.Sync("clipboard", ui.SeverityError,
+						"Copy failed: "+err.Error())
+				} else {
+					// Success ack is meta -- hide the Copy hint on
+					// it via SyncMeta. Dismiss (Ctrl+K) still works.
+					a.notifications.SyncMeta("clipboard", ui.SeverityInfo,
+						"Message copied to clipboard.")
 				}
 				a.draw()
-				return false
 			}
+			return false
+		}
 
-			// Tab switching. Clears the new tab's sticky crash state
-			// (if any) so switching away + back gives the broken tab
-			// a fresh try -- the user's only built-in "retry this
-			// pane" gesture.
-			if newTab := a.tabBar.HandleKey(ev); newTab >= 0 {
-				a.tabBar.SetActive(newTab)
-				if t := a.tabBar.ActiveTab(); t != nil {
-					delete(a.tabCrashes, t.Name)
+		// Help overlay consumes Escape when visible.
+		if a.helpOverlay.Visible {
+			if ev.Key() == tcell.KeyEscape {
+				a.helpOverlay.Visible = false
+			}
+			a.draw()
+			return false
+		}
+
+		// Tab switching. Clears the new tab's sticky crash state
+		// (if any) so switching away + back gives the broken tab
+		// a fresh try -- the user's only built-in "retry this
+		// pane" gesture.
+		if newTab := a.tabBar.HandleKey(ev); newTab >= 0 {
+			a.tabBar.SetActive(newTab)
+			if t := a.tabBar.ActiveTab(); t != nil {
+				delete(a.tabCrashes, t.Name)
+			}
+			a.draw()
+			return false
+		}
+
+		// Forward to active tab. Wrapped in crash.Catch so a
+		// panic in the tab's HandleEvent doesn't kill the loop;
+		// the tab's draw will surface the placeholder next frame.
+		if tab := a.tabBar.ActiveTab(); tab != nil && tab.Content != nil {
+			var handled bool
+			if report := crash.Catch("event:"+tab.Name, func() {
+				handled = tab.Content.HandleEvent(ev)
+			}); report != nil {
+				a.tabCrashes[tab.Name] = report
+				if a.logger != nil {
+					a.logger.Error("tab handle-event panicked",
+						"tab", tab.Name,
+						"code", report.Code,
+						"logPath", report.LogPath,
+					)
 				}
+				handled = true
+			}
+			if handled {
 				a.draw()
-				return false
 			}
+		}
 
-			// Forward to active tab. Wrapped in crash.Catch so a
-			// panic in the tab's HandleEvent doesn't kill the loop;
-			// the tab's draw will surface the placeholder next frame.
-			if tab := a.tabBar.ActiveTab(); tab != nil && tab.Content != nil {
-				var handled bool
-				if report := crash.Catch("event:"+tab.Name, func() {
-					handled = tab.Content.HandleEvent(ev)
-				}); report != nil {
-					a.tabCrashes[tab.Name] = report
-					if a.logger != nil {
-						a.logger.Error("tab handle-event panicked",
-							"tab", tab.Name,
-							"code", report.Code,
-							"logPath", report.LogPath,
-						)
-					}
-					handled = true
+	case *tcell.EventMouse:
+		// Forward to active tab if needed.
+		if tab := a.tabBar.ActiveTab(); tab != nil && tab.Content != nil {
+			var handled bool
+			if report := crash.Catch("mouse:"+tab.Name, func() {
+				handled = tab.Content.HandleEvent(ev)
+			}); report != nil {
+				a.tabCrashes[tab.Name] = report
+				if a.logger != nil {
+					a.logger.Error("tab handle-mouse panicked",
+						"tab", tab.Name,
+						"code", report.Code,
+						"logPath", report.LogPath,
+					)
 				}
-				if handled {
-					a.draw()
-				}
+				handled = true
 			}
-
-		case *tcell.EventMouse:
-			// Forward to active tab if needed.
-			if tab := a.tabBar.ActiveTab(); tab != nil && tab.Content != nil {
-				var handled bool
-				if report := crash.Catch("mouse:"+tab.Name, func() {
-					handled = tab.Content.HandleEvent(ev)
-				}); report != nil {
-					a.tabCrashes[tab.Name] = report
-					if a.logger != nil {
-						a.logger.Error("tab handle-mouse panicked",
-							"tab", tab.Name,
-							"code", report.Code,
-							"logPath", report.LogPath,
-						)
-					}
-					handled = true
-				}
-				if handled {
-					a.draw()
-				}
+			if handled {
+				a.draw()
 			}
 		}
 	}
@@ -742,10 +745,10 @@ func genesisFilePath() string {
 // IDENTITY_BOOTSTRAP_DOMAIN, and writes a fully-configured local
 // row to clusters.yaml:
 //
-//   DisplayName = <domain>                  (e.g. local.znas.io)
-//   Endpoint    = https://bff.<domain>      (NGINX LB entry)
-//   Issuer      = https://identity.<domain> (OIDC issuer)
-//   ClientId    = cockpit                   (registered cockpit client)
+//	DisplayName = <domain>                  (e.g. local.znas.io)
+//	Endpoint    = https://bff.<domain>      (NGINX LB entry)
+//	Issuer      = https://identity.<domain> (OIDC issuer)
+//	ClientId    = cockpit                   (registered cockpit client)
 //
 // The Name slot stays "local" -- it's the config key, used by yaml
 // lookup, token cache filenames, etc. DisplayName is the
@@ -2345,4 +2348,3 @@ func (a *App) draw() {
 	// have a repro that isn't user-specific.
 	a.screen.Sync()
 }
-
