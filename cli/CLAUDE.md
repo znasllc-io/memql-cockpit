@@ -85,7 +85,10 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
 
 1. **Clusters (F1)** -- cluster manager + partition manager + topology
 2. **Concepts (F2)** -- generic browser for every registered concept
-3. **Settings (F3)** -- credentials, theme, version
+3. **Planner (F3)** -- submit a goal to the Planner Agent and watch
+   the resulting v1:planner:plan + child v1:planner:task rows
+   evolve. Gated on a connected, selected cluster.
+4. **Settings (F4)** -- credentials, theme, version
 
 Concepts is gated on a connected, selected cluster -- it shows a
 placeholder message until the user presses Enter on a cluster row in
@@ -312,6 +315,7 @@ collects the slug + type and hands them off.
 | `client/queries.go`      | `QueryClient` (also runs mutations via ExecuteQuery)          |
 | `config/clusters.go`     | `~/.memql/clusters.yaml` load/save                            |
 | `concepts/`              | Concepts tab (concept picker + row list + generic renderer)   |
+| `planner/`               | Planner tab (goal input + plan list + task list / detail)     |
 | `editor/`                | Reusable text editor with Sense integration                   |
 | `settings/`              | Settings tab                                                  |
 | `ui/`                    | Theme, screen, tab bar, layout primitives                     |

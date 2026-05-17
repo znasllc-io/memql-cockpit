@@ -21,6 +21,7 @@ import (
 	"github.com/znasllc-io/memql-cockpit/cli/config"
 	"github.com/znasllc-io/memql-cockpit/cli/crash"
 	"github.com/znasllc-io/memql-cockpit/cli/discovery"
+	"github.com/znasllc-io/memql-cockpit/cli/planner"
 	"github.com/znasllc-io/memql-cockpit/cli/settings"
 	"github.com/znasllc-io/memql-cockpit/cli/splash"
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
@@ -69,7 +70,15 @@ type App struct {
 	// Tab views
 	conceptsView *concepts.View
 	clustersView *cluster.ClustersView
+	plannerView  *planner.View
 	settingsView *settings.View
+
+	// userID is the cached v1:identity:user.id resolved from
+	// GetMyAccess on cluster connect. Used by the Planner tab as
+	// Plan.requestedBy. Set under userIDMu so the resolver goroutine
+	// and the UI reader don't race on the empty default.
+	userIDMu sync.RWMutex
+	userID   string
 
 	// getQueries returns a QueryClient bound to the currently active
 	// cluster's dispatcher, or nil if none is connected. Cached by
@@ -106,11 +115,13 @@ func NewApp(cfg AppConfig) *App {
 
 	conceptsView := concepts.NewView(theme)
 	clustersView := cluster.NewClustersView(theme)
+	plannerView := planner.NewView(theme)
 
 	// Clusters comes first -- it's the starting context for the session.
 	tabBar := ui.NewTabBar(theme,
 		ui.Tab{Name: "Clusters", Content: clustersView},
 		ui.Tab{Name: "Concepts", Content: conceptsView},
+		ui.Tab{Name: "Planner", Content: plannerView},
 		ui.Tab{Name: "Settings", Content: settingsView},
 	)
 	tabBar.SetActive(0)
@@ -127,6 +138,7 @@ func NewApp(cfg AppConfig) *App {
 		pool:          make(map[string]*connEntry),
 		conceptsView:  conceptsView,
 		clustersView:  clustersView,
+		plannerView:   plannerView,
 		settingsView:  settingsView,
 		helpOverlay:   ui.NewHelpOverlay(theme),
 		tabCrashes:    make(map[string]*crash.Report),
@@ -486,6 +498,7 @@ func (a *App) connect() {
 	// before the first successful dial lands.
 	a.wireConcepts()
 	a.wireCluster()
+	a.wirePlanner()
 
 	for _, cfg := range configs {
 		a.openEntry(cfg)
@@ -1051,6 +1064,17 @@ func (a *App) setSelected(name string) {
 	// empty even though ListConcepts would return data the moment we ask.
 	go a.refreshConcepts(context.Background())
 
+	// Same one-shot refresh for the Planner tab. The 3s background
+	// refresher in plannerView will keep it fresh after this; we just
+	// want the first paint on cluster-up to not wait the full tick.
+	if a.plannerView != nil {
+		go func() {
+			a.plannerView.RefreshPlans()
+			a.plannerView.RefreshTasksForSelected()
+			a.postRedraw()
+		}()
+	}
+
 	a.postRedraw()
 }
 
@@ -1133,6 +1157,78 @@ func (a *App) wireConcepts() {
 	// cluster (e.g. local) is already in stateConnected by the time
 	// wireConcepts runs.
 	go a.refreshConcepts(context.Background())
+}
+
+// wirePlanner connects the Planner tab callbacks to the gRPC client.
+// Same getQueries closure pattern as wireConcepts: every call resolves
+// against the currently active dispatcher, so a cluster switch is
+// transparent to the view. Also kicks off a background refresh loop
+// that polls queryAllPlans + queryTasksForPlan periodically so Plan /
+// Task state appears live without subscriptions.
+//
+// User identity (Plan.requestedBy) is resolved lazily off GetMyAccess
+// the first time a refresh actually returns -- handled inside the
+// resolveUserID goroutine.
+func (a *App) wirePlanner() {
+	if a.plannerView == nil {
+		return
+	}
+	getQueries := func() *client.QueryClient {
+		d := a.activeDispatcher()
+		if d == nil {
+			return nil
+		}
+		return client.NewQueryClient(d)
+	}
+	a.plannerView.QueryClient = getQueries
+	a.plannerView.UserID = func() string {
+		a.userIDMu.RLock()
+		defer a.userIDMu.RUnlock()
+		return a.userID
+	}
+	a.plannerView.OnStatus = func(msg string) {
+		if a.notifications != nil {
+			a.notifications.Sync("planner", ui.SeverityWarning, msg)
+		}
+	}
+	a.plannerView.OnRedraw = func() {
+		// Background refresher landed new data. Post an Interrupt so
+		// the tcell event loop re-renders even though no key was
+		// pressed.
+		if a.screen != nil {
+			a.screen.PostEvent(tcell.NewEventInterrupt(nil))
+		}
+	}
+	a.plannerView.StartRefreshLoop(a.quitCh, 3*time.Second)
+	go a.resolveUserID()
+}
+
+// resolveUserID pulls the caller's v1:identity:user.id from
+// GetMyAccess once a cluster connection is live. Retried with a short
+// backoff because dispatcher availability is racing against the
+// per-cluster dial lifecycle. Cached under userIDMu and exposed to
+// the Planner tab as Plan.requestedBy.
+func (a *App) resolveUserID() {
+	for attempt := 0; attempt < 30; attempt++ {
+		d := a.activeDispatcher()
+		if d != nil {
+			qc := client.NewQueryClient(d)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			res, err := qc.GetMyAccess(ctx)
+			cancel()
+			if err == nil && res != nil && res.GetUserId() != "" {
+				a.userIDMu.Lock()
+				a.userID = res.GetUserId()
+				a.userIDMu.Unlock()
+				return
+			}
+		}
+		select {
+		case <-a.quitCh:
+			return
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
 // wireCluster wires the topology pane's OnInitialLoad callback to the
@@ -2094,25 +2190,32 @@ func (a *App) persistSelectedPartition(clusterName, partition string) {
 	}
 }
 
-// updateTabGating sets the GatedMessage on the Concepts tab based on
-// whether the user's selected cluster has a live connection. Called
-// from draw() so state changes show up on the next repaint.
+// updateTabGating sets the GatedMessage on the cluster-dependent tabs
+// (Concepts + Planner) based on whether the user's selected cluster
+// has a live connection. Called from draw() so state changes show up
+// on the next repaint.
 func (a *App) updateTabGating() {
+	setGated := func(msg string) {
+		a.conceptsView.GatedMessage = msg
+		if a.plannerView != nil {
+			a.plannerView.GatedMessage = msg
+		}
+	}
 	name := a.selectedName()
 	if name == "" {
-		a.conceptsView.GatedMessage = "No cluster selected. Switch to the Clusters tab (F1) and press Enter on a cluster."
+		setGated("No cluster selected. Switch to the Clusters tab (F1) and press Enter on a cluster.")
 		return
 	}
 	a.poolMu.RLock()
 	entry := a.pool[name]
 	a.poolMu.RUnlock()
 	if entry == nil {
-		a.conceptsView.GatedMessage = fmt.Sprintf("Selected cluster %q is not open. Switch to the Clusters tab (F1) and press Enter on its row.", name)
+		setGated(fmt.Sprintf("Selected cluster %q is not open. Switch to the Clusters tab (F1) and press Enter on its row.", name))
 		return
 	}
 	state, _, _ := entry.stateSnapshot()
 	if state == stateConnected {
-		a.conceptsView.GatedMessage = ""
+		setGated("")
 		return
 	}
 	var why string
@@ -2124,7 +2227,7 @@ func (a *App) updateTabGating() {
 	default:
 		why = state.String()
 	}
-	a.conceptsView.GatedMessage = fmt.Sprintf("Selected cluster %q is %s. Available again once it reaches a connected state.", name, why)
+	setGated(fmt.Sprintf("Selected cluster %q is %s. Available again once it reaches a connected state.", name, why))
 }
 
 // backoffRedrawLoop schedules periodic redraws while any pool entry
