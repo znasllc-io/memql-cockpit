@@ -181,17 +181,24 @@ func (v *View) drawConceptList(screen *ui.Screen, bounds ui.Rect) {
 	if v.Focus == FocusConcepts {
 		titleStyle = v.Theme.AccentStyle().Bold(true)
 	}
-	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, " CONCEPTS ", titleStyle)
+	title := " CONCEPTS "
+	if c := len(v.Concepts); c > 0 {
+		title = fmt.Sprintf(" CONCEPTS (%d/%d) ", v.conceptSelected+1, c)
+	}
+	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, titleStyle)
 
 	if len(v.Concepts) == 0 {
 		v.drawCentered(screen, bounds, "No concepts loaded.")
+		v.drawBottomHints(screen, bounds, hintsForConcepts(v))
 		return
 	}
 
+	// Reserve one bottom row for the action-hint chrome band.
+	const chromeH = 1
 	listTop := bounds.Y + 2
-	listHeight := bounds.Height - 3
+	listHeight := bounds.Height - 2 - chromeH
 	if listHeight < 1 {
-		return
+		listHeight = 1
 	}
 
 	v.clampConceptScroll(listHeight)
@@ -210,8 +217,7 @@ func (v *View) drawConceptList(screen *ui.Screen, bounds ui.Rect) {
 		screen.DrawText(bounds.X+2, y, bounds.Width-3, label, style)
 	}
 
-	footer := footerCount(v.conceptSelected, len(v.Concepts))
-	screen.DrawText(bounds.X+1, bounds.Y+bounds.Height-1, bounds.Width-2, footer, v.Theme.SubtleStyle())
+	v.drawBottomHints(screen, bounds, hintsForConcepts(v))
 }
 
 func (v *View) drawRowList(screen *ui.Screen, bounds ui.Rect) {
@@ -225,35 +231,35 @@ func (v *View) drawRowList(screen *ui.Screen, bounds ui.Rect) {
 	if v.conceptSelected >= 0 && v.conceptSelected < len(v.Concepts) {
 		conceptId = v.Concepts[v.conceptSelected].GetId()
 	}
+	matches := v.rowMatches
 	title := " ROWS "
 	if conceptId != "" {
-		title = " ROWS: " + conceptId + " "
+		switch {
+		case len(matches) < len(v.Rows):
+			title = fmt.Sprintf(" ROWS: %s (%d/%d filtered from %d) ", conceptId, v.rowSelected+1, len(matches), len(v.Rows))
+		case len(matches) > 0:
+			title = fmt.Sprintf(" ROWS: %s (%d/%d) ", conceptId, v.rowSelected+1, len(matches))
+		default:
+			title = " ROWS: " + conceptId + " "
+		}
 	}
 	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, titleStyle)
 
-	// Search row.
-	searchY := bounds.Y + 1
-	searchStyle := v.Theme.SubtleStyle()
-	prefix := "/search: "
-	display := prefix + v.rowFilter
-	if v.searchOn {
-		display = "[search] " + v.rowFilter + "_"
-		searchStyle = v.Theme.AccentStyle()
-	}
-	screen.DrawText(bounds.X+1, searchY, bounds.Width-2, display, searchStyle)
-
+	// Reserve one bottom row for the chrome band (action hints or
+	// active search input). The list grows up from above the chrome.
+	const chromeH = 1
 	if len(v.Rows) == 0 {
-		v.drawCentered(screen, ui.Rect{X: bounds.X, Y: bounds.Y + 3, Width: bounds.Width, Height: bounds.Height - 3}, "No rows.")
+		v.drawCentered(screen, ui.Rect{X: bounds.X, Y: bounds.Y + 2, Width: bounds.Width, Height: bounds.Height - 2 - chromeH}, "No rows.")
+		v.drawBottomHints(screen, bounds, hintsForRows(v))
 		return
 	}
 
-	listTop := bounds.Y + 3
-	listHeight := bounds.Height - 4
+	listTop := bounds.Y + 2
+	listHeight := bounds.Height - 2 - chromeH
 	if listHeight < 1 {
-		return
+		listHeight = 1
 	}
 
-	matches := v.rowMatches
 	v.clampRowScroll(listHeight)
 
 	for i := 0; i < listHeight && v.rowScrollY+i < len(matches); i++ {
@@ -270,11 +276,7 @@ func (v *View) drawRowList(screen *ui.Screen, bounds ui.Rect) {
 		screen.DrawText(bounds.X+2, y, bounds.Width-3, label, style)
 	}
 
-	footer := footerCount(v.rowSelected, len(matches))
-	if len(matches) < len(v.Rows) {
-		footer = fmt.Sprintf(" %d/%d (filtered from %d) ", v.rowSelected+1, len(matches), len(v.Rows))
-	}
-	screen.DrawText(bounds.X+1, bounds.Y+bounds.Height-1, bounds.Width-2, footer, v.Theme.SubtleStyle())
+	v.drawBottomHints(screen, bounds, hintsForRows(v))
 }
 
 func (v *View) drawDetail(screen *ui.Screen, bounds ui.Rect) {
@@ -286,7 +288,9 @@ func (v *View) drawDetail(screen *ui.Screen, bounds ui.Rect) {
 	}
 	title := " DETAIL "
 	if v.versionsOpen {
-		title = " VERSIONS (Esc to close) "
+		title = fmt.Sprintf(" VERSIONS (%d/%d) ", v.versionSelected+1, len(v.versionRows))
+	} else if n := len(v.detailLines); n > 0 {
+		title = fmt.Sprintf(" DETAIL (line %d/%d) ", v.detailScroll+1, n)
 	}
 	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, titleStyle)
 
@@ -297,31 +301,35 @@ func (v *View) drawDetail(screen *ui.Screen, bounds ui.Rect) {
 
 	if len(v.detailLines) == 0 {
 		v.drawCentered(screen, bounds, "Select a row to see its rendered detail.")
+		v.drawBottomHints(screen, bounds, hintsForDetail(v))
 		return
 	}
 
+	// Reserve one bottom row for the action-hint chrome band.
+	const chromeH = 1
 	contentTop := bounds.Y + 2
-	contentH := bounds.Height - 3
+	contentH := bounds.Height - 2 - chromeH
 	if contentH < 1 {
-		return
+		contentH = 1
 	}
 	v.clampDetailScroll(contentH)
 	for i := 0; i < contentH && v.detailScroll+i < len(v.detailLines); i++ {
 		screen.DrawText(bounds.X+2, contentTop+i, bounds.Width-3, v.detailLines[v.detailScroll+i], v.Theme.BaseStyle())
 	}
-	footer := fmt.Sprintf(" line %d/%d ", v.detailScroll+1, len(v.detailLines))
-	screen.DrawText(bounds.X+1, bounds.Y+bounds.Height-1, bounds.Width-2, footer, v.Theme.SubtleStyle())
+	v.drawBottomHints(screen, bounds, hintsForDetail(v))
 }
 
 func (v *View) drawVersionsList(screen *ui.Screen, bounds ui.Rect) {
 	if len(v.versionRows) == 0 {
 		v.drawCentered(screen, bounds, "No version history for this row.")
+		v.drawBottomHints(screen, bounds, hintsForDetail(v))
 		return
 	}
+	const chromeH = 1
 	contentTop := bounds.Y + 2
-	contentH := bounds.Height - 3
+	contentH := bounds.Height - 2 - chromeH
 	if contentH < 1 {
-		return
+		contentH = 1
 	}
 	for i := 0; i < contentH && v.versionScrollY+i < len(v.versionRows); i++ {
 		idx := v.versionScrollY + i
@@ -338,8 +346,7 @@ func (v *View) drawVersionsList(screen *ui.Screen, bounds ui.Rect) {
 		label := fmt.Sprintf("%s  by %s  (%s)", shortenTimestamp(when), who, prov)
 		screen.DrawText(bounds.X+2, y, bounds.Width-3, label, style)
 	}
-	footer := footerCount(v.versionSelected, len(v.versionRows))
-	screen.DrawText(bounds.X+1, bounds.Y+bounds.Height-1, bounds.Width-2, footer, v.Theme.SubtleStyle())
+	v.drawBottomHints(screen, bounds, hintsForDetail(v))
 }
 
 func (v *View) drawCentered(screen *ui.Screen, bounds ui.Rect, msg string) {
@@ -349,6 +356,61 @@ func (v *View) drawCentered(screen *ui.Screen, bounds ui.Rect, msg string) {
 		lineX = bounds.X + 1
 	}
 	screen.DrawText(lineX, midY, bounds.Width-1, msg, v.Theme.SubtleStyle())
+}
+
+// drawBottomHints renders the per-pane chrome band anchored to the
+// last row of bounds. Implements the panel chrome contract documented
+// in cli/CLAUDE.md "Panel chrome contract": action hints live at the
+// bottom in `Key:Action` format, separated by two spaces. Search input
+// rides the same band -- when active for the rows pane the hint is
+// replaced with `:search <query>_` in accent style. Title-bar
+// counters do the work of the old per-pane count footers.
+func (v *View) drawBottomHints(screen *ui.Screen, bounds ui.Rect, hint paneHint) {
+	if hint.text == "" {
+		return
+	}
+	style := v.Theme.SubtleStyle()
+	if hint.accent {
+		style = v.Theme.AccentStyle()
+	}
+	ui.DrawBottom(screen, bounds, style, 1, hint.text)
+}
+
+// paneHint is what drawBottomHints renders. accent=true is reserved
+// for the active-search prompt so it visually stands out from the
+// regular subtle action-hint strip.
+type paneHint struct {
+	text   string
+	accent bool
+}
+
+func hintsForConcepts(v *View) paneHint {
+	if len(v.Concepts) == 0 {
+		return paneHint{text: "Tab:Cycle"}
+	}
+	return paneHint{text: "↑/↓:Move  Enter:Open  Tab:Cycle"}
+}
+
+func hintsForRows(v *View) paneHint {
+	if v.searchOn {
+		// Active search input. Vim-style `:search` prefix so the
+		// prompt visually echoes the key the user just pressed --
+		// no second mental model for "search is on" vs. "press : to
+		// search".
+		return paneHint{text: ":search " + v.rowFilter + "_", accent: true}
+	}
+	parts := []string{"↑/↓:Move", "Enter:Detail", ":Search", "v:Versions", "Tab:Cycle"}
+	if v.rowFilter != "" {
+		parts = append(parts, "Esc:ClearSearch")
+	}
+	return paneHint{text: strings.Join(parts, "  ")}
+}
+
+func hintsForDetail(v *View) paneHint {
+	if v.versionsOpen {
+		return paneHint{text: "↑/↓:Move  Esc:CloseVersions  Tab:Cycle"}
+	}
+	return paneHint{text: "↑/↓:Scroll  PgUp/PgDn:Page  Esc:Back  Tab:Cycle"}
 }
 
 // HandleEvent processes keyboard input for the Concepts tab. Takes
@@ -375,8 +437,11 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 		return true
 	}
 
-	// Slash anywhere -> jump to search.
-	if keyEv.Key() == tcell.KeyRune && keyEv.Rune() == '/' {
+	// `:` anywhere -> jump to search. Mirrors the panel chrome
+	// contract: the bottom-band hint advertises `:Search`, and the
+	// active prompt renders as `:search <query>_` in the same band.
+	// `/` is intentionally NOT a trigger -- see cli/CLAUDE.md.
+	if keyEv.Key() == tcell.KeyRune && keyEv.Rune() == ':' {
 		v.Focus = FocusRows
 		v.searchOn = true
 		return true
@@ -448,6 +513,17 @@ func (v *View) handleRowListKeyLocked(ev *tcell.EventKey) bool {
 		v.refreshDetailFromCurrentLocked()
 		v.Focus = FocusDetail
 		return true
+	case tcell.KeyEsc:
+		// Esc clears an active filter so the user can get back to the
+		// full row list without re-typing through the search box. The
+		// `Esc:Clear search` chip in the bottom hint band advertises
+		// this affordance; the chip only shows when rowFilter != "".
+		if v.rowFilter != "" {
+			v.rowFilter = ""
+			v.recomputeRowMatchesLocked()
+			return true
+		}
+		return false
 	}
 	return false
 }
@@ -712,13 +788,6 @@ func rowDisplayLabel(row map[string]any) string {
 		}
 	}
 	return getString(row, "id")
-}
-
-func footerCount(sel, total int) string {
-	if total == 0 {
-		return ""
-	}
-	return fmt.Sprintf(" %d/%d ", sel+1, total)
 }
 
 func shortenTimestamp(ts string) string {
