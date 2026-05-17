@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	memqlv1 "github.com/visionarys-io/memql/component/grpc/gen"
+	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 )
 
 // runHTTPFetch implements workerHost.http_fetch with SSRF hardening

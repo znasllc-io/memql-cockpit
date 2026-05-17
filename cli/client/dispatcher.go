@@ -2,12 +2,14 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 
 	"github.com/google/uuid"
-	memqlv1 "github.com/visionarys-io/memql/component/grpc/gen"
+	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 )
 
 // Dispatcher handles message multiplexing over a single gRPC stream.
@@ -198,6 +200,61 @@ func (d *Dispatcher) SendAndWait(ctx context.Context, msg *memqlv1.MemqlClientMe
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+// ErrRotateAuthRejected is returned by RotateAuth when the server
+// accepted the envelope but refused the new token. The wrapped error
+// message includes the server's RotateAuthResult.error code +
+// description so callers can distinguish transient ("access_load_failed")
+// from terminal ("invalid_token") rejections.
+var ErrRotateAuthRejected = errors.New("rotate_auth: server rejected new token")
+
+// RotateAuth swaps the bearer on this stream's session without
+// tearing the stream down. Called by the cockpit's background token
+// refresher after a successful /auth/refresh round-trip: the on-disk
+// credential was rolled forward, and we now ask the server to align
+// its in-memory identity with the rolled token.
+//
+// Contract:
+//   - Returns nil if and only if the server replied
+//     RotateAuthResult{ok: true}.
+//   - Returns ErrRotateAuthRejected (wrapped) if the server replied
+//     ok=false. The stream stays open; the caller can fall back to
+//     dropping the connection + reconnecting, or just keep using the
+//     old bearer until the next natural reconnect.
+//   - Returns a transport error if the stream is down or the context
+//     deadline fires before the reply lands. Same fallback applies.
+func (d *Dispatcher) RotateAuth(ctx context.Context, accessToken string) error {
+	if d == nil {
+		return errors.New("rotate_auth: nil dispatcher")
+	}
+	accessToken = strings.TrimSpace(accessToken)
+	if accessToken == "" {
+		return errors.New("rotate_auth: empty access token")
+	}
+	resp, err := d.SendAndWait(ctx, &memqlv1.MemqlClientMessage{
+		Payload: &memqlv1.MemqlClientMessage_RotateAuth{
+			RotateAuth: &memqlv1.RotateAuthMsg{AccessToken: accessToken},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("rotate_auth: %w", err)
+	}
+	result := resp.GetRotateAuthResult()
+	if result == nil {
+		// Wrong reply shape -- shouldn't happen against an updated
+		// server, but a forward-compat client should fail loud rather
+		// than silently treat the stream as rotated.
+		return fmt.Errorf("rotate_auth: server reply missing RotateAuthResult payload")
+	}
+	if !result.GetOk() {
+		code := result.GetError()
+		if code == "" {
+			code = "unknown"
+		}
+		return fmt.Errorf("%w: %s: %s", ErrRotateAuthRejected, code, result.GetErrorDescription())
+	}
+	return nil
 }
 
 // Events returns the channel for uncorrelated server messages (events, heartbeats).

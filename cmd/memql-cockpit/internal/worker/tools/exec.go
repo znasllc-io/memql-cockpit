@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	memqlv1 "github.com/visionarys-io/memql/component/grpc/gen"
+	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 )
 
 // runExec implements workerHost.exec: run a shell command, capture

@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 )
 
-const launchAgentLabel = "com.visionarys.memql-cockpit-worker"
+const launchAgentLabel = "com.znasllc.memql-cockpit-worker"
 
 // InstallLaunchAgent drops a per-user LaunchAgent plist and loads
 // it. Subsequent reboots auto-start the worker without the user

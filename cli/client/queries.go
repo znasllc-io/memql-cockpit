@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	memqlv1 "github.com/visionarys-io/memql/component/grpc/gen"
+	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 	"google.golang.org/protobuf/encoding/protojson"
 )
 

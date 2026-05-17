@@ -3,8 +3,8 @@ package client
 import (
 	"context"
 
-	memqlv1 "github.com/visionarys-io/memql/component/grpc/gen"
-	"github.com/visionarys-io/memql-cockpit/cli/editor"
+	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
+	"github.com/znasllc-io/memql-cockpit/cli/editor"
 )
 
 // SenseClient provides convenience methods for MemQL Sense operations over gRPC.

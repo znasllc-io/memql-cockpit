@@ -24,8 +24,8 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 
-	"github.com/visionarys-io/memql-cockpit/cli/config"
-	"github.com/visionarys-io/memql-cockpit/cli/ui"
+	"github.com/znasllc-io/memql-cockpit/cli/config"
+	"github.com/znasllc-io/memql-cockpit/cli/ui"
 )
 
 const (

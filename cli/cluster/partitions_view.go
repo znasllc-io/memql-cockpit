@@ -5,8 +5,8 @@ import (
 	"sync"
 
 	"github.com/gdamore/tcell/v2"
-	"github.com/visionarys-io/memql-cockpit/cli/ui"
-	"github.com/visionarys-io/memql/core/id"
+	"github.com/znasllc-io/memql-cockpit/cli/ui"
+	"github.com/znasllc-io/memql/core/id"
 )
 
 // PartitionInfo describes one v1:platform:partition row for the
@@ -160,7 +160,7 @@ func (v *PartitionsView) Draw(screen *ui.Screen, bounds ui.Rect) {
 	// Content region excludes the title row on top. ui.DrawBottom
 	// anchors text to the last row of this region and wraps as needed,
 	// so long empty-state messages like
-	// '"visionarys" is unreachable. Press Enter on the cluster row to
+	// '"staging" is unreachable. Press Enter on the cluster row to
 	// retry.' stack onto a second row instead of getting truncated.
 	contentBounds := ui.Rect{X: bounds.X, Y: bounds.Y + 1, Width: bounds.Width, Height: bounds.Height - 1}
 
