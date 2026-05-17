@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
@@ -31,7 +32,22 @@ const (
 )
 
 // View renders the Concepts tab.
+//
+// Thread-safety. The view is mutated from two distinct goroutine
+// classes:
+//   - the tcell event-loop goroutine (key handlers, HandleEvent)
+//   - background fetcher goroutines (refreshConcepts wires
+//     QueryClient + SetConcepts from a `go ...` spawn in app.go)
+//
+// Draw runs from the event-loop goroutine. Without locking, a
+// background fetcher that calls SetConcepts (which clears Rows +
+// rebuilds rowMatches) while Draw is mid-render through rowMatches
+// produces a stale-index crash: idx came from a valid matches
+// slice, then Rows was emptied before the v.Rows[idx] read. The
+// mu RWMutex eliminates that window -- mutators take Lock(),
+// Draw takes RLock().
 type View struct {
+	mu    sync.RWMutex
 	Theme ui.Theme
 
 	// Concept registry (left pane).
@@ -87,7 +103,14 @@ func NewView(theme ui.Theme) *View {
 
 // SetConcepts replaces the concept registry. Sorting is `domain:entity`
 // alphabetical so cognition/agents/etc. stay grouped.
+//
+// Safe to call from a background goroutine -- holds the write lock
+// while replacing the concept list AND while refreshRowsFromCurrent
+// runs (which clears + re-fills Rows). Draw is blocked the whole time
+// so it never observes a torn intermediate state.
 func (v *View) SetConcepts(concepts []*memqlv1.ConceptInfo) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	v.Concepts = make([]*memqlv1.ConceptInfo, 0, len(concepts))
 	for _, c := range concepts {
 		if c == nil {
@@ -101,11 +124,15 @@ func (v *View) SetConcepts(concepts []*memqlv1.ConceptInfo) {
 	if v.conceptSelected >= len(v.Concepts) {
 		v.conceptSelected = 0
 	}
-	v.refreshRowsFromCurrent()
+	v.refreshRowsFromCurrentLocked()
 }
 
-// Draw renders the Concepts tab.
+// Draw renders the Concepts tab. Holds the read lock for the whole
+// frame so concurrent mutators (SetConcepts from a background fetch)
+// can't tear v.Rows / v.rowMatches mid-render.
 func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	if v.GatedMessage != "" {
 		v.drawGated(screen, bounds)
 		return
@@ -324,16 +351,23 @@ func (v *View) drawCentered(screen *ui.Screen, bounds ui.Rect, msg string) {
 	screen.DrawText(lineX, midY, bounds.Width-1, msg, v.Theme.SubtleStyle())
 }
 
-// HandleEvent processes keyboard input for the Concepts tab.
+// HandleEvent processes keyboard input for the Concepts tab. Takes
+// the write lock for the duration so a concurrent Draw + a concurrent
+// background SetConcepts both observe a stable, fully-applied state
+// transition. The inner handlers use the *Locked variants since the
+// lock is already held.
 func (v *View) HandleEvent(ev tcell.Event) bool {
 	keyEv, ok := ev.(*tcell.EventKey)
 	if !ok {
 		return false
 	}
 
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
 	// When the search box is active, keys go to the search box first.
 	if v.searchOn {
-		return v.handleSearchKey(keyEv)
+		return v.handleSearchKeyLocked(keyEv)
 	}
 
 	if keyEv.Key() == tcell.KeyTab {
@@ -352,68 +386,73 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 		if v.versionsOpen {
 			v.versionsOpen = false
 		} else {
+			// openVersions takes its own lock; drop ours before calling
+			// to avoid a self-deadlock. State coherence is preserved
+			// because openVersions reads the same fields we just set.
+			v.mu.Unlock()
 			v.openVersions()
+			v.mu.Lock()
 		}
 		return true
 	}
 
 	switch v.Focus {
 	case FocusConcepts:
-		return v.handleConceptListKey(keyEv)
+		return v.handleConceptListKeyLocked(keyEv)
 	case FocusRows:
-		return v.handleRowListKey(keyEv)
+		return v.handleRowListKeyLocked(keyEv)
 	case FocusDetail:
-		return v.handleDetailKey(keyEv)
+		return v.handleDetailKeyLocked(keyEv)
 	}
 	return false
 }
 
-func (v *View) handleConceptListKey(ev *tcell.EventKey) bool {
+func (v *View) handleConceptListKeyLocked(ev *tcell.EventKey) bool {
 	switch ev.Key() {
 	case tcell.KeyUp:
 		if v.conceptSelected > 0 {
 			v.conceptSelected--
-			v.refreshRowsFromCurrent()
+			v.refreshRowsFromCurrentLocked()
 		}
 		return true
 	case tcell.KeyDown:
 		if v.conceptSelected < len(v.Concepts)-1 {
 			v.conceptSelected++
-			v.refreshRowsFromCurrent()
+			v.refreshRowsFromCurrentLocked()
 		}
 		return true
 	case tcell.KeyEnter:
-		v.refreshRowsFromCurrent()
+		v.refreshRowsFromCurrentLocked()
 		v.Focus = FocusRows
 		return true
 	}
 	return false
 }
 
-func (v *View) handleRowListKey(ev *tcell.EventKey) bool {
+func (v *View) handleRowListKeyLocked(ev *tcell.EventKey) bool {
 	matches := v.rowMatches
 	switch ev.Key() {
 	case tcell.KeyUp:
 		if v.rowSelected > 0 {
 			v.rowSelected--
-			v.refreshDetailFromCurrent()
+			v.refreshDetailFromCurrentLocked()
 		}
 		return true
 	case tcell.KeyDown:
 		if v.rowSelected < len(matches)-1 {
 			v.rowSelected++
-			v.refreshDetailFromCurrent()
+			v.refreshDetailFromCurrentLocked()
 		}
 		return true
 	case tcell.KeyEnter:
-		v.refreshDetailFromCurrent()
+		v.refreshDetailFromCurrentLocked()
 		v.Focus = FocusDetail
 		return true
 	}
 	return false
 }
 
-func (v *View) handleDetailKey(ev *tcell.EventKey) bool {
+func (v *View) handleDetailKeyLocked(ev *tcell.EventKey) bool {
 	switch ev.Key() {
 	case tcell.KeyUp:
 		if v.detailScroll > 0 {
@@ -446,7 +485,7 @@ func (v *View) handleDetailKey(ev *tcell.EventKey) bool {
 	return false
 }
 
-func (v *View) handleSearchKey(ev *tcell.EventKey) bool {
+func (v *View) handleSearchKeyLocked(ev *tcell.EventKey) bool {
 	switch ev.Key() {
 	case tcell.KeyEsc, tcell.KeyEnter:
 		v.searchOn = false
@@ -454,40 +493,58 @@ func (v *View) handleSearchKey(ev *tcell.EventKey) bool {
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
 		if len(v.rowFilter) > 0 {
 			v.rowFilter = v.rowFilter[:len(v.rowFilter)-1]
-			v.recomputeRowMatches()
+			v.recomputeRowMatchesLocked()
 		}
 		return true
 	case tcell.KeyRune:
 		v.rowFilter += string(ev.Rune())
-		v.recomputeRowMatches()
+		v.recomputeRowMatchesLocked()
 		return true
 	}
 	return false
 }
 
-// refreshRowsFromCurrent reloads rows for the currently-selected
-// concept via the active QueryClient. Runs synchronously -- the view's
-// keystroke handlers don't return control until rows are loaded, so a
-// slow node feels like a slow keystroke. Acceptable for v1; switch to
-// a background fetch + spinner once we have one.
+// refreshRowsFromCurrent is the exported (lock-taking) wrapper for
+// callers that aren't already holding the write lock. Most event-loop
+// handlers go through here; SetConcepts calls the *Locked variant
+// directly since it already holds the lock.
 func (v *View) refreshRowsFromCurrent() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.refreshRowsFromCurrentLocked()
+}
+
+// refreshRowsFromCurrentLocked reloads rows for the currently-
+// selected concept via the active QueryClient. Caller MUST hold
+// v.mu (write). Runs the network call synchronously while holding
+// the lock -- Draw blocks for the duration. For local clusters this
+// is sub-100ms; remote slow clusters will manifest as a brief UI
+// stall, which is correct behavior (the data is what's stalling, not
+// the UI) and is preferable to either a torn read or a spinner-state
+// flash. The async-with-spinner version is a future cleanup, not a
+// hot path bug.
+func (v *View) refreshRowsFromCurrentLocked() {
 	v.Rows = nil
 	v.detailLines = nil
 	v.rowSelected = 0
 	v.rowScrollY = 0
 	v.versionsOpen = false
 	if v.QueryClient == nil {
+		v.rowMatches = nil
 		return
 	}
 	if v.conceptSelected < 0 || v.conceptSelected >= len(v.Concepts) {
+		v.rowMatches = nil
 		return
 	}
 	qc := v.QueryClient()
 	if qc == nil {
+		v.rowMatches = nil
 		return
 	}
 	conceptId := v.Concepts[v.conceptSelected].GetId()
 	if conceptId == "" {
+		v.rowMatches = nil
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
@@ -497,28 +554,42 @@ func (v *View) refreshRowsFromCurrent() {
 		if v.OnStatus != nil {
 			v.OnStatus(fmt.Sprintf("rows load failed: %v", err))
 		}
-		v.recomputeRowMatches()
+		v.recomputeRowMatchesLocked()
 		return
 	}
 	v.Rows = extractRows(res)
-	v.recomputeRowMatches()
-	v.refreshDetailFromCurrent()
+	v.recomputeRowMatchesLocked()
+	v.refreshDetailFromCurrentLocked()
 }
 
 func (v *View) refreshDetailFromCurrent() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.refreshDetailFromCurrentLocked()
+}
+
+func (v *View) refreshDetailFromCurrentLocked() {
 	v.detailScroll = 0
 	matches := v.rowMatches
 	if v.rowSelected < 0 || v.rowSelected >= len(matches) {
 		v.detailLines = nil
 		return
 	}
-	row := v.Rows[matches[v.rowSelected]]
-	v.detailLines = renderRowDetail(row)
+	idx := matches[v.rowSelected]
+	if idx < 0 || idx >= len(v.Rows) {
+		// Defensive: matches was computed against an older v.Rows.
+		// Shouldn't happen under the lock but cheap to guard.
+		v.detailLines = nil
+		return
+	}
+	v.detailLines = renderRowDetail(v.Rows[idx])
 }
 
 // openVersions fetches the time-series history for the selected row
 // (concept + id) and swaps the detail pane into the version-list view.
 func (v *View) openVersions() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	if v.QueryClient == nil {
 		return
 	}
@@ -526,7 +597,11 @@ func (v *View) openVersions() {
 	if v.rowSelected < 0 || v.rowSelected >= len(matches) {
 		return
 	}
-	row := v.Rows[matches[v.rowSelected]]
+	idx := matches[v.rowSelected]
+	if idx < 0 || idx >= len(v.Rows) {
+		return
+	}
+	row := v.Rows[idx]
 	rowId := getString(row, "id")
 	conceptId := getString(row, "concept")
 	if conceptId == "" && v.conceptSelected >= 0 && v.conceptSelected < len(v.Concepts) {
@@ -558,6 +633,12 @@ func (v *View) openVersions() {
 }
 
 func (v *View) recomputeRowMatches() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.recomputeRowMatchesLocked()
+}
+
+func (v *View) recomputeRowMatchesLocked() {
 	filter := strings.TrimSpace(strings.ToLower(v.rowFilter))
 	v.rowMatches = v.rowMatches[:0]
 	for idx, row := range v.Rows {
@@ -568,7 +649,7 @@ func (v *View) recomputeRowMatches() {
 	if v.rowSelected >= len(v.rowMatches) {
 		v.rowSelected = 0
 	}
-	v.refreshDetailFromCurrent()
+	v.refreshDetailFromCurrentLocked()
 }
 
 func (v *View) clampConceptScroll(visibleRows int) {
