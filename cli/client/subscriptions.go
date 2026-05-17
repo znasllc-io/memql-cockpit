@@ -6,7 +6,7 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
-	memqlv1 "github.com/visionarys-io/memql/component/grpc/gen"
+	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 )
 
 // SubscriptionManager handles event subscriptions over the gRPC stream.

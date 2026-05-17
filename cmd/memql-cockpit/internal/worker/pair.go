@@ -12,8 +12,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/visionarys-io/memql-cockpit/cmd/memql-cockpit/internal/worker/tools"
-	"github.com/visionarys-io/memql/component/identity/workerpairing"
+	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/internal/worker/tools"
+	"github.com/znasllc-io/memql/component/identity/workerpairing"
 )
 
 // PairOptions configures the pairing wizard's entry conditions.

@@ -135,7 +135,7 @@ function install_launch_agent() {
         return 0
     fi
     local plist_dir="${HOME}/Library/LaunchAgents"
-    local plist="${plist_dir}/com.visionarys.memql-cockpit-worker.plist"
+    local plist="${plist_dir}/com.znasllc.memql-cockpit-worker.plist"
     mkdir -p "$plist_dir"
     cat > "$plist" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -143,7 +143,7 @@ function install_launch_agent() {
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.visionarys.memql-cockpit-worker</string>
+    <string>com.znasllc.memql-cockpit-worker</string>
     <key>ProgramArguments</key>
     <array>
         <string>${INSTALLED_BINARY}</string>
@@ -195,7 +195,7 @@ boot. To check the status:
 
 To stop it:
 
-  launchctl unload ~/Library/LaunchAgents/com.visionarys.memql-cockpit-worker.plist
+  launchctl unload ~/Library/LaunchAgents/com.znasllc.memql-cockpit-worker.plist
 ================================================================
 EOF
 }
