@@ -3,10 +3,14 @@ package cli
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/visionarys-io/memql-cockpit/cli/auth"
 	"github.com/visionarys-io/memql-cockpit/cli/client"
 	"github.com/visionarys-io/memql-cockpit/cli/cluster"
@@ -250,6 +254,25 @@ func (e *connEntry) attemptConnectCycle() bool {
 		err := e.dialOnce(ctx)
 		cancelDial()
 
+		// If the server rejected our credentials (stale token from
+		// before the cluster was wiped, server rotated keys, etc.),
+		// stop retrying and prompt the user to re-authenticate. The
+		// alternative is 90s of silent "Connecting to..." that ends
+		// in stateFailed without telling the user the problem is
+		// fixable with a fresh login.
+		if err != nil && looksLikeAuthRejection(err) {
+			_ = config.DeleteToken(e.Config.Name)
+			e.setStateAttempt(stateNeedsToken, attempt, time.Time{})
+			e.app.postRedraw()
+			if e.app.logger != nil {
+				e.app.logger.Info("cached token rejected; transitioning to stateNeedsToken",
+					"cluster", e.Config.Name,
+					"error", err,
+				)
+			}
+			return false
+		}
+
 		if err == nil {
 			// Connected. Start both subscribers; each exits when its
 			// Events channel closes (either normal shutdown or stream
@@ -297,6 +320,40 @@ func (e *connEntry) attemptConnectCycle() bool {
 			e.setStateAttempt(stateFailed, attempt, time.Time{})
 			e.app.postRedraw()
 			return false
+		}
+	}
+	return false
+}
+
+// looksLikeAuthRejection returns true when err looks like the server
+// refused our credentials (gRPC Unauthenticated / PermissionDenied
+// codes, or the auth interceptor's well-known reject strings). Used
+// to short-circuit a stale-token retry loop and prompt the user to
+// re-login instead of silently spinning on "Connecting to...".
+//
+// String matching is a fallback for transport / handshake errors
+// that don't propagate the gRPC status code cleanly.
+func looksLikeAuthRejection(err error) bool {
+	if err == nil {
+		return false
+	}
+	if st, ok := status.FromError(err); ok {
+		switch st.Code() {
+		case codes.Unauthenticated, codes.PermissionDenied:
+			return true
+		}
+	}
+	msg := strings.ToLower(err.Error())
+	for _, needle := range []string{
+		"unauthenticated",
+		"permission denied",
+		"invalid token",
+		"token expired",
+		"authentication required",
+		"unauthorized",
+	} {
+		if strings.Contains(msg, needle) {
+			return true
 		}
 	}
 	return false
