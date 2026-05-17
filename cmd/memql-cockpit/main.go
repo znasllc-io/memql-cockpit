@@ -37,6 +37,7 @@ import (
 	"github.com/visionarys-io/memql-cockpit/cli"
 	"github.com/visionarys-io/memql-cockpit/cli/auth"
 	"github.com/visionarys-io/memql-cockpit/cli/config"
+	"github.com/visionarys-io/memql-cockpit/cli/crash"
 	"github.com/visionarys-io/memql-cockpit/cmd/memql-cockpit/internal/lint"
 	"github.com/visionarys-io/memql-cockpit/cmd/memql-cockpit/internal/worker"
 )
@@ -135,8 +136,19 @@ func main() {
 	})
 
 	errCh := make(chan error, 1)
+	// app.Run is wrapped in crash.Catch so a panic that escapes
+	// every in-app recovery layer (per-tab Draw / per-tab HandleEvent
+	// / main-loop iteration) lands here as a Report instead of
+	// killing the process with a stack trace. The Catch'd goroutine
+	// returns normally so the select below sees errCh close cleanly.
+	var lastResort *crash.Report
 	go func() {
-		errCh <- app.Run()
+		if r := crash.Catch("app.Run", func() {
+			errCh <- app.Run()
+		}); r != nil {
+			lastResort = r
+			errCh <- fmt.Errorf("cockpit hit an unexpected error (code %s)", r.Code)
+		}
 	}()
 
 	select {
@@ -144,6 +156,15 @@ func main() {
 		logger.Info("signal received, shutting down", "signal", sig.String())
 		app.Quit()
 	case err := <-errCh:
+		if lastResort != nil {
+			// Print the friendly message to stderr AFTER tcell has
+			// had a chance to unwind. The deferred app.Quit isn't
+			// strictly necessary here -- tcell's screen finalizer
+			// ran on the way out of app.Run -- but it's harmless
+			// and belt-and-suspenders.
+			fmt.Fprint(os.Stderr, crash.UserMessage(lastResort))
+			os.Exit(1)
+		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 			os.Exit(1)

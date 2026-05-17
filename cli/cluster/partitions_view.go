@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/visionarys-io/memql-cockpit/cli/ui"
@@ -22,7 +23,14 @@ type PartitionInfo struct {
 // rendering: status icon, name, `*` marker for the selected partition,
 // detail block under the highlighted row, footer hints. No state
 // machine -- partitions don't dial anything.
+//
+// Thread-safety: v1:platform:partition CDC events arrive on the
+// per-cluster runPartitionsSubscriber goroutine (see pool.go) and
+// mutate this view via SetPartitions / Reset. The tcell event loop
+// concurrently calls Draw + HandleEvent. mu serializes the
+// background mutators (Lock) against Draw (RLock).
 type PartitionsView struct {
+	mu       sync.RWMutex
 	Theme    ui.Theme
 	Focused  bool // true when this pane has keyboard focus
 	Empty    bool // true when no cluster connected -- show "Waiting for cluster..."
@@ -79,6 +87,8 @@ func NewPartitionsView(theme ui.Theme) *PartitionsView {
 
 // SetPartitions replaces the rendered list.
 func (v *PartitionsView) SetPartitions(parts []PartitionInfo) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	v.Partitions = parts
 	if v.Selected >= len(parts) {
 		v.Selected = 0
@@ -88,6 +98,8 @@ func (v *PartitionsView) SetPartitions(parts []PartitionInfo) {
 
 // Reset clears the list and shows the empty-state message.
 func (v *PartitionsView) Reset(emptyMsg string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	v.Partitions = nil
 	v.Selected = 0
 	v.Active = ""
@@ -105,12 +117,18 @@ func (v *PartitionsView) Reset(emptyMsg string) {
 // in ClustersView.HandleEvent). Mirrored on ClustersView so every
 // pane that hosts an input form exposes the same predicate.
 func (v *PartitionsView) FormOpen() bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	return v.showAddForm
 }
 
 // Draw renders the partitions pane within bounds. Caller is
 // responsible for sizing/positioning relative to the cluster list.
+// Holds the read lock for the full frame so a concurrent
+// runPartitionsSubscriber can't tear v.Partitions mid-render.
 func (v *PartitionsView) Draw(screen *ui.Screen, bounds ui.Rect) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	x := bounds.X + 1
 	maxW := bounds.Width - 2
 	y := bounds.Y
@@ -308,7 +326,11 @@ func (v *PartitionsView) Draw(screen *ui.Screen, bounds ui.Rect) {
 }
 
 // HandleEvent processes keys when the partitions pane has focus.
+// Takes the write lock for the duration so a concurrent
+// runPartitionsSubscriber can't race Selected / Active / form state.
 func (v *PartitionsView) HandleEvent(ev tcell.Event) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 	keyEv, ok := ev.(*tcell.EventKey)
 	if !ok {
 		return false

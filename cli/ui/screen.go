@@ -24,6 +24,16 @@ func NewScreen() (*Screen, error) {
 	return &Screen{tcell: s}, nil
 }
 
+// NewScreenFromTcell wraps an existing tcell.Screen. Intended for
+// tests that need to drive the UI primitives (DrawText, FillRect,
+// etc.) against tcell.NewSimulationScreen instead of a real TTY.
+// Caller is responsible for Init / SetStyle / Fini on the inner
+// screen -- this constructor is a thin wrapper, not a lifecycle
+// manager.
+func NewScreenFromTcell(s tcell.Screen) *Screen {
+	return &Screen{tcell: s}
+}
+
 // EnableInteraction enables mouse and paste support.
 // Call after the first draw to avoid escape sequence interference.
 func (s *Screen) EnableInteraction() {
