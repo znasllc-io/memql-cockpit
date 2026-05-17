@@ -227,9 +227,8 @@ func (v *View) drawKeyBindings(screen *ui.Screen, bounds ui.Rect) {
 			Title: "GLOBAL",
 			Bindings: []keyBinding{
 				{"F1 / " + alt + "+1", "Clusters tab"},
-				{"F2 / " + alt + "+2", "Explorer tab"},
-				{"F3 / " + alt + "+3", "Agents tab"},
-				{"F4 / " + alt + "+4", "Settings tab"},
+				{"F2 / " + alt + "+2", "Concepts tab"},
+				{"F3 / " + alt + "+3", "Settings tab"},
 				{"Tab", "Switch focus between panes"},
 				{"Ctrl+Y", "Copy header notification to clipboard"},
 				{"Ctrl+K", "Dismiss header notification"},
@@ -251,13 +250,17 @@ func (v *View) drawKeyBindings(screen *ui.Screen, bounds ui.Rect) {
 			Bindings: []keyBinding{
 				{"W / A / S / D", "Pan viewport"},
 				{"R", "Reset pan"},
+				{"X", "Toggle architecture navigator"},
 			},
 		},
 		{
-			Title: "EXPLORER (F2)",
+			Title: "CONCEPTS (F2)",
 			Bindings: []keyBinding{
-				{"Ctrl+Space", "Trigger completion"},
-				{"Escape", "Close popup"},
+				{"Up / Down", "Navigate list"},
+				{"Enter", "Open / drill into selection"},
+				{":", "Search rows (bottom band)"},
+				{"V", "Toggle version history"},
+				{"Esc", "Back / clear active filter"},
 			},
 		},
 	}
