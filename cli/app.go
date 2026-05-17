@@ -2461,17 +2461,32 @@ func (a *App) draw() {
 	// positioned at the bottom-right corner (causing the stray '{').
 	a.screen.Inner().ShowCursor(0, 0)
 	a.screen.Inner().HideCursor()
-	// Show() emits a cell-level diff against the previous frame --
-	// tcell only writes ANSI for cells whose content or style
-	// actually changed. That's the no-flicker path.
+	// IMPORTANT: Sync(), not Show(). Three Show() attempts have all
+	// reproduced the same 1-row-offset ghost on Pop_OS:
 	//
-	// History: two prior Show() attempts were reverted because a
-	// Pop_OS user reported a 1-row-offset ghost. Since that report
-	// we've landed (a) state-coherence locks on every racing view,
-	// (b) the layout-edge-glyph rule documented in CLAUDE.md, and
-	// (c) the postRedraw coalescer that eliminates per-event burst
-	// repaints -- any of which could have masked the underlying
-	// cause. User can no longer reproduce the ghost. Going back to
-	// Show(); revert just this hunk (Show -> Sync) if it returns.
-	a.screen.Show()
+	//   1. Original Show() experiment    -- reverted (no notes).
+	//   2. Second Show() experiment      -- reverted; ghost screenshots
+	//      Screenshot_2026-05-17_11-32-12.png /
+	//      Screenshot_2026-05-17_11-54-02.png.
+	//   3. PR #12 Show() experiment      -- reverted by this commit.
+	//      The ghost reproduces immediately on cockpit launch the
+	//      moment the cluster auto-connects: CLUSTERS header,
+	//      local.znas.io row, TOPOLOGY header, the bottom tab strip
+	//      and WASD:Pan hint all paint twice (a duplicate frame
+	//      shifted one row down). Screenshot 2026-05-17 14:24.
+	//
+	// Hypothesis going in to PR #12 was that the prior reverts had
+	// been masked by races we'd since fixed (state-coherence locks on
+	// every racing view, the layout-edge-glyph rule, the postRedraw
+	// coalescer). Wrong: the coalescer alone is fine and we keep it,
+	// but Show() still produces the same ghost on the same OS even
+	// with all three of those landed. Whatever the root cause is, it
+	// lives at the tcell-diff-vs-Pop_OS layer, not in our race fixes.
+	//
+	// Per-frame flicker on Sync() is real, but the ghost is worse:
+	// duplicated rows make the UI unreadable. Sync() stays until a
+	// reproducer that ISN'T platform-specific gives us something to
+	// debug. The coalescer (postRedraw -> redrawPending atomic) keeps
+	// flicker bounded by collapsing event bursts into one frame.
+	a.screen.Sync()
 }
