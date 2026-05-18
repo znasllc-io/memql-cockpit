@@ -23,7 +23,7 @@ Output lands under `bin/`.
 
 ```bash
 ./bin/memql-cockpit                # main IDE (multi-tab TUI)
-./bin/memql-cockpit worker run     # run as a per-user worker (computer_use)
+./bin/memql-cockpit worker run     # run as a per-user worker (computer_use_headless / computer_use_embodied)
 ./bin/memql-cockpit-gui worker setup  # one-time GUI worker setup wizard
 ```
 
