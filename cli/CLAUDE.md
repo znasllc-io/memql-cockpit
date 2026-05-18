@@ -85,9 +85,12 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
 
 1. **Clusters (F1)** -- cluster manager + partition manager + topology
 2. **Concepts (F2)** -- generic browser for every registered concept
-3. **Planner (F3)** -- submit a goal to the Planner Agent and watch
-   the resulting v1:planner:plan + child v1:planner:task rows
-   evolve. Gated on a connected, selected cluster.
+3. **Planner (F3)** -- observe v1:planner:plan + child v1:planner:task
+   rows in the active partition. Read-only: goal submission moved to
+   the Chat tab (the user talks to the assistant, which decides when
+   to escalate to the planner). The one mutation that remains is
+   R:Run on a queued plan -- flips it to running via
+   mutationStartPlan. Gated on a connected, selected cluster.
 4. **Agents (F4)** -- read-only catalog of v1:agents:agent rows in
    the active partition. Left pane lists agents (name + role); right
    pane shows identity, capabilities, knowledge domains, live
@@ -338,7 +341,7 @@ collects the slug + type and hands them off.
 | `client/queries.go`      | `QueryClient` (also runs mutations via ExecuteQuery)          |
 | `config/clusters.go`     | `~/.memql/clusters.yaml` load/save                            |
 | `concepts/`              | Concepts tab (concept picker + row list + generic renderer)   |
-| `planner/`               | Planner tab (goal input + plan list + task list / detail)     |
+| `planner/`               | Planner tab (read-only plan list + task list + detail; R:Run)  |
 | `agents/`                | Agents tab (agent list + read-only detail pane)               |
 | `editor/`                | Reusable text editor with Sense integration                   |
 | `settings/`              | Settings tab                                                  |
