@@ -15,28 +15,38 @@ package planner
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
 
+	"github.com/znasllc-io/memql/component/memql"
+
 	"github.com/znasllc-io/memql-cockpit/cli/client"
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
 )
 
-// FocusPane identifies which of the three keyboard-focus regions is
-// active. Tab cycles through them.
+// FocusPane identifies which of the four keyboard-focus regions is
+// active. Tab cycles through them in order.
 type FocusPane int
 
 const (
-	FocusGoal  FocusPane = 0 // the goal input + submit chrome
-	FocusPlans FocusPane = 1 // the plan list
-	FocusTasks FocusPane = 2 // the task list under the selected plan
+	FocusGoal       FocusPane = 0 // the goal input + submit chrome
+	FocusPlans      FocusPane = 1 // the plan list (bottom-left)
+	FocusTasks      FocusPane = 2 // the task list under the selected plan
+	FocusTaskDetail FocusPane = 3 // input/output/metadata of the selected task
 )
+
+// focusPaneCount caps the modulo used by Tab cycling; bump when
+// adding a new focus region.
+const focusPaneCount = 4
 
 // defaultSpaceID is the fallback Plan.spaceId when the user hasn't
 // overridden it via the Space input. Plans require a spaceId; cockpit
@@ -72,6 +82,11 @@ type View struct {
 	tasks         []map[string]any
 	taskSelected  int
 	taskScrollY   int
+
+	// Vertical scroll offset for the Task Detail pane (the third
+	// pane on the right). Reset to 0 whenever taskSelected changes
+	// so a fresh row starts at the top of the detail view.
+	taskDetailScrollY int
 
 	// Focus + transient flags.
 	Focus     FocusPane
@@ -186,7 +201,7 @@ func (v *View) RefreshPlans() {
 		return
 	}
 
-	rows := extractRows(res)
+	rows := memql.MaterializeRows(res)
 	sort.Slice(rows, func(i, j int) bool {
 		return getString(rows[i], "createdAt") > getString(rows[j], "createdAt")
 	})
@@ -248,7 +263,7 @@ func (v *View) RefreshTasksForSelected() {
 		return
 	}
 
-	rows := extractRows(res)
+	rows := memql.MaterializeRows(res)
 	sort.SliceStable(rows, func(i, j int) bool {
 		return getInt(rows[i], "seq") < getInt(rows[j], "seq")
 	})
@@ -266,18 +281,35 @@ func (v *View) RefreshTasksForSelected() {
 // kicks an immediate refresh so the user sees their submission. The
 // Planner Agent (planner-tagged nodes only) picks the row up from the
 // event bus and starts decomposing.
+//
+// Three things happen at Enter, in this order:
+//
+//  1. The input field is cleared synchronously, so the user can
+//     immediately start typing the next goal.
+//  2. A client-generated planId is built, and a synthetic "queued"
+//     plan row is prepended to v.plans so the user sees it in the
+//     list right away. No round-trip required for visibility.
+//  3. The actual mutationCreatePlan call runs (same goroutine), and
+//     RefreshPlans replaces the optimistic row with the real one
+//     once the server-side insert is durable. On error, the
+//     optimistic row is removed and submitErr / OnStatus carry the
+//     failure.
+//
+// The cleared goalText is NOT restored on error -- the user has
+// moved on.
 func (v *View) submitGoal() {
-	v.mu.RLock()
+	v.mu.Lock()
 	goal := strings.TrimSpace(v.goalText)
 	space := strings.TrimSpace(v.spaceText)
-	v.mu.RUnlock()
-
 	if goal == "" {
-		v.mu.Lock()
 		v.submitErr = "goal is empty"
 		v.mu.Unlock()
 		return
 	}
+	v.goalText = ""
+	v.submitErr = ""
+	v.mu.Unlock()
+
 	if space == "" {
 		space = defaultSpaceID
 	}
@@ -303,7 +335,33 @@ func (v *View) submitGoal() {
 		}
 	}
 
+	planId := newPlanId()
+	nowRFC := time.Now().UTC().Format(time.RFC3339)
+	optimistic := map[string]any{
+		"id":        planId,
+		"createdAt": nowRFC,
+		"payload": map[string]any{
+			"id":            planId,
+			"spaceId":       space,
+			"kind":          defaultPlanKind,
+			"goal":          goal,
+			"requestedBy":   userID,
+			"triggerSource": "user.explicit",
+			"status":        "planning",
+			"input": map[string]any{
+				"prompt": goal,
+			},
+		},
+	}
+	v.mu.Lock()
+	v.plans = append([]map[string]any{optimistic}, v.plans...)
+	v.mu.Unlock()
+	if v.OnRedraw != nil {
+		v.OnRedraw()
+	}
+
 	args := map[string]any{
+		"planId":        planId,
 		"spaceId":       space,
 		"kind":          defaultPlanKind,
 		"goal":          goal,
@@ -320,6 +378,8 @@ func (v *View) submitGoal() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if _, err := qc.Execute(ctx, call); err != nil {
+		// Drop the optimistic row -- the server never persisted it.
+		v.removeOptimisticPlan(planId)
 		if isPlannerDSLMissing(err) {
 			// Same root cause as the read-side: the BFF doesn't
 			// have the Planner DSL loaded. Latch dslMissing so the
@@ -337,13 +397,42 @@ func (v *View) submitGoal() {
 		return
 	}
 
-	v.mu.Lock()
-	v.goalText = ""
-	v.submitErr = ""
-	v.mu.Unlock()
-
 	v.RefreshPlans()
 	v.RefreshTasksForSelected()
+}
+
+// newPlanId returns a content-shaped id that matches the server's
+// `{partition}:v1:planner:plan:{hash}` convention closely enough for
+// the optimistic UI to stand in until the real row lands. The
+// mutationCreatePlan handler accepts a caller-supplied planId via
+// args.planId and uses it verbatim, so the optimistic id and the
+// persisted id agree -- the next RefreshPlans cleanly reconciles.
+func newPlanId() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// rand.Read failures are exceedingly rare and there's no
+		// recoverable path here; fall back to a time-based id so the
+		// optimistic UI still has something unique.
+		return fmt.Sprintf("default:v1:planner:plan:cockpit-%d", time.Now().UnixNano())
+	}
+	return "default:v1:planner:plan:cockpit-" + hex.EncodeToString(b[:])
+}
+
+// removeOptimisticPlan strips the synthetic row added by submitGoal
+// when the server-side insert fails. No-op if RefreshPlans already
+// replaced it with the real version.
+func (v *View) removeOptimisticPlan(planId string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	for i, p := range v.plans {
+		if getString(p, "id") == planId {
+			v.plans = append(v.plans[:i], v.plans[i+1:]...)
+			if v.planSelected >= len(v.plans) && v.planSelected > 0 {
+				v.planSelected = len(v.plans) - 1
+			}
+			return
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -375,35 +464,40 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 		return
 	}
 
-	// Three panes mirroring the Clusters tab's visual structure
-	// (CLUSTERS top-left, PARTITIONS bottom-left, TOPOLOGY right):
+	// Four panes mirroring the Concepts tab's progressive-disclosure
+	// flow (picker -> row list -> detail), with the GOAL input bolted
+	// onto the top of the left column:
 	//
-	//   GOAL    (top-left, fixed 9 rows for the input chrome)
-	//   PLANS   (bottom-left, flex)
-	//   TASKS   (right, full height -- shows tasks for the
-	//            highlighted plan)
+	//   GOAL         (top-left, fixed 9 rows for the input chrome)
+	//   PLANS        (bottom-left, flex)
+	//   TASKS        (center, flex -- tasks under the highlighted plan)
+	//   TASK DETAIL  (right, flex -- input / output / metadata for
+	//                the highlighted task)
 	//
-	// The earlier 5-pane layout (Goal / Plans on the left, Plan
-	// Detail / Tasks / Task Detail stacked on the right) packed too
-	// many vertical splits into the right column without horizontal
-	// dividers, so the boundaries between sub-panes weren't visible.
-	// Folding detail back into list rows keeps the screen readable as
-	// panes instead of one mushy column.
+	// Vertical dividers separate the three columns; a horizontal
+	// divider inside the left column separates GOAL from PLANS. The
+	// width split (28% / 36% / 36%) is tuned so the left column is
+	// wide enough for the goal input + plan goal text on a typical
+	// 120-col terminal, and the two right columns are balanced for
+	// task lists vs. JSON / error blobs.
 	panes := ui.FlexColumn(bounds, []ui.FlexItem{
-		{Flex: 0.40, MinSize: 32},
-		{Flex: 0.60, MinSize: 40},
+		{Flex: 0.28, MinSize: 32},
+		{Flex: 0.36, MinSize: 28},
+		{Flex: 0.36, MinSize: 28},
 	})
 	leftBounds := panes[0]
-	rightBounds := panes[1]
+	tasksBounds := panes[1]
+	detailBounds := panes[2]
 
-	// Vertical divider between the left and right columns. Mirrors
-	// cluster_view.go's divider drawing: single box-drawing char,
-	// safe at the layout edge.
+	// Vertical dividers between each column. Single box-drawing char
+	// per row -- safe at the layout edge (East-Asian-width Narrow).
 	divStyle := v.Theme.SubtleStyle()
 	for y := bounds.Y; y < bounds.Y+bounds.Height; y++ {
 		screen.SetCell(leftBounds.X+leftBounds.Width-1, y, '│', divStyle)
+		screen.SetCell(tasksBounds.X+tasksBounds.Width-1, y, '│', divStyle)
 	}
 	leftBounds.Width--
+	tasksBounds.Width--
 
 	// Left column: GOAL on top (fixed height for the input chrome),
 	// PLANS below (flex). Horizontal divider between them so the two
@@ -421,9 +515,11 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 	}
 	v.drawPlanList(screen, plansBounds)
 
-	// Right column: TASKS, full height. Shows the task list for
-	// whichever plan is currently highlighted in PLANS.
-	v.drawTaskList(screen, rightBounds)
+	// Center column: TASKS list for the highlighted plan.
+	v.drawTaskList(screen, tasksBounds)
+
+	// Right column: TASK DETAIL for the highlighted task.
+	v.drawTaskDetail(screen, detailBounds)
 }
 
 // drawGated renders the centered "tab unavailable" layout with the
@@ -521,7 +617,7 @@ func (v *View) drawPlanList(screen *ui.Screen, bounds ui.Rect) {
 	if len(v.plans) == 0 {
 		drawCentered(screen, v.Theme, bounds, "No plans yet -- submit a goal above.")
 		ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1,
-			"R:Refresh  Tab:Cycle")
+			"Tab:Cycle")
 		return
 	}
 
@@ -558,11 +654,28 @@ func (v *View) drawPlanList(screen *ui.Screen, bounds ui.Rect) {
 		status := getString(p, "status")
 		when := shortenTimestamp(getString(p, "createdAt"))
 		sub := fmt.Sprintf("%s  %s", statusLabel(status), when)
+		// Active-status timer: when a plan is in a non-terminal,
+		// non-idle state, show how long it's been there so the user
+		// can spot stuck plans at a glance. Terminal statuses
+		// (succeeded / failed / cancelled) and `queued` (idle,
+		// waiting for the user's Run click) get no timer -- a timer
+		// on those is misleading. The clock is computed relative to
+		// the row's createdAt because there isn't a separate
+		// status-changed timestamp on the projection today; close
+		// enough for at-a-glance UX, and a refresh upgrade is
+		// straightforward once Plan.startedAt / phaseStartedAt land.
+		if elapsed := activeStatusElapsed(status, getString(p, "createdAt")); elapsed != "" {
+			sub = fmt.Sprintf("%s  %s  +%s", statusLabel(status), when, elapsed)
+		}
 		screen.DrawText(bounds.X+2, y+1, bounds.Width-3, sub, dimify(style, v.Theme.Subtle))
 	}
 
-	ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1,
-		"↑/↓:Move  Enter:Tasks  R:Refresh  Tab:Cycle")
+	hint := "↑/↓:Move  Enter:Tasks  Tab:Cycle"
+	if v.planSelected >= 0 && v.planSelected < len(v.plans) &&
+		getString(v.plans[v.planSelected], "status") == "queued" {
+		hint = "↑/↓:Move  Enter:Tasks  R:Run  Tab:Cycle"
+	}
+	ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1, hint)
 }
 
 func (v *View) drawTaskList(screen *ui.Screen, bounds ui.Rect) {
@@ -580,9 +693,29 @@ func (v *View) drawTaskList(screen *ui.Screen, bounds ui.Rect) {
 	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, titleStyle)
 
 	if len(v.tasks) == 0 {
-		drawCentered(screen, v.Theme, bounds, "No tasks for this plan.")
-		ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1,
-			"R:Refresh  Tab:Cycle")
+		msg := "No tasks for this plan."
+		if v.planSelected >= 0 && v.planSelected < len(v.plans) {
+			switch getString(v.plans[v.planSelected], "status") {
+			case "planning":
+				msg = "Planning in progress -- the planner agent is decomposing the goal and emitting tasks. This usually takes 10-30 seconds. Tasks appear here as they are committed; the plan transitions to 'queued' once planning is done."
+			case "needsAgent":
+				msg = "Plan is parked: no good-fit agent in this space. Create or extend an agent that matches the goal, then resume the plan."
+			case "awaitingFeedback":
+				msg = "Plan is awaiting your feedback. Respond on the plan card to resume."
+			case "succeeded":
+				msg = "Plan completed with no tasks emitted."
+			case "failed":
+				if errMsg := getString(v.plans[v.planSelected], "errorMessage"); errMsg != "" {
+					msg = "Plan failed: " + truncate(errMsg, 240)
+				} else {
+					msg = "Plan failed."
+				}
+			case "cancelled":
+				msg = "Plan was cancelled."
+			}
+		}
+		drawCentered(screen, v.Theme, bounds, msg)
+		ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1, "Tab:Cycle")
 		return
 	}
 
@@ -594,26 +727,267 @@ func (v *View) drawTaskList(screen *ui.Screen, bounds ui.Rect) {
 	}
 	v.clampTaskScroll(listH)
 
-	for i := 0; i < listH && v.taskScrollY+i < len(v.tasks); i++ {
+	// Each task row is 2 visual rows: a primary line (seq + label)
+	// and a subtitle (status + phase + elapsed-since-created). Same
+	// pattern the Plans pane uses; gives the user enough at-a-glance
+	// signal that the Task Detail pane doesn't have to carry every
+	// bit of context.
+	rowsPerTask := 2
+	maxVisible := listH / rowsPerTask
+	for i := 0; i < maxVisible && v.taskScrollY+i < len(v.tasks); i++ {
 		idx := v.taskScrollY + i
 		t := v.tasks[idx]
-		y := listTop + i
+		y := listTop + i*rowsPerTask
 
 		style := v.Theme.BaseStyle()
 		if idx == v.taskSelected {
 			style = tcell.StyleDefault.Foreground(v.Theme.FG).Background(tcell.NewRGBColor(40, 44, 52))
 		}
 		screen.FillRect(bounds.X, y, bounds.Width, 1, style)
+		screen.FillRect(bounds.X, y+1, bounds.Width, 1, style)
 
-		label := fmt.Sprintf("[%d] %-18s %s",
-			getInt(t, "seq"),
-			truncate(getString(t, "kind"), 18),
-			statusLabel(getString(t, "status")))
-		screen.DrawText(bounds.X+2, y, bounds.Width-3, label, style)
+		// Primary line: "[seq] <label>". Label prefers the
+		// logicalStepId (the planner-assigned stable id like
+		// "simulate-superman-vs-spiderman") because the `kind`
+		// field is often the generic "chat" and isn't useful for
+		// telling tasks apart. Fall back to kind when no
+		// logicalStepId, fall back to "(unnamed)" otherwise.
+		label := getString(t, "logicalStepId")
+		if label == "" {
+			label = getString(t, "kind")
+		}
+		if label == "" {
+			label = "(unnamed)"
+		}
+		primary := fmt.Sprintf("[%d] %s", getInt(t, "seq"), label)
+		screen.DrawText(bounds.X+2, y, bounds.Width-3, primary, style)
+
+		// Subtitle: status + phase + active-status timer.
+		status := getString(t, "status")
+		sub := statusLabel(status)
+		if phase := getString(t, "phase"); phase != "" {
+			sub += "  phase:" + phase
+		}
+		if elapsed := activeStatusElapsed(status, getString(t, "createdAt")); elapsed != "" {
+			sub += "  +" + elapsed
+		}
+		screen.DrawText(bounds.X+2, y+1, bounds.Width-3, sub, dimify(style, v.Theme.Subtle))
 	}
 
 	ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1,
-		"↑/↓:Move  Esc:Plans  R:Refresh  Tab:Cycle")
+		"↑/↓:Move  Enter:Detail  Esc:Plans  Tab:Cycle")
+}
+
+// drawTaskDetail renders the third pane: rich per-task detail for
+// whichever task is highlighted in the center Tasks pane. Sections,
+// top to bottom: identity (id, agent, kind, phase, status, attempts),
+// timing (createdAt, startedAt, completedAt, elapsed), input
+// payload, output payload, error message, parking state. Each section
+// is omitted when empty, so a freshly-queued task with no output yet
+// renders only identity + timing + input.
+func (v *View) drawTaskDetail(screen *ui.Screen, bounds ui.Rect) {
+	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, v.Theme.BaseStyle())
+
+	titleStyle := v.Theme.SubtleStyle().Bold(true)
+	if v.Focus == FocusTaskDetail {
+		titleStyle = v.Theme.AccentStyle().Bold(true)
+	}
+	title := " TASK DETAIL "
+	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, titleStyle)
+
+	// Empty-state precedence: no plan selected -> no task -> nothing
+	// to show. Each handled with a centered hint that wraps to pane
+	// width via drawCentered.
+	if len(v.plans) == 0 || v.planSelected < 0 || v.planSelected >= len(v.plans) {
+		drawCentered(screen, v.Theme, bounds, "Select a plan to see its tasks.")
+		ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1, "Tab:Cycle")
+		return
+	}
+	if len(v.tasks) == 0 || v.taskSelected < 0 || v.taskSelected >= len(v.tasks) {
+		drawCentered(screen, v.Theme, bounds, "No task selected. Pick one in the Tasks pane to see its input, output, and metadata here.")
+		ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1, "Tab:Cycle")
+		return
+	}
+
+	task := v.tasks[v.taskSelected]
+	plan := v.plans[v.planSelected]
+
+	// Build the rendered block as a []string of lines, then paint with
+	// scroll. Easier to manage than direct draw + a tight bounds
+	// calculation, and lets the same code path drive PageUp/Down later.
+	lines := v.buildTaskDetailLines(task, plan, bounds.Width-3)
+
+	const chromeH = 1
+	bodyTop := bounds.Y + 2
+	bodyH := bounds.Height - 2 - chromeH
+	if bodyH < 1 {
+		bodyH = 1
+	}
+	// Clamp scroll so we never paint past the end.
+	maxScroll := len(lines) - bodyH
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if v.taskDetailScrollY > maxScroll {
+		v.taskDetailScrollY = maxScroll
+	}
+	if v.taskDetailScrollY < 0 {
+		v.taskDetailScrollY = 0
+	}
+
+	for i := 0; i < bodyH && v.taskDetailScrollY+i < len(lines); i++ {
+		line := lines[v.taskDetailScrollY+i]
+		style := v.Theme.BaseStyle()
+		// Section headers (lines that start with "─" or end with ":")
+		// render in subtle/bold to give the eye anchors as it scrolls.
+		if strings.HasPrefix(line, "─") {
+			style = v.Theme.SubtleStyle().Bold(true)
+		}
+		screen.DrawText(bounds.X+2, bodyTop+i, bounds.Width-3, line, style)
+	}
+
+	hint := "↑/↓:Scroll  Esc:Tasks  Tab:Cycle"
+	if maxScroll == 0 {
+		hint = "Esc:Tasks  Tab:Cycle"
+	}
+	ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1, hint)
+}
+
+// buildTaskDetailLines flattens the task + plan context into a list
+// of pre-wrapped display lines for the detail pane. Pure function so
+// it's easy to unit-test against fixture rows. innerWidth bounds each
+// JSON/string field's wrap so the detail pane never overflows.
+func (v *View) buildTaskDetailLines(task, plan map[string]any, innerWidth int) []string {
+	if innerWidth < 16 {
+		innerWidth = 16
+	}
+	var lines []string
+
+	addKV := func(label, value string) {
+		if value == "" {
+			value = "—"
+		}
+		// Two-space indent under the section header keeps the eye on
+		// the key column.
+		line := fmt.Sprintf("  %-13s %s", label+":", value)
+		// If the value pushes us past innerWidth, wrap the continuation
+		// lines flush under the value column.
+		if len(line) <= innerWidth {
+			lines = append(lines, line)
+			return
+		}
+		wrapped := ui.WrapText(value, innerWidth-17)
+		lines = append(lines, fmt.Sprintf("  %-13s %s", label+":", wrapped[0]))
+		for _, cont := range wrapped[1:] {
+			lines = append(lines, strings.Repeat(" ", 17)+cont)
+		}
+	}
+	addSection := func(name string) {
+		if len(lines) > 0 {
+			lines = append(lines, "")
+		}
+		lines = append(lines, "─ "+name+" ─")
+	}
+	addBlock := func(name string, body string) {
+		body = strings.TrimSpace(body)
+		if body == "" {
+			return
+		}
+		addSection(name)
+		for _, raw := range strings.Split(body, "\n") {
+			if raw == "" {
+				lines = append(lines, "")
+				continue
+			}
+			for _, w := range ui.WrapText(raw, innerWidth-2) {
+				lines = append(lines, "  "+w)
+			}
+		}
+	}
+
+	// Identity section. Pulls the agent name from the parent plan
+	// since the task concept doesn't carry agentId itself.
+	addSection("identity")
+	addKV("task id", getString(task, "id"))
+	addKV("seq", strconv.Itoa(getInt(task, "seq")))
+	addKV("kind", getString(task, "kind"))
+	addKV("category", getString(task, "category"))
+	addKV("phase", getString(task, "phase"))
+	addKV("logical id", getString(task, "logicalStepId"))
+	addKV("attempts", strconv.Itoa(getInt(task, "attemptNumber")))
+	addKV("status", getString(task, "status"))
+	addKV("agent (plan.ownerAgentId)", getString(plan, "ownerAgentId"))
+	addKV("execution", getString(task, "executionSurface"))
+	if backend := getString(task, "executorBackend"); backend != "" {
+		addKV("backend", backend)
+	}
+	if toolName := getString(task, "toolName"); toolName != "" {
+		addKV("tool name", toolName)
+	}
+
+	// Timing section: createdAt + startedAt + completedAt; elapsed is
+	// computed for transient statuses, omitted for terminal.
+	addSection("timing")
+	addKV("created", shortenTimestamp(getString(task, "createdAt")))
+	if started := getString(task, "startedAt"); started != "" {
+		addKV("started", shortenTimestamp(started))
+	}
+	if completed := getString(task, "completedAt"); completed != "" {
+		addKV("completed", shortenTimestamp(completed))
+	}
+	if parked := getString(task, "parkedAt"); parked != "" {
+		addKV("parked", shortenTimestamp(parked))
+		if mark := getString(task, "parkedAtCheckpoint"); mark != "" {
+			addKV("checkpoint", mark)
+		}
+	}
+	if elapsed := activeStatusElapsed(getString(task, "status"), getString(task, "createdAt")); elapsed != "" {
+		addKV("elapsed", elapsed)
+	}
+
+	// Input / output / tool args+result / error / metrics blocks --
+	// each rendered as JSON when non-empty. addBlock skips empties so
+	// the pane only shows sections that have content.
+	addBlock("input", prettyJSON(task["input"]))
+	addBlock("output", prettyJSON(task["output"]))
+	addBlock("tool args", prettyJSON(task["toolArgs"]))
+	addBlock("tool result", prettyJSON(task["toolResult"]))
+	if errMsg := getString(task, "errorMessage"); errMsg != "" {
+		addBlock("error", errMsg)
+	}
+	addBlock("metrics", prettyJSON(task["metrics"]))
+
+	return lines
+}
+
+// prettyJSON serializes v with two-space indentation. Used by the
+// task detail pane to render input/output/error payloads. Returns
+// "" for nil / empty-map / empty-slice so the caller's addBlock
+// skips the section entirely. Marshal errors return "" too; the
+// pane is a developer surface, not a serializer correctness gate.
+func prettyJSON(v any) string {
+	if v == nil {
+		return ""
+	}
+	switch x := v.(type) {
+	case map[string]any:
+		if len(x) == 0 {
+			return ""
+		}
+	case []any:
+		if len(x) == 0 {
+			return ""
+		}
+	case string:
+		if x == "" {
+			return ""
+		}
+	}
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 // ---------------------------------------------------------------------------
@@ -632,28 +1006,25 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 	// a literal character in the goal field.
 	if keyEv.Key() == tcell.KeyTab {
 		v.mu.Lock()
-		v.Focus = (v.Focus + 1) % 3
+		v.Focus = (v.Focus + 1) % FocusPane(focusPaneCount)
 		v.mu.Unlock()
 		return true
 	}
 
-	// R refreshes plans + tasks, except while typing in the goal box
-	// (where r should mean a literal 'r'). Also clears the
-	// dslMissing latch so a redeployed BFF that now carries the
-	// Planner DSL gets retried -- without this the gated screen
-	// would be sticky until cockpit restart.
-	if v.Focus != FocusGoal && keyEv.Key() == tcell.KeyRune &&
+	// R means Run: when a plan in status="queued" is highlighted in
+	// the Plans pane, R calls mutationStartPlan to flip it to
+	// running. R is a no-op on any non-queued row -- the bottom hint
+	// strip only advertises R:Run when the highlighted plan is
+	// actually runnable. FocusGoal exempts the binding so 'r' types
+	// literally into the goal box. (The dslMissing latch can still
+	// be cleared via re-entering the tab; we deliberately drop the
+	// implicit-refresh behavior here so R has one unambiguous
+	// meaning per the cockpit panel-chrome contract.)
+	if v.Focus == FocusPlans && keyEv.Key() == tcell.KeyRune &&
 		(keyEv.Rune() == 'r' || keyEv.Rune() == 'R') {
-		v.mu.Lock()
-		v.dslMissing = false
-		v.mu.Unlock()
-		go func() {
-			v.RefreshPlans()
-			v.RefreshTasksForSelected()
-			if v.OnRedraw != nil {
-				v.OnRedraw()
-			}
-		}()
+		if v.highlightedPlanIsQueued() {
+			go v.runSelectedPlan()
+		}
 		return true
 	}
 
@@ -664,6 +1035,54 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 		return v.handlePlanListKey(keyEv)
 	case FocusTasks:
 		return v.handleTaskListKey(keyEv)
+	case FocusTaskDetail:
+		return v.handleTaskDetailKey(keyEv)
+	}
+	return false
+}
+
+// handleTaskDetailKey scrolls the detail pane's content (Up/Down,
+// PgUp/PgDn, Home/End) and bounces focus back to the Tasks pane on
+// Esc. The pane's content is a pre-wrapped []string built by
+// buildTaskDetailLines; this handler only mutates taskDetailScrollY,
+// the Draw path clamps it on the next paint.
+func (v *View) handleTaskDetailKey(ev *tcell.EventKey) bool {
+	switch ev.Key() {
+	case tcell.KeyUp:
+		v.mu.Lock()
+		if v.taskDetailScrollY > 0 {
+			v.taskDetailScrollY--
+		}
+		v.mu.Unlock()
+		return true
+	case tcell.KeyDown:
+		v.mu.Lock()
+		v.taskDetailScrollY++
+		v.mu.Unlock()
+		return true
+	case tcell.KeyPgUp:
+		v.mu.Lock()
+		v.taskDetailScrollY -= 10
+		if v.taskDetailScrollY < 0 {
+			v.taskDetailScrollY = 0
+		}
+		v.mu.Unlock()
+		return true
+	case tcell.KeyPgDn:
+		v.mu.Lock()
+		v.taskDetailScrollY += 10
+		v.mu.Unlock()
+		return true
+	case tcell.KeyHome:
+		v.mu.Lock()
+		v.taskDetailScrollY = 0
+		v.mu.Unlock()
+		return true
+	case tcell.KeyEsc:
+		v.mu.Lock()
+		v.Focus = FocusTasks
+		v.mu.Unlock()
+		return true
 	}
 	return false
 }
@@ -735,12 +1154,74 @@ func (v *View) handlePlanListKey(ev *tcell.EventKey) bool {
 	return false
 }
 
+// highlightedPlanIsQueued reports whether the currently-highlighted
+// plan in the FocusPlans pane is in status="queued" (i.e. planning
+// complete, ready for the user to click Run). Used by the R-key
+// dispatcher to decide Run-vs-Refresh.
+func (v *View) highlightedPlanIsQueued() bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if v.planSelected < 0 || v.planSelected >= len(v.plans) {
+		return false
+	}
+	return getString(v.plans[v.planSelected], "status") == "queued"
+}
+
+// runSelectedPlan calls mutationStartPlan on the highlighted plan
+// when its status is "queued" (planning complete, awaiting user).
+// No-op for any other status -- the prompt strip in the chrome band
+// only advertises R:Run when the highlighted plan is actually queued.
+func (v *View) runSelectedPlan() {
+	v.mu.RLock()
+	if v.planSelected < 0 || v.planSelected >= len(v.plans) {
+		v.mu.RUnlock()
+		return
+	}
+	plan := v.plans[v.planSelected]
+	v.mu.RUnlock()
+
+	if getString(plan, "status") != "queued" {
+		if v.OnStatus != nil {
+			v.OnStatus("planner: Run only applies to plans in 'queued' status")
+		}
+		return
+	}
+	planID := getString(plan, "id")
+	if planID == "" {
+		return
+	}
+	if v.QueryClient == nil {
+		return
+	}
+	qc := v.QueryClient()
+	if qc == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	call := fmt.Sprintf("mutationStartPlan({planId:%q})", planID)
+	if _, err := qc.Execute(ctx, call); err != nil {
+		if v.OnStatus != nil {
+			v.OnStatus(fmt.Sprintf("planner: run failed: %v", err))
+		}
+		return
+	}
+	v.RefreshPlans()
+	if v.OnRedraw != nil {
+		v.OnRedraw()
+	}
+}
+
 func (v *View) handleTaskListKey(ev *tcell.EventKey) bool {
 	switch ev.Key() {
 	case tcell.KeyUp:
 		v.mu.Lock()
 		if v.taskSelected > 0 {
 			v.taskSelected--
+			// Reset detail scroll so a fresh row starts at the top
+			// of the detail pane instead of the previous row's
+			// scroll position.
+			v.taskDetailScrollY = 0
 		}
 		v.mu.Unlock()
 		return true
@@ -748,7 +1229,16 @@ func (v *View) handleTaskListKey(ev *tcell.EventKey) bool {
 		v.mu.Lock()
 		if v.taskSelected < len(v.tasks)-1 {
 			v.taskSelected++
+			v.taskDetailScrollY = 0
 		}
+		v.mu.Unlock()
+		return true
+	case tcell.KeyEnter:
+		// Enter promotes focus to the detail pane so the user can
+		// scroll through long input/output blocks without
+		// hijacking the task list's Up/Down.
+		v.mu.Lock()
+		v.Focus = FocusTaskDetail
 		v.mu.Unlock()
 		return true
 	case tcell.KeyEsc:
@@ -794,47 +1284,46 @@ func (v *View) clampTaskScroll(visibleRows int) {
 }
 
 func drawCentered(screen *ui.Screen, theme ui.Theme, bounds ui.Rect, msg string) {
-	midY := bounds.Y + bounds.Height/2
-	lineX := bounds.X + (bounds.Width-len(msg))/2
-	if lineX < bounds.X+1 {
-		lineX = bounds.X + 1
+	// Width-aware: explicit `\n` becomes a hard break, and any
+	// individual line longer than the pane's inner width is word-
+	// wrapped via ui.WrapText. The resulting block is centered
+	// vertically and horizontally within bounds.
+	innerW := bounds.Width - 2
+	if innerW < 1 {
+		innerW = 1
 	}
-	screen.DrawText(lineX, midY, bounds.Width-1, msg, theme.SubtleStyle())
+	var lines []string
+	for _, paragraph := range strings.Split(msg, "\n") {
+		if paragraph == "" {
+			lines = append(lines, "")
+			continue
+		}
+		lines = append(lines, ui.WrapText(paragraph, innerW)...)
+	}
+	startY := bounds.Y + (bounds.Height-len(lines))/2
+	if startY < bounds.Y+1 {
+		startY = bounds.Y + 1
+	}
+	for i, line := range lines {
+		y := startY + i
+		if y >= bounds.Y+bounds.Height {
+			break
+		}
+		lineX := bounds.X + (bounds.Width-len(line))/2
+		if lineX < bounds.X+1 {
+			lineX = bounds.X + 1
+		}
+		screen.DrawText(lineX, y, bounds.Width-1, line, theme.SubtleStyle())
+	}
 }
 
 func dimify(style tcell.Style, dim tcell.Color) tcell.Style {
 	return style.Foreground(dim)
 }
 
-func extractRows(res any) []map[string]any {
-	if res == nil {
-		return nil
-	}
-	// Server returns shapes that come back as either a top-level array
-	// or a wrapper object with the array under "rows" / "results" --
-	// we accept both since both shapes appear across queries.
-	switch v := res.(type) {
-	case []any:
-		return rowsFromArray(v)
-	case map[string]any:
-		for _, key := range []string{"rows", "results", "data", "output"} {
-			if arr, ok := v[key].([]any); ok {
-				return rowsFromArray(arr)
-			}
-		}
-	}
-	return nil
-}
-
-func rowsFromArray(arr []any) []map[string]any {
-	out := make([]map[string]any, 0, len(arr))
-	for _, item := range arr {
-		if m, ok := item.(map[string]any); ok {
-			out = append(out, m)
-		}
-	}
-	return out
-}
+// (extractRows / rowsFromArray moved to component/memql.MaterializeRows
+// in memql -- one canonical helper for every consumer of a query
+// response, in-process or over the wire.)
 
 func getString(m map[string]any, key string) string {
 	if m == nil {
@@ -890,6 +1379,52 @@ func statusLabel(s string) string {
 		return "—"
 	}
 	return s
+}
+
+// activeStatusElapsed returns a compact "Ns / Nm Ss / Nh Mm" string
+// describing how long the plan has been in the given status, but
+// ONLY for statuses where a timer carries useful signal. Terminal
+// statuses (succeeded / failed / cancelled) and `queued` (waiting
+// on a user click, intentionally idle) return "" so the row chrome
+// stays clean. Anything else (planning / routing / running /
+// paused / awaitingFeedback / needsAgent) is "active" -- the user
+// wants to see how long it's been sitting there.
+//
+// Timestamp source today is row.createdAt, which approximates the
+// time the plan entered the current status: close enough at a
+// glance, and tightens up once the planner stamps
+// statusChangedAt / phaseStartedAt on every transition (follow-up
+// work mentioned in docs/planner/observability.md).
+func activeStatusElapsed(status, createdAt string) string {
+	switch status {
+	case "planning", "routing", "running", "paused", "awaitingFeedback", "needsAgent":
+		// fall through; these get a timer
+	default:
+		return ""
+	}
+	if createdAt == "" {
+		return ""
+	}
+	t, err := time.Parse(time.RFC3339, createdAt)
+	if err != nil {
+		return ""
+	}
+	d := time.Since(t)
+	if d < 0 {
+		return ""
+	}
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		m := int(d.Minutes())
+		s := int(d.Seconds()) % 60
+		return fmt.Sprintf("%dm %ds", m, s)
+	default:
+		h := int(d.Hours())
+		m := int(d.Minutes()) % 60
+		return fmt.Sprintf("%dh %dm", h, m)
+	}
 }
 
 func orDash(s string) string {
