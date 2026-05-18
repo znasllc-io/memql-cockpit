@@ -1,22 +1,23 @@
-// Package planner renders the Planner tab: a thin operator surface
-// for interacting with the Planner Agent that lives in the connected
-// cluster.
+// Package planner renders the Planner tab: a read-only operator
+// surface for observing v1:planner:plan + v1:planner:task rows in the
+// connected cluster.
 //
-// The user does not chat with the Planner. They submit a GOAL (the
-// agent's prompt) and the Planner Agent decomposes it into Plans and
-// Tasks. The right pane shows the live state of the selected Plan's
-// Tasks (kind, status, output, errorMessage) refreshed on a timer.
+// Goal submission lives in the Chat tab now -- the user talks to the
+// assistant, which decides whether to escalate to the planner via its
+// tools. This tab is for watching what the planner is doing, not for
+// driving it. The one mutation that remains is mutationStartPlan: when
+// a plan sits in status="queued" awaiting user confirmation, pressing R
+// on the Plans pane flips it to running.
 //
-// Data plane: mutationCreatePlan to submit, queryAllPlans + queryTasksForPlan
-// to read. Both live in memql-bff-copresent/dsl/copresent/{mutations,queries}.memql.
-// The Planner Agent (memql/integrations/planner/agent_loop.go) picks the
-// Plan up from the event bus on planner-tagged nodes.
+// Data plane: queryAllPlans + queryTasksForPlan to read (live in
+// memql-bff-copresent/dsl/copresent/queries.memql), mutationStartPlan
+// to advance a queued plan. The Planner Agent
+// (memql/integrations/planner/agent_loop.go) drives the actual
+// decomposition + dispatch from the event bus on planner-tagged nodes.
 package planner
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -33,33 +34,19 @@ import (
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
 )
 
-// FocusPane identifies which of the four keyboard-focus regions is
+// FocusPane identifies which of the three keyboard-focus regions is
 // active. Tab cycles through them in order.
 type FocusPane int
 
 const (
-	FocusGoal       FocusPane = 0 // the goal input + submit chrome
-	FocusPlans      FocusPane = 1 // the plan list (bottom-left)
-	FocusTasks      FocusPane = 2 // the task list under the selected plan
-	FocusTaskDetail FocusPane = 3 // input/output/metadata of the selected task
+	FocusPlans      FocusPane = 0 // the plan list (left column)
+	FocusTasks      FocusPane = 1 // the task list under the selected plan
+	FocusTaskDetail FocusPane = 2 // input/output/metadata of the selected task
 )
 
 // focusPaneCount caps the modulo used by Tab cycling; bump when
 // adding a new focus region.
-const focusPaneCount = 4
-
-// defaultSpaceID is the fallback Plan.spaceId when the user hasn't
-// overridden it via the Space input. Plans require a spaceId; cockpit
-// is a developer tool and doesn't manage cognition spaces directly,
-// so we pin all Planner-tab submissions to a sentinel space the user
-// can search for ("plans authored from cockpit").
-const defaultSpaceID = "cockpit-default"
-
-// defaultPlanKind is the kind we stamp on Plans created from the
-// Planner tab. Any kind other than adHocAction / scopeElevation /
-// agentInvocation triggers the Planner Agent's HandlePlanCreated
-// path (see memql/integrations/planner/agent_loop.go).
-const defaultPlanKind = "userGoal"
+const focusPaneCount = 3
 
 // View is the Planner tab. Mutated from both the event-loop goroutine
 // (HandleEvent) and a background refresher (refreshLoop). Locking
@@ -68,10 +55,6 @@ const defaultPlanKind = "userGoal"
 type View struct {
 	mu    sync.RWMutex
 	Theme ui.Theme
-
-	// Goal-input state.
-	goalText  string
-	spaceText string
 
 	// Plans + currently-selected.
 	plans         []map[string]any
@@ -90,8 +73,7 @@ type View struct {
 
 	// Focus + transient flags.
 	Focus     FocusPane
-	submitErr string
-	fetching  bool
+	fetching bool
 
 	// dslMissing latches when the cluster's BFF returns
 	// "function not found" for a Planner query. Once set, the
@@ -106,10 +88,8 @@ type View struct {
 	// Plumbing.
 	//
 	// QueryClient returns a client bound to the active cluster's
-	// dispatcher, or nil. UserID is the caller's v1:identity:user.id
-	// used as Plan.requestedBy.
+	// dispatcher, or nil.
 	QueryClient func() *client.QueryClient
-	UserID      func() string
 
 	// GatedMessage, when non-empty, replaces the whole layout with a
 	// "not available" message (no cluster connected, etc.).
@@ -123,12 +103,11 @@ type View struct {
 	OnRedraw func()
 }
 
-// NewView creates a fresh Planner view focused on the goal input.
+// NewView creates a fresh Planner view focused on the plan list.
 func NewView(theme ui.Theme) *View {
 	return &View{
-		Theme:     theme,
-		Focus:     FocusGoal,
-		spaceText: defaultSpaceID,
+		Theme: theme,
+		Focus: FocusPlans,
 	}
 }
 
@@ -277,164 +256,6 @@ func (v *View) RefreshTasksForSelected() {
 	}
 }
 
-// submitGoal creates a v1:planner:plan via mutationCreatePlan, then
-// kicks an immediate refresh so the user sees their submission. The
-// Planner Agent (planner-tagged nodes only) picks the row up from the
-// event bus and starts decomposing.
-//
-// Three things happen at Enter, in this order:
-//
-//  1. The input field is cleared synchronously, so the user can
-//     immediately start typing the next goal.
-//  2. A client-generated planId is built, and a synthetic "queued"
-//     plan row is prepended to v.plans so the user sees it in the
-//     list right away. No round-trip required for visibility.
-//  3. The actual mutationCreatePlan call runs (same goroutine), and
-//     RefreshPlans replaces the optimistic row with the real one
-//     once the server-side insert is durable. On error, the
-//     optimistic row is removed and submitErr / OnStatus carry the
-//     failure.
-//
-// The cleared goalText is NOT restored on error -- the user has
-// moved on.
-func (v *View) submitGoal() {
-	v.mu.Lock()
-	goal := strings.TrimSpace(v.goalText)
-	space := strings.TrimSpace(v.spaceText)
-	if goal == "" {
-		v.submitErr = "goal is empty"
-		v.mu.Unlock()
-		return
-	}
-	v.goalText = ""
-	v.submitErr = ""
-	v.mu.Unlock()
-
-	if space == "" {
-		space = defaultSpaceID
-	}
-
-	if v.QueryClient == nil {
-		v.mu.Lock()
-		v.submitErr = "no cluster connection"
-		v.mu.Unlock()
-		return
-	}
-	qc := v.QueryClient()
-	if qc == nil {
-		v.mu.Lock()
-		v.submitErr = "no cluster connection"
-		v.mu.Unlock()
-		return
-	}
-
-	userID := "cockpit"
-	if v.UserID != nil {
-		if id := v.UserID(); id != "" {
-			userID = id
-		}
-	}
-
-	planId := newPlanId()
-	nowRFC := time.Now().UTC().Format(time.RFC3339)
-	optimistic := map[string]any{
-		"id":        planId,
-		"createdAt": nowRFC,
-		"payload": map[string]any{
-			"id":            planId,
-			"spaceId":       space,
-			"kind":          defaultPlanKind,
-			"goal":          goal,
-			"requestedBy":   userID,
-			"triggerSource": "user.explicit",
-			"status":        "planning",
-			"input": map[string]any{
-				"prompt": goal,
-			},
-		},
-	}
-	v.mu.Lock()
-	v.plans = append([]map[string]any{optimistic}, v.plans...)
-	v.mu.Unlock()
-	if v.OnRedraw != nil {
-		v.OnRedraw()
-	}
-
-	args := map[string]any{
-		"planId":        planId,
-		"spaceId":       space,
-		"kind":          defaultPlanKind,
-		"goal":          goal,
-		"requestedBy":   userID,
-		"triggerSource": "user.explicit",
-		"authorizedBy":  userID,
-		"input": map[string]any{
-			"prompt": goal,
-		},
-	}
-	argBytes, _ := json.Marshal(args)
-	call := fmt.Sprintf("mutationCreatePlan(%s)", string(argBytes))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if _, err := qc.Execute(ctx, call); err != nil {
-		// Drop the optimistic row -- the server never persisted it.
-		v.removeOptimisticPlan(planId)
-		if isPlannerDSLMissing(err) {
-			// Same root cause as the read-side: the BFF doesn't
-			// have the Planner DSL loaded. Latch dslMissing so the
-			// gated screen surfaces instead of a stale goal-input
-			// pane, and suppress the notification spam.
-			v.markDSLMissing()
-			return
-		}
-		v.mu.Lock()
-		v.submitErr = err.Error()
-		v.mu.Unlock()
-		if v.OnStatus != nil {
-			v.OnStatus(fmt.Sprintf("planner: submit failed: %v", err))
-		}
-		return
-	}
-
-	v.RefreshPlans()
-	v.RefreshTasksForSelected()
-}
-
-// newPlanId returns a content-shaped id that matches the server's
-// `{partition}:v1:planner:plan:{hash}` convention closely enough for
-// the optimistic UI to stand in until the real row lands. The
-// mutationCreatePlan handler accepts a caller-supplied planId via
-// args.planId and uses it verbatim, so the optimistic id and the
-// persisted id agree -- the next RefreshPlans cleanly reconciles.
-func newPlanId() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		// rand.Read failures are exceedingly rare and there's no
-		// recoverable path here; fall back to a time-based id so the
-		// optimistic UI still has something unique.
-		return fmt.Sprintf("default:v1:planner:plan:cockpit-%d", time.Now().UnixNano())
-	}
-	return "default:v1:planner:plan:cockpit-" + hex.EncodeToString(b[:])
-}
-
-// removeOptimisticPlan strips the synthetic row added by submitGoal
-// when the server-side insert fails. No-op if RefreshPlans already
-// replaced it with the real version.
-func (v *View) removeOptimisticPlan(planId string) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	for i, p := range v.plans {
-		if getString(p, "id") == planId {
-			v.plans = append(v.plans[:i], v.plans[i+1:]...)
-			if v.planSelected >= len(v.plans) && v.planSelected > 0 {
-				v.planSelected = len(v.plans) - 1
-			}
-			return
-		}
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Drawing
 // ---------------------------------------------------------------------------
@@ -457,35 +278,31 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 	if v.dslMissing {
 		v.drawGated(screen, bounds,
 			"Planner DSL not loaded on this cluster. The Planner tab "+
-				"requires queryAllPlans / queryTasksForPlan / "+
-				"mutationCreatePlan to be registered with the BFF "+
-				"engine (the copresent DSL tree provides them). "+
-				"Press R to retry once the BFF has been redeployed.")
+				"requires queryAllPlans / queryTasksForPlan to be "+
+				"registered with the BFF engine (the copresent DSL "+
+				"tree provides them). Press R to retry once the BFF "+
+				"has been redeployed.")
 		return
 	}
 
-	// Four panes mirroring the Concepts tab's progressive-disclosure
-	// flow (picker -> row list -> detail), with the GOAL input bolted
-	// onto the top of the left column:
+	// Three panes mirroring the Concepts tab's progressive-disclosure
+	// flow (picker -> row list -> detail):
 	//
-	//   GOAL         (top-left, fixed 9 rows for the input chrome)
-	//   PLANS        (bottom-left, flex)
+	//   PLANS        (left, flex -- plans in the active partition)
 	//   TASKS        (center, flex -- tasks under the highlighted plan)
 	//   TASK DETAIL  (right, flex -- input / output / metadata for
 	//                the highlighted task)
 	//
-	// Vertical dividers separate the three columns; a horizontal
-	// divider inside the left column separates GOAL from PLANS. The
-	// width split (28% / 36% / 36%) is tuned so the left column is
-	// wide enough for the goal input + plan goal text on a typical
-	// 120-col terminal, and the two right columns are balanced for
-	// task lists vs. JSON / error blobs.
+	// Goal submission moved to the Chat tab -- the user talks to the
+	// assistant, which decides when to escalate to the planner. The
+	// planner tab is observation-only now (R:Run still flips queued
+	// plans to running).
 	panes := ui.FlexColumn(bounds, []ui.FlexItem{
 		{Flex: 0.28, MinSize: 32},
 		{Flex: 0.36, MinSize: 28},
 		{Flex: 0.36, MinSize: 28},
 	})
-	leftBounds := panes[0]
+	plansBounds := panes[0]
 	tasksBounds := panes[1]
 	detailBounds := panes[2]
 
@@ -493,32 +310,14 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 	// per row -- safe at the layout edge (East-Asian-width Narrow).
 	divStyle := v.Theme.SubtleStyle()
 	for y := bounds.Y; y < bounds.Y+bounds.Height; y++ {
-		screen.SetCell(leftBounds.X+leftBounds.Width-1, y, '│', divStyle)
+		screen.SetCell(plansBounds.X+plansBounds.Width-1, y, '│', divStyle)
 		screen.SetCell(tasksBounds.X+tasksBounds.Width-1, y, '│', divStyle)
 	}
-	leftBounds.Width--
+	plansBounds.Width--
 	tasksBounds.Width--
 
-	// Left column: GOAL on top (fixed height for the input chrome),
-	// PLANS below (flex). Horizontal divider between them so the two
-	// panes visually separate -- same convention the Clusters tab uses
-	// between its CLUSTERS and PARTITIONS panes.
-	const goalH = 9
-	goalBounds := ui.Rect{X: leftBounds.X, Y: leftBounds.Y, Width: leftBounds.Width, Height: goalH}
-	v.drawGoalPane(screen, goalBounds)
-	screen.DrawHLine(leftBounds.X, leftBounds.Y+goalH, leftBounds.Width-1, '─', v.Theme.SubtleStyle())
-	plansBounds := ui.Rect{
-		X:      leftBounds.X,
-		Y:      leftBounds.Y + goalH + 1,
-		Width:  leftBounds.Width,
-		Height: leftBounds.Height - goalH - 1,
-	}
 	v.drawPlanList(screen, plansBounds)
-
-	// Center column: TASKS list for the highlighted plan.
 	v.drawTaskList(screen, tasksBounds)
-
-	// Right column: TASK DETAIL for the highlighted task.
 	v.drawTaskDetail(screen, detailBounds)
 }
 
@@ -552,50 +351,6 @@ func (v *View) drawGated(screen *ui.Screen, bounds ui.Rect, msg string) {
 		}
 		screen.DrawText(lineX, startY+i, bounds.Width-1, line, v.Theme.SubtleStyle())
 	}
-}
-
-func (v *View) drawGoalPane(screen *ui.Screen, bounds ui.Rect) {
-	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, v.Theme.BaseStyle())
-
-	titleStyle := v.Theme.SubtleStyle().Bold(true)
-	if v.Focus == FocusGoal {
-		titleStyle = v.Theme.AccentStyle().Bold(true)
-	}
-	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, " NEW GOAL ", titleStyle)
-
-	// Goal entry line.
-	goalY := bounds.Y + 2
-	prefix := "goal> "
-	display := prefix + v.goalText
-	if v.Focus == FocusGoal {
-		display += "_"
-	}
-	goalStyle := v.Theme.BaseStyle()
-	if v.Focus == FocusGoal {
-		goalStyle = v.Theme.AccentStyle()
-	}
-	screen.DrawText(bounds.X+1, goalY, bounds.Width-2, display, goalStyle)
-
-	// Space line.
-	spaceY := bounds.Y + 4
-	screen.DrawText(bounds.X+1, spaceY, bounds.Width-2,
-		fmt.Sprintf("space: %s", v.spaceText), v.Theme.SubtleStyle())
-
-	// Status / error line.
-	statusY := bounds.Y + 5
-	if v.submitErr != "" {
-		screen.DrawText(bounds.X+1, statusY, bounds.Width-2,
-			fmt.Sprintf("error: %s", v.submitErr), v.Theme.ErrorStyle())
-	}
-
-	// Action hints, anchored to the bottom row per the panel chrome
-	// contract (cli/CLAUDE.md "Panel chrome contract"). Same
-	// `Key:Label` grammar (two-space chip separator, CamelCase
-	// labels, no space after colon) that Clusters / Concepts use.
-	// `Tab:Cycle` rather than the earlier `Tab:Focus` to match the
-	// contract's vocabulary.
-	ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1,
-		"Enter:Submit  Esc:Clear  Tab:Cycle")
 }
 
 func (v *View) drawPlanList(screen *ui.Screen, bounds ui.Rect) {
@@ -1015,11 +770,10 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 	// the Plans pane, R calls mutationStartPlan to flip it to
 	// running. R is a no-op on any non-queued row -- the bottom hint
 	// strip only advertises R:Run when the highlighted plan is
-	// actually runnable. FocusGoal exempts the binding so 'r' types
-	// literally into the goal box. (The dslMissing latch can still
-	// be cleared via re-entering the tab; we deliberately drop the
-	// implicit-refresh behavior here so R has one unambiguous
-	// meaning per the cockpit panel-chrome contract.)
+	// actually runnable. (The dslMissing latch can still be cleared
+	// via re-entering the tab; we deliberately drop the implicit-
+	// refresh behavior here so R has one unambiguous meaning per the
+	// cockpit panel-chrome contract.)
 	if v.Focus == FocusPlans && keyEv.Key() == tcell.KeyRune &&
 		(keyEv.Rune() == 'r' || keyEv.Rune() == 'R') {
 		if v.highlightedPlanIsQueued() {
@@ -1029,8 +783,6 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 	}
 
 	switch v.Focus {
-	case FocusGoal:
-		return v.handleGoalKey(keyEv)
 	case FocusPlans:
 		return v.handlePlanListKey(keyEv)
 	case FocusTasks:
@@ -1081,36 +833,6 @@ func (v *View) handleTaskDetailKey(ev *tcell.EventKey) bool {
 	case tcell.KeyEsc:
 		v.mu.Lock()
 		v.Focus = FocusTasks
-		v.mu.Unlock()
-		return true
-	}
-	return false
-}
-
-func (v *View) handleGoalKey(ev *tcell.EventKey) bool {
-	switch ev.Key() {
-	case tcell.KeyEnter:
-		go v.submitGoal()
-		return true
-	case tcell.KeyEsc:
-		v.mu.Lock()
-		v.goalText = ""
-		v.submitErr = ""
-		v.mu.Unlock()
-		return true
-	case tcell.KeyBackspace, tcell.KeyBackspace2:
-		v.mu.Lock()
-		if len(v.goalText) > 0 {
-			// Trim a full rune from the end so multi-byte chars don't
-			// leave dangling bytes in the string.
-			r := []rune(v.goalText)
-			v.goalText = string(r[:len(r)-1])
-		}
-		v.mu.Unlock()
-		return true
-	case tcell.KeyRune:
-		v.mu.Lock()
-		v.goalText += string(ev.Rune())
 		v.mu.Unlock()
 		return true
 	}
@@ -1478,7 +1200,6 @@ func (v *View) markDSLMissing() {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.dslMissing = true
-	v.submitErr = ""
 }
 
 func prettyJSONLines(v any, maxWidth int) []string {
