@@ -25,7 +25,7 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 
-	"github.com/znasllc-io/memql-cockpit/cli/client"
+	"github.com/znasllc-io/memql/sdk/go/client"
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
 )
 

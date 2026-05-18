@@ -13,7 +13,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/znasllc-io/memql-cockpit/cli/auth"
-	"github.com/znasllc-io/memql-cockpit/cli/client"
+	"github.com/znasllc-io/memql/sdk/go/client"
 	"github.com/znasllc-io/memql-cockpit/cli/cluster"
 	"github.com/znasllc-io/memql-cockpit/cli/config"
 	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"

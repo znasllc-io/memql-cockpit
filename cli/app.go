@@ -17,7 +17,7 @@ import (
 	"github.com/gdamore/tcell/v2"
 	"github.com/znasllc-io/memql-cockpit/cli/agents"
 	"github.com/znasllc-io/memql-cockpit/cli/auth"
-	"github.com/znasllc-io/memql-cockpit/cli/client"
+	"github.com/znasllc-io/memql/sdk/go/client"
 	"github.com/znasllc-io/memql-cockpit/cli/chat"
 	"github.com/znasllc-io/memql-cockpit/cli/cluster"
 	"github.com/znasllc-io/memql-cockpit/cli/concepts"
