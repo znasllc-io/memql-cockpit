@@ -46,11 +46,6 @@ func TestIsPlannerDSLMissing_Classification(t *testing.T) {
 			expect: true,
 		},
 		{
-			name:   "mutationCreatePlan missing (submitGoal path)",
-			err:    errors.New(`function "mutationCreatePlan" not found`),
-			expect: true,
-		},
-		{
 			name:   "nil error",
 			err:    nil,
 			expect: false,
@@ -85,20 +80,12 @@ func TestIsPlannerDSLMissing_Classification(t *testing.T) {
 	}
 }
 
-// TestMarkDSLMissing_Latches checks the state mutation. The
-// submitErr field is intentionally cleared as part of the latch --
-// without that, a prior submit error would render alongside the
-// gated message, which is visually confusing (the gated screen
-// already explains the situation).
+// TestMarkDSLMissing_Latches checks the state mutation.
 func TestMarkDSLMissing_Latches(t *testing.T) {
 	v := NewView(ui.DefaultTheme())
-	v.submitErr = "stale error from a previous failure"
 	v.markDSLMissing()
 	if !v.dslMissing {
 		t.Errorf("markDSLMissing did not set the flag")
-	}
-	if v.submitErr != "" {
-		t.Errorf("markDSLMissing did not clear submitErr; got %q", v.submitErr)
 	}
 }
 

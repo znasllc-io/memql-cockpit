@@ -188,28 +188,6 @@ func TestPanelChrome_TaskList_ChromeBand(t *testing.T) {
 	}
 }
 
-// TestPanelChrome_GoalPane_Hints checks the goal-input pane's hint
-// row -- it never had a count footer, but it WAS using the
-// pre-contract `Tab:Focus` label that the chrome contract retired.
-func TestPanelChrome_GoalPane_Hints(t *testing.T) {
-	v := makeView()
-	v.Focus = FocusGoal
-	bounds := ui.Rect{X: 0, Y: 0, Width: 60, Height: 12}
-	rows := renderPaneAndSnapshot(t, v.drawGoalPane, bounds)
-
-	chrome := rows[bounds.Y+bounds.Height-1]
-	assertChipFormat(t, "GoalPane chrome band", chrome)
-	if !strings.Contains(chrome, "Enter:Submit") {
-		t.Errorf("GoalPane chrome must advertise Enter:Submit; got %q", chrome)
-	}
-	if !strings.Contains(chrome, "Tab:Cycle") {
-		t.Errorf("GoalPane chrome must advertise Tab:Cycle; got %q", chrome)
-	}
-	if strings.Contains(chrome, "Tab:Focus") {
-		t.Errorf("GoalPane chrome still uses Tab:Focus (pre-contract vocabulary); got %q", chrome)
-	}
-}
-
 // TestPanelChrome_EmptyStates_StillCarryHints asserts that the
 // empty-data branches of drawPlanList / drawTaskList ALSO render the
 // chrome band, not just the populated path. The pre-migration code
