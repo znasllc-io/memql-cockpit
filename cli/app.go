@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gdamore/tcell/v2"
+	"github.com/znasllc-io/memql-cockpit/cli/agents"
 	"github.com/znasllc-io/memql-cockpit/cli/auth"
 	"github.com/znasllc-io/memql-cockpit/cli/client"
 	"github.com/znasllc-io/memql-cockpit/cli/chat"
@@ -87,6 +88,7 @@ type App struct {
 	conceptsView *concepts.View
 	clustersView *cluster.ClustersView
 	plannerView  *planner.View
+	agentsView   *agents.View
 	chatView     *chat.View
 	settingsView *settings.View
 
@@ -133,13 +135,18 @@ func NewApp(cfg AppConfig) *App {
 	conceptsView := concepts.NewView(theme)
 	clustersView := cluster.NewClustersView(theme)
 	plannerView := planner.NewView(theme)
+	agentsView := agents.NewView(theme)
 	chatView := chat.NewView(theme)
 
 	// Clusters comes first -- it's the starting context for the session.
+	// Agents + Chat sit between Planner (orchestration surface) and
+	// Settings so the cluster-dependent operational tabs are grouped
+	// together at F1..F5.
 	tabBar := ui.NewTabBar(theme,
 		ui.Tab{Name: "Clusters", Content: clustersView},
 		ui.Tab{Name: "Concepts", Content: conceptsView},
 		ui.Tab{Name: "Planner", Content: plannerView},
+		ui.Tab{Name: "Agents", Content: agentsView},
 		ui.Tab{Name: "Chat", Content: chatView},
 		ui.Tab{Name: "Settings", Content: settingsView},
 	)
@@ -158,6 +165,7 @@ func NewApp(cfg AppConfig) *App {
 		conceptsView:  conceptsView,
 		clustersView:  clustersView,
 		plannerView:   plannerView,
+		agentsView:    agentsView,
 		chatView:      chatView,
 		settingsView:  settingsView,
 		helpOverlay:   ui.NewHelpOverlay(theme),
@@ -538,6 +546,7 @@ func (a *App) connect() {
 	a.wireConcepts()
 	a.wireCluster()
 	a.wirePlanner()
+	a.wireAgents()
 	a.wireChat()
 
 	for _, cfg := range configs {
@@ -1241,6 +1250,38 @@ func (a *App) wirePlanner() {
 	}
 	a.plannerView.StartRefreshLoop(a.quitCh, 3*time.Second)
 	go a.resolveUserID()
+}
+
+// wireAgents connects the Agents tab callbacks to the gRPC client.
+// Same getQueries closure pattern as wireConcepts / wirePlanner: every
+// call resolves against the currently active dispatcher so a cluster
+// switch is transparent to the view. Kicks off a background refresh
+// loop on a longer interval than the Planner since agents change at
+// human pace (create / edit / soft-delete from CoPresent), not at
+// task-execution pace.
+func (a *App) wireAgents() {
+	if a.agentsView == nil {
+		return
+	}
+	getQueries := func() *client.QueryClient {
+		d := a.activeDispatcher()
+		if d == nil {
+			return nil
+		}
+		return client.NewQueryClient(d)
+	}
+	a.agentsView.QueryClient = getQueries
+	a.agentsView.OnStatus = func(msg string) {
+		if a.notifications != nil {
+			a.notifications.Sync("agents", ui.SeverityWarning, msg)
+		}
+	}
+	a.agentsView.OnRedraw = func() {
+		if a.screen != nil {
+			a.screen.PostEvent(tcell.NewEventInterrupt(nil))
+		}
+	}
+	a.agentsView.StartRefreshLoop(a.quitCh, 10*time.Second)
 }
 
 // wireChat connects the Chat tab to the gRPC client. The chat view
@@ -2248,14 +2289,17 @@ func (a *App) persistSelectedPartition(clusterName, partition string) {
 }
 
 // updateTabGating sets the GatedMessage on the cluster-dependent tabs
-// (Concepts + Planner) based on whether the user's selected cluster
-// has a live connection. Called from draw() so state changes show up
-// on the next repaint.
+// (Concepts, Planner, Agents) based on whether the user's selected
+// cluster has a live connection. Called from draw() so state changes
+// show up on the next repaint.
 func (a *App) updateTabGating() {
 	setGated := func(msg string) {
 		a.conceptsView.GatedMessage = msg
 		if a.plannerView != nil {
 			a.plannerView.GatedMessage = msg
+		}
+		if a.agentsView != nil {
+			a.agentsView.GatedMessage = msg
 		}
 	}
 	name := a.selectedName()
