@@ -88,11 +88,17 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
 3. **Planner (F3)** -- submit a goal to the Planner Agent and watch
    the resulting v1:planner:plan + child v1:planner:task rows
    evolve. Gated on a connected, selected cluster.
-4. **Settings (F4)** -- credentials, theme, version
+4. **Agents (F4)** -- read-only catalog of v1:agents:agent rows in
+   the active partition. Left pane lists agents (name + role); right
+   pane shows identity, capabilities, knowledge domains, live
+   knowledge, provider config, and recent plan attribution for the
+   highlighted agent. No create/edit -- mutation surfaces live in
+   CoPresent. Gated on a connected, selected cluster.
+5. **Settings (F5)** -- credentials, theme, version
 
-Concepts is gated on a connected, selected cluster -- it shows a
-placeholder message until the user presses Enter on a cluster row in
-the Clusters tab.
+Concepts, Planner, and Agents are all gated on a connected, selected
+cluster -- they show a placeholder message until the user presses
+Enter on a cluster row in the Clusters tab.
 
 ### Concepts tab layout
 
@@ -243,7 +249,7 @@ pane still shows the full topology and the full partition list.
 ### Global
 | Key      | Action                              |
 |----------|-------------------------------------|
-| F1..F3   | Switch tab                          |
+| F1..F5   | Switch tab                          |
 | Ctrl+Q   | Quit                                |
 | Ctrl+T   | Cycle theme                         |
 
@@ -298,6 +304,23 @@ collects the slug + type and hands them off.
 | Backspace   | Zoom out one level                                  |
 | Esc / X     | Return to live topology                             |
 
+### Agents tab (Agent list focus)
+| Key   | Action                                              |
+|-------|-----------------------------------------------------|
+| ↑/↓   | Move highlight                                      |
+| Enter | Focus the detail pane                               |
+| R     | Manual refresh (background polls every 10s)         |
+| Tab   | Cycle: List → Detail                                |
+
+### Agents tab (Detail pane focus)
+| Key       | Action                                          |
+|-----------|-------------------------------------------------|
+| ↑/↓       | Scroll detail by one line                       |
+| PgUp/PgDn | Scroll detail by ten lines                      |
+| Home      | Scroll to top                                   |
+| Esc       | Back to the agent list                          |
+| Tab       | Cycle: Detail → List                            |
+
 ---
 
 ## Files
@@ -316,6 +339,7 @@ collects the slug + type and hands them off.
 | `config/clusters.go`     | `~/.memql/clusters.yaml` load/save                            |
 | `concepts/`              | Concepts tab (concept picker + row list + generic renderer)   |
 | `planner/`               | Planner tab (goal input + plan list + task list / detail)     |
+| `agents/`                | Agents tab (agent list + read-only detail pane)               |
 | `editor/`                | Reusable text editor with Sense integration                   |
 | `settings/`              | Settings tab                                                  |
 | `ui/`                    | Theme, screen, tab bar, layout primitives                     |
