@@ -13,8 +13,9 @@ import "github.com/gdamore/tcell/v2"
 //             in each per-pane footer (and saves a footer row in the
 //             tabs that previously had to dedicate one to "Tab:...").
 //
-// Tab-switching shortcuts (F1..F4 / Alt+1..4) still live in the bottom
-// TabBar footer so the keys cluster physically near the tabs they pick.
+// Tab-switching shortcuts (F-keys / Alt+digit, range tracks the
+// registered tab count) still live in the bottom TabBar footer so
+// the keys cluster physically near the tabs they pick.
 type Header struct {
 	Theme         Theme
 	Title         string         // app branding shown on the left
@@ -45,7 +46,7 @@ func (h *Header) Draw(screen *Screen, y, width int) {
 	screen.DrawText(1, y, width-2, h.Title, titleStyle)
 
 	// Right: navigation hint, right-justified one column from the edge
-	// (mirrors the F1..F4 hint's placement in the footer).
+	// (mirrors the tab-key hint's placement in the footer).
 	hintStart := width
 	if h.NavHint != "" && width >= len(h.NavHint)+len(h.Title)+4 {
 		hintStyle := tcell.StyleDefault.Foreground(h.Theme.Subtle).Background(barBG)
