@@ -30,7 +30,7 @@ import (
 
 	"github.com/znasllc-io/memql/component/memql"
 
-	"github.com/znasllc-io/memql-cockpit/cli/client"
+	"github.com/znasllc-io/memql/sdk/go/client"
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
 )
 
