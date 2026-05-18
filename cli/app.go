@@ -18,6 +18,7 @@ import (
 	"github.com/znasllc-io/memql-cockpit/cli/agents"
 	"github.com/znasllc-io/memql-cockpit/cli/auth"
 	"github.com/znasllc-io/memql-cockpit/cli/client"
+	"github.com/znasllc-io/memql-cockpit/cli/chat"
 	"github.com/znasllc-io/memql-cockpit/cli/cluster"
 	"github.com/znasllc-io/memql-cockpit/cli/concepts"
 	"github.com/znasllc-io/memql-cockpit/cli/config"
@@ -88,6 +89,7 @@ type App struct {
 	clustersView *cluster.ClustersView
 	plannerView  *planner.View
 	agentsView   *agents.View
+	chatView     *chat.View
 	settingsView *settings.View
 
 	// userID is the cached v1:identity:user.id resolved from
@@ -134,16 +136,18 @@ func NewApp(cfg AppConfig) *App {
 	clustersView := cluster.NewClustersView(theme)
 	plannerView := planner.NewView(theme)
 	agentsView := agents.NewView(theme)
+	chatView := chat.NewView(theme)
 
 	// Clusters comes first -- it's the starting context for the session.
-	// Agents sits between Planner (orchestration surface) and Settings
-	// (configuration) so the cluster-dependent operational tabs are
-	// grouped together at F1..F4.
+	// Agents + Chat sit between Planner (orchestration surface) and
+	// Settings so the cluster-dependent operational tabs are grouped
+	// together at F1..F5.
 	tabBar := ui.NewTabBar(theme,
 		ui.Tab{Name: "Clusters", Content: clustersView},
 		ui.Tab{Name: "Concepts", Content: conceptsView},
 		ui.Tab{Name: "Planner", Content: plannerView},
 		ui.Tab{Name: "Agents", Content: agentsView},
+		ui.Tab{Name: "Chat", Content: chatView},
 		ui.Tab{Name: "Settings", Content: settingsView},
 	)
 	tabBar.SetActive(0)
@@ -162,6 +166,7 @@ func NewApp(cfg AppConfig) *App {
 		clustersView:  clustersView,
 		plannerView:   plannerView,
 		agentsView:    agentsView,
+		chatView:      chatView,
 		settingsView:  settingsView,
 		helpOverlay:   ui.NewHelpOverlay(theme),
 		tabCrashes:    make(map[string]*crash.Report),
@@ -542,6 +547,7 @@ func (a *App) connect() {
 	a.wireCluster()
 	a.wirePlanner()
 	a.wireAgents()
+	a.wireChat()
 
 	for _, cfg := range configs {
 		a.openEntry(cfg)
@@ -1276,6 +1282,31 @@ func (a *App) wireAgents() {
 		}
 	}
 	a.agentsView.StartRefreshLoop(a.quitCh, 10*time.Second)
+}
+
+// wireChat connects the Chat tab to the gRPC client. The chat view
+// polls v1:cognition:space + v1:cognition:utterance every 3s and
+// renders the single-chat-per-space stream. OnRedraw posts an
+// EventInterrupt after each refresh so the event loop repaints the
+// new data without waiting for a keystroke -- same pattern as
+// wirePlanner / wireAgents.
+func (a *App) wireChat() {
+	if a.chatView == nil {
+		return
+	}
+	a.chatView.QueryClient = func() *client.QueryClient {
+		d := a.activeDispatcher()
+		if d == nil {
+			return nil
+		}
+		return client.NewQueryClient(d)
+	}
+	a.chatView.OnRedraw = func() {
+		if a.screen != nil {
+			a.screen.PostEvent(tcell.NewEventInterrupt(nil))
+		}
+	}
+	a.chatView.StartRefreshLoop(a.quitCh, 3*time.Second)
 }
 
 // resolveUserID pulls the caller's v1:identity:user.id from
