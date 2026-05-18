@@ -1,19 +1,26 @@
-package client
+// Package sense wraps the memQL Sense gRPC surface with cockpit-side
+// helpers that return editor-friendly types (SenseToken /
+// SenseDiagnostic / CompletionItem). Talks to the cluster through the
+// shared memql-sdk-go Dispatcher so it stays in lockstep with the rest
+// of the client wire path.
+package sense
 
 import (
 	"context"
 
 	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
+	"github.com/znasllc-io/memql/sdk/go/client"
+
 	"github.com/znasllc-io/memql-cockpit/cli/editor"
 )
 
 // SenseClient provides convenience methods for MemQL Sense operations over gRPC.
 type SenseClient struct {
-	dispatcher *Dispatcher
+	dispatcher *client.Dispatcher
 }
 
 // NewSenseClient creates a client that calls Sense operations via the dispatcher.
-func NewSenseClient(dispatcher *Dispatcher) *SenseClient {
+func NewSenseClient(dispatcher *client.Dispatcher) *SenseClient {
 	return &SenseClient{dispatcher: dispatcher}
 }
 
