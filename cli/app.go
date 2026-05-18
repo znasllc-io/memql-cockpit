@@ -17,6 +17,7 @@ import (
 	"github.com/gdamore/tcell/v2"
 	"github.com/znasllc-io/memql-cockpit/cli/auth"
 	"github.com/znasllc-io/memql-cockpit/cli/client"
+	"github.com/znasllc-io/memql-cockpit/cli/chat"
 	"github.com/znasllc-io/memql-cockpit/cli/cluster"
 	"github.com/znasllc-io/memql-cockpit/cli/concepts"
 	"github.com/znasllc-io/memql-cockpit/cli/config"
@@ -86,6 +87,7 @@ type App struct {
 	conceptsView *concepts.View
 	clustersView *cluster.ClustersView
 	plannerView  *planner.View
+	chatView     *chat.View
 	settingsView *settings.View
 
 	// userID is the cached v1:identity:user.id resolved from
@@ -131,12 +133,14 @@ func NewApp(cfg AppConfig) *App {
 	conceptsView := concepts.NewView(theme)
 	clustersView := cluster.NewClustersView(theme)
 	plannerView := planner.NewView(theme)
+	chatView := chat.NewView(theme)
 
 	// Clusters comes first -- it's the starting context for the session.
 	tabBar := ui.NewTabBar(theme,
 		ui.Tab{Name: "Clusters", Content: clustersView},
 		ui.Tab{Name: "Concepts", Content: conceptsView},
 		ui.Tab{Name: "Planner", Content: plannerView},
+		ui.Tab{Name: "Chat", Content: chatView},
 		ui.Tab{Name: "Settings", Content: settingsView},
 	)
 	tabBar.SetActive(0)
@@ -154,6 +158,7 @@ func NewApp(cfg AppConfig) *App {
 		conceptsView:  conceptsView,
 		clustersView:  clustersView,
 		plannerView:   plannerView,
+		chatView:      chatView,
 		settingsView:  settingsView,
 		helpOverlay:   ui.NewHelpOverlay(theme),
 		tabCrashes:    make(map[string]*crash.Report),
@@ -533,6 +538,7 @@ func (a *App) connect() {
 	a.wireConcepts()
 	a.wireCluster()
 	a.wirePlanner()
+	a.wireChat()
 
 	for _, cfg := range configs {
 		a.openEntry(cfg)
@@ -1235,6 +1241,23 @@ func (a *App) wirePlanner() {
 	}
 	a.plannerView.StartRefreshLoop(a.quitCh, 3*time.Second)
 	go a.resolveUserID()
+}
+
+// wireChat connects the Chat tab to the gRPC client. The chat view
+// polls v1:cognition:space + v1:cognition:utterance every 3s and
+// renders the single-chat-per-space stream.
+func (a *App) wireChat() {
+	if a.chatView == nil {
+		return
+	}
+	a.chatView.QueryClient = func() *client.QueryClient {
+		d := a.activeDispatcher()
+		if d == nil {
+			return nil
+		}
+		return client.NewQueryClient(d)
+	}
+	a.chatView.StartRefreshLoop(a.quitCh, 3*time.Second)
 }
 
 // resolveUserID pulls the caller's v1:identity:user.id from
