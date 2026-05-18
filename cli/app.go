@@ -92,13 +92,6 @@ type App struct {
 	chatView     *chat.View
 	settingsView *settings.View
 
-	// userID is the cached v1:identity:user.id resolved from
-	// GetMyAccess on cluster connect. Used by the Planner tab as
-	// Plan.requestedBy. Set under userIDMu so the resolver goroutine
-	// and the UI reader don't race on the empty default.
-	userIDMu sync.RWMutex
-	userID   string
-
 	// getQueries returns a QueryClient bound to the currently active
 	// cluster's dispatcher, or nil if none is connected. Cached by
 	// wireConcepts so setSelected can re-trigger refreshConcepts
@@ -1214,10 +1207,6 @@ func (a *App) wireConcepts() {
 // transparent to the view. Also kicks off a background refresh loop
 // that polls queryAllPlans + queryTasksForPlan periodically so Plan /
 // Task state appears live without subscriptions.
-//
-// User identity (Plan.requestedBy) is resolved lazily off GetMyAccess
-// the first time a refresh actually returns -- handled inside the
-// resolveUserID goroutine.
 func (a *App) wirePlanner() {
 	if a.plannerView == nil {
 		return
@@ -1230,11 +1219,6 @@ func (a *App) wirePlanner() {
 		return client.NewQueryClient(d)
 	}
 	a.plannerView.QueryClient = getQueries
-	a.plannerView.UserID = func() string {
-		a.userIDMu.RLock()
-		defer a.userIDMu.RUnlock()
-		return a.userID
-	}
 	a.plannerView.OnStatus = func(msg string) {
 		if a.notifications != nil {
 			a.notifications.Sync("planner", ui.SeverityWarning, msg)
@@ -1249,7 +1233,6 @@ func (a *App) wirePlanner() {
 		}
 	}
 	a.plannerView.StartRefreshLoop(a.quitCh, 3*time.Second)
-	go a.resolveUserID()
 }
 
 // wireAgents connects the Agents tab callbacks to the gRPC client.
@@ -1307,34 +1290,6 @@ func (a *App) wireChat() {
 		}
 	}
 	a.chatView.StartRefreshLoop(a.quitCh, 3*time.Second)
-}
-
-// resolveUserID pulls the caller's v1:identity:user.id from
-// GetMyAccess once a cluster connection is live. Retried with a short
-// backoff because dispatcher availability is racing against the
-// per-cluster dial lifecycle. Cached under userIDMu and exposed to
-// the Planner tab as Plan.requestedBy.
-func (a *App) resolveUserID() {
-	for attempt := 0; attempt < 30; attempt++ {
-		d := a.activeDispatcher()
-		if d != nil {
-			qc := client.NewQueryClient(d)
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			res, err := qc.GetMyAccess(ctx)
-			cancel()
-			if err == nil && res != nil && res.GetUserId() != "" {
-				a.userIDMu.Lock()
-				a.userID = res.GetUserId()
-				a.userIDMu.Unlock()
-				return
-			}
-		}
-		select {
-		case <-a.quitCh:
-			return
-		case <-time.After(2 * time.Second):
-		}
-	}
 }
 
 // wireCluster wires the topology pane's OnInitialLoad callback to the
