@@ -1286,7 +1286,10 @@ func (a *App) wireAgents() {
 
 // wireChat connects the Chat tab to the gRPC client. The chat view
 // polls v1:cognition:space + v1:cognition:utterance every 3s and
-// renders the single-chat-per-space stream.
+// renders the single-chat-per-space stream. OnRedraw posts an
+// EventInterrupt after each refresh so the event loop repaints the
+// new data without waiting for a keystroke -- same pattern as
+// wirePlanner / wireAgents.
 func (a *App) wireChat() {
 	if a.chatView == nil {
 		return
@@ -1297,6 +1300,11 @@ func (a *App) wireChat() {
 			return nil
 		}
 		return client.NewQueryClient(d)
+	}
+	a.chatView.OnRedraw = func() {
+		if a.screen != nil {
+			a.screen.PostEvent(tcell.NewEventInterrupt(nil))
+		}
 	}
 	a.chatView.StartRefreshLoop(a.quitCh, 3*time.Second)
 }

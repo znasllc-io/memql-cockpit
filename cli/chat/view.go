@@ -52,6 +52,13 @@ type View struct {
 	// gated placeholder in that case.
 	QueryClient func() *client.QueryClient
 
+	// OnRedraw is posted by the background refresher when new data
+	// has landed so the event loop redraws even if no key was pressed.
+	// Without this, the 3s tick mutates v.spaces / v.utterances but
+	// the screen waits for the next keystroke to repaint -- the user
+	// sees stale data until they interact.
+	OnRedraw func()
+
 	spaces           []spaceRow
 	spaceSelected    int
 	spaceScrollY     int
@@ -92,12 +99,18 @@ func (v *View) StartRefreshLoop(stop <-chan struct{}, interval time.Duration) {
 	go func() {
 		defer t.Stop()
 		v.refresh()
+		if v.OnRedraw != nil {
+			v.OnRedraw()
+		}
 		for {
 			select {
 			case <-stop:
 				return
 			case <-t.C:
 				v.refresh()
+				if v.OnRedraw != nil {
+					v.OnRedraw()
+				}
 			}
 		}
 	}()
