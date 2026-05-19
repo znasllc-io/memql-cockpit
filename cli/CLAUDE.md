@@ -84,30 +84,35 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
 "connect to a cluster" is the first thing the user sees:
 
 1. **Clusters (F1)** -- cluster manager + partition manager + topology
-2. **Concepts (F2)** -- generic browser for every registered concept
-3. **Planner (F3)** -- observe v1:planner:plan + child v1:planner:task
+2. **Chat (F2)** -- single-chat-per-space utterance viewer. Today's
+   daily space for the connected user (`v1:cognition:space.kind=="daily"`,
+   id `daily-{userShortId}-{dateKey}`) is pinned at the top of the
+   space list, auto-selected on first paint, and ensured to exist
+   on connect via the dailyspace integration's `ensureForUser`
+   capability. Archived/saved spaces are filtered out; archived
+   rows expire and hard-delete via the existing
+   `purgeExpiredArchivedSpaces` cron. `v` toggles push-to-talk:
+   first press starts microphone capture (requires the `voice`
+   build tag -- `make cockpit-voice`), second press releases the
+   mic and the SDK finalizes the transcript via `memql-sdk-go`'s
+   `voice.PushToTalk`. The status strip above the chrome shows the
+   partial transcript while recording and the final text once
+   resolved. Without the `voice` tag the key surfaces a clear
+   "voice support not compiled in" message. Gated on a connected,
+   selected cluster.
+3. **Concepts (F3)** -- generic browser for every registered concept
+4. **Planner (F4)** -- observe v1:planner:plan + child v1:planner:task
    rows in the active partition. Read-only: goal submission moved to
    the Chat tab (the user talks to the assistant, which decides when
    to escalate to the planner). The one mutation that remains is
    R:Run on a queued plan -- flips it to running via
    mutationStartPlan. Gated on a connected, selected cluster.
-4. **Agents (F4)** -- read-only catalog of v1:agents:agent rows in
+5. **Agents (F5)** -- read-only catalog of v1:agents:agent rows in
    the active partition. Left pane lists agents (name + role); right
    pane shows identity, capabilities, knowledge domains, live
    knowledge, provider config, and recent plan attribution for the
    highlighted agent. No create/edit -- mutation surfaces live in
    CoPresent. Gated on a connected, selected cluster.
-5. **Chat (F5)** -- read-only viewer over the single-chat-per-space
-   `v1:cognition:utterance` stream. Left pane lists active spaces;
-   right pane renders the recent utterances for the selected space.
-   `v` toggles push-to-talk: first press starts microphone capture
-   (requires the `voice` build tag -- `make cockpit-voice`), second
-   press releases the mic and the SDK finalizes the transcript via
-   `memql-sdk-go`'s `voice.PushToTalk`. The status strip above the
-   chrome shows the partial transcript while recording and the
-   final text once resolved. Without the `voice` tag the key
-   surfaces a clear "voice support not compiled in" message.
-   Gated on a connected, selected cluster.
 6. **Settings (F6)** -- credentials, theme, version
 
 Concepts, Planner, Agents, and Chat are all gated on a connected,
