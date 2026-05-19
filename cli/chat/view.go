@@ -26,6 +26,9 @@ import (
 	"github.com/gdamore/tcell/v2"
 
 	"github.com/znasllc-io/memql/sdk/go/client"
+	"github.com/znasllc-io/memql/sdk/go/voice"
+
+	"github.com/znasllc-io/memql-cockpit/cli/audio"
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
 )
 
@@ -52,12 +55,24 @@ type View struct {
 	// gated placeholder in that case.
 	QueryClient func() *client.QueryClient
 
+	// Dispatcher returns the active cluster's stream dispatcher --
+	// used by the PTT flow to drive memql-sdk-go's voice.PushToTalk.
+	Dispatcher func() *client.Dispatcher
+
 	// OnRedraw is posted by the background refresher when new data
 	// has landed so the event loop redraws even if no key was pressed.
 	// Without this, the 3s tick mutates v.spaces / v.utterances but
 	// the screen waits for the next keystroke to repaint -- the user
 	// sees stale data until they interact.
 	OnRedraw func()
+
+	// PTT state, surfaced in the chat-pane title strip.
+	pttActive     bool
+	pttPartial    string
+	pttFinal      string
+	pttStatus     string // "" | "listening" | "transcribing" | "done" | "error: <msg>"
+	pttCancel     context.CancelFunc
+	pttStopAudio  func() error
 
 	spaces           []spaceRow
 	spaceSelected    int
@@ -279,6 +294,12 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 	screen.DrawText(right.X+2, right.Y, right.Width-4, title, accentStyle)
 
 	contentH := right.Height - 3
+	// Reserve a row for the PTT status strip when a session is active
+	// or has just produced a final transcript / error to surface.
+	reservePTT := v.pttActive || v.pttStatus != ""
+	if reservePTT {
+		contentH--
+	}
 	start := v.utteranceScrollY
 	if start < 0 {
 		start = 0
@@ -300,11 +321,41 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 		screen.DrawText(right.X+1, right.Y+1+i, right.Width-2, truncate(line, right.Width-2), style)
 	}
 
-	hint := "Up/Dn:Scroll  Tab:Left"
+	if reservePTT {
+		pttRow := right.Y + right.Height - 2
+		pttText := v.pttStatusLine()
+		screen.DrawText(right.X+1, pttRow, right.Width-2, pttText, accentStyle)
+	}
+
+	hint := "Up/Dn:Scroll  v:PTT  Tab:Left"
 	if v.lastFetchErr != "" {
 		hint = "err: " + truncate(v.lastFetchErr, right.Width-10)
 	}
 	ui.DrawBottom(screen, right, subtleStyle, 1, hint)
+}
+
+// pttStatusLine renders the PTT state strip just above the chrome:
+// "[mic] listening: <partial>" while active, "[mic] transcribing..."
+// after release, "[mic] done: <final>" once the SDK resolves, or
+// the error string otherwise. Caller must hold the read lock.
+func (v *View) pttStatusLine() string {
+	switch v.pttStatus {
+	case "listening":
+		if v.pttPartial != "" {
+			return "[mic] " + truncate(v.pttPartial, 240)
+		}
+		return "[mic] listening... (press v again to stop)"
+	case "transcribing":
+		if v.pttPartial != "" {
+			return "[mic] transcribing... " + truncate(v.pttPartial, 200)
+		}
+		return "[mic] transcribing..."
+	case "done":
+		return "[mic] " + truncate(v.pttFinal, 240)
+	default:
+		// "error: ..." or empty
+		return v.pttStatus
+	}
 }
 
 // HandleEvent processes a key event. Returns true if consumed.
@@ -313,6 +364,17 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 	if !ok {
 		return false
 	}
+
+	// `v` toggles push-to-talk capture: first press starts the
+	// session, second press ends it cleanly so the SDK can finalize
+	// the transcript. Handled OUTSIDE the locked switch below because
+	// startPTT / stopPTT need to manage their own locking and spawn
+	// goroutines.
+	if kev.Key() == tcell.KeyRune && (kev.Rune() == 'v' || kev.Rune() == 'V') {
+		v.togglePTT()
+		return true
+	}
+
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
@@ -346,6 +408,102 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 		return true
 	}
 	return false
+}
+
+// togglePTT starts a PTT session if none is active, or signals the
+// active session to end. Audio capture + SDK transcription run in a
+// background goroutine; partials + final land on v.pttPartial /
+// v.pttFinal under v.mu, with OnRedraw posted so the title strip
+// repaints in real time.
+func (v *View) togglePTT() {
+	v.mu.Lock()
+	if v.pttActive {
+		// Second press: ask the audio reader to close, which lets
+		// PushToTalk see EOF on its read and send End{cancel:false}.
+		if v.pttStopAudio != nil {
+			_ = v.pttStopAudio()
+		}
+		v.pttStatus = "transcribing"
+		v.mu.Unlock()
+		if v.OnRedraw != nil {
+			v.OnRedraw()
+		}
+		return
+	}
+
+	if v.Dispatcher == nil || v.Dispatcher() == nil {
+		v.pttStatus = "error: no cluster connected"
+		v.mu.Unlock()
+		if v.OnRedraw != nil {
+			v.OnRedraw()
+		}
+		return
+	}
+	dispatcher := v.Dispatcher()
+
+	reader, stopAudio, err := audio.StartCapture(audio.DefaultFormat())
+	if err != nil {
+		v.pttStatus = "error: " + err.Error()
+		v.mu.Unlock()
+		if v.OnRedraw != nil {
+			v.OnRedraw()
+		}
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	v.pttActive = true
+	v.pttPartial = ""
+	v.pttFinal = ""
+	v.pttStatus = "listening"
+	v.pttCancel = cancel
+	v.pttStopAudio = stopAudio
+	v.mu.Unlock()
+	if v.OnRedraw != nil {
+		v.OnRedraw()
+	}
+
+	go func() {
+		defer func() {
+			_ = stopAudio()
+			v.mu.Lock()
+			v.pttActive = false
+			v.pttCancel = nil
+			v.pttStopAudio = nil
+			v.mu.Unlock()
+			if v.OnRedraw != nil {
+				v.OnRedraw()
+			}
+		}()
+
+		final, err := voice.PushToTalk(ctx, dispatcher, reader, voice.Options{
+			Audio: voice.AudioFormat{
+				Encoding:   "pcm16",
+				SampleRate: 16000,
+				Channels:   1,
+			},
+			ChunkBytes: 3200, // 100ms of 16kHz mono PCM16
+			OnPartial: func(p voice.PartialTranscript) {
+				v.mu.Lock()
+				v.pttPartial = p.Text
+				v.mu.Unlock()
+				if v.OnRedraw != nil {
+					v.OnRedraw()
+				}
+			},
+		})
+		v.mu.Lock()
+		if err != nil {
+			v.pttStatus = "error: " + err.Error()
+		} else if final != nil {
+			v.pttFinal = final.Text
+			v.pttStatus = "done"
+		}
+		v.mu.Unlock()
+		if v.OnRedraw != nil {
+			v.OnRedraw()
+		}
+	}()
 }
 
 // normalizeRows accepts the protojson-decoded Execute result and

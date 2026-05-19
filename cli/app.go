@@ -1284,6 +1284,7 @@ func (a *App) wireChat() {
 		}
 		return client.NewQueryClient(d)
 	}
+	a.chatView.Dispatcher = a.activeDispatcher
 	a.chatView.OnRedraw = func() {
 		if a.screen != nil {
 			a.screen.PostEvent(tcell.NewEventInterrupt(nil))
