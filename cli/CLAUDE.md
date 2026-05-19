@@ -97,11 +97,22 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
    knowledge, provider config, and recent plan attribution for the
    highlighted agent. No create/edit -- mutation surfaces live in
    CoPresent. Gated on a connected, selected cluster.
-5. **Settings (F5)** -- credentials, theme, version
+5. **Chat (F5)** -- read-only viewer over the single-chat-per-space
+   `v1:cognition:utterance` stream. Left pane lists active spaces;
+   right pane renders the recent utterances for the selected space.
+   `v` toggles push-to-talk: first press starts microphone capture
+   (requires the `voice` build tag -- `make cockpit-voice`), second
+   press releases the mic and the SDK finalizes the transcript via
+   `memql-sdk-go`'s `voice.PushToTalk`. The status strip above the
+   chrome shows the partial transcript while recording and the
+   final text once resolved. Without the `voice` tag the key
+   surfaces a clear "voice support not compiled in" message.
+   Gated on a connected, selected cluster.
+6. **Settings (F6)** -- credentials, theme, version
 
-Concepts, Planner, and Agents are all gated on a connected, selected
-cluster -- they show a placeholder message until the user presses
-Enter on a cluster row in the Clusters tab.
+Concepts, Planner, Agents, and Chat are all gated on a connected,
+selected cluster -- they show a placeholder message until the user
+presses Enter on a cluster row in the Clusters tab.
 
 ### Concepts tab layout
 
@@ -337,12 +348,14 @@ collects the slug + type and hands them off.
 | `cluster/topology.go`    | Live cluster topology grid (right pane) + Architecture toggle |
 | `cluster/architecture.go`| `ArchView`: drill-down navigator over `topology.model.json`   |
 | `cluster/metrics_fetcher.go` | `QueryClientMetricsFetcher`: codeMetric overlay fetch      |
-| `client/dispatcher.go`   | Multiplexed gRPC stream, partition auto-stamping              |
-| `client/queries.go`      | `QueryClient` (also runs mutations via ExecuteQuery)          |
+| _gRPC client_            | Lives in `memql/sdk/go/client/` -- `Connection`, `Dispatcher`, `QueryClient`, `SubscriptionManager`. Cockpit imports the SDK rather than reimplementing the wire layer. |
+| `sense/`                 | `SenseClient` over the SDK Dispatcher -- editor-side wrappers for MemQL Sense (Tokenize / Diagnose / Complete / Hover). |
+| `audio/`                 | Microphone capture for push-to-talk (malgo / miniaudio). Build-tag-gated (`voice`); stub returns a clear error on default headless builds. |
 | `config/clusters.go`     | `~/.memql/clusters.yaml` load/save                            |
 | `concepts/`              | Concepts tab (concept picker + row list + generic renderer)   |
 | `planner/`               | Planner tab (read-only plan list + task list + detail; R:Run)  |
 | `agents/`                | Agents tab (agent list + read-only detail pane)               |
+| `chat/`                  | Chat tab (space list + utterance scroll + `v`:PTT via memql-sdk-go voice.PushToTalk) |
 | `editor/`                | Reusable text editor with Sense integration                   |
 | `settings/`              | Settings tab                                                  |
 | `ui/`                    | Theme, screen, tab bar, layout primitives                     |
