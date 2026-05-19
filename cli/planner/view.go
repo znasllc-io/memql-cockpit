@@ -422,6 +422,13 @@ func (v *View) drawPlanList(screen *ui.Screen, bounds ui.Rect) {
 		if elapsed := activeStatusElapsed(status, getString(p, "createdAt")); elapsed != "" {
 			sub = fmt.Sprintf("%s  %s  +%s", statusLabel(status), when, elapsed)
 		}
+		// Token strip rides on the subtitle so the plan list stays
+		// 2 rows tall. Format: " · 1.2k / 5k tok" or " · 482 tok"
+		// when there's no budget. Skipped entirely when the plan
+		// hasn't spent any tokens yet (queued, idle).
+		if tok := planTokenSummary(p); tok != "" {
+			sub += "  ·  " + tok
+		}
 		screen.DrawText(bounds.X+2, y+1, bounds.Width-3, sub, dimify(style, v.Theme.Subtle))
 	}
 
@@ -441,9 +448,16 @@ func (v *View) drawTaskList(screen *ui.Screen, bounds ui.Rect) {
 		titleStyle = v.Theme.AccentStyle().Bold(true)
 	}
 	// Position count rides the title bar per the chrome contract.
+	// Plan-level token rollup tags onto the title strip so the user
+	// sees the running total without leaving the Tasks pane.
 	title := " TASKS "
 	if n := len(v.tasks); n > 0 {
 		title = fmt.Sprintf(" TASKS (%d/%d) ", v.taskSelected+1, n)
+	}
+	if v.planSelected >= 0 && v.planSelected < len(v.plans) {
+		if tok := planTokenSummary(v.plans[v.planSelected]); tok != "" {
+			title = strings.TrimRight(title, " ") + "  ·  " + tok + " "
+		}
 	}
 	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, titleStyle)
 
@@ -517,7 +531,10 @@ func (v *View) drawTaskList(screen *ui.Screen, bounds ui.Rect) {
 		primary := fmt.Sprintf("[%d] %s", getInt(t, "seq"), label)
 		screen.DrawText(bounds.X+2, y, bounds.Width-3, primary, style)
 
-		// Subtitle: status + phase + active-status timer.
+		// Subtitle: status + phase + active-status timer + tokens.
+		// task.metrics.tokensSpent rolls up the task's LLM + tool
+		// costs; 0 for queued / fresh-running tasks where no calls
+		// have completed yet.
 		status := getString(t, "status")
 		sub := statusLabel(status)
 		if phase := getString(t, "phase"); phase != "" {
@@ -525,6 +542,9 @@ func (v *View) drawTaskList(screen *ui.Screen, bounds ui.Rect) {
 		}
 		if elapsed := activeStatusElapsed(status, getString(t, "createdAt")); elapsed != "" {
 			sub += "  +" + elapsed
+		}
+		if tok := taskTokensSpent(t); tok > 0 {
+			sub += "  ·  " + formatTokens(tok) + " tok"
 		}
 		screen.DrawText(bounds.X+2, y+1, bounds.Width-3, sub, dimify(style, v.Theme.Subtle))
 	}
@@ -700,9 +720,53 @@ func (v *View) buildTaskDetailLines(task, plan map[string]any, innerWidth int) [
 		addKV("elapsed", elapsed)
 	}
 
+	// Tokens section: per-task LLM + tool spend, with the parent
+	// Plan's total + budget alongside so the operator sees the
+	// task's share of the plan-level cap. Always rendered (even if
+	// 0) so the section is a stable reference point as tasks
+	// transition queued -> running -> succeeded and the counts
+	// climb. Model breakdown (modelBreakdown[]) is collapsed into
+	// one line per (tag, tokens) entry when present.
+	metrics, _ := task["metrics"].(map[string]any)
+	addSection("tokens")
+	taskSpent := taskTokensSpent(task)
+	addKV("task spent", formatTokens(taskSpent)+" tok")
+	planSpent := getInt(plan, "tokenSpent")
+	planBudget := getInt(plan, "tokenBudget")
+	if planBudget > 0 {
+		addKV("plan spent", fmt.Sprintf("%s / %s tok", formatTokens(planSpent), formatTokens(planBudget)))
+	} else {
+		addKV("plan spent", formatTokens(planSpent)+" tok")
+	}
+	if metrics != nil {
+		if llm := getInt(metrics, "llmCallCount"); llm > 0 {
+			addKV("LLM calls", strconv.Itoa(llm))
+		}
+		if tools := getInt(metrics, "toolCallCount"); tools > 0 {
+			addKV("tool calls", strconv.Itoa(tools))
+		}
+		if breakdown, ok := metrics["modelBreakdown"].([]any); ok && len(breakdown) > 0 {
+			lines = append(lines, "")
+			lines = append(lines, "  by model:")
+			for _, item := range breakdown {
+				row, _ := item.(map[string]any)
+				if row == nil {
+					continue
+				}
+				tag := getString(row, "tag")
+				if tag == "" {
+					tag = "(unknown)"
+				}
+				lines = append(lines, fmt.Sprintf("    - %s: %s tok", tag, formatTokens(getInt(row, "tokens"))))
+			}
+		}
+	}
+
 	// Input / output / tool args+result / error / metrics blocks --
 	// each rendered as JSON when non-empty. addBlock skips empties so
-	// the pane only shows sections that have content.
+	// the pane only shows sections that have content. The full
+	// metrics JSON still renders at the bottom; the tokens section
+	// above is the surface-level summary.
 	addBlock("input", prettyJSON(task["input"]))
 	addBlock("output", prettyJSON(task["output"]))
 	addBlock("tool args", prettyJSON(task["toolArgs"]))
@@ -1079,6 +1143,67 @@ func getInt(m map[string]any, key string) int {
 		}
 	}
 	return 0
+}
+
+// taskTokensSpent extracts task.metrics.tokensSpent. Tasks track
+// their own LLM + tool token costs under the metrics rollup; the
+// parent Plan's tokenSpent is the sum of these plus the planner's
+// own decomposition / replanning calls. Returns 0 when metrics is
+// missing or hasn't been populated yet (e.g., a fresh queued task).
+func taskTokensSpent(task map[string]any) int {
+	if task == nil {
+		return 0
+	}
+	metrics, _ := task["metrics"].(map[string]any)
+	if metrics == nil {
+		return 0
+	}
+	return getInt(metrics, "tokensSpent")
+}
+
+// formatTokens renders a token count in a compact "1.2k" / "23.4k" /
+// "120" form so it fits on a row alongside status + phase + elapsed
+// without pushing the elapsed timer off the edge. Anything under 1000
+// renders verbatim; 1000+ rolls up to a one-decimal "k" with the
+// trailing ".0" stripped so 4000 reads as "4k" not "4.0k".
+func formatTokens(n int) string {
+	if n < 0 {
+		n = 0
+	}
+	if n < 1000 {
+		return strconv.Itoa(n)
+	}
+	if n < 1_000_000 {
+		v := float64(n) / 1000.0
+		if v == float64(int(v)) {
+			return fmt.Sprintf("%dk", int(v))
+		}
+		return fmt.Sprintf("%.1fk", v)
+	}
+	v := float64(n) / 1_000_000.0
+	if v == float64(int(v)) {
+		return fmt.Sprintf("%dM", int(v))
+	}
+	return fmt.Sprintf("%.1fM", v)
+}
+
+// planTokenSummary returns the plan-level "<spent> / <budget>" pair
+// for display in the Tasks pane title, or just "<spent> tok" when no
+// budget is set. Empty when the plan has no token activity yet
+// (queued state, no llm calls).
+func planTokenSummary(plan map[string]any) string {
+	if plan == nil {
+		return ""
+	}
+	spent := getInt(plan, "tokenSpent")
+	budget := getInt(plan, "tokenBudget")
+	if spent == 0 && budget == 0 {
+		return ""
+	}
+	if budget == 0 {
+		return formatTokens(spent) + " tok"
+	}
+	return fmt.Sprintf("%s / %s tok", formatTokens(spent), formatTokens(budget))
 }
 
 func shortenTimestamp(ts string) string {
