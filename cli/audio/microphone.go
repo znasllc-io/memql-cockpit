@@ -19,6 +19,7 @@ package audio
 import (
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/gen2brain/malgo"
 )
@@ -81,15 +82,28 @@ func StartCapture(fmtSpec Format) (io.Reader, func() error, error) {
 		return nil, nil, fmt.Errorf("audio: device.Start: %w", err)
 	}
 
+	// stop is idempotent: the chat view calls it once on the second
+	// `v` press to drive the SDK toward EOF + clean End{cancel:false},
+	// then again from the PushToTalk-pump goroutine's defer after
+	// Complete lands. malgo's Free() is not safe to call twice, so
+	// guard with sync.Once.
+	var (
+		stopOnce sync.Once
+		stopErr  error
+	)
 	stop := func() error {
-		device.Uninit()
-		if err := ctx.Uninit(); err != nil {
+		stopOnce.Do(func() {
+			device.Uninit()
+			if err := ctx.Uninit(); err != nil {
+				ctx.Free()
+				stopErr = fmt.Errorf("audio: ctx.Uninit: %w", err)
+				pipe.close()
+				return
+			}
 			ctx.Free()
-			return fmt.Errorf("audio: ctx.Uninit: %w", err)
-		}
-		ctx.Free()
-		pipe.close()
-		return nil
+			pipe.close()
+		})
+		return stopErr
 	}
 	return pipe, stop, nil
 }
