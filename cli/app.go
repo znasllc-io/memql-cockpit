@@ -132,15 +132,16 @@ func NewApp(cfg AppConfig) *App {
 	chatView := chat.NewView(theme)
 
 	// Clusters comes first -- it's the starting context for the session.
-	// Agents + Chat sit between Planner (orchestration surface) and
-	// Settings so the cluster-dependent operational tabs are grouped
-	// together at F1..F5.
+	// Chat sits next (F2) because the daily-space conversation is the
+	// primary surface users open after connecting; Concepts / Planner /
+	// Agents follow as operations-console reads, and Settings stays
+	// last.
 	tabBar := ui.NewTabBar(theme,
 		ui.Tab{Name: "Clusters", Content: clustersView},
+		ui.Tab{Name: "Chat", Content: chatView},
 		ui.Tab{Name: "Concepts", Content: conceptsView},
 		ui.Tab{Name: "Planner", Content: plannerView},
 		ui.Tab{Name: "Agents", Content: agentsView},
-		ui.Tab{Name: "Chat", Content: chatView},
 		ui.Tab{Name: "Settings", Content: settingsView},
 	)
 	tabBar.SetActive(0)
@@ -1285,6 +1286,11 @@ func (a *App) wireChat() {
 		return client.NewQueryClient(d)
 	}
 	a.chatView.Dispatcher = a.activeDispatcher
+	a.chatView.OnStatus = func(msg string) {
+		if a.notifications != nil {
+			a.notifications.Sync("chat", ui.SeverityError, msg)
+		}
+	}
 	a.chatView.OnRedraw = func() {
 		if a.screen != nil {
 			a.screen.PostEvent(tcell.NewEventInterrupt(nil))
