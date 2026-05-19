@@ -66,6 +66,15 @@ type View struct {
 	// sees stale data until they interact.
 	OnRedraw func()
 
+	// OnStatus surfaces refresh / ensure errors to the cockpit's
+	// notification center (the header band, copy + dismiss). The
+	// chrome strip below the chat pane is reserved for action
+	// hints; pushing user-visible errors there hides them behind a
+	// half-line truncation and gives the user no way to copy or
+	// dismiss. The app's wireChat function points this at
+	// `a.notifications.Sync("chat", ui.SeverityError, msg)`.
+	OnStatus func(msg string)
+
 	// PTT state, surfaced in the chat-pane title strip.
 	pttActive     bool
 	pttPartial    string
@@ -77,13 +86,24 @@ type View struct {
 	spaces           []spaceRow
 	spaceSelected    int
 	spaceScrollY     int
+	// userPickedSpace tracks whether the user has manually selected a
+	// space this session. While false, the refresher auto-snaps the
+	// highlight to today's daily on every refresh -- so a freshly
+	// provisioned daily lands selected even when it arrives a tick
+	// or two after the first paint. Flipped true the first time
+	// HandleEvent moves the highlight.
+	userPickedSpace bool
 
 	utterances       []utteranceRow
 	utteranceScrollY int
 
 	Focus FocusPane
 
-	lastFetchErr string
+	// ensureRan flips true after the first successful
+	// ensureDailySpaceForCaller call. Cheap idempotent capability,
+	// but no point hammering it -- once per session is enough; the
+	// midnight-rollover safety net is the server-side hourly cron.
+	ensureRan bool
 }
 
 type spaceRow struct {
@@ -91,6 +111,7 @@ type spaceRow struct {
 	Name        string
 	OwnerUserId string
 	Status      string
+	Kind        string
 }
 
 type utteranceRow struct {
@@ -135,8 +156,62 @@ func (v *View) StartRefreshLoop(stop <-chan struct{}, interval time.Duration) {
 func (v *View) Refresh() { v.refresh() }
 
 func (v *View) refresh() {
+	v.ensureDailyOnce()
 	v.refreshSpaces()
 	v.refreshUtterances()
+}
+
+// ensureDailyOnce fires integration.dailyspace.ensureForCaller exactly
+// once per session, on the first refresh after a cluster connects.
+// The capability resolves the caller's user id from the request's
+// auth context (PAT subject in the cockpit's case) and provisions
+// today's `daily-{userShortId}-{dateKey}` space if it doesn't
+// already exist. The mutation is content-addressable on the id, so
+// repeat calls collapse server-side -- the ensureRan latch is just
+// a chattiness reducer, not a correctness gate.
+//
+// We do NOT wait for this call before painting the space list; the
+// 3s refresh loop will pick the row up on the next tick. That keeps
+// the chat tab snappy even when the engine has to do the
+// read-user + write-space dance.
+func (v *View) ensureDailyOnce() {
+	v.mu.RLock()
+	already := v.ensureRan
+	v.mu.RUnlock()
+	if already {
+		return
+	}
+	if v.QueryClient == nil {
+		return
+	}
+	qc := v.QueryClient()
+	if qc == nil {
+		return
+	}
+	v.mu.Lock()
+	v.ensureRan = true
+	v.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// Engine's top-level Execute dispatches the Logic wrapper, which
+	// runs the dailyspace.ensureForCaller integration capability;
+	// the capability resolves the JWT/PAT subject as the userId
+	// and runs the idempotent create.
+	if _, err := qc.Execute(ctx, `logicEnsureDailySpaceForCaller({})`); err != nil {
+		// Push the failure through the header notifications center
+		// (with copy + dismiss) instead of the chrome strip below
+		// the pane -- chrome rows are for action hints, not errors
+		// the user needs to read and act on. Clear the latch so the
+		// next 3s tick retries; a transient failure shouldn't
+		// strand the user without a daily.
+		if v.OnStatus != nil {
+			v.OnStatus("ensure daily space: " + err.Error())
+		}
+		v.mu.Lock()
+		v.ensureRan = false
+		v.mu.Unlock()
+	}
 }
 
 func (v *View) refreshSpaces() {
@@ -152,9 +227,9 @@ func (v *View) refreshSpaces() {
 
 	res, err := qc.Execute(ctx, `concept==v1:cognition:space; payload.status=="active"`)
 	if err != nil {
-		v.mu.Lock()
-		v.lastFetchErr = err.Error()
-		v.mu.Unlock()
+		if v.OnStatus != nil {
+			v.OnStatus("load spaces: " + err.Error())
+		}
 		return
 	}
 
@@ -169,17 +244,59 @@ func (v *View) refreshSpaces() {
 		name, _ := payload["name"].(string)
 		owner, _ := payload["ownerUserId"].(string)
 		status, _ := payload["status"].(string)
-		out = append(out, spaceRow{ID: id, Name: name, OwnerUserId: owner, Status: status})
+		kind, _ := payload["kind"].(string)
+		out = append(out, spaceRow{ID: id, Name: name, OwnerUserId: owner, Status: status, Kind: kind})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	// Pin daily spaces at the top -- the user's "today" surface is
+	// the primary thing they came here to see. Within each group
+	// (daily vs regular) sort by id so the list is stable across
+	// refresh ticks. The list grouping mirrors what the CoPresent
+	// SpacesPanel does on the web -- daily first, ambient spaces
+	// underneath.
+	sort.SliceStable(out, func(i, j int) bool {
+		di, dj := out[i].Kind == "daily", out[j].Kind == "daily"
+		if di != dj {
+			return di
+		}
+		return out[i].ID < out[j].ID
+	})
 
 	v.mu.Lock()
 	v.spaces = out
 	if v.spaceSelected >= len(v.spaces) {
 		v.spaceSelected = 0
 	}
-	v.lastFetchErr = ""
+	// Until the user has moved the highlight themselves, anchor the
+	// selection on today's daily. This makes a freshly provisioned
+	// daily land selected the tick it appears in the list even when
+	// the refresher beat ensureForCaller to first paint.
+	if !v.userPickedSpace && len(v.spaces) > 0 {
+		idx := indexOfDaily(v.spaces)
+		if idx < 0 {
+			idx = 0
+		}
+		if idx != v.spaceSelected {
+			// Adjust scroll so the row stays visible -- otherwise a
+			// list with several non-daily rows pushed the daily off
+			// the top of the viewport on first paint.
+			v.spaceSelected = idx
+			v.spaceScrollY = 0
+		}
+	}
 	v.mu.Unlock()
+}
+
+// indexOfDaily returns the index of the first daily-kind row, or -1.
+// Lives next to refreshSpaces because both paths assume the same
+// "daily rows are pinned to the top" sort order; if that contract
+// changes, both routines change together.
+func indexOfDaily(rows []spaceRow) int {
+	for i, r := range rows {
+		if r.Kind == "daily" {
+			return i
+		}
+	}
+	return -1
 }
 
 func (v *View) refreshUtterances() {
@@ -209,9 +326,9 @@ func (v *View) refreshUtterances() {
 	q := fmt.Sprintf(`concept==v1:cognition:utterance; payload.spaceId==%q`, spaceID)
 	res, err := qc.Execute(ctx, q)
 	if err != nil {
-		v.mu.Lock()
-		v.lastFetchErr = err.Error()
-		v.mu.Unlock()
+		if v.OnStatus != nil {
+			v.OnStatus("load utterances: " + err.Error())
+		}
 		return
 	}
 
@@ -282,6 +399,13 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 		if label == "" {
 			label = s.ID
 		}
+		// Daily-kind rows get a "Today: " prefix so the user can
+		// distinguish "today's daily space" from any other space
+		// they've created with the same name; saves a Tab+arrow
+		// roundtrip to read the row id.
+		if s.Kind == "daily" {
+			label = "Today: " + label
+		}
 		screen.DrawText(left.X+1, left.Y+1+i, left.Width-2, marker+truncate(label, left.Width-4), style)
 	}
 	ui.DrawBottom(screen, left, subtleStyle, 1, "Up/Dn:Move  Tab:Right")
@@ -327,11 +451,10 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 		screen.DrawText(right.X+1, pttRow, right.Width-2, pttText, accentStyle)
 	}
 
-	hint := "Up/Dn:Scroll  v:PTT  Tab:Left"
-	if v.lastFetchErr != "" {
-		hint = "err: " + truncate(v.lastFetchErr, right.Width-10)
-	}
-	ui.DrawBottom(screen, right, subtleStyle, 1, hint)
+	// Chrome strip is action hints only; refresh + ensure errors go
+	// through OnStatus to the header notifications center where the
+	// user can read them in full and copy / dismiss.
+	ui.DrawBottom(screen, right, subtleStyle, 1, "Up/Dn:Scroll  v:PTT  Tab:Left")
 }
 
 // pttStatusLine renders the PTT state strip just above the chrome:
@@ -390,6 +513,7 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 		if v.Focus == FocusSpaces {
 			if v.spaceSelected > 0 {
 				v.spaceSelected--
+				v.userPickedSpace = true
 				go v.refreshUtterances()
 			}
 		} else if v.utteranceScrollY > 0 {
@@ -400,6 +524,7 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 		if v.Focus == FocusSpaces {
 			if v.spaceSelected < len(v.spaces)-1 {
 				v.spaceSelected++
+				v.userPickedSpace = true
 				go v.refreshUtterances()
 			}
 		} else if v.utteranceScrollY < len(v.utterances)-1 {
