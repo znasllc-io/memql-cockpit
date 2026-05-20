@@ -19,11 +19,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout memql-cockpit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: memql-cockpit
       - name: Checkout memql (sibling for replace directive)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: znasllc-io/memql
           path: memql
@@ -41,11 +41,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout memql-cockpit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: memql-cockpit
       - name: Checkout memql (sibling for replace directive)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: znasllc-io/memql
           path: memql
@@ -63,11 +63,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout memql-cockpit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: memql-cockpit
       - name: Checkout memql (sibling for replace directive)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: znasllc-io/memql
           path: memql
