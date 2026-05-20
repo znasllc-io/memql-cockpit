@@ -14,6 +14,8 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/znasllc-io/memql-cockpit/cli/config"
 )
 
 // Config is the worker run mode configuration. Backed by
@@ -53,8 +55,19 @@ func Defaults() Config {
 
 // LoadFile reads a worker.yaml file at the supplied path. Missing
 // file returns the defaults; malformed file is an error.
+//
+// The worker config stores the worker token (mql_wkr_*) in
+// plaintext; the file MUST be 0600. VerifyCredentialFileMode rejects
+// loads from a group- or world-readable file so a drift in
+// permissions surfaces loudly instead of silently exposing the
+// worker token to other local users.
 func LoadFile(path string) (Config, error) {
 	cfg := Defaults()
+	if _, statErr := os.Stat(path); statErr == nil {
+		if err := config.VerifyCredentialFileMode(path); err != nil {
+			return cfg, err
+		}
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {

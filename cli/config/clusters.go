@@ -95,8 +95,19 @@ func ConfigDir() string {
 
 // LoadClusters reads the cluster registry from ~/.memql/clusters.yaml.
 // Returns an empty registry if the file doesn't exist.
+//
+// The cluster registry stores PAT bearer tokens in plaintext; the
+// file MUST be 0600. VerifyCredentialFileMode rejects loads from
+// group- or world-readable files so a drift in permissions surfaces
+// loudly instead of silently exposing tokens to other local users.
 func LoadClusters() (*ClustersFile, error) {
 	path := filepath.Join(ConfigDir(), "clusters.yaml")
+
+	if _, statErr := os.Stat(path); statErr == nil {
+		if err := VerifyCredentialFileMode(path); err != nil {
+			return nil, err
+		}
+	}
 
 	data, err := os.ReadFile(path)
 	if err != nil {
