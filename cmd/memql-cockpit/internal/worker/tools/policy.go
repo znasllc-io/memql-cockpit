@@ -103,6 +103,22 @@ func DefaultPolicy() *Policy {
 				"kill", "killall", "reboot", "shutdown", "halt", "poweroff",
 				"curl", "wget", "fdisk", "format", "mount", "umount",
 			},
+			// Per-call rlimits. Earlier defaults left these as zero
+			// (inherit parent), which gave a runaway shell exec the
+			// full ulimit ceiling of the user session -- a
+			// fork-bomb-shaped agent could exhaust CPU + memory of
+			// the operator's laptop before the kill switch fired.
+			// 5 minutes / 1 GiB / 1024 fds is generous for normal
+			// dev work but caps the blast radius. Operators with
+			// genuine heavier workloads can override via worker
+			// policy.yaml.
+			//
+			// Note: RLIMIT_AS (memory) is a no-op on macOS today --
+			// macOS lacks a portable equivalent; see
+			// exec_unix_darwin.go. The cap still applies on Linux.
+			MaxCPUSeconds: 300,
+			MaxMemoryMB:   1024,
+			MaxOpenFiles:  1024,
 		},
 		fs: FSPolicy{
 			WorkspaceRoot: "",
