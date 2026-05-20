@@ -53,3 +53,7 @@ This module depends on `github.com/znasllc-io/memql` for:
 During local development the `replace` directive in `go.mod` points
 at a sibling `../memql/` tree. Once memql core is published with a
 real version tag, drop the replace and pin the version.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
