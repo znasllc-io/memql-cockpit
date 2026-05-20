@@ -19,7 +19,7 @@
 
 <p align="center"><sub><em>Designed and built with Claude as co-author.</em></sub></p>
 
-> **Pre-1.0 / actively developed.** API and configuration are still evolving.
+> **Status: Alpha / pre-1.0 — not production-ready.** memQL Cockpit is under active development and tracks memQL core. The TUI, worker contract, and configuration are still evolving; expect breaking changes between commits. Suitable for experimentation and early-design feedback today.
 
 ---
 
