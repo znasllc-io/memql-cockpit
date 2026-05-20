@@ -9,39 +9,73 @@ on:
 permissions:
   contents: read
 
+# memql-cockpit's go.mod points at ../memql/ via a `replace` directive for
+# local development. CI mirrors that layout: check out both repos as siblings,
+# then run from inside memql-cockpit.
+
 jobs:
   build:
     name: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout memql-cockpit
+        uses: actions/checkout@v4
+        with:
+          path: memql-cockpit
+      - name: Checkout memql (sibling for replace directive)
+        uses: actions/checkout@v4
+        with:
+          repository: znasllc-io/memql
+          path: memql
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26.1'
           cache: true
+          cache-dependency-path: memql-cockpit/go.sum
       - name: go build (headless)
+        working-directory: memql-cockpit
         run: go build ./...
 
   test:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout memql-cockpit
+        uses: actions/checkout@v4
+        with:
+          path: memql-cockpit
+      - name: Checkout memql (sibling for replace directive)
+        uses: actions/checkout@v4
+        with:
+          repository: znasllc-io/memql
+          path: memql
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26.1'
           cache: true
+          cache-dependency-path: memql-cockpit/go.sum
       - name: go test
+        working-directory: memql-cockpit
         run: go test -count=1 -timeout=300s ./...
 
   vet:
     name: vet
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout memql-cockpit
+        uses: actions/checkout@v4
+        with:
+          path: memql-cockpit
+      - name: Checkout memql (sibling for replace directive)
+        uses: actions/checkout@v4
+        with:
+          repository: znasllc-io/memql
+          path: memql
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26.1'
           cache: true
+          cache-dependency-path: memql-cockpit/go.sum
       - name: go vet
+        working-directory: memql-cockpit
         run: go vet ./...
