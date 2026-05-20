@@ -804,7 +804,6 @@ func shortenTimestamp(ts string) string {
 	return ts
 }
 
-
 func getString(m map[string]any, key string) string {
 	if m == nil {
 		return ""

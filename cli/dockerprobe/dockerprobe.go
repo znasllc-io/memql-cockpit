@@ -2,14 +2,14 @@
 // memQL cluster running on the local docker daemon. The data backs
 // two surfaces:
 //
-//   1. The "Set up local cluster" wizard uses ClusterRunning to
-//      branch into a "already running" status mode instead of
-//      blindly running port-in-use checks against ports owned by
-//      the cluster itself.
-//   2. The operating console's topology pane uses Containers to
-//      augment the gRPC clusterNodes feed with infrastructure
-//      services (LB, DB, IDENTITY, REDIS, ...) that don't register
-//      themselves as memQL nodes.
+//  1. The "Set up local cluster" wizard uses ClusterRunning to
+//     branch into a "already running" status mode instead of
+//     blindly running port-in-use checks against ports owned by
+//     the cluster itself.
+//  2. The operating console's topology pane uses Containers to
+//     augment the gRPC clusterNodes feed with infrastructure
+//     services (LB, DB, IDENTITY, REDIS, ...) that don't register
+//     themselves as memQL nodes.
 //
 // Everything here is best-effort: missing docker, missing daemon,
 // or an unknown compose project label all return an empty result

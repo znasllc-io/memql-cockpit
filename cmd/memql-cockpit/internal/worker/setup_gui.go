@@ -41,10 +41,10 @@ import (
 //     per-binary `tccutil check` result so the user can tell the
 //     cases apart.
 //   - Probes the actual gated operations (not just reads):
-//       Accessibility    -> robotgo.MoveRelative(2,0) + back
-//                           (CGEventPost; denied -> silent no-op)
-//       Screen Recording -> robotgo.SaveCapture; denied capture
-//                           comes back tiny / empty
+//     Accessibility    -> robotgo.MoveRelative(2,0) + back
+//     (CGEventPost; denied -> silent no-op)
+//     Screen Recording -> robotgo.SaveCapture; denied capture
+//     comes back tiny / empty
 func runSetupWizard() error {
 	if isInteractiveTTY() && (runtime.GOOS == "darwin" || runtime.GOOS == "linux") {
 		if err := runTUIWizard(); err != nil {

@@ -32,9 +32,9 @@ import (
 // RefreshMetrics. Keyed by model.Node.ID so the renderer can look it
 // up O(1) per visible row.
 type MetricSummary struct {
-	CallCount  int64
-	P95DurNs   int64
-	ErrorRate  float64 // 0..1
+	CallCount int64
+	P95DurNs  int64
+	ErrorRate float64 // 0..1
 }
 
 // ArchView is the in-pane navigator for the architecture model.

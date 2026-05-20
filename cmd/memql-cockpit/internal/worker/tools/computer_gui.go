@@ -14,8 +14,8 @@ import (
 	"os"
 	"strings"
 
-	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 	"github.com/go-vgo/robotgo"
+	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 )
 
 // dispatchComputer routes workerComputer.<action> to the matching
@@ -134,13 +134,13 @@ func guiScreenshot(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	encoded := base64.StdEncoding.EncodeToString(raw)
 	preview := fmt.Sprintf("[%s] %dx%d, %d bytes", format, width, height, len(raw))
 	return successComputerJSON(map[string]any{
-		"format":      format,
-		"width":       width,
-		"height":      height,
+		"format":       format,
+		"width":        width,
+		"height":       height,
 		"sourceWidth":  width,
 		"sourceHeight": height,
-		"bytesBase64": encoded,
-		"sizeBytes":   len(raw),
+		"bytesBase64":  encoded,
+		"sizeBytes":    len(raw),
 	}, preview, len(raw)), nil
 }
 

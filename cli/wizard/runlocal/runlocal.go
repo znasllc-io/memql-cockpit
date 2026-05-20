@@ -1,12 +1,12 @@
 // Package runlocal is the "Set up local cluster" wizard reached
 // from the launch splash. Two modes:
 //
-//   1. running -- when the local memQL cluster is already up,
-//      shows the service inventory + status so the operator can
-//      see what's online without running irrelevant port checks.
-//   2. deps-check -- when nothing is running, probes the machine
-//      for prerequisites (docker, mkcert, free ports, etc.) and
-//      surfaces remediation hints for each failure.
+//  1. running -- when the local memQL cluster is already up,
+//     shows the service inventory + status so the operator can
+//     see what's online without running irrelevant port checks.
+//  2. deps-check -- when nothing is running, probes the machine
+//     for prerequisites (docker, mkcert, free ports, etc.) and
+//     surfaces remediation hints for each failure.
 //
 // The wizard decides which mode to enter by asking
 // dockerprobe.ClusterRunning at entry + on every R re-probe.

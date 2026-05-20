@@ -98,9 +98,9 @@ func TestHandleKey_OtherKeysReturnMinusOne(t *testing.T) {
 // for some tabs but the UI lied about which ones.
 func TestHintText_ReflectsTabCount(t *testing.T) {
 	cases := []struct {
-		tabs        int
-		wantFRange  string
-		wantAltMax  string
+		tabs       int
+		wantFRange string
+		wantAltMax string
 	}{
 		{1, "F1 ", "+1:Tab"},
 		{4, "F1..F4", "+1..4:Tabs"},

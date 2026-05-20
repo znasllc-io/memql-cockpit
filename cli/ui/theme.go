@@ -6,41 +6,41 @@ import "github.com/gdamore/tcell/v2"
 
 // Theme holds the color scheme for the entire TUI.
 type Theme struct {
-	BG         tcell.Color // Main background
-	FG         tcell.Color // Default text
-	Accent     tcell.Color // Highlights, active tab, selections
-	Subtle     tcell.Color // Dimmed text, borders, separators
-	Error      tcell.Color // Errors, critical health
-	Warning    tcell.Color // Warnings, degraded health
-	Success    tcell.Color // Healthy nodes, confirmations
-	Info       tcell.Color // Informational, links
+	BG      tcell.Color // Main background
+	FG      tcell.Color // Default text
+	Accent  tcell.Color // Highlights, active tab, selections
+	Subtle  tcell.Color // Dimmed text, borders, separators
+	Error   tcell.Color // Errors, critical health
+	Warning tcell.Color // Warnings, degraded health
+	Success tcell.Color // Healthy nodes, confirmations
+	Info    tcell.Color // Informational, links
 
 	// Editor token styles
-	Keyword    tcell.Color
-	String     tcell.Color
-	Number     tcell.Color
-	Comment    tcell.Color
-	Annotation tcell.Color
-	Concept    tcell.Color
-	Operator   tcell.Color
+	Keyword     tcell.Color
+	String      tcell.Color
+	Number      tcell.Color
+	Comment     tcell.Color
+	Annotation  tcell.Color
+	Concept     tcell.Color
+	Operator    tcell.Color
 	Punctuation tcell.Color
 }
 
 // DefaultTheme returns the standard dark color scheme.
 func DefaultTheme() Theme {
 	return Theme{
-		BG:          tcell.NewRGBColor(24, 24, 28),
-		FG:          tcell.NewRGBColor(212, 212, 216),
+		BG: tcell.NewRGBColor(24, 24, 28),
+		FG: tcell.NewRGBColor(212, 212, 216),
 		// Vivid violet -- distinct from semantic colors (Error red,
 		// Warning amber, Success green, Info blue, Concept teal) and far
 		// more eye-catching than the prior blue. Used everywhere a focus
 		// indicator or "selected" marker needs to read at a glance.
-		Accent:      tcell.NewRGBColor(189, 147, 249),
-		Subtle:      tcell.NewRGBColor(90, 90, 100),
-		Error:       tcell.NewRGBColor(244, 71, 71),
-		Warning:     tcell.NewRGBColor(229, 192, 123),
-		Success:     tcell.NewRGBColor(152, 195, 121),
-		Info:        tcell.NewRGBColor(97, 175, 239),
+		Accent:  tcell.NewRGBColor(189, 147, 249),
+		Subtle:  tcell.NewRGBColor(90, 90, 100),
+		Error:   tcell.NewRGBColor(244, 71, 71),
+		Warning: tcell.NewRGBColor(229, 192, 123),
+		Success: tcell.NewRGBColor(152, 195, 121),
+		Info:    tcell.NewRGBColor(97, 175, 239),
 
 		Keyword:     tcell.NewRGBColor(198, 120, 221),
 		String:      tcell.NewRGBColor(152, 195, 121),
