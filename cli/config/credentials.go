@@ -44,8 +44,18 @@ func credentialsDir() string {
 }
 
 // LoadToken reads a cached token for the given cluster.
+//
+// The token file stores OAuth access + refresh tokens in plaintext;
+// it MUST be 0600. VerifyCredentialFileMode rejects loads from a
+// group- or world-readable file.
 func LoadToken(clusterName string) (*StoredToken, error) {
 	path := filepath.Join(credentialsDir(), clusterName+".json")
+
+	if _, statErr := os.Stat(path); statErr == nil {
+		if err := VerifyCredentialFileMode(path); err != nil {
+			return nil, err
+		}
+	}
 
 	data, err := os.ReadFile(path)
 	if err != nil {

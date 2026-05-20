@@ -162,10 +162,17 @@ func handleRun(args []string) {
 	fs := flag.NewFlagSet("worker run", flag.ExitOnError)
 	configPath := fs.String("config", DefaultConfigPath(), "path to worker.yaml")
 	cluster := fs.String("cluster", "", "cluster URL (overrides config)")
-	token := fs.String("token", "", "worker token (overrides config)")
+	tokenFile := fs.String("token-file", "", "path to a 0600 file whose contents are the worker token (overrides config)")
 	name := fs.String("name", "", "worker name (overrides config)")
 	logLevel := fs.String("log-level", "", "log level: debug | info | warn | error")
 	metricsPort := fs.Int("metrics-port", 9100, "loopback port for the prometheus metrics endpoint (0 disables)")
+	// --token (the literal token on argv) was retained as a hidden
+	// alias for backwards-compatibility with legacy LaunchAgent /
+	// systemd unit invocations. Tokens on argv leak into `ps`,
+	// shell history, and process listings -- we accept the flag but
+	// emit a loud WARN every time it's used. Prefer --token-file or
+	// MEMQL_WORKER_TOKEN.
+	tokenInline := fs.String("token", "", "DEPRECATED: worker token literal. Use --token-file or MEMQL_WORKER_TOKEN to avoid leaking into ps/shell history.")
 	fs.Parse(args)
 
 	cfg, err := LoadFile(*configPath)
@@ -176,10 +183,30 @@ func handleRun(args []string) {
 	if *cluster != "" {
 		cfg.ClusterURL = *cluster
 	}
-	if *token != "" {
-		cfg.Token = *token
-	} else if env := os.Getenv("MEMQL_WORKER_TOKEN"); env != "" && cfg.Token == "" {
+	// Token resolution order (each step overrides the previous):
+	//   1. worker.yaml (already in cfg.Token if present).
+	//   2. MEMQL_WORKER_TOKEN env var (in-process memory, not argv).
+	//   3. --token-file path (read once, 0600 enforced).
+	//   4. --token literal (DEPRECATED; logs a WARN).
+	if env := os.Getenv("MEMQL_WORKER_TOKEN"); env != "" && cfg.Token == "" {
 		cfg.Token = env
+	}
+	if *tokenFile != "" {
+		if err := config.VerifyCredentialFileMode(*tokenFile); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: --token-file: %v\n", err)
+			os.Exit(1)
+		}
+		raw, err := os.ReadFile(*tokenFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: --token-file: %v\n", err)
+			os.Exit(1)
+		}
+		cfg.Token = strings.TrimSpace(string(raw))
+	}
+	if *tokenInline != "" {
+		fmt.Fprintln(os.Stderr, "WARNING: --token <literal> leaks the token to `ps` and shell history.")
+		fmt.Fprintln(os.Stderr, "WARNING: Use --token-file or MEMQL_WORKER_TOKEN instead. Continuing for backwards compatibility.")
+		cfg.Token = *tokenInline
 	}
 	if *name != "" {
 		cfg.Name = *name
