@@ -171,7 +171,6 @@ func NewApp(cfg AppConfig) *App {
 
 	// Wire cluster management callbacks.
 	app.wireClustersCallbacks()
-	app.wirePartitionsCallbacks()
 
 	// Load initial cluster list.
 	app.refreshClusterList()
@@ -547,12 +546,6 @@ func (a *App) connect() {
 		a.openEntry(cfg)
 	}
 
-	// Paint the partitions pane immediately so the auto-selected cluster
-	// (typically "local") shows the "default" fallback row from the
-	// first frame -- before any dial has had a chance to land. Once the
-	// connection completes, onEntryConnected refreshes again with the
-	// real listPartitions result.
-	a.refreshPartitionsView()
 }
 
 // persistSelected writes a.selected to clusters.yaml so the next
@@ -638,9 +631,8 @@ func (a *App) runAuthorizeFlow(discoveryURL, existingName string) {
 	replaced := false
 	for i := range clusters.Clusters {
 		if clusters.Clusters[i].Name == cfg.Name {
-			// Preserve user-set sticky bits (selected partition, PAT)
-			// when overwriting the auth-relevant fields.
-			cfg.SelectedPartition = clusters.Clusters[i].SelectedPartition
+			// Preserve user-set PAT when overwriting the auth-relevant
+			// fields.
 			cfg.PAT = clusters.Clusters[i].PAT
 			clusters.Clusters[i] = cfg
 			replaced = true
@@ -869,8 +861,8 @@ func (a *App) autoSeedLocalFromGenesis() {
 			continue
 		}
 		// Merge genesis-derived fields onto whatever was there. Preserve
-		// sticky bits (selected partition, optional PAT, etc.) so
-		// re-seeding doesn't wipe operator-set state.
+		// sticky bits (optional PAT, etc.) so re-seeding doesn't wipe
+		// operator-set state.
 		existing := clusters.Clusters[i]
 		merged := existing
 		if merged.DisplayName != seed.DisplayName {
@@ -1003,8 +995,8 @@ func (a *App) viewedEntry() *connEntry {
 	return a.pool[a.viewed]
 }
 
-// setViewed updates which cluster the topology + partitions panes
-// render. Called by OnHighlight (arrow keys). No side effects on the
+// setViewed updates which cluster the topology pane renders.
+// Called by OnHighlight (arrow keys). No side effects on the
 // Explorer / Agents workspace -- those follow a.selected, which
 // is a separate concept changed by OnEnter, not arrow keys.
 func (a *App) setViewed(name string) {
@@ -1037,9 +1029,6 @@ func (a *App) setViewed(name string) {
 		a.clustersView.Topology.SetNodes(nil)
 		a.clustersView.Topology.SetDisconnected(false)
 	}
-	// Partitions pane follows the highlighted cluster on every
-	// arrow-key move, same as topology.
-	a.refreshPartitionsView()
 	a.postRedraw()
 }
 
@@ -1075,7 +1064,6 @@ func (a *App) setSelected(name string) {
 	entry.mu.Lock()
 	state := entry.State
 	conn := entry.Conn
-	part := entry.SelectedPartition
 	entry.mu.Unlock()
 	if state != stateConnected {
 		// Silent no-op. Retry uses R, not Enter.
@@ -1088,15 +1076,7 @@ func (a *App) setSelected(name string) {
 
 	a.clustersView.SelectedCluster = name
 	a.persistSelected(name)
-	// Partitions pane follows the VIEWED cluster (highlighted via
-	// arrow keys), not the SELECTED one. No refresh from setSelected.
 
-	// Push the cluster's sticky partition onto the live dispatcher
-	// the moment it becomes the user's working cluster, so the next
-	// query/mutation routes to the right partition.
-	if conn != nil && conn.Dispatcher() != nil && part != "" {
-		_ = part
-	}
 	// Refresh the Settings tab's "My Access" block with the new
 	// cluster's access record. Async so the UI stays responsive.
 	a.refreshMyAccess(name, conn)
@@ -1532,126 +1512,6 @@ func parseClusterNodes(result any) []cluster.NodeInfo {
 	return nodes
 }
 
-// parsePartitionEvent converts a CDC EventNotification carrying a
-// v1:platform:partition payload into a PartitionInfo. Each partition is
-// its own concept-id time-series, so events arrive one-per-mutation
-// with the latest field values flattened into the payload.
-func parsePartitionEvent(ev *memqlv1.EventNotification) (cluster.PartitionInfo, bool) {
-	if ev == nil || ev.GetPayload() == nil {
-		return cluster.PartitionInfo{}, false
-	}
-	m := ev.GetPayload().AsMap()
-	payload := m
-	if p, ok := m["payload"].(map[string]any); ok && p != nil {
-		payload = p
-	}
-	name := firstNonEmpty(getString(payload, "name"), getString(m, "id"))
-	if name == "" {
-		return cluster.PartitionInfo{}, false
-	}
-	return cluster.PartitionInfo{
-		Name:          name,
-		PartitionType: firstNonEmpty(getString(payload, "partitionType"), "standard"),
-		Status:        firstNonEmpty(getString(payload, "status"), "active"),
-	}, true
-}
-
-// parsePartitions converts a listPartitions query result into a deduped
-// PartitionInfo slice. Mirrors parseClusterNodes' time-series dedup --
-// concept==v1:platform:partition returns every historical version, so
-// we keep the row with the newest createdAt per partition name.
-func parsePartitions(result any) []cluster.PartitionInfo {
-	if result == nil {
-		return nil
-	}
-	var items []any
-	switch v := result.(type) {
-	case []any:
-		items = v
-	case map[string]any:
-		// Reuse the cluster-nodes array extractor -- it already handles
-		// the nested shapes the MemQL engine can return (bundle.nodes,
-		// result.bundle.nodes, items/results/data). Without this the
-		// list looked empty even after createPartition succeeded,
-		// because we only tried the top-level keys.
-		items = extractNodeArray(v)
-		if items == nil {
-			items = []any{v}
-		}
-	default:
-		return nil
-	}
-
-	type rowWithTime struct {
-		info    cluster.PartitionInfo
-		created string
-	}
-	latest := make(map[string]rowWithTime)
-	for _, item := range items {
-		m, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		payload := m
-		if p, ok := m["payload"].(map[string]any); ok {
-			payload = p
-		}
-		name := firstNonEmpty(getString(payload, "name"), getString(m, "id"))
-		if name == "" {
-			continue
-		}
-		createdAt := firstNonEmpty(
-			getString(m, "createdAt"),
-			getString(payload, "createdAt"),
-			getString(m, "created_at"),
-		)
-		info := cluster.PartitionInfo{
-			Name:          name,
-			PartitionType: firstNonEmpty(getString(payload, "partitionType"), "standard"),
-			Status:        firstNonEmpty(getString(payload, "status"), "active"),
-		}
-		if existing, found := latest[name]; found && createdAt <= existing.created {
-			continue
-		}
-		latest[name] = rowWithTime{info: info, created: createdAt}
-	}
-	out := make([]cluster.PartitionInfo, 0, len(latest))
-	for _, r := range latest {
-		// Filter out soft-deleted partitions at parse time -- drainin
-		// rows shouldn't appear in the CLI list.
-		if r.info.Status == "draining" {
-			continue
-		}
-		out = append(out, r.info)
-	}
-	return out
-}
-
-// ensureDefaultPartition guarantees the "default" partition appears
-// first in the returned slice, followed by the rest sorted
-// alphabetically by name. The bootstrap automation seeds default on
-// every cluster, so the pin is never a lie; sorting the tail makes
-// the list stable across inserts (adding "acme" and "zzz" always
-// lands them in the same visual slots instead of append order).
-func ensureDefaultPartition(parts []cluster.PartitionInfo) []cluster.PartitionInfo {
-	var def cluster.PartitionInfo
-	hasDef := false
-	rest := make([]cluster.PartitionInfo, 0, len(parts))
-	for _, p := range parts {
-		if p.Name == "default" && !hasDef {
-			def = p
-			hasDef = true
-			continue
-		}
-		rest = append(rest, p)
-	}
-	if !hasDef {
-		def = cluster.PartitionInfo{Name: "default", PartitionType: "standard", Status: "active"}
-	}
-	sort.Slice(rest, func(i, j int) bool { return rest[i].Name < rest[j].Name })
-	return append([]cluster.PartitionInfo{def}, rest...)
-}
-
 // parseClusterNodeTypes converts a queryClusterNodeTypes({}) result
 // into a NodeTypeInfo slice. Dedupes by `name` keeping the row with
 // the newest createdAt (the concept is a time-series, so re-seeding
@@ -1885,12 +1745,10 @@ func (a *App) wireClustersCallbacks() {
 		a.openEntry(c)
 
 		// Highlight the new row + move the "viewed" pointer so the
-		// topology and partitions panes follow it. Without setViewed
-		// here, the highlight cursor visually jumps to the new row
-		// but the right-pane topology and bottom-left partitions stay
-		// frozen on whatever cluster was viewed before -- the same
-		// thing the arrow keys would normally do is what this
-		// shortcut should do too.
+		// topology pane follows it. Without setViewed here, the
+		// highlight cursor visually jumps to the new row but the
+		// right-pane topology stays frozen on whatever cluster was
+		// viewed before.
 		for i, cs := range a.clustersView.Clusters {
 			if cs.Config.Name == c.Name {
 				a.clustersView.Selected = i
@@ -1939,9 +1797,9 @@ func (a *App) wireClustersCallbacks() {
 	// the user was viewing OR working against re-homes both the viewed
 	// and selected pointers onto the row the cluster-list now
 	// highlights -- local in practice, since it's always at index 0.
-	// Without this rehoming the topology + partitions panes would stay
-	// frozen on the deleted cluster's title/state until the user
-	// manually arrowed back.
+	// Without this rehoming the topology pane would stay frozen on
+	// the deleted cluster's title/state until the user manually
+	// arrowed back.
 	a.clustersView.OnDelete = func(clusterName string) {
 		if clusterName == "local" {
 			return
@@ -1996,8 +1854,8 @@ func (a *App) wireClustersCallbacks() {
 				return
 			}
 			newName := v.Clusters[v.Selected].Config.Name
-			// Rehome the viewed pointer (and its topology + partitions
-			// side-effects) whenever the viewed cluster went away.
+			// Rehome the viewed pointer (and its topology side-effect)
+			// whenever the viewed cluster went away.
 			if viewedDeleted {
 				a.setViewed(newName)
 			}
@@ -2009,252 +1867,6 @@ func (a *App) wireClustersCallbacks() {
 			}
 			v.SelectedCluster = a.selectedName()
 		}
-	}
-}
-
-// wirePartitionsCallbacks hooks the partition manager's callbacks into
-// the app's pool-backed state machine. All mutations target the
-// currently-selected cluster's dispatcher; the partition list is then
-// re-rendered from the cluster's local snapshot, with CDC events
-// trickling in shortly after to confirm.
-func (a *App) wirePartitionsCallbacks() {
-	if a.clustersView == nil || a.clustersView.Partitions == nil {
-		return
-	}
-	pv := a.clustersView.Partitions
-
-	// Highlight changes don't touch any state -- partition selection is
-	// driven by Enter only. Hook stays empty so future work can add a
-	// detail pane without revisiting wiring.
-	pv.OnHighlight = func(name string) {}
-
-	// Enter promotes a partition to "selected" for the VIEWED cluster
-	// (the one the user is highlighting in the cluster list -- same
-	// target as the topology pane). Pushes the partition onto that
-	// cluster's dispatcher so subsequent queries against it are
-	// partition-stamped, and persists the choice to clusters.yaml.
-	pv.OnEnter = func(name string) {
-		if name == "" {
-			return
-		}
-		a.poolMu.RLock()
-		clusterName := a.viewed
-		entry := a.pool[clusterName]
-		a.poolMu.RUnlock()
-		if clusterName == "" || entry == nil {
-			return
-		}
-		entry.mu.Lock()
-		entry.SelectedPartition = name
-		conn := entry.Conn
-		entry.mu.Unlock()
-		if conn != nil && conn.Dispatcher() != nil {
-			_ = name
-		}
-		a.persistSelectedPartition(clusterName, name)
-		a.refreshPartitionsView()
-		a.postRedraw()
-	}
-
-	// MemQL's top-level function-call parser requires object keys to
-	// be quoted strings (parser.go:576 "function argument keys must be
-	// strings"). The automation DSL is more permissive for inline use,
-	// but Execute() goes through the strict parser. Keep the quoted
-	// form here so mutations round-trip cleanly.
-	//
-	// Duplicate names are intercepted before the mutation runs.
-	// Without this guard, createPartition would happily insert a new
-	// time-series version of the same id and silently overwrite the
-	// existing partition's type / config -- the user thinks they're
-	// adding a new partition but they're actually editing the old
-	// one. The check + warning notification matches the cluster
-	// duplicate behavior on the top-half pane.
-	pv.OnAdd = func(p cluster.PartitionInfo) {
-		a.poolMu.RLock()
-		entry := a.pool[a.viewed]
-		a.poolMu.RUnlock()
-		if entry != nil {
-			for _, existing := range entry.snapshotPartitions() {
-				if existing.Name == p.Name {
-					a.notifications.SyncMeta("partition:add", ui.SeverityWarning,
-						fmt.Sprintf("Partition %q already exists -- nothing added.", p.Name))
-					return
-				}
-			}
-		}
-		a.notifications.Clear("partition:add")
-		a.runPartitionMutation("create "+p.Name, fmt.Sprintf(
-			`mutationCreatePartition({"name": %q, "partitionType": %q, "config": {}})`,
-			p.Name, p.PartitionType,
-		), p.Name)
-	}
-	pv.OnSave = func(p cluster.PartitionInfo) {
-		// Edit isn't exposed in the CLI any more, but OnSave stays
-		// wired for future use (e.g. config-only edits) so the
-		// mutation path is still exercised.
-		a.runPartitionMutation("update "+p.Name, fmt.Sprintf(
-			`mutationUpdatePartition({"name": %q, "partitionType": %q, "config": {}})`,
-			p.Name, p.PartitionType,
-		))
-	}
-	pv.OnDelete = func(name string) {
-		if name == "default" || name == "" {
-			return
-		}
-		a.runPartitionMutation("delete "+name,
-			fmt.Sprintf(`mutationDeletePartition({"name": %q})`, name))
-	}
-}
-
-// runPartitionMutation executes a partition CRUD MemQL call against
-// the VIEWED (arrow-key-highlighted) cluster's dispatcher -- not the
-// selected/working cluster. The partitions pane is a management tool
-// scoped to whichever cluster the user is looking at, so edits go
-// there too. On success it re-pulls the partition list (don't rely
-// solely on CDC -- events can lag or arrive with a shape the parser
-// doesn't match yet); on failure it surfaces the error to the header
-// notifications feed so the user actually sees that the mutation
-// failed instead of silently staring at an unchanged list.
-//
-// If selectOnSuccess is non-empty, the named partition becomes the
-// viewed entry's active partition once the list refresh confirms it
-// exists -- used by OnAdd so creating "test" also routes subsequent
-// queries at it without the user having to press Enter afterwards.
-//
-// verb is a short human-readable label like "create test" used only
-// for the notification message.
-func (a *App) runPartitionMutation(verb, call string, selectOnSuccess ...string) {
-	a.poolMu.RLock()
-	clusterName := a.viewed
-	entry := a.pool[clusterName]
-	a.poolMu.RUnlock()
-	var d *client.Dispatcher
-	if entry != nil {
-		entry.mu.Lock()
-		state := entry.State
-		conn := entry.Conn
-		entry.mu.Unlock()
-		if state == stateConnected && conn != nil {
-			d = conn.Dispatcher()
-		}
-	}
-	if d == nil || entry == nil {
-		a.notifications.Sync(
-			"partition:mutation",
-			ui.SeverityError,
-			fmt.Sprintf("Cannot %s: %q is not connected.", verb, clusterName),
-		)
-		return
-	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		queries := client.NewQueryClient(d)
-		if _, err := queries.Execute(ctx, call); err != nil {
-			if a.logger != nil {
-				a.logger.Warn("partition mutation failed", "call", call, "error", err)
-			}
-			a.notifications.Sync(
-				"partition:mutation",
-				ui.SeverityError,
-				fmt.Sprintf("Partition %s failed: %v", verb, err),
-			)
-			return
-		}
-		// Mutation succeeded. Clear any prior error notification, then
-		// re-read the partition list directly -- CDC will also update
-		// it shortly, but explicit re-read guarantees the user sees the
-		// change immediately regardless of event routing.
-		a.notifications.Clear("partition:mutation")
-		parts := entry.partitionsInitialLoad(context.Background())
-
-		// Belt-and-braces: the mutation itself just succeeded, so the
-		// row DEFINITELY exists server-side. If the parse didn't
-		// surface it (shape mismatch, race with CDC, etc.), force-add
-		// it here so the user sees the partition they just created.
-		// No-op for delete (empty selectOnSuccess).
-		if len(selectOnSuccess) > 0 && selectOnSuccess[0] != "" {
-			have := false
-			for _, p := range parts {
-				if p.Name == selectOnSuccess[0] {
-					have = true
-					break
-				}
-			}
-			if !have {
-				parts = append(parts, cluster.PartitionInfo{
-					Name:          selectOnSuccess[0],
-					PartitionType: "standard",
-					Status:        "active",
-				})
-			}
-		}
-
-		entry.mu.Lock()
-		entry.Partitions = parts
-		// Auto-select the newly-created partition so the user's next
-		// query routes at it without an extra Enter press.
-		if len(selectOnSuccess) > 0 && selectOnSuccess[0] != "" {
-			entry.SelectedPartition = selectOnSuccess[0]
-			if entry.Conn != nil && entry.Conn.Dispatcher() != nil {
-				_ = selectOnSuccess[0]
-			}
-		}
-		part := entry.SelectedPartition
-		entry.mu.Unlock()
-		if len(selectOnSuccess) > 0 && selectOnSuccess[0] != "" && part == selectOnSuccess[0] {
-			a.persistSelectedPartition(clusterName, part)
-		}
-		if a.isViewed(clusterName) {
-			a.refreshPartitionsView()
-		}
-		a.postRedraw()
-	}()
-}
-
-// persistSelectedPartition writes the per-cluster sticky partition
-// choice to clusters.yaml so the next launch restores it.
-func (a *App) persistSelectedPartition(clusterName, partition string) {
-	clusters, err := config.LoadClusters()
-	if err != nil || clusters == nil {
-		return
-	}
-	changed := false
-	for i := range clusters.Clusters {
-		if clusters.Clusters[i].Name == clusterName {
-			if clusters.Clusters[i].SelectedPartition != partition {
-				clusters.Clusters[i].SelectedPartition = partition
-				changed = true
-			}
-			break
-		}
-	}
-	if !changed {
-		// First write for a cluster that isn't yet in yaml (e.g. "local"
-		// using the hardcoded default). Append a thin row so the
-		// selection survives the next load.
-		appended := false
-		for _, c := range clusters.Clusters {
-			if c.Name == clusterName {
-				appended = true
-				break
-			}
-		}
-		if !appended {
-			cfg := config.ClusterConfig{Name: clusterName, SelectedPartition: partition}
-			if clusterName == "local" {
-				local := cluster.LocalClusterConfig()
-				cfg.Endpoint = local.Endpoint
-			}
-			clusters.Clusters = append(clusters.Clusters, cfg)
-			changed = true
-		}
-	}
-	if !changed {
-		return
-	}
-	if err := config.SaveClusters(clusters); err != nil && a.logger != nil {
-		a.logger.Warn("failed to persist selected partition", "cluster", clusterName, "error", err)
 	}
 }
 

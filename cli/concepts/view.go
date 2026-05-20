@@ -887,7 +887,7 @@ func renderRowDetail(row map[string]any) []string {
 	var lines []string
 
 	lines = append(lines, "INTRINSICS")
-	for _, key := range []string{"id", "concept", "type", "createdBy", "createdAt", "partition"} {
+	for _, key := range []string{"id", "concept", "type", "createdBy", "createdAt"} {
 		if v := getString(row, key); v != "" {
 			lines = append(lines, fmt.Sprintf("  %-12s %s", key, v))
 		}
