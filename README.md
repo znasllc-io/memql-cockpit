@@ -1,11 +1,43 @@
-# memql-cockpit
+<p align="center">
+  <img src="assets/logo.svg" alt="memQL Cockpit" width="500">
+</p>
 
-Terminal-native IDE and operations console for memQL clusters.
+<h1 align="center">memQL Cockpit</h1>
 
-Lifted from `github.com/znasllc-io/memql` on 2026-05-14 as part
-of the monorepo carve-up. The cockpit communicates with memQL
-clusters over gRPC (`MemqlService.Stream` and `NodeService.Stream`)
-and does not embed the memQL engine.
+<p align="center">
+  <strong>Terminal-native IDE and operations console for memQL clusters.</strong><br>
+  Multi-tab TUI with worker modes that bring computer-use into the platform.
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/znasllc-io/memql-cockpit?color=blue" alt="License"></a>
+  <img src="https://img.shields.io/github/go-mod/go-version/znasllc-io/memql-cockpit" alt="Go version">
+  <img src="https://img.shields.io/github/last-commit/znasllc-io/memql-cockpit" alt="Last commit">
+  <a href="https://goreportcard.com/report/github.com/znasllc-io/memql-cockpit"><img src="https://goreportcard.com/badge/github.com/znasllc-io/memql-cockpit" alt="Go Report Card"></a>
+</p>
+
+<p align="center"><sub><em>Designed and built with Claude as co-author.</em></sub></p>
+
+> **Pre-1.0 / actively developed.** API and configuration are still evolving.
+
+---
+
+## What is memQL Cockpit?
+
+memQL Cockpit is the terminal-native IDE and operations console for [memQL](https://github.com/znasllc-io/memql) clusters. It's a multi-tab TUI that gives engineers and operators one place to write, lint, and execute DSL; explore cluster state; manage identity and workers; and observe what the platform is doing in real time. It communicates with memQL clusters over gRPC (`MemqlService.Stream` and `NodeService.Stream`) and does not embed the memQL engine.
+
+## Features
+
+- **Multi-tab TUI** — agents, auth, client, cluster, config, editor, explorer, settings — all in one terminal
+- **DSL editor + linter** — write `.memql` files with structured validation
+- **Worker modes** — `computer_use_headless` and `computer_use_embodied` bring computer use into the platform as per-user workers
+- **GUI variant** — opt-in CGO build with screenshot, mouse, and keyboard via RobotGo
+- **Service install** — register as a LaunchAgent (macOS) or systemd user service (Linux)
+- **gRPC client** — talks to memQL cluster nodes; no engine embedded
+
+> Demo recording (asciinema) coming soon.
+
+---
 
 ## Build
 
