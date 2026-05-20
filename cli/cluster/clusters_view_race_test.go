@@ -89,8 +89,7 @@ func TestClustersView_NoRaceUnderConcurrentMutate(t *testing.T) {
 	}()
 
 	// FormOpen: takes its own lock; exercises the read-locked
-	// accessor path that has both ClustersView's mu and the nested
-	// PartitionsView's mu in the chain.
+	// accessor path under ClustersView's mu.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()

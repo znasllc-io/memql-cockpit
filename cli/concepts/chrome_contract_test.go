@@ -57,7 +57,7 @@ func makeView(t *testing.T) (*View, *ui.Screen, tcell.SimulationScreen, ui.Rect)
 
 	v := NewView(ui.DefaultTheme())
 	v.SetConcepts([]*memqlv1.ConceptInfo{
-		{Id: "v1:platform:partition"},
+		{Id: "v1:platform:policyTrace"},
 		{Id: "v1:cognition:agent"},
 		{Id: "v1:hr:milestone"},
 	})

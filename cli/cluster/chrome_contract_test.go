@@ -1,12 +1,12 @@
 package cluster
 
-// Regression tests that the Clusters tab's two list panes (cluster
-// manager + partition manager) abide by the panel chrome contract in
-// cli/CLAUDE.md ("Panel chrome contract"). These panes are the
-// reference implementation -- the contract was reverse-engineered
-// from them, so a future refactor breaking the convention here is
-// the worst-case regression: it would silently legitimize divergence
-// in any other pane that follows by copy/paste.
+// Regression tests that the Clusters tab's cluster manager pane
+// abides by the panel chrome contract in cli/CLAUDE.md
+// ("Panel chrome contract"). The cluster manager is the reference
+// implementation -- the contract was reverse-engineered from it, so
+// a future refactor breaking the convention here is the worst-case
+// regression: it would silently legitimize divergence in any other
+// pane that follows by copy/paste.
 //
 // What we assert per pane:
 //   * The bottom row of the rendered bounds carries the action-hint
@@ -128,8 +128,8 @@ func TestPanelChrome_ClustersView_BottomBand(t *testing.T) {
 	sim.Show()
 	rows := flattenSim(sim)
 
-	// The Clusters tab splits the screen into a left column (manager
-	// + partitions) and a right column (topology) with a `│` divider
+	// The Clusters tab splits the screen into a left column (cluster
+	// manager) and a right column (topology) with a `│` divider
 	// between them. Action hints live in the left column; trim
 	// everything from the divider onward before running the chip
 	// assertions so right-pane content isn't mistakenly treated as
@@ -150,6 +150,3 @@ func TestPanelChrome_ClustersView_BottomBand(t *testing.T) {
 	}
 }
 
-// TestPanelChrome_PartitionsView_BottomBand retired in #56 phase 8.
-// The PartitionsView is now a no-op stub and the partition manager
-// chrome contract no longer applies.

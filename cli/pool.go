@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -109,23 +108,6 @@ type connEntry struct {
 	Attempt   int       // current attempt number within the 1..maxAttempts cycle
 	NextTryAt time.Time // when the next attempt will fire (meaningful only in stateBackoff)
 
-	// SelectedPartition is the partition the user has chosen to work
-	// against in this cluster. Restored from clusters.yaml on startup
-	// (per-cluster sticky selection); falls back to "default" when
-	// missing. Pushed onto the live Dispatcher so every outbound
-	// request stamps this partition on the envelope.
-	SelectedPartition string
-
-	// Partitions is the live snapshot of v1:platform:partition rows
-	// for this cluster, fed by a dedicated subscription. The CLI's
-	// partition list reads from here on every redraw.
-	Partitions []cluster.PartitionInfo
-
-	// PartitionsSubId + PartitionsEvents track the secondary
-	// subscription used to keep Partitions in sync.
-	PartitionsSubId  string
-	PartitionsEvents <-chan *memqlv1.EventNotification
-
 	// cancelCh interrupts a backoff wait or aborts an in-flight dial.
 	// Recreated by Retry() so closed-channel sends don't panic.
 	cancelCh chan struct{}
@@ -135,9 +117,8 @@ type connEntry struct {
 	done chan struct{}
 	// Lifecycle completion markers. Close() waits briefly on these
 	// so callers know the entry is quiescent.
-	lifecycleExited            chan struct{}
-	subscriberExited           chan struct{}
-	partitionsSubscriberExited chan struct{}
+	lifecycleExited  chan struct{}
+	subscriberExited chan struct{}
 
 	closed bool
 }
@@ -145,22 +126,14 @@ type connEntry struct {
 // newConnEntry builds the entry metadata. Start the lifecycle
 // goroutine (runLifecycle) via openEntry in app.go.
 func newConnEntry(app *App, cfg config.ClusterConfig) *connEntry {
-	// Restore per-cluster sticky partition. Empty string falls back to
-	// "default" downstream so a brand-new cluster works without any
-	// extra config -- the bootstrap automation seeds default on startup.
-	selected := cfg.SelectedPartition
-	if selected == "" {
-		selected = "default"
-	}
 	return &connEntry{
-		app:               app,
-		Config:            cfg,
-		State:             stateIdle,
-		SelectedPartition: selected,
-		cancelCh:          make(chan struct{}),
-		done:              make(chan struct{}),
-		lifecycleExited:   make(chan struct{}),
-		subscriberExited:  nil, // allocated each time runSubscriber starts
+		app:              app,
+		Config:           cfg,
+		State:            stateIdle,
+		cancelCh:         make(chan struct{}),
+		done:             make(chan struct{}),
+		lifecycleExited:  make(chan struct{}),
+		subscriberExited: nil, // allocated each time runSubscriber starts
 	}
 }
 
@@ -347,20 +320,20 @@ func (e *connEntry) runTokenRefresher() {
 		}
 
 		// In-stream rotation: ask the server to swap the bearer on the
-		// live stream so admin-side revocation / partition-grant
-		// changes propagate to the in-flight session in O(seconds)
-		// rather than waiting for the next stream drop. The stream's
-		// gRPC metadata is fixed at open time, so without RotateAuth
-		// the server keeps verifying envelopes against the original
-		// token until reconnect. With RotateAuth the server re-verifies
-		// the new token and swaps streamSession.identity + .access.
+		// live stream so admin-side revocation / role changes
+		// propagate to the in-flight session in O(seconds) rather
+		// than waiting for the next stream drop. The stream's gRPC
+		// metadata is fixed at open time, so without RotateAuth the
+		// server keeps verifying envelopes against the original
+		// token until reconnect. With RotateAuth the server
+		// re-verifies the new token and swaps
+		// streamSession.identity + .access.
 		//
 		// Failure is non-fatal: the on-disk credential is fresh, so
 		// any subsequent reconnect still lands on the rotated pair.
 		// A rejected rotate (ErrRotateAuthRejected) typically means
 		// the server's verifier doesn't know about the new token yet
-		// (JWKS-refresh lag) or the user's access changed in a way
-		// that's incompatible with the live stream's partition stamp.
+		// (JWKS-refresh lag).
 		e.mu.Lock()
 		conn := e.Conn
 		e.mu.Unlock()
@@ -445,17 +418,14 @@ func (e *connEntry) attemptConnectCycle() bool {
 		}
 
 		if err == nil {
-			// Connected. Start both subscribers; each exits when its
-			// Events channel closes (either normal shutdown or stream
-			// drop). One for v1:cluster:node, one for
-			// v1:platform:partition.
+			// Connected. Start the cluster-node subscriber; it exits
+			// when its Events channel closes (normal shutdown or
+			// stream drop).
 			e.mu.Lock()
 			e.State = stateConnected
 			e.subscriberExited = make(chan struct{})
-			e.partitionsSubscriberExited = make(chan struct{})
 			e.mu.Unlock()
 			go e.runSubscriber()
-			go e.runPartitionsSubscriber()
 			e.app.onEntryConnected(e)
 			e.app.postRedraw()
 			return true
@@ -582,34 +552,11 @@ func (e *connEntry) dialOnce(ctx context.Context) error {
 		return err
 	}
 
-	// Push the user's selected partition (if any) onto the dispatcher
-	// so every outbound query/mutation/subscribe is partition-stamped
-	// from the very first request.
-	e.mu.Lock()
-	selectedPart := e.SelectedPartition
-	e.mu.Unlock()
-	if selectedPart == "" {
-		selectedPart = "default"
-	}
-	_ = selectedPart
-
 	sm := client.NewSubscriptionManager(conn.Dispatcher())
 	subCtx := context.Background()
 	subId, events, err := sm.Subscribe(subCtx,
 		memqlv1.SubscriptionKind_SUBSCRIPTION_KIND_GRAPH_EVENTS,
-		"node.*.*.v1:cluster:node",
-	)
-	if err != nil {
-		conn.Close()
-		return err
-	}
-
-	// Second subscription: v1:platform:partition CRUD. Keeps the
-	// partition list live as users add / edit / soft-delete from any
-	// CLI session against the same cluster.
-	partsSubId, partsEvents, err := sm.Subscribe(subCtx,
-		memqlv1.SubscriptionKind_SUBSCRIPTION_KIND_GRAPH_EVENTS,
-		"node.*.*.v1:platform:partition",
+		"node.created.v1:cluster:node",
 	)
 	if err != nil {
 		conn.Close()
@@ -621,16 +568,12 @@ func (e *connEntry) dialOnce(ctx context.Context) error {
 	e.SubMgr = sm
 	e.SubId = subId
 	e.Events = events
-	e.PartitionsSubId = partsSubId
-	e.PartitionsEvents = partsEvents
 	e.mu.Unlock()
 
 	nodes := e.initialLoad(ctx)
-	parts := e.partitionsInitialLoad(ctx)
 	types := e.nodeTypesInitialLoad(ctx)
 	e.mu.Lock()
 	e.Nodes = nodes
-	e.Partitions = parts
 	e.NodeTypes = types
 	e.mu.Unlock()
 
@@ -661,48 +604,6 @@ func (e *connEntry) nodeTypesInitialLoad(ctx context.Context) []cluster.NodeType
 		return nil
 	}
 	return parseClusterNodeTypes(result)
-}
-
-// partitionsInitialLoad pulls queryListPartitions({}) and dedupes to the
-// latest row per partition name. Soft-deleted (status="draining")
-// rows are filtered out so the CLI list shows only active partitions.
-// "default" is guaranteed to appear in the result so the CLI never
-// renders a partition-less list (the bootstrap automation seeds it
-// on every cluster; if the query didn't surface it, we add it back).
-func (e *connEntry) partitionsInitialLoad(ctx context.Context) []cluster.PartitionInfo {
-	e.mu.Lock()
-	conn := e.Conn
-	e.mu.Unlock()
-	if conn == nil {
-		return ensureDefaultPartition(nil)
-	}
-	queries := client.NewQueryClient(conn.Dispatcher())
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	result, err := queries.Execute(ctx, `queryListPartitions({})`)
-	if err != nil {
-		// Server may not have the listPartitions function loaded yet
-		// (e.g. against an older deployment) -- show "default" as a
-		// safe fallback so the CLI isn't empty.
-		if e.app.logger != nil {
-			e.app.logger.Warn("listPartitions query failed",
-				"cluster", e.Config.Name, "error", err)
-		}
-		return ensureDefaultPartition(nil)
-	}
-	parsed := parsePartitions(result)
-	if e.app.logger != nil {
-		// Log the raw response shape so we can diagnose any parse
-		// surprises -- "default disappeared after creating test"-class
-		// bugs have usually been the parser dropping rows silently.
-		e.app.logger.Debug("listPartitions parsed",
-			"cluster", e.Config.Name,
-			"parsed_count", len(parsed),
-			"raw", result,
-		)
-	}
-	parsed = ensureDefaultPartition(parsed)
-	return parsed
 }
 
 // initialLoad pulls clusterNodes + clusterSpawnEvents from this
@@ -782,70 +683,6 @@ func (e *connEntry) runSubscriber() {
 			e.app.postRedraw()
 		}
 	}
-}
-
-// runPartitionsSubscriber drains v1:platform:partition CDC events and
-// keeps e.Partitions in sync. Re-renders the partition pane whenever
-// this entry is the selected/active cluster.
-func (e *connEntry) runPartitionsSubscriber() {
-	e.mu.Lock()
-	exited := e.partitionsSubscriberExited
-	events := e.PartitionsEvents
-	e.mu.Unlock()
-	defer close(exited)
-
-	if events == nil {
-		return
-	}
-
-	for ev := range events {
-		info, ok := parsePartitionEvent(ev)
-		if !ok {
-			continue
-		}
-		e.applyPartitionUpdate(info)
-		// Partition pane mirrors the VIEWED cluster (arrow-key
-		// highlighted), so redraw when this entry is the one in view.
-		if e.app.isViewed(e.Config.Name) {
-			e.app.refreshPartitionsView()
-			e.app.postRedraw()
-		}
-	}
-}
-
-// applyPartitionUpdate merges a single partition CDC event into
-// e.Partitions under lock. Replaces by name (each partition is its
-// own concept-id time-series so name uniquely identifies the row).
-func (e *connEntry) applyPartitionUpdate(incoming cluster.PartitionInfo) {
-	if incoming.Name == "" {
-		return
-	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	for i := range e.Partitions {
-		if e.Partitions[i].Name == incoming.Name {
-			e.Partitions[i] = incoming
-			return
-		}
-	}
-	e.Partitions = append(e.Partitions, incoming)
-}
-
-// snapshotPartitions returns a copy of the entry's active partitions
-// (status="active"; "draining" rows are filtered out). "default" is
-// always included even if the backing data hasn't surfaced it -- the
-// CLI treats default as an invariant.
-func (e *connEntry) snapshotPartitions() []cluster.PartitionInfo {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	out := make([]cluster.PartitionInfo, 0, len(e.Partitions))
-	for _, p := range e.Partitions {
-		if p.Status == "draining" {
-			continue
-		}
-		out = append(out, p)
-	}
-	return ensureDefaultPartition(out)
 }
 
 // applyUpdate merges a single-node event into e.Nodes under lock.
@@ -997,12 +834,6 @@ func (e *connEntry) setStateAttempt(s entryState, attempt int, nextTryAt time.Ti
 	e.mu.Unlock()
 
 	e.app.syncRowStatus(e.Config.Name, s)
-	// Partitions pane mirrors the VIEWED cluster's lifecycle --
-	// "Connecting..." / "Unreachable..." messages swap in/out as the
-	// arrow-key-highlighted cluster transitions through states.
-	if e.app.isViewed(e.Config.Name) {
-		e.app.refreshPartitionsView()
-	}
 }
 
 // Close tears down the entry: signals goroutines to exit, closes the
@@ -1068,90 +899,22 @@ func (a *App) isViewed(name string) bool {
 }
 
 // isSelectedCluster reports whether the given cluster name is the
-// user's "working cluster". Used by the partitions subscriber to
-// decide whether to repaint the partition pane on every CDC event.
+// user's "working cluster".
 func (a *App) isSelectedCluster(name string) bool {
 	a.poolMu.RLock()
 	defer a.poolMu.RUnlock()
 	return a.selected == name
 }
 
-// refreshPartitionsView pushes the VIEWED (arrow-key-highlighted)
-// cluster's latest partition snapshot into the PartitionsView. The
-// pane mirrors whichever cluster the user is looking at -- same
-// semantics as the topology pane on the right. The working (selected)
-// cluster is a separate concept that drives Explorer / Agents
-// and is NOT what the partitions pane follows.
-//
-// States:
-//   - No viewed cluster at all (very rare -- startup highlights the
-//     saved selection): "Highlight a cluster..."
-//   - Viewed but not connected: contextual "connecting..." /
-//     "unreachable..." message, matches topology's
-//     "Waiting for cluster data..." behavior.
-//   - Connected: live partition snapshot (ensureDefaultPartition keeps
-//     default visible even during a parse race).
-func (a *App) refreshPartitionsView() {
-	if a.clustersView == nil || a.clustersView.Partitions == nil {
-		return
-	}
-	a.poolMu.RLock()
-	name := a.viewed
-	entry := a.pool[name]
-	a.poolMu.RUnlock()
-
-	if name == "" || entry == nil {
-		a.clustersView.Partitions.Reset("Highlight a cluster to manage partitions.")
-		return
-	}
-
-	entry.mu.Lock()
-	state := entry.State
-	entry.mu.Unlock()
-
-	if state != stateConnected {
-		var msg string
-		switch state {
-		case stateConnecting, stateBackoff:
-			msg = fmt.Sprintf("Connecting to %q -- partitions will appear once connected.", name)
-		case stateFailed:
-			msg = fmt.Sprintf("%q is unreachable. Press R on its row to retry.", name)
-		case stateNeedsConfig:
-			msg = fmt.Sprintf("%q is not configured. Press L on its row to authorize.", name)
-		case stateNeedsToken:
-			msg = fmt.Sprintf("%q needs a login. Press L on its row to authenticate.", name)
-		default:
-			msg = fmt.Sprintf("Cluster %q is not connected.", name)
-		}
-		a.clustersView.Partitions.Reset(msg)
-		return
-	}
-
-	parts := entry.snapshotPartitions()
-	active := entry.SelectedPartition
-	if active == "" {
-		active = "default"
-	}
-	_ = parts
-	_ = active
-	// Partition manager retired in #56 phase 8.
-}
-
 // onEntryConnected is called by an entry's lifecycle when it reaches
 // stateConnected. Updates the list row and -- if this entry is the
-// VIEWED one (arrow-key highlighted) -- paints its topology and
-// partitions pane. partitionsInitialLoad has just completed in
-// dialOnce, so this is the first opportunity to show real partition
-// data instead of the pre-connect placeholder. The user's working
-// cluster selection is NOT touched here; it's sticky across sessions
-// (see persistSelected).
+// VIEWED one (arrow-key highlighted) -- paints its topology pane.
 func (a *App) onEntryConnected(e *connEntry) {
 	a.clustersView.SetConnected(e.Config.Name, true, e.Conn.NodeId, e.Conn.Version)
 	if a.isViewed(e.Config.Name) {
 		a.clustersView.Topology.SetNodeTypes(e.snapshotNodeTypes())
 		a.clustersView.Topology.SetNodes(e.snapshotNodes())
 		a.clustersView.Topology.SetDisconnected(false)
-		a.refreshPartitionsView()
 		// One-shot observability overlay fetch -- best-effort. The
 		// Architecture navigator picks up the result on its next
 		// draw; transient query failures leave the previous overlay
@@ -1197,10 +960,6 @@ func (a *App) onEntryDisconnected(e *connEntry) {
 	a.clustersView.SetConnected(e.Config.Name, false, "", "")
 	if a.isViewed(e.Config.Name) {
 		a.clustersView.Topology.SetDisconnected(true)
-		// Last-known partitions are still in entry.Partitions until the
-		// next dial wipes them, so this preserves whatever the user was
-		// looking at + keeps the active marker correct.
-		a.refreshPartitionsView()
 	}
 }
 

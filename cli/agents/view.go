@@ -1,9 +1,8 @@
 // Package agents renders the Agents tab: a read-only operator
 // surface that lists the AI agent templates registered in the
-// connected cluster's active partition. The user picks an agent
-// from the left pane and sees its identity, capabilities, knowledge
-// surface, and recent plan attribution in the detail pane on the
-// right.
+// connected cluster. The user picks an agent from the left pane and
+// sees its identity, capabilities, knowledge surface, and recent
+// plan attribution in the detail pane on the right.
 //
 // Creation / editing of agents is intentionally out of scope -- the
 // cockpit's job here is observability. Mutations live in CoPresent
@@ -14,8 +13,8 @@
 //   - queryListKnowledgeDomains -- knowledgeDomain.id -> displayName
 //     lookup so capabilities.domains[] reads as human-friendly names
 //     instead of opaque ids.
-//   - queryAllPlans -- partition-wide plans; we filter client-side
-//     to whichever ones name this agent in payload.ownerAgentId for
+//   - queryAllPlans -- every plan; we filter client-side to
+//     whichever ones name this agent in payload.ownerAgentId for
 //     the "recent tasks" section.
 //
 // All three queries live in memql/dsl/{agents,knowledge,planner}/queries.memql
