@@ -7,8 +7,8 @@ require (
 	github.com/go-vgo/robotgo v1.0.2
 	github.com/google/uuid v1.6.0
 	github.com/znasllc-io/memql v0.1.1-0.20260519030726-c52d9a687b5e
-	golang.org/x/sys v0.42.0
-	golang.org/x/term v0.41.0
+	golang.org/x/sys v0.44.0
+	golang.org/x/term v0.43.0
 	google.golang.org/grpc v1.79.3
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
