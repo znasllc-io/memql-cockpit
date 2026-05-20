@@ -35,10 +35,7 @@ func (f *QueryClientMetricsFetcher) FetchRecentMetrics(ctx context.Context) (map
 	if f == nil || f.Client == nil {
 		return nil, fmt.Errorf("metrics fetcher has no QueryClient")
 	}
-	// Raw-form MemQL query: pull every codeMetric row in the
-	// _system partition (the concept is @scope("global")). The
-	// engine ignores the envelope partition for global concepts,
-	// so the dispatcher's auto-stamped partition is moot here.
+	// Raw-form MemQL query: pull every codeMetric row.
 	// Future enhancement: switch to a struct-form query under
 	// dsl/observability/queries.memql once we have a stable
 	// shape; until then the raw form keeps the cockpit decoupled

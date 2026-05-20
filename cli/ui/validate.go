@@ -12,7 +12,7 @@ import (
 // validators stay in sync. Chosen to match real-world constraints:
 //
 //   - MaxNameLen 50 is generous for a user-chosen label; most
-//     real cluster/partition names end up under 20.
+//     real cluster names end up under 20.
 //   - MaxHostLen 253 is the RFC 1035 maximum for a fully-qualified
 //     DNS name.
 //   - MaxPortLen 5 covers the full uint16 port range ("65535").
@@ -30,9 +30,8 @@ const (
 
 // dnsLabelRE matches a lower-case DNS-style label: starts and ends
 // with alphanumeric, may contain dashes in between, no leading or
-// trailing dashes. Used for cluster and partition names -- both end
-// up as concept ids / partition segments in event topics, and those
-// layers want the stricter shape.
+// trailing dashes. Used for cluster names -- they end up as concept
+// ids in event topics, and that layer wants the stricter shape.
 var dnsLabelRE = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`)
 
 // hostRE accepts either a simple hostname (letters, digits, dots,
@@ -49,8 +48,8 @@ func NormalizeName(s string) string {
 	return strings.ToLower(strings.TrimSpace(s))
 }
 
-// ValidateName checks a cluster or partition name against the shared
-// rules: required, DNS-label style (lower-case alphanumeric + inner
+// ValidateName checks a cluster name against the shared rules:
+// required, DNS-label style (lower-case alphanumeric + inner
 // dashes), <= MaxNameLen. Returns the normalized value on success
 // for callers that want to persist the clean form.
 func ValidateName(s string) (string, error) {

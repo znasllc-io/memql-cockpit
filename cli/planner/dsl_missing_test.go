@@ -26,7 +26,7 @@ import (
 // TestIsPlannerDSLMissing_Classification covers the matcher: it must
 // fire only for the specific "function <name> not found" shape and
 // only for the three function names the Planner tab calls. Anything
-// else (a partition-ACL reject, a network timeout, a parser failure
+// else (a permission denial, a network timeout, a parser failure
 // that happens to mention the word "function") must NOT be
 // classified as DSL-missing -- those need their normal warning path.
 func TestIsPlannerDSLMissing_Classification(t *testing.T) {
@@ -57,7 +57,7 @@ func TestIsPlannerDSLMissing_Classification(t *testing.T) {
 		},
 		{
 			name:   "permission denial -- distinct failure path",
-			err:    errors.New("permission denied: caller lacks reader role on partition default"),
+			err:    errors.New("permission denied: caller lacks reader role"),
 			expect: false,
 		},
 		{

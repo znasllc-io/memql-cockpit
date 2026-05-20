@@ -83,7 +83,7 @@ focused subcommand surface that imports the TUI primitives.
 The tab bar lives at the top of the screen. Tabs are ordered so that
 "connect to a cluster" is the first thing the user sees:
 
-1. **Clusters (F1)** -- cluster manager + partition manager + topology
+1. **Clusters (F1)** -- cluster manager + topology
 2. **Chat (F2)** -- single-chat-per-space utterance viewer. Today's
    daily space for the connected user (`v1:cognition:space.kind=="daily"`,
    id `daily-{userShortId}-{dateKey}`) is pinned at the top of the
@@ -102,17 +102,17 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
    selected cluster.
 3. **Concepts (F3)** -- generic browser for every registered concept
 4. **Planner (F4)** -- observe v1:planner:plan + child v1:planner:task
-   rows in the active partition. Read-only: goal submission moved to
-   the Chat tab (the user talks to the assistant, which decides when
-   to escalate to the planner). The one mutation that remains is
-   R:Run on a queued plan -- flips it to running via
-   mutationStartPlan. Gated on a connected, selected cluster.
-5. **Agents (F5)** -- read-only catalog of v1:agents:agent rows in
-   the active partition. Left pane lists agents (name + role); right
-   pane shows identity, capabilities, knowledge domains, live
-   knowledge, provider config, and recent plan attribution for the
-   highlighted agent. No create/edit -- mutation surfaces live in
-   CoPresent. Gated on a connected, selected cluster.
+   rows. Read-only: goal submission moved to the Chat tab (the user
+   talks to the assistant, which decides when to escalate to the
+   planner). The one mutation that remains is R:Run on a queued
+   plan -- flips it to running via mutationStartPlan. Gated on a
+   connected, selected cluster.
+5. **Agents (F5)** -- read-only catalog of v1:agents:agent rows.
+   Left pane lists agents (name + role); right pane shows identity,
+   capabilities, knowledge domains, live knowledge, provider config,
+   and recent plan attribution for the highlighted agent. No
+   create/edit -- mutation surfaces live in CoPresent. Gated on a
+   connected, selected cluster.
 6. **Settings (F6)** -- credentials, theme, version
 
 Concepts, Planner, Agents, and Chat are all gated on a connected,
@@ -146,24 +146,13 @@ chrome-contract) below. Tab cycles focus between the three panes.
 │   Endpoint  ...          │                                   │
 │   Status    connected    │                                   │
 │  A:Add E:Edit Enter:Sel  │                                   │
-│  Tab:Partitions          │                                   │
-│ ─────────────────────────│                                   │
-│  PARTITION MANAGER       │                                   │
-│   ▸ ● default     *      │                                   │
-│     ● acme               │                                   │
-│   A:Add E:Edit Enter:Sel │                                   │
 └──────────────────────────┴───────────────────────────────────┘
 ```
 
-The left column splits 50/50 vertically when a cluster is connected:
-
-- **Top half**: cluster manager (list + detail + add/edit form).
-- **Bottom half**: partition manager for the connected cluster.
-- **Right pane**: topology diagram (current cluster's nodes + health), or
-  the architecture-model drill-down navigator when toggled with `X`.
-
-When the add/edit form opens it takes the full left column for typing
-room; the partition pane re-appears on save/cancel.
+- **Left pane**: cluster manager (list + detail + add/edit form).
+- **Right pane**: topology diagram (current cluster's nodes +
+  health), or the architecture-model drill-down navigator when
+  toggled with `X`.
 
 ### Architecture navigator (the `X` toggle)
 
@@ -216,53 +205,6 @@ via `Cancel()` does NOT trigger reconnect; only `Unexpected()` does.
 
 ---
 
-## Partition Selector
-
-Every cluster has a sticky per-cluster partition choice. The selector
-lives in the bottom half of the Clusters tab.
-
-The partition the user selects scopes **domain data** (cognition
-spaces/agents, HR milestones, user concepts) -- their next query /
-mutation / subscription runs against rows tagged with that partition.
-It does NOT hide infrastructure data: the cluster topology and the
-partition list itself are global-scoped concepts
-(`@scope("global")` in their `.memql` files) that live in the reserved
-`_system` partition. You can switch to any partition and the clusters
-pane still shows the full topology and the full partition list.
-
-- **Source of truth**: `v1:platform:partition` rows fetched via
-  `listPartitions({})` on connect, then kept fresh by a CDC subscription
-  (`graph.node.created.*.v1:platform:partition`). Because the concept
-  is global-scoped, these events fire under `_system` regardless of
-  the subscriber's envelope partition.
-- **Selection**: highlight a row + Enter. The chosen partition name is
-  pushed onto the connection's `Dispatcher.SetPartition(name)` so every
-  subsequent gRPC envelope auto-stamps `partition: <name>` -- the
-  engine uses this for partition-scoped writes/reads but ignores it
-  for global-scoped concepts.
-- **Persistence**: written to `~/.memql/clusters.yaml` as
-  `selected_partition: <name>` under the cluster's entry. Restored on
-  next launch via `newConnEntry` -> `cfg.SelectedPartition`.
-- **Default fallback**: if no selection is recorded, the entry uses
-  `"default"`. The bootstrap automation
-  (`automations/v1/platform/bootstrapDefaultPartition`) seeds the
-  `default` partition on `system.startup`, so a fresh cluster always has
-  at least one row to select.
-- **Protection**: the `default` row cannot be deleted from the CLI
-  (matches the `local` cluster protection).
-- **Soft delete only**: `D` writes a new version with `status:
-  "draining"`, which filters out of the visible list. Hard delete is
-  admin-only and tracked in [docs/ROADMAP.md](../docs/ROADMAP.md).
-- **Edit**: only `partitionType` is editable in the CLI today
-  (Standard / Dedicated / Personal). `displayName` and `description`
-  exist on the concept but are CoPresent's domain to surface; the CLI
-  doesn't expose form fields for them.
-- **Slug validation**: enforced at keystroke time and at server pre-
-  insert (`core/id.ValidatePartitionName`), DNS-label shape, max 50
-  chars, no leading underscore (`_system` is reserved).
-
----
-
 ## Key Bindings
 
 ### Global
@@ -282,28 +224,12 @@ pane still shows the full topology and the full partition list.
 | D     | Delete highlighted cluster (not "local")            |
 | Esc   | Cancel an in-flight dial                            |
 | R     | Manual retry after Failed                           |
-| Tab   | Cycle: Cluster Manager → Partitions → Topology      |
-
-### Clusters tab (Partition Manager focus)
-| Key   | Action                                              |
-|-------|-----------------------------------------------------|
-| ↑/↓   | Move highlight                                      |
-| Enter | Set as the selected partition for this cluster      |
-| A     | Add a new partition (form: Name + Type)             |
-| E     | Edit highlighted partition (Name read-only; Type editable) |
-| D     | Soft-delete highlighted partition (not "default")   |
-| Tab   | Cycle to Topology pane                              |
-
-When the user creates a partition through the CLI, the resulting two
-calls (`mutationCreatePartition` then `mutationGrantPartitionAccess`)
-are issued by the app layer's `OnAdd` callback -- the form just
-collects the slug + type and hands them off.
+| Tab   | Cycle: Cluster Manager → Topology                   |
 
 ### Add/Edit forms
 | Key       | Action                              |
 |-----------|-------------------------------------|
 | Tab       | Next field                          |
-| Space     | Cycle Type (partition form only)    |
 | Enter     | Save                                |
 | Esc       | Cancel                              |
 | Ctrl+N    | Toggle "No Auth" (cluster form)     |
@@ -349,7 +275,6 @@ collects the slug + type and hands them off.
 | `app.go`                 | Top-level App: tab bar, screen loop, callback wiring          |
 | `pool.go`                | Per-cluster `connEntry` + lifecycle state machine             |
 | `cluster/clusters_view.go` | Clusters tab layout, focus, cluster manager                |
-| `cluster/partitions_view.go` | Partition manager (bottom-left pane)                     |
 | `cluster/topology.go`    | Live cluster topology grid (right pane) + Architecture toggle |
 | `cluster/architecture.go`| `ArchView`: drill-down navigator over `topology.model.json`   |
 | `cluster/metrics_fetcher.go` | `QueryClientMetricsFetcher`: codeMetric overlay fetch      |
@@ -369,41 +294,38 @@ collects the slug + type and hands them off.
 
 ## List-pane conventions
 
-Any pane that renders a list of selectable items (clusters,
-partitions, future analogues) should follow the same UX rules so
-keybinding hints stay consistent and predictable:
+Any pane that renders a list of selectable items (clusters, future
+analogues) should follow the same UX rules so keybinding hints stay
+consistent and predictable:
 
 - **Highlight vs selection are two axes.** The "highlight" is the
   cursor — moves with arrow keys, never persists. The "selection"
   (or "active") is the chosen item — marked with `*` (strict
   single-cell ASCII, see "Layout-edge glyph rule" below), persists
-  in config, drives downstream behavior (working cluster / active
-  partition / etc.).
+  in config, drives downstream behavior (working cluster, etc.).
 - **`Enter` always means "promote highlighted to selected".** Never
   overload it with secondary behavior like "and also retry". Other
   keys do other things.
 - **Hint strip is context-aware.** `Enter:Select` only appears when:
   - The highlighted item is in a state where selection makes sense
-    (e.g. cluster is `connected`; partition has no state but is
-    always selectable in principle).
+    (e.g. cluster is `connected`).
   - The highlighted item is **not already the selected one**
     (Enter on the active row is a no-op, so don't advertise it).
   Lifecycle / repair keys take Enter's place when applicable
   (`Esc:Cancel` while connecting, `R:Retry` when failed, etc.).
 - **Sticky pinned + sorted rest.** When a list has a fallback
-  invariant (cluster `local`, partition `default`), pin it at index
-  0 with a `─` divider, sort the rest alphabetically, and keep the
-  pinned row visible across scroll. The scrollable region is
-  scoped to the rest. See `ClustersView` / `PartitionsView` Draw
-  methods + `ui.ScrollTo` / `ui.DrawScrollbar`.
+  invariant (cluster `local`), pin it at index 0 with a `─`
+  divider, sort the rest alphabetically, and keep the pinned row
+  visible across scroll. The scrollable region is scoped to the
+  rest. See `ClustersView` Draw method + `ui.ScrollTo` /
+  `ui.DrawScrollbar`.
 - **Pane chrome stays pinned.** Action hints, optional confirmation
   prompts, detail block (when present) all live in fixed-height
   bands at the bottom -- only the row list scrolls inside what's
   left. Use `ui.DrawBottom` / `ui.DrawBottomBlocks` for the chrome.
 
 When you add a new list-bearing pane, copy these conventions.
-Existing implementations: `cli/cluster/clusters_view.go` and
-`cli/cluster/partitions_view.go`.
+Reference implementation: `cli/cluster/clusters_view.go`.
 
 ---
 
@@ -423,11 +345,10 @@ regression.
 [title]      Pane title + meta. One row. Counts/positions go here,
              NOT in a separate bottom footer. Examples:
                 " CLUSTERS "
-                " PARTITIONS "
-                " ROWS: v1:platform:partition (3/12) "
+                " ROWS: v1:cognition:space (3/12) "
                 " DETAIL (line 4/27) "
              When a form is open, the title rewrites in place
-             (" ADD CLUSTER ", " EDIT PARTITION ") -- no second
+             (" ADD CLUSTER ", " EDIT CLUSTER ") -- no second
              title stacked inside the form.
 
 [content]    The scrollable list / detail / form body. Whatever
@@ -551,8 +472,8 @@ visually consumed.
   - Most Geometric Shapes block (U+25xx)
 
 **Where the rule applies:**
-  - The "active row" marker on `ClustersView` / `PartitionsView`
-    (right-edge, two cells from the divider).
+  - The "active row" marker on `ClustersView` (right-edge, two
+    cells from the divider).
   - Scroll-bar thumb / track glyphs (right-edge of any scrollable
     pane).
   - The leftmost cell of any pane that has a left border drawn
@@ -579,9 +500,6 @@ bug.
 Every gRPC envelope leaves the CLI carrying:
 
 - `message_id` -- correlation id (UUID per request).
-- `partition` -- auto-stamped from `Dispatcher.partition` if the caller
-  didn't already set it. The dispatcher's partition is updated by
-  `setSelected` and by partition `Enter`.
 
-The server uses `partition` to scope reads/writes/subscriptions. See
-`docs/core/events.md` and the partition section in the root `CLAUDE.md`.
+Authorization happens per row inside the DSL post-#56; the cockpit
+no longer stamps anything tenant-scoping onto the envelope.

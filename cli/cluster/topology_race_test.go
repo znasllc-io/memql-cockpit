@@ -108,5 +108,3 @@ func snapshotForRace(v *View) (nodes int, types int, edges int, disc bool) {
 	return
 }
 
-// TestPartitions_NoRaceUnderConcurrentMutate retired in #56 phase 8.
-// The PartitionsView is now a no-op stub.
