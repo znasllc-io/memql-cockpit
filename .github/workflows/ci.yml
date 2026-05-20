@@ -29,7 +29,7 @@ jobs:
           path: memql
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26.1'
+          go-version: '1.26.2'
           cache: true
           cache-dependency-path: memql-cockpit/go.sum
       - name: go build (headless)
@@ -51,7 +51,7 @@ jobs:
           path: memql
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26.1'
+          go-version: '1.26.2'
           cache: true
           cache-dependency-path: memql-cockpit/go.sum
       - name: go test
@@ -73,7 +73,7 @@ jobs:
           path: memql
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.26.1'
+          go-version: '1.26.2'
           cache: true
           cache-dependency-path: memql-cockpit/go.sum
       - name: go vet
