@@ -84,13 +84,19 @@ func Catch(label string, fn func()) (report *Report) {
 
 // newReport assembles a Report from a recover() value. Captures the
 // stack inside the deferred recover so the panic frames are present.
+// Both the panic value and the stack go through SanitizeForCrashLog
+// to scrub token-shaped strings before they ever land on disk -- the
+// crash log is mode 0600 but is also the file support engineers see
+// when a user pastes it into a ticket, and tokens in stack frames
+// (locals from closures, function arguments) are a leak surface even
+// at 0600.
 func newReport(label string, panicValue any) *Report {
 	return &Report{
 		Code:  shortCode(),
 		At:    time.Now().UTC(),
 		Label: strings.TrimSpace(label),
-		Value: fmt.Sprintf("%v", panicValue),
-		Stack: string(debug.Stack()),
+		Value: SanitizeForCrashLog(fmt.Sprintf("%v", panicValue)),
+		Stack: SanitizeForCrashLog(string(debug.Stack())),
 	}
 }
 
