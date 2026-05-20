@@ -132,6 +132,16 @@ function install_systemd_unit() {
     local unit_dir="${HOME}/.config/systemd/user"
     mkdir -p "$unit_dir"
     local unit="${unit_dir}/memql-cockpit-worker.service"
+    local env_file="${HOME}/.memql/worker.env"
+    # Create the env file as 0600 even when empty so an operator
+    # who later wants to inject MEMQL_WORKER_TOKEN via the env-file
+    # path drops it into a file that already has owner-only mode.
+    # The unit references EnvironmentFile= with a leading `-` so
+    # systemd ignores the file when it's missing.
+    if [[ ! -f "$env_file" ]]; then
+        umask 077 && touch "$env_file"
+    fi
+    chmod 0600 "$env_file" 2>/dev/null || true
     cat > "$unit" << UNIT
 [Unit]
 Description=memQL Cockpit Worker
@@ -145,6 +155,33 @@ Restart=on-failure
 RestartSec=5
 StandardOutput=append:${HOME}/.memql/state/worker.log
 StandardError=append:${HOME}/.memql/state/worker.log
+
+# Environment file for the worker token + cluster URL. Marked with
+# leading `-` so systemd doesn't fail if the file is missing; the
+# worker also reads MEMQL_WORKER_TOKEN from ~/.memql/worker.yaml.
+# Use this file (chmod 0600) instead of inline Environment= so
+# the token is NOT visible in `systemctl show` output.
+EnvironmentFile=-${env_file}
+
+# Hardening directives. The headless worker doesn't need write
+# access to the system tree or other users' home dirs; tighten
+# accordingly. The GUI build (computer_use_embodied) needs a
+# more permissive ProtectHome to drive the user's desktop, but
+# the headless install path here is the default.
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=${HOME}/.memql
+NoNewPrivileges=yes
+PrivateTmp=yes
+RestrictSUIDSGID=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=default.target
