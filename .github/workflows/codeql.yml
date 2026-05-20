@@ -13,6 +13,10 @@ permissions:
   contents: read
   security-events: write
 
+# memql-cockpit's go.mod uses a `replace` directive pointing at ../memql/.
+# CodeQL's autobuild runs `go build ./...` which fails without that sibling,
+# so we lay out both repos as siblings before analysis.
+
 jobs:
   analyze:
     name: Analyze
@@ -23,11 +27,27 @@ jobs:
         language: [go]
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout memql-cockpit
+        uses: actions/checkout@v4
+        with:
+          path: memql-cockpit
+      - name: Checkout memql (sibling for replace directive)
+        uses: actions/checkout@v4
+        with:
+          repository: znasllc-io/memql
+          path: memql
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.1'
+          cache: true
+          cache-dependency-path: memql-cockpit/go.sum
       - uses: github/codeql-action/init@v3
         with:
           languages: ${{ matrix.language }}
-      - uses: github/codeql-action/autobuild@v3
+          source-root: memql-cockpit
+      - name: Manual build (replaces autobuild for sibling layout)
+        working-directory: memql-cockpit
+        run: go build ./...
       - uses: github/codeql-action/analyze@v3
         with:
           category: "/language:${{ matrix.language }}"
