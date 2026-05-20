@@ -70,7 +70,19 @@ func Connect(ctx context.Context, cfg Config, logger *slog.Logger) (*Connection,
 		),
 	}
 	if useTLS {
-		dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(nil)))
+		// Build a proper *tls.Config with ServerName pinned to the
+		// configured FQDN. Without ServerName pinning the TLS
+		// handshake accepts any chain-valid certificate whose name
+		// matches whatever DNS resolved to -- a successful MITM with
+		// a different but chain-valid cert (DNS hijack + Let's Encrypt
+		// for the attacker's hostname) goes unnoticed. Pinning makes
+		// the handshake fail unless the certificate's SAN matches
+		// the operator-configured cluster URL.
+		tlsCfg, terr := buildTLSConfig(endpoint, logger)
+		if terr != nil {
+			return nil, fmt.Errorf("worker.connect: tls config: %w", terr)
+		}
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)))
 	} else {
 		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
