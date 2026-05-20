@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/znasllc-io/memql-cockpit/cli/crash"
 	"github.com/znasllc-io/memql/component/memql/dslimports"
 )
 
@@ -22,6 +23,22 @@ import (
 // user types `memql-cockpit lint ...`. Returns the process exit code
 // for the caller to forward to os.Exit.
 func HandleCommand(args []string) int {
+	// Wrap the dispatch in crash.Catch so a panic anywhere downstream
+	// (dslimports.Load, the diagnostic walk) doesn't kill the process
+	// with an unsanitized goroutine trace to stderr. Token-shaped
+	// strings in stack frames are scrubbed by crash.SanitizeForCrashLog
+	// before the report lands on disk.
+	exitCode := 0
+	if rep := crash.Catch("lint:HandleCommand", func() {
+		exitCode = dispatchLint(args)
+	}); rep != nil {
+		fmt.Fprint(os.Stderr, crash.UserMessage(rep))
+		return 2
+	}
+	return exitCode
+}
+
+func dispatchLint(args []string) int {
 	var (
 		jsonOut bool
 		path    string

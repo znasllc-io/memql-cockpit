@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/znasllc-io/memql-cockpit/cli/config"
+	"github.com/znasllc-io/memql-cockpit/cli/crash"
 	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/internal/worker/tools"
 )
 
@@ -30,6 +31,22 @@ import (
 // stays as the headless / scripted path for users who want to
 // reinvoke an already-configured worker (LaunchAgent uses this).
 func HandleCommand(args []string) {
+	// Wrap the whole dispatch in crash.Catch so any panic in a
+	// subcommand (the wizard, the runner loop, tools.Dispatch, etc.)
+	// is caught, sanitized for token-shaped strings, written to a
+	// 0600 crash log, and surfaced as a friendly message rather than
+	// a raw goroutine dump to stderr. Without this a panic
+	// mid-`worker run` killed the process with sensitive locals
+	// visible on the terminal.
+	if rep := crash.Catch("worker:HandleCommand", func() {
+		dispatchHandleCommand(args)
+	}); rep != nil {
+		fmt.Fprint(os.Stderr, crash.UserMessage(rep))
+		os.Exit(1)
+	}
+}
+
+func dispatchHandleCommand(args []string) {
 	if len(args) == 0 {
 		// No-args entry: open the wizard with a paste field. On
 		// non-TTY callers this falls back to a clear usage hint.
