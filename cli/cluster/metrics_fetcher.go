@@ -35,60 +35,55 @@ func (f *QueryClientMetricsFetcher) FetchRecentMetrics(ctx context.Context) (map
 	if f == nil || f.Client == nil {
 		return nil, fmt.Errorf("metrics fetcher has no QueryClient")
 	}
-	// Raw-form MemQL query: pull every codeMetric row.
-	// Future enhancement: switch to a struct-form query under
-	// dsl/observability/queries.memql once we have a stable
-	// shape; until then the raw form keeps the cockpit decoupled
-	// from DSL-authoring tweaks.
-	raw, err := f.Client.Execute(ctx, "concept==v1:observability:codeMetric")
+	// Admin / observability surface -- concept-agnostic row browse
+	// for the architecture-model overlay. Reach the SDK's
+	// BrowseConcept escape hatch (see sdk/go/CLAUDE.md) so the
+	// raw DSL string lives once, on the SDK side. Future
+	// enhancement: switch to a struct-form query under
+	// dsl/observability/queries.memql once we have a stable shape.
+	res, err := f.Client.BrowseConcept(ctx, "v1:observability:codeMetric")
 	if err != nil {
 		return nil, err
 	}
-	return parseMetricsResult(raw), nil
+	return parseMetricsResult(res), nil
 }
 
-// parseMetricsResult walks the loosely-typed query result returned
-// by QueryClient.Execute and collapses it to one MetricSummary per
-// codeReference, keeping the row with the latest windowEnd. The
-// shape comes from the engine's protojson conversion of a Result
-// proto -- a slice of map[string]any payloads under a top-level
-// envelope -- so we navigate defensively and skip anything that
-// doesn't look right.
-func parseMetricsResult(raw any) map[model.ID]MetricSummary {
-	rows := extractRows(raw)
+// parseMetricsResult walks the typed *Result from BrowseConcept and
+// collapses it to one MetricSummary per codeReference, keeping the
+// row with the latest windowEnd. The SDK's Result.Rows() flattens
+// bundle payloads to top-level keys, so we read `row["codeReference"]`
+// directly rather than reaching through a nested `payload` map.
+func parseMetricsResult(res *client.Result) map[model.ID]MetricSummary {
+	rows := res.Rows()
 	if len(rows) == 0 {
 		return map[model.ID]MetricSummary{}
 	}
 
 	latest := make(map[model.ID]struct {
-		summary MetricSummary
+		summary   MetricSummary
 		windowEnd string
 	}, len(rows))
 
 	for _, row := range rows {
-		payload, ok := row["payload"].(map[string]any)
-		if !ok {
-			continue
-		}
-		fqn := stringField(payload, "codeReference")
+		fqn := stringField(row, "codeReference")
 		if fqn == "" {
 			continue
 		}
 		id := model.ID(fqn)
-		windowEnd := stringField(payload, "windowEnd")
+		windowEnd := stringField(row, "windowEnd")
 		existing, seen := latest[id]
 		if seen && existing.windowEnd >= windowEnd {
 			// Already have a same-or-later window for this FQN.
 			continue
 		}
 		latest[id] = struct {
-			summary MetricSummary
+			summary   MetricSummary
 			windowEnd string
 		}{
 			summary: MetricSummary{
-				CallCount: intField(payload, "callCount"),
-				P95DurNs:  intField(payload, "p95DurationNs"),
-				ErrorRate: floatField(payload, "errorRate"),
+				CallCount: intField(row, "callCount"),
+				P95DurNs:  intField(row, "p95DurationNs"),
+				ErrorRate: floatField(row, "errorRate"),
 			},
 			windowEnd: windowEnd,
 		}
@@ -97,37 +92,6 @@ func parseMetricsResult(raw any) map[model.ID]MetricSummary {
 	out := make(map[model.ID]MetricSummary, len(latest))
 	for id, v := range latest {
 		out[id] = v.summary
-	}
-	return out
-}
-
-// extractRows handles the two shapes we've seen come back from
-// Execute(): {"rows": [...]} and a bare slice. Either way we end
-// up with a []map[string]any of node rows.
-func extractRows(raw any) []map[string]any {
-	switch v := raw.(type) {
-	case map[string]any:
-		if rows, ok := v["rows"].([]any); ok {
-			return castSliceMap(rows)
-		}
-		// Some result paths wrap under "result"; try that.
-		if result, ok := v["result"].(map[string]any); ok {
-			if rows, ok := result["rows"].([]any); ok {
-				return castSliceMap(rows)
-			}
-		}
-	case []any:
-		return castSliceMap(v)
-	}
-	return nil
-}
-
-func castSliceMap(in []any) []map[string]any {
-	out := make([]map[string]any, 0, len(in))
-	for _, item := range in {
-		if m, ok := item.(map[string]any); ok {
-			out = append(out, m)
-		}
 	}
 	return out
 }

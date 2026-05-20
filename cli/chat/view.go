@@ -76,16 +76,16 @@ type View struct {
 	OnStatus func(msg string)
 
 	// PTT state, surfaced in the chat-pane title strip.
-	pttActive     bool
-	pttPartial    string
-	pttFinal      string
-	pttStatus     string // "" | "listening" | "transcribing" | "done" | "error: <msg>"
-	pttCancel     context.CancelFunc
-	pttStopAudio  func() error
+	pttActive    bool
+	pttPartial   string
+	pttFinal     string
+	pttStatus    string // "" | "listening" | "transcribing" | "done" | "error: <msg>"
+	pttCancel    context.CancelFunc
+	pttStopAudio func() error
 
-	spaces           []spaceRow
-	spaceSelected    int
-	spaceScrollY     int
+	spaces        []spaceRow
+	spaceSelected int
+	spaceScrollY  int
 	// userPickedSpace tracks whether the user has manually selected a
 	// space this session. While false, the refresher auto-snaps the
 	// highlight to today's daily on every refresh -- so a freshly
@@ -198,7 +198,7 @@ func (v *View) ensureDailyOnce() {
 	// runs the dailyspace.ensureForCaller integration capability;
 	// the capability resolves the JWT/PAT subject as the userId
 	// and runs the idempotent create.
-	if _, err := qc.Execute(ctx, `logicEnsureDailySpaceForCaller({})`); err != nil {
+	if _, err := qc.LogicEnsureDailySpaceForCaller(ctx, client.LogicEnsureDailySpaceForCallerArgs{}); err != nil {
 		// Push the failure through the header notifications center
 		// (with copy + dismiss) instead of the chrome strip below
 		// the pane -- chrome rows are for action hints, not errors
@@ -225,10 +225,11 @@ func (v *View) refreshSpaces() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Named primitive — the engine returns the user's active spaces
-	// already filtered by per-row authz. The cockpit must never
-	// inline raw concept queries; primitives are the contract.
-	res, err := qc.Execute(ctx, `queryActiveSpaces({})`)
+	// Typed primitive -- the engine returns the user's active spaces
+	// already filtered by per-row authz, projected through the
+	// `spaceFull` shape. Fields land at the row top level (shape-
+	// wrapped queries flatten; see memql/sdk/go/CLAUDE.md).
+	res, err := qc.QueryActiveSpaces(ctx, client.QueryActiveSpacesArgs{})
 	if err != nil {
 		if v.OnStatus != nil {
 			v.OnStatus("load spaces: " + err.Error())
@@ -236,19 +237,20 @@ func (v *View) refreshSpaces() {
 		return
 	}
 
-	rows := normalizeRows(res)
+	rows := res.Rows()
 	out := make([]spaceRow, 0, len(rows))
 	for _, r := range rows {
-		payload, _ := r["payload"].(map[string]any)
-		id, _ := r["id"].(string)
+		id := client.RowString(r, "id")
 		if id == "" {
 			continue
 		}
-		name, _ := payload["name"].(string)
-		owner, _ := payload["ownerUserId"].(string)
-		status, _ := payload["status"].(string)
-		kind, _ := payload["kind"].(string)
-		out = append(out, spaceRow{ID: id, Name: name, OwnerUserId: owner, Status: status, Kind: kind})
+		out = append(out, spaceRow{
+			ID:          id,
+			Name:        client.RowString(r, "name"),
+			OwnerUserId: client.RowString(r, "ownerUserId"),
+			Status:      client.RowString(r, "status"),
+			Kind:        client.RowString(r, "kind"),
+		})
 	}
 	// Pin daily spaces at the top -- the user's "today" surface is
 	// the primary thing they came here to see. Within each group
@@ -326,10 +328,10 @@ func (v *View) refreshUtterances() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Named primitive — querySpaceUtterances returns utterances for
-	// the given space already shape-projected to utteranceFull.
-	q := fmt.Sprintf(`querySpaceUtterances({spaceId: %q})`, spaceID)
-	res, err := qc.Execute(ctx, q)
+	// Typed primitive -- querySpaceUtterances returns utterances for
+	// the given space already shape-projected to utteranceFull (flat
+	// row.X / payload.X paths land at the row top level).
+	res, err := qc.QuerySpaceUtterances(ctx, client.QuerySpaceUtterancesArgs{SpaceId: spaceID})
 	if err != nil {
 		if v.OnStatus != nil {
 			v.OnStatus("load utterances: " + err.Error())
@@ -337,23 +339,19 @@ func (v *View) refreshUtterances() {
 		return
 	}
 
-	rows := normalizeRows(res)
+	rows := res.Rows()
 	if len(rows) > maxUtterances {
 		rows = rows[len(rows)-maxUtterances:]
 	}
 	out := make([]utteranceRow, 0, len(rows))
 	for _, r := range rows {
-		id, _ := r["id"].(string)
-		payload, _ := r["payload"].(map[string]any)
-		text, _ := payload["text"].(string)
-		speaker, _ := payload["participantId"].(string)
-		speakerKind, _ := payload["participantType"].(string)
+		id := client.RowString(r, "id")
 		createdMillis := parseMillis(r["createdAt"])
 		out = append(out, utteranceRow{
 			ID:              id,
-			SpeakerID:       speaker,
-			SpeakerKind:     speakerKind,
-			Text:            text,
+			SpeakerID:       client.RowString(r, "participantId"),
+			SpeakerKind:     client.RowString(r, "participantType"),
+			Text:            client.RowString(r, "text"),
 			CreatedAtMillis: createdMillis,
 		})
 	}
@@ -634,46 +632,6 @@ func (v *View) togglePTT() {
 			v.OnRedraw()
 		}
 	}()
-}
-
-// normalizeRows accepts the protojson-decoded Execute result and
-// returns it as a flat []map[string]any of row records. The Chat
-// tab only calls named query primitives (queryActiveSpaces,
-// querySpaceUtterances) -- both shape-wrapped -- so the protojson
-// shape is `{"data": [...]}` where each entry is a flat row. Raw
-// concept queries are intentionally not used here: the cockpit
-// consumes the engine through its named-primitive contract so the
-// engine is free to evolve the bundle shape without breaking the
-// client (see znasllc-io/memql-cockpit#49).
-func normalizeRows(res any) []map[string]any {
-	if res == nil {
-		return nil
-	}
-	switch x := res.(type) {
-	case []any:
-		out := make([]map[string]any, 0, len(x))
-		for _, item := range x {
-			if m, ok := item.(map[string]any); ok {
-				out = append(out, m)
-			}
-		}
-		return out
-	case map[string]any:
-		for _, key := range []string{"rows", "results", "items", "data"} {
-			if arr, ok := x[key].([]any); ok {
-				out := make([]map[string]any, 0, len(arr))
-				for _, item := range arr {
-					if m, ok := item.(map[string]any); ok {
-						out = append(out, m)
-					}
-				}
-				return out
-			}
-		}
-		// Single-row case.
-		return []map[string]any{x}
-	}
-	return nil
 }
 
 func parseMillis(v any) int64 {

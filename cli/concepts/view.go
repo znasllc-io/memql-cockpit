@@ -18,8 +18,8 @@ import (
 	"github.com/gdamore/tcell/v2"
 	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 
-	"github.com/znasllc-io/memql/sdk/go/client"
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
+	"github.com/znasllc-io/memql/sdk/go/client"
 )
 
 // FocusPane identifies which pane has keyboard focus.
@@ -56,9 +56,9 @@ type View struct {
 	conceptScrollY  int
 
 	// Loaded rows for the selected concept (middle pane).
-	Rows      []map[string]any
-	rowFilter string // text from the search box
-	rowMatches []int // indices into Rows that match rowFilter (cached)
+	Rows        []map[string]any
+	rowFilter   string // text from the search box
+	rowMatches  []int  // indices into Rows that match rowFilter (cached)
 	rowSelected int
 	rowScrollY  int
 
@@ -69,10 +69,10 @@ type View struct {
 	// Version overlay -- when versionsOpen is true the detail pane
 	// shows the time-series of versions for the selected row instead
 	// of the current snapshot.
-	versionsOpen   bool
-	versionRows    []map[string]any
+	versionsOpen    bool
+	versionRows     []map[string]any
 	versionSelected int
-	versionScrollY int
+	versionScrollY  int
 
 	Focus    FocusPane
 	searchOn bool
@@ -625,7 +625,11 @@ func (v *View) refreshRowsFromCurrentLocked() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
-	res, err := qc.Execute(ctx, fmt.Sprintf("concept==%s", conceptId))
+	// Admin-surface escape hatch: the Concepts tab is a concept-
+	// agnostic row browser, so there's no compile-time named primitive
+	// to call. The SDK's BrowseConcept method exists precisely for
+	// this case; see sdk/go/CLAUDE.md for the rule.
+	res, err := qc.BrowseConcept(ctx, conceptId)
 	if err != nil {
 		if v.OnStatus != nil {
 			v.OnStatus(fmt.Sprintf("rows load failed: %v", err))
@@ -633,7 +637,7 @@ func (v *View) refreshRowsFromCurrentLocked() {
 		v.recomputeRowMatchesLocked()
 		return
 	}
-	v.Rows = extractRows(res)
+	v.Rows = res.Rows()
 	v.recomputeRowMatchesLocked()
 	v.refreshDetailFromCurrentLocked()
 }
@@ -692,14 +696,17 @@ func (v *View) openVersions() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
-	res, err := qc.Execute(ctx, fmt.Sprintf("concept==%s;id==%s", conceptId, rowId))
+	// Admin-surface escape hatch (see refreshRows for context). The
+	// version-history pane needs the time-series tail of one row,
+	// which is intrinsically concept-agnostic.
+	res, err := qc.GetRowByConceptAndId(ctx, conceptId, rowId)
 	if err != nil {
 		if v.OnStatus != nil {
 			v.OnStatus(fmt.Sprintf("version history failed: %v", err))
 		}
 		return
 	}
-	v.versionRows = extractRows(res)
+	v.versionRows = res.Rows()
 	sort.Slice(v.versionRows, func(i, j int) bool {
 		return getString(v.versionRows[i], "createdAt") > getString(v.versionRows[j], "createdAt")
 	})
@@ -797,56 +804,6 @@ func shortenTimestamp(ts string) string {
 	return ts
 }
 
-// extractRows pulls a flat slice of row maps out of a MemQL query
-// response. The engine returns one of several wrapper shapes
-// depending on which read path produced the result; we walk a fixed
-// list of well-known wrappers + finally fall through to "treat the
-// map as a single row".
-func extractRows(result any) []map[string]any {
-	if result == nil {
-		return nil
-	}
-	toRowSlice := func(arr []any) []map[string]any {
-		out := make([]map[string]any, 0, len(arr))
-		for _, item := range arr {
-			if m, ok := item.(map[string]any); ok {
-				out = append(out, m)
-			}
-		}
-		return out
-	}
-	switch v := result.(type) {
-	case []any:
-		return toRowSlice(v)
-	case map[string]any:
-		// Direct array keys the engine commonly returns.
-		for _, key := range []string{"nodes", "items", "results", "data"} {
-			if arr, ok := v[key].([]any); ok {
-				return toRowSlice(arr)
-			}
-		}
-		// Nested: { bundle: { nodes: [...] } }
-		if bundle, ok := v["bundle"].(map[string]any); ok {
-			if arr, ok := bundle["nodes"].([]any); ok {
-				return toRowSlice(arr)
-			}
-		}
-		// Nested: { result: { bundle: { nodes: [...] } } }
-		if rs, ok := v["result"].(map[string]any); ok {
-			if bundle, ok := rs["bundle"].(map[string]any); ok {
-				if arr, ok := bundle["nodes"].([]any); ok {
-					return toRowSlice(arr)
-				}
-			}
-		}
-		// Top-level map looks like a single row (has id/concept) --
-		// wrap. Otherwise we don't know what this is.
-		if _, hasId := v["id"]; hasId {
-			return []map[string]any{v}
-		}
-	}
-	return nil
-}
 
 func getString(m map[string]any, key string) string {
 	if m == nil {
