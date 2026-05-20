@@ -2,6 +2,9 @@ package editor
 
 import (
 	"github.com/gdamore/tcell/v2"
+
+	"github.com/znasllc-io/memql/sdk/go/sense"
+
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
 )
 
@@ -12,40 +15,19 @@ type StyledSpan struct {
 	Style tcell.Style
 }
 
-// SenseToken mirrors the data from a SenseTokenizeResult entry.
-type SenseToken struct {
-	Type    string // keyword, identifier, string, number, operator, annotation, comment, punctuation, concept
-	Literal string
-	StartLine int // 1-indexed
-	StartCol  int // 1-indexed
-	EndLine   int // 1-indexed
-	EndCol    int // 1-indexed
-}
-
-// SenseDiagnostic mirrors the data from a SenseDiagnoseResult entry.
-type SenseDiagnostic struct {
-	StartLine int // 1-indexed
-	StartCol  int // 1-indexed
-	EndLine   int // 1-indexed
-	EndCol    int // 1-indexed
-	Severity  int // 1=Error, 2=Warning, 3=Info, 4=Hint
-	Message   string
-	Code      string
-}
-
 // HighlightMap builds a per-line style map from Sense tokens.
 // Returns map[lineIndex][]StyledSpan (0-based line index).
-func HighlightMap(tokens []SenseToken, theme ui.Theme) map[int][]StyledSpan {
+func HighlightMap(tokens []sense.Token, theme ui.Theme) map[int][]StyledSpan {
 	result := make(map[int][]StyledSpan)
 	for _, tok := range tokens {
-		if tok.StartLine < 1 {
+		if tok.Range.Start.Line < 1 {
 			continue
 		}
-		lineIdx := tok.StartLine - 1
+		lineIdx := tok.Range.Start.Line - 1
 		style := theme.TokenStyle(tok.Type)
 		result[lineIdx] = append(result[lineIdx], StyledSpan{
-			Start: tok.StartCol - 1,
-			End:   tok.EndCol - 1,
+			Start: tok.Range.Start.Column - 1,
+			End:   tok.Range.End.Column - 1,
 			Style: style,
 		})
 	}
@@ -53,14 +35,14 @@ func HighlightMap(tokens []SenseToken, theme ui.Theme) map[int][]StyledSpan {
 }
 
 // DiagnosticMap builds a per-line diagnostic list from Sense diagnostics.
-// Returns map[lineIndex][]SenseDiagnostic (0-based line index).
-func DiagnosticMap(diagnostics []SenseDiagnostic) map[int][]SenseDiagnostic {
-	result := make(map[int][]SenseDiagnostic)
+// Returns map[lineIndex][]sense.Diagnostic (0-based line index).
+func DiagnosticMap(diagnostics []sense.Diagnostic) map[int][]sense.Diagnostic {
+	result := make(map[int][]sense.Diagnostic)
 	for _, d := range diagnostics {
-		if d.StartLine < 1 {
+		if d.Range.Start.Line < 1 {
 			continue
 		}
-		lineIdx := d.StartLine - 1
+		lineIdx := d.Range.Start.Line - 1
 		result[lineIdx] = append(result[lineIdx], d)
 	}
 	return result
@@ -68,7 +50,7 @@ func DiagnosticMap(diagnostics []SenseDiagnostic) map[int][]SenseDiagnostic {
 
 // DiagnosticGutterIcon returns the gutter rune and style for the highest-severity
 // diagnostic on a line. Returns 0 rune if no diagnostics.
-func DiagnosticGutterIcon(diagnostics []SenseDiagnostic, theme ui.Theme) (rune, tcell.Style) {
+func DiagnosticGutterIcon(diagnostics []sense.Diagnostic, theme ui.Theme) (rune, tcell.Style) {
 	if len(diagnostics) == 0 {
 		return 0, tcell.StyleDefault
 	}
