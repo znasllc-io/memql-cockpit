@@ -12,11 +12,11 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/znasllc-io/memql-cockpit/cli/auth"
-	"github.com/znasllc-io/memql/sdk/go/client"
 	"github.com/znasllc-io/memql-cockpit/cli/cluster"
 	"github.com/znasllc-io/memql-cockpit/cli/config"
 	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 	nodev1 "github.com/znasllc-io/memql/component/node/gen"
+	"github.com/znasllc-io/memql/sdk/go/client"
 )
 
 // entryState is the single source of truth for one pool entry's
@@ -595,7 +595,7 @@ func (e *connEntry) nodeTypesInitialLoad(ctx context.Context) []cluster.NodeType
 	queries := client.NewQueryClient(conn.Dispatcher())
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	result, err := queries.Execute(ctx, `queryClusterNodeTypes({})`)
+	result, err := queries.QueryClusterNodeTypes(ctx, client.QueryClusterNodeTypesArgs{})
 	if err != nil {
 		if e.app.logger != nil {
 			e.app.logger.Warn("queryClusterNodeTypes failed, topology will fall back to node order",
@@ -621,10 +621,10 @@ func (e *connEntry) initialLoad(ctx context.Context) []cluster.NodeInfo {
 	defer cancel()
 
 	var allNodes []cluster.NodeInfo
-	if result, err := queries.Execute(ctx, `queryClusterNodes({})`); err == nil {
+	if result, err := queries.QueryClusterNodes(ctx, client.QueryClusterNodesArgs{}); err == nil {
 		allNodes = parseClusterNodes(result)
 	}
-	if spawnResult, err := queries.Execute(ctx, `queryClusterSpawnEvents({})`); err == nil {
+	if spawnResult, err := queries.QueryClusterSpawnEvents(ctx, client.QueryClusterSpawnEventsArgs{}); err == nil {
 		spawnNodes := parseSpawnEvents(spawnResult)
 		seen := make(map[string]bool)
 		for _, n := range allNodes {

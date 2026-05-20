@@ -6,7 +6,7 @@ require (
 	github.com/gdamore/tcell/v2 v2.13.9
 	github.com/gen2brain/malgo v0.11.25
 	github.com/go-vgo/robotgo v1.0.2
-	github.com/znasllc-io/memql v0.1.1-0.20260519030726-c52d9a687b5e
+	github.com/znasllc-io/memql v0.1.1-0.20260520225549-5f4d051ff8fa
 	golang.org/x/sys v0.44.0
 	golang.org/x/term v0.43.0
 	google.golang.org/grpc v1.81.1

@@ -32,10 +32,8 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 
-	"github.com/znasllc-io/memql/component/memql"
-
-	"github.com/znasllc-io/memql/sdk/go/client"
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
+	"github.com/znasllc-io/memql/sdk/go/client"
 )
 
 // FocusPane identifies which of the two keyboard-focus regions is
@@ -164,14 +162,14 @@ func (v *View) Refresh() {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 
-	agentRes, err := qc.Execute(ctx, "queryAllAgents({})")
+	agentRes, err := qc.QueryAllAgents(ctx, client.QueryAllAgentsArgs{})
 	if err != nil {
 		if v.OnStatus != nil {
 			v.OnStatus(fmt.Sprintf("agents: queryAllAgents failed: %v", err))
 		}
 		return
 	}
-	agentRows := memql.MaterializeRows(agentRes)
+	agentRows := agentRes.Rows()
 	sort.SliceStable(agentRows, func(i, j int) bool {
 		ni := strings.ToLower(getString(agentRows[i], "name"))
 		nj := strings.ToLower(getString(agentRows[j], "name"))
@@ -187,8 +185,8 @@ func (v *View) Refresh() {
 	// through shape knowledgeDomainFull, which flattens fields to the
 	// row top level -- read row.name, NOT row.payload.name.
 	domainNames := map[string]string{}
-	if domRes, err := qc.Execute(ctx, "queryListKnowledgeDomains({})"); err == nil {
-		for _, row := range memql.MaterializeRows(domRes) {
+	if domRes, err := qc.QueryListKnowledgeDomains(ctx, client.QueryListKnowledgeDomainsArgs{}); err == nil {
+		for _, row := range domRes.Rows() {
 			id := getString(row, "id")
 			if id == "" {
 				continue
@@ -205,8 +203,8 @@ func (v *View) Refresh() {
 	// ownerAgentId means a missing planner DSL just blanks the
 	// "recent tasks" section.
 	var planRows []map[string]any
-	if planRes, err := qc.Execute(ctx, "queryAllPlans({})"); err == nil {
-		planRows = memql.MaterializeRows(planRes)
+	if planRes, err := qc.QueryAllPlans(ctx, client.QueryAllPlansArgs{}); err == nil {
+		planRows = planRes.Rows()
 		sort.SliceStable(planRows, func(i, j int) bool {
 			return getString(planRows[i], "createdAt") > getString(planRows[j], "createdAt")
 		})

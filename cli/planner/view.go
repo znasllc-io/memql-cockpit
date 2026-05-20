@@ -28,10 +28,8 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 
-	"github.com/znasllc-io/memql/component/memql"
-
-	"github.com/znasllc-io/memql/sdk/go/client"
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
+	"github.com/znasllc-io/memql/sdk/go/client"
 )
 
 // FocusPane identifies which of the three keyboard-focus regions is
@@ -57,14 +55,14 @@ type View struct {
 	Theme ui.Theme
 
 	// Plans + currently-selected.
-	plans         []map[string]any
-	planSelected  int
-	planScrollY   int
+	plans        []map[string]any
+	planSelected int
+	planScrollY  int
 
 	// Tasks for the selected plan + currently-selected.
-	tasks         []map[string]any
-	taskSelected  int
-	taskScrollY   int
+	tasks        []map[string]any
+	taskSelected int
+	taskScrollY  int
 
 	// Vertical scroll offset for the Task Detail pane (the third
 	// pane on the right). Reset to 0 whenever taskSelected changes
@@ -72,7 +70,7 @@ type View struct {
 	taskDetailScrollY int
 
 	// Focus + transient flags.
-	Focus     FocusPane
+	Focus    FocusPane
 	fetching bool
 
 	// dslMissing latches when the cluster's BFF returns
@@ -168,7 +166,7 @@ func (v *View) RefreshPlans() {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 
-	res, err := qc.Execute(ctx, "queryAllPlans({})")
+	res, err := qc.QueryAllPlans(ctx, client.QueryAllPlansArgs{})
 	if err != nil {
 		if isPlannerDSLMissing(err) {
 			v.markDSLMissing()
@@ -180,7 +178,7 @@ func (v *View) RefreshPlans() {
 		return
 	}
 
-	rows := memql.MaterializeRows(res)
+	rows := res.Rows()
 	sort.Slice(rows, func(i, j int) bool {
 		return getString(rows[i], "createdAt") > getString(rows[j], "createdAt")
 	})
@@ -230,7 +228,7 @@ func (v *View) RefreshTasksForSelected() {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 
-	res, err := qc.Execute(ctx, fmt.Sprintf(`queryTasksForPlan({"planId": %q})`, planID))
+	res, err := qc.QueryTasksForPlan(ctx, client.QueryTasksForPlanArgs{PlanId: planID})
 	if err != nil {
 		if isPlannerDSLMissing(err) {
 			v.markDSLMissing()
@@ -242,7 +240,7 @@ func (v *View) RefreshTasksForSelected() {
 		return
 	}
 
-	rows := memql.MaterializeRows(res)
+	rows := res.Rows()
 	sort.SliceStable(rows, func(i, j int) bool {
 		return getInt(rows[i], "seq") < getInt(rows[j], "seq")
 	})
@@ -985,8 +983,7 @@ func (v *View) runSelectedPlan() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
-	call := fmt.Sprintf("mutationStartPlan({planId:%q})", planID)
-	if _, err := qc.Execute(ctx, call); err != nil {
+	if _, err := qc.MutationStartPlan(ctx, client.MutationStartPlanArgs{PlanId: planID}); err != nil {
 		if v.OnStatus != nil {
 			v.OnStatus(fmt.Sprintf("planner: run failed: %v", err))
 		}
