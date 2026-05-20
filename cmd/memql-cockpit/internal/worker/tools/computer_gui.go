@@ -67,6 +67,19 @@ func (d *Dispatcher) dispatchComputer(ctx context.Context, action string, args m
 //	region: { x, y, w, h } -- optional sub-rect; full screen when absent
 //	quality: int 1-100 (jpeg only; default 80)
 func guiScreenshot(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
+	// Per-call TCC preflight: confirm the Screen Recording grant is
+	// still in place. The setup wizard probes this once at first
+	// run; if the user later revokes the grant from System Settings
+	// -> Privacy -> Screen Recording, the next screenshot would
+	// otherwise return an empty / black image with no clear error.
+	// The hook is set by the darwin && gui build at init time; on
+	// every other platform it's nil and we skip.
+	if ScreenCapturePreflightHook != nil && !ScreenCapturePreflightHook() {
+		return nil, failure("permission_denied",
+			"Screen Recording permission is not granted for this binary. "+
+				"Open System Settings -> Privacy & Security -> Screen Recording, "+
+				"enable memql-cockpit-gui, then re-run.")
+	}
 	format := strings.ToLower(strings.TrimSpace(argString(args, "format")))
 	if format == "" {
 		format = "png"
@@ -199,7 +212,20 @@ func guiKeyType(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 		return nil, failure("bad_request", "key_type: text required")
 	}
 	robotgo.TypeStr(text)
-	return successComputerJSON(map[string]any{"text": text, "chars": len(text)}, "typed", len(text)), nil
+	// The typed text often includes credentials (the agent will
+	// drive `key_type(text="<password>\n")` against a password
+	// field). The dispatcher's audit log records the success preview
+	// verbatim, which means the password would otherwise land in the
+	// log shipper as cleartext. We deliberately omit the typed text
+	// from both the result payload and the preview; the length is
+	// preserved as a length-only indicator. If a downstream consumer
+	// needs the typed value (e.g. a record-and-replay tool), it must
+	// supply the value itself and not depend on read-back.
+	return successComputerJSON(
+		map[string]any{"chars": len(text), "text_redacted": true},
+		fmt.Sprintf("typed %d chars (text redacted)", len(text)),
+		len(text),
+	), nil
 }
 
 func guiKeyCombo(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
