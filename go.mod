@@ -3,7 +3,7 @@ module github.com/znasllc-io/memql-cockpit
 go 1.26.1
 
 require (
-	github.com/gdamore/tcell/v2 v2.13.8
+	github.com/gdamore/tcell/v2 v2.13.9
 	github.com/gen2brain/malgo v0.11.25
 	github.com/go-vgo/robotgo v1.0.2
 	github.com/znasllc-io/memql v0.1.1-0.20260519030726-c52d9a687b5e
