@@ -24,8 +24,7 @@ type FocusPane int
 
 const (
 	FocusManagement FocusPane = 0
-	FocusPartitions FocusPane = 1
-	FocusTopology   FocusPane = 2
+	FocusTopology   FocusPane = 1
 )
 
 // ClustersView is the top-level Clusters tab: left = management, right = topology.
@@ -40,16 +39,15 @@ const (
 // from pool-lifecycle goroutines whenever a cluster's dial state
 // changes; the tcell event loop concurrently calls Draw + HandleEvent.
 // mu serializes writers (Lock) against Draw (RLock). The embedded
-// Topology + Partitions views own their own mu, so locking here is
-// per-row state only (Clusters slice, Selected, SelectedCluster,
-// form state) -- nested re-entry through Topology.Draw etc. happens
-// outside this view's lock.
+// Topology view owns its own mu, so locking here is per-row state
+// only (Clusters slice, Selected, SelectedCluster, form state) --
+// nested re-entry through Topology.Draw etc. happens outside this
+// view's lock.
 type ClustersView struct {
-	mu         sync.RWMutex
-	Theme      ui.Theme
-	Focus      FocusPane
-	Topology   *View           // node topology diagram (right pane)
-	Partitions *PartitionsView // partition manager (bottom-left pane)
+	mu       sync.RWMutex
+	Theme    ui.Theme
+	Focus    FocusPane
+	Topology *View // node topology diagram (right pane)
 
 	// Cluster management state.
 	Clusters     []ClusterStatus
@@ -228,10 +226,9 @@ func formStateFromConfig(c config.ClusterConfig) addFormState {
 // The "local" cluster is always present and cannot be deleted.
 func NewClustersView(theme ui.Theme) *ClustersView {
 	v := &ClustersView{
-		Theme:      theme,
-		Topology:   NewView(theme),
-		Partitions: NewPartitionsView(theme),
-		Focus:      FocusManagement,
+		Theme:    theme,
+		Topology: NewView(theme),
+		Focus:    FocusManagement,
 	}
 	// Ensure local cluster is always in the list.
 	v.Clusters = []ClusterStatus{{
@@ -368,26 +365,7 @@ func (v *ClustersView) Draw(screen *ui.Screen, bounds ui.Rect) {
 	}
 	leftBounds.Width--
 
-	// Split the left column vertically when the form isn't open --
-	// top half is the cluster manager, bottom half is the partition
-	// manager. The form takes the full pane to keep the editor wide
-	// enough to type into.
-	if v.showAddForm || v.Partitions == nil {
-		v.drawManagement(screen, leftBounds)
-	} else {
-		topRows := leftBounds.Height / 2
-		if topRows < 8 {
-			topRows = leftBounds.Height
-		}
-		topBounds := ui.Rect{X: leftBounds.X, Y: leftBounds.Y, Width: leftBounds.Width, Height: topRows}
-		botBounds := ui.Rect{X: leftBounds.X, Y: leftBounds.Y + topRows, Width: leftBounds.Width, Height: leftBounds.Height - topRows}
-		v.drawManagement(screen, topBounds)
-		// Horizontal divider between the two halves.
-		screen.DrawHLine(botBounds.X, botBounds.Y, botBounds.Width-1, '─', v.Theme.SubtleStyle())
-		partBounds := ui.Rect{X: botBounds.X, Y: botBounds.Y + 1, Width: botBounds.Width, Height: botBounds.Height - 1}
-		v.Partitions.Focused = v.Focus == FocusPartitions
-		v.Partitions.Draw(screen, partBounds)
-	}
+	v.drawManagement(screen, leftBounds)
 
 	// Topology pane.
 	titleStyle := v.Theme.SubtleStyle().Bold(true)
@@ -618,9 +596,9 @@ func (v *ClustersView) drawManagement(screen *ui.Screen, bounds ui.Rect) {
 	//   Esc:Cancel -- mid-connect (connecting | backoff)
 	//   R:Retry    -- terminal failure (failed)
 	//
-	// Same convention used by PartitionsView: Enter:Select only
-	// surfaces for selectable, not-already-active rows. Future
-	// list-bearing panes should follow this pattern.
+	// Convention: Enter:Select only surfaces for selectable,
+	// not-already-active rows. Future list-bearing panes should
+	// follow this pattern.
 	subtle := v.Theme.SubtleStyle()
 	warnStyle := tcell.StyleDefault.Foreground(v.Theme.Warning).Background(v.Theme.BG)
 	canDelete := v.Selected >= 0 && v.Selected < len(v.Clusters) && v.Clusters[v.Selected].Config.Name != "local"
@@ -769,27 +747,20 @@ func (v *ClustersView) drawAddForm(screen *ui.Screen, x, y, maxW int, bounds ui.
 // to cancel. Arrow keys, Tab, Ctrl+1..4 all keep working regardless
 // of what any cluster is doing in the background.
 // FormOpen reports whether this pane (cluster manager OR its nested
-// partition manager) has a form active. Exposed so higher-level
-// views (or the app shell) can short-circuit any Tab-like behavior
-// that would pull focus out from under the user mid-edit.
+// any sub-pane) has a form active. Exposed so higher-level views
+// (or the app shell) can short-circuit any Tab-like behavior that
+// would pull focus out from under the user mid-edit.
 func (v *ClustersView) FormOpen() bool {
 	if v == nil {
 		return false
 	}
-	if v.showAddForm {
-		return true
-	}
-	if v.Partitions != nil && v.Partitions.FormOpen() {
-		return true
-	}
-	return false
+	return v.showAddForm
 }
 
 // HandleEvent processes keys. Takes the write lock for the duration
 // so a concurrent pool-lifecycle SetX call can't race row-level
-// state. Sub-views (Topology, Partitions) own their own locks and
-// are dispatched without this lock held -- the routing fan-out is
-// state-free.
+// state. The Topology sub-view owns its own lock and is dispatched
+// without this lock held -- the routing fan-out is state-free.
 func (v *ClustersView) HandleEvent(ev tcell.Event) bool {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -798,19 +769,16 @@ func (v *ClustersView) HandleEvent(ev tcell.Event) bool {
 		return false
 	}
 
-	// Tab switches focus between panes EXCEPT when a form is open on
-	// ANY sub-pane. Typing inside a form and accidentally jumping to
-	// Topology is confusing; the form owner always keeps Tab until
-	// the form closes. Esc dismisses the form and re-enables pane
-	// cycling. Cycle order: Management → Partitions → Topology.
+	// Tab switches focus between Management and Topology, EXCEPT
+	// when a form is open. Typing inside a form and accidentally
+	// jumping to Topology is confusing; the form owner always
+	// keeps Tab until the form closes.
 	if keyEv.Key() == tcell.KeyTab {
-		if v.showAddForm || (v.Partitions != nil && v.Partitions.FormOpen()) {
+		if v.showAddForm {
 			return true // swallow silently so nothing else fires
 		}
 		switch v.Focus {
 		case FocusManagement:
-			v.Focus = FocusPartitions
-		case FocusPartitions:
 			v.Focus = FocusTopology
 		default:
 			v.Focus = FocusManagement
@@ -824,10 +792,6 @@ func (v *ClustersView) HandleEvent(ev tcell.Event) bool {
 
 	if v.confirmDelete {
 		return v.handleDeleteConfirm(keyEv)
-	}
-
-	if v.Focus == FocusPartitions && v.Partitions != nil {
-		return v.Partitions.HandleEvent(ev)
 	}
 
 	if v.Focus == FocusTopology {

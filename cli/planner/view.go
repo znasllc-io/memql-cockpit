@@ -288,7 +288,7 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 	// Three panes mirroring the Concepts tab's progressive-disclosure
 	// flow (picker -> row list -> detail):
 	//
-	//   PLANS        (left, flex -- plans in the active partition)
+	//   PLANS        (left, flex -- recent plans)
 	//   TASKS        (center, flex -- tasks under the highlighted plan)
 	//   TASK DETAIL  (right, flex -- input / output / metadata for
 	//                the highlighted task)
@@ -1297,8 +1297,8 @@ func truncate(s string, max int) string {
 // functions as `function "<name>" not found` (see
 // component/memql/engine.go's resolver). Matching on that exact
 // shape avoids tripping on unrelated errors that happen to contain
-// the word "function" -- a permission denial, a parser failure, or
-// a partition-ACL reject all use different verbs.
+// the word "function" -- a permission denial or a parser failure
+// use different verbs.
 //
 // The check is intentionally loose on the function name -- we want
 // the same code path to fire for queryAllPlans, queryTasksForPlan,
