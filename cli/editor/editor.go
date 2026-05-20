@@ -4,6 +4,9 @@ import (
 	"fmt"
 
 	"github.com/gdamore/tcell/v2"
+
+	"github.com/znasllc-io/memql/sdk/go/sense"
+
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
 )
 
@@ -19,12 +22,12 @@ type Editor struct {
 	ScrollX     int // horizontal scroll offset
 
 	// Sense data (updated asynchronously from gRPC).
-	Tokens      []SenseToken
-	Diagnostics []SenseDiagnostic
+	Tokens      []sense.Token
+	Diagnostics []sense.Diagnostic
 
 	// Cached maps rebuilt when Sense data changes.
 	highlights    map[int][]StyledSpan
-	diagnosticMap map[int][]SenseDiagnostic
+	diagnosticMap map[int][]sense.Diagnostic
 	dirty         bool // true when Sense data needs re-mapping
 
 	// Status
@@ -41,13 +44,13 @@ func NewEditor(buf *Buffer, theme ui.Theme) *Editor {
 }
 
 // SetTokens updates the syntax highlighting tokens from Sense.
-func (e *Editor) SetTokens(tokens []SenseToken) {
+func (e *Editor) SetTokens(tokens []sense.Token) {
 	e.Tokens = tokens
 	e.highlights = HighlightMap(tokens, e.Theme)
 }
 
 // SetDiagnostics updates the diagnostic markers from Sense.
-func (e *Editor) SetDiagnostics(diagnostics []SenseDiagnostic) {
+func (e *Editor) SetDiagnostics(diagnostics []sense.Diagnostic) {
 	e.Diagnostics = diagnostics
 	e.diagnosticMap = DiagnosticMap(diagnostics)
 
@@ -154,7 +157,7 @@ func (e *Editor) drawLine(screen *ui.Screen, x, y, maxW, lineIdx int, line strin
 		// Underline for diagnostic ranges.
 		if diags, ok := e.diagnosticMap[lineIdx]; ok {
 			for _, d := range diags {
-				if col >= d.StartCol-1 && col < d.EndCol-1 {
+				if col >= d.Range.Start.Column-1 && col < d.Range.End.Column-1 {
 					if d.Severity == 1 {
 						style = style.Underline(true).Foreground(e.Theme.Error)
 					} else if d.Severity == 2 {

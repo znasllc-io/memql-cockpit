@@ -4,23 +4,16 @@ import (
 	"strings"
 
 	"github.com/gdamore/tcell/v2"
+
+	"github.com/znasllc-io/memql/sdk/go/sense"
+
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
 )
 
-// CompletionItem mirrors a Sense completion suggestion.
-type CompletionItem struct {
-	Label         string
-	Kind          string // keyword, function, concept, annotation, etc.
-	Detail        string
-	Documentation string
-	InsertText    string
-	SortPriority  int
-}
-
 // CompletionPopup renders and manages an autocomplete popup overlay.
 type CompletionPopup struct {
-	Items    []CompletionItem
-	Filtered []CompletionItem
+	Items    []sense.CompletionItem
+	Filtered []sense.CompletionItem
 	Selected int
 	Visible  bool
 	Filter   string // current filter prefix
@@ -37,7 +30,7 @@ func NewCompletionPopup(theme ui.Theme) *CompletionPopup {
 }
 
 // Show displays the popup with the given items at the anchor position.
-func (cp *CompletionPopup) Show(items []CompletionItem, anchorX, anchorY int) {
+func (cp *CompletionPopup) Show(items []sense.CompletionItem, anchorX, anchorY int) {
 	cp.Items = items
 	cp.Filtered = items
 	cp.Selected = 0
@@ -75,7 +68,7 @@ func (cp *CompletionPopup) ApplyFilter(prefix string) {
 }
 
 // SelectedItem returns the currently highlighted completion item.
-func (cp *CompletionPopup) SelectedItem() *CompletionItem {
+func (cp *CompletionPopup) SelectedItem() *sense.CompletionItem {
 	if cp.Selected >= 0 && cp.Selected < len(cp.Filtered) {
 		return &cp.Filtered[cp.Selected]
 	}
@@ -144,8 +137,8 @@ func (cp *CompletionPopup) Draw(screen *ui.Screen, bounds ui.Rect) {
 }
 
 // HandleEvent processes keys for the completion popup.
-// Returns: consumed bool, accepted *CompletionItem (non-nil if user selected an item).
-func (cp *CompletionPopup) HandleEvent(ev *tcell.EventKey) (bool, *CompletionItem) {
+// Returns: consumed bool, accepted *sense.CompletionItem (non-nil if user selected an item).
+func (cp *CompletionPopup) HandleEvent(ev *tcell.EventKey) (bool, *sense.CompletionItem) {
 	if !cp.Visible {
 		return false, nil
 	}
