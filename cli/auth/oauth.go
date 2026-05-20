@@ -8,19 +8,21 @@
 // Sequence:
 //
 //  1. Cockpit opens a loopback HTTP listener on a random port.
+//
 //  2. Cockpit opens the user's browser at
 //
-//	    <issuer>/login?return_to=http://127.0.0.1:<port>/cockpit/callback
+//     <issuer>/login?return_to=http://127.0.0.1:<port>/cockpit/callback
 //
 //     Identity matches return_to against its registered clients (the
 //     "cockpit" client has loopback-any-port redirects per RFC 8252)
 //     and renders the email-entry form.
 //
 //  3. User enters their email, identity issues a magic link.
+//
 //  4. User clicks the magic link, identity's /auth/complete consumes
 //     the token and 302s the browser to
 //
-//	    http://127.0.0.1:<port>/cockpit/callback?code=<auth_code>&state=<...>
+//     http://127.0.0.1:<port>/cockpit/callback?code=<auth_code>&state=<...>
 //
 //  5. Cockpit's callback handler captures the code and POSTs to
 //     <issuer>/oauth/token to swap it for an access + refresh token

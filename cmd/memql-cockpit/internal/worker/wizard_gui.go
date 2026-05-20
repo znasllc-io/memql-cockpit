@@ -57,10 +57,10 @@ const (
 
 // stepStatus is per-step probe state.
 type stepStatus struct {
-	probed   bool
-	granted  bool
-	detail   string
-	tcc      string
+	probed  bool
+	granted bool
+	detail  string
+	tcc     string
 }
 
 // wizard holds the wizard's mutable state. All UI work happens on
@@ -80,7 +80,7 @@ type wizard struct {
 	probing   atomic.Bool
 	statusMsg string
 
-	quit  bool
+	quit bool
 }
 
 func newWizard(screen *ui.Screen) *wizard {

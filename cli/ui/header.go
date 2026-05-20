@@ -8,10 +8,11 @@ import "github.com/gdamore/tcell/v2"
 //
 // Left side:  app branding ("memQL Cockpit").
 // Right side: a single short hint about Tab navigating between panes.
-//             Tab is universal across every tab content view, so the
-//             hint lives in the global chrome instead of being repeated
-//             in each per-pane footer (and saves a footer row in the
-//             tabs that previously had to dedicate one to "Tab:...").
+//
+//	Tab is universal across every tab content view, so the
+//	hint lives in the global chrome instead of being repeated
+//	in each per-pane footer (and saves a footer row in the
+//	tabs that previously had to dedicate one to "Tab:...").
 //
 // Tab-switching shortcuts (F-keys / Alt+digit, range tracks the
 // registered tab count) still live in the bottom TabBar footer so

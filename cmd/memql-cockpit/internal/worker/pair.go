@@ -21,14 +21,14 @@ import (
 // Three supported invocation shapes:
 //
 //  1. PairingCode != ""         -- code came from the command line.
-//                                   Wizard runs paste -> redeem ->
-//                                   yaml -> tcc -> run.
+//     Wizard runs paste -> redeem ->
+//     yaml -> tcc -> run.
 //  2. IdentityURL + Token != "" -- advanced "I already have a token,
-//                                   skip redemption" path. Wizard
-//                                   needs ClusterURL too (advanced
-//                                   callers supply both).
+//     skip redemption" path. Wizard
+//     needs ClusterURL too (advanced
+//     callers supply both).
 //  3. all empty                 -- no-args entry. Wizard prompts for
-//                                   the code interactively.
+//     the code interactively.
 //
 // IdentityURL is the public origin of the memQL identity service
 // (e.g. https://identity.acme.com). The pairing redeem POSTs to

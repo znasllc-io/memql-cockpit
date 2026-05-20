@@ -421,8 +421,8 @@ func (v *ClustersView) drawManagement(screen *ui.Screen, bounds ui.Rect) {
 	// can't grow into them when the cluster count balloons. When the
 	// list exceeds its viewport we scroll + draw an accent-colored
 	// indicator via ui.DrawScrollbar.
-	const detailMaxH = 5    // divider + Endpoint + Auth + Status + (retry|Node)
-	const chromeGapH = 1    // clear row above the action hints
+	const detailMaxH = 5 // divider + Endpoint + Auth + Status + (retry|Node)
+	const chromeGapH = 1 // clear row above the action hints
 	chromeH := 1
 	if v.confirmDelete && v.Selected >= 0 && v.Selected < len(v.Clusters) && v.Clusters[v.Selected].Config.Name != "local" {
 		chromeH = 2

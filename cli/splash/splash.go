@@ -18,9 +18,9 @@ import (
 type Choice int
 
 const (
-	ChoiceQuit              Choice = iota // Ctrl+Q / Ctrl+C / 'q'
-	ChoiceOperatingConsole                // '1' -- open the multi-tab IDE
-	ChoiceRunLocalCluster                 // '2' -- placeholder wizard for now
+	ChoiceQuit             Choice = iota // Ctrl+Q / Ctrl+C / 'q'
+	ChoiceOperatingConsole               // '1' -- open the multi-tab IDE
+	ChoiceRunLocalCluster                // '2' -- placeholder wizard for now
 )
 
 // Run blocks polling events from screen until the user picks an

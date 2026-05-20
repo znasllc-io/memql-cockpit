@@ -79,17 +79,17 @@ func runHTTPFetch(ctx context.Context, args map[string]any, policy *Policy) (*me
 	if int64(len(respBody)) > limit {
 		respBody = respBody[:limit]
 		return successJSON(map[string]any{
-			"status":     resp.StatusCode,
-			"truncated":  true,
-			"body":       string(respBody),
-			"headers":    flattenHeaders(resp.Header),
-			"sizeLimit":  limit,
+			"status":    resp.StatusCode,
+			"truncated": true,
+			"body":      string(respBody),
+			"headers":   flattenHeaders(resp.Header),
+			"sizeLimit": limit,
 		}, 0, 0, len(respBody), truncate(string(respBody), 1024)), nil
 	}
 	return successJSON(map[string]any{
-		"status":   resp.StatusCode,
-		"body":     string(respBody),
-		"headers":  flattenHeaders(resp.Header),
+		"status":  resp.StatusCode,
+		"body":    string(respBody),
+		"headers": flattenHeaders(resp.Header),
 	}, 0, 0, len(respBody), truncate(string(respBody), 1024)), nil
 }
 

@@ -149,4 +149,3 @@ func TestPanelChrome_ClustersView_BottomBand(t *testing.T) {
 		t.Fatalf("expected to find a 'A:Add' chip in the rendered Clusters tab; got:\n%s", strings.Join(rows, "\n"))
 	}
 }
-

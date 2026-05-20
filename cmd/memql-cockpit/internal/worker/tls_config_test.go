@@ -109,10 +109,10 @@ func TestVerifyPrivateKeyFileMode_AcceptsSecure(t *testing.T) {
 
 func TestStripPort(t *testing.T) {
 	cases := map[string]string{
-		"host":          "host",
-		"host:443":      "host",
+		"host":            "host",
+		"host:443":        "host",
 		"bff.local:50050": "bff.local",
-		"":            "",
+		"":                "",
 	}
 	for in, want := range cases {
 		if got := stripPort(in); got != want {
