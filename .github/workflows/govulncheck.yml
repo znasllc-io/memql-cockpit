@@ -1,0 +1,41 @@
+name: govulncheck
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 1"  # weekly Mondays 06:00 UTC
+
+permissions:
+  contents: read
+
+# memql-cockpit's go.mod has `replace github.com/znasllc-io/memql => ../memql`,
+# so vulnerability analysis needs the sibling memql checkout to resolve.
+# Mirrors the pattern in ci.yml.
+
+jobs:
+  scan:
+    name: scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout memql-cockpit
+        uses: actions/checkout@v6
+        with:
+          path: memql-cockpit
+      - name: Checkout memql (sibling for replace directive)
+        uses: actions/checkout@v6
+        with:
+          repository: znasllc-io/memql
+          path: memql
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          cache: true
+          cache-dependency-path: memql-cockpit/go.sum
+      - name: install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: scan
+        working-directory: memql-cockpit
+        run: govulncheck ./...
