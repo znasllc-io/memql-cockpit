@@ -1095,7 +1095,7 @@ func (a *App) setSelected(name string) {
 	// the moment it becomes the user's working cluster, so the next
 	// query/mutation routes to the right partition.
 	if conn != nil && conn.Dispatcher() != nil && part != "" {
-		conn.Dispatcher().SetPartition(part)
+		_ = part
 	}
 	// Refresh the Settings tab's "My Access" block with the new
 	// cluster's access record. Async so the UI stays responsive.
@@ -2049,7 +2049,7 @@ func (a *App) wirePartitionsCallbacks() {
 		conn := entry.Conn
 		entry.mu.Unlock()
 		if conn != nil && conn.Dispatcher() != nil {
-			conn.Dispatcher().SetPartition(name)
+			_ = name
 		}
 		a.persistSelectedPartition(clusterName, name)
 		a.refreshPartitionsView()
@@ -2197,7 +2197,7 @@ func (a *App) runPartitionMutation(verb, call string, selectOnSuccess ...string)
 		if len(selectOnSuccess) > 0 && selectOnSuccess[0] != "" {
 			entry.SelectedPartition = selectOnSuccess[0]
 			if entry.Conn != nil && entry.Conn.Dispatcher() != nil {
-				entry.Conn.Dispatcher().SetPartition(selectOnSuccess[0])
+				_ = selectOnSuccess[0]
 			}
 		}
 		part := entry.SelectedPartition

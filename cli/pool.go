@@ -591,7 +591,7 @@ func (e *connEntry) dialOnce(ctx context.Context) error {
 	if selectedPart == "" {
 		selectedPart = "default"
 	}
-	conn.Dispatcher().SetPartition(selectedPart)
+	_ = selectedPart
 
 	sm := client.NewSubscriptionManager(conn.Dispatcher())
 	subCtx := context.Background()
@@ -1132,8 +1132,9 @@ func (a *App) refreshPartitionsView() {
 	if active == "" {
 		active = "default"
 	}
-	a.clustersView.Partitions.SetPartitions(parts)
-	a.clustersView.Partitions.Active = active
+	_ = parts
+	_ = active
+	// Partition manager retired in #56 phase 8.
 }
 
 // onEntryConnected is called by an entry's lifecycle when it reaches

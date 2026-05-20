@@ -150,35 +150,6 @@ func TestPanelChrome_ClustersView_BottomBand(t *testing.T) {
 	}
 }
 
-// TestPanelChrome_PartitionsView_BottomBand is the equivalent for
-// the partition manager pane, rendered in isolation (no
-// ClustersView wrapper) so the assertions target a single, known
-// bottom row.
-func TestPanelChrome_PartitionsView_BottomBand(t *testing.T) {
-	sim := tcell.NewSimulationScreen("UTF-8")
-	if err := sim.Init(); err != nil {
-		t.Fatalf("sim init: %v", err)
-	}
-	defer sim.Fini()
-	sim.SetSize(contractWidth, contractHeight)
-	sim.Clear()
-
-	screen := ui.NewScreenFromTcell(sim)
-	v := NewPartitionsView(ui.DefaultTheme())
-	v.Focused = true
-	v.SetPartitions([]PartitionInfo{
-		{Name: "default", PartitionType: "standard", Status: "active"},
-		{Name: "acme", PartitionType: "dedicated", Status: "active"},
-	})
-
-	bounds := ui.Rect{X: 0, Y: 0, Width: contractWidth, Height: contractHeight}
-	v.Draw(screen, bounds)
-	sim.Show()
-	rows := flattenSim(sim)
-
-	chrome := rows[contractHeight-1]
-	assertChipFormat(t, "PartitionsView chrome band", chrome)
-	if !strings.Contains(chrome, "A:Add") {
-		t.Errorf("expected partition manager chrome to advertise 'A:Add'; got %q", chrome)
-	}
-}
+// TestPanelChrome_PartitionsView_BottomBand retired in #56 phase 8.
+// The PartitionsView is now a no-op stub and the partition manager
+// chrome contract no longer applies.

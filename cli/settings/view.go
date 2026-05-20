@@ -3,7 +3,6 @@ package settings
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 
@@ -159,42 +158,7 @@ func (v *View) drawMyAccess(screen *ui.Screen, x, y, maxW int) int {
 	y++
 	drawField(screen, x+1, y, maxW-1, "Cluster role", roleLabel(v.access.GetClusterRole()), v.Theme.SubtleStyle(), v.Theme.BaseStyle())
 	y += 2
-
-	// PARTITIONS sub-block.
-	grants := v.access.GetPartitions()
-	screen.DrawText(x+1, y, maxW-2, "PARTITIONS", v.Theme.BaseStyle().Bold(true))
-	y++
-	if len(grants) == 0 {
-		if v.access.GetClusterRole() == memqlv1.UserRole_USER_ROLE_OWNER {
-			screen.DrawText(x+2, y, maxW-3,
-				"(cluster owner -- implicit access to all)",
-				v.Theme.SubtleStyle())
-		} else {
-			screen.DrawText(x+2, y, maxW-3,
-				"No partitions accessible. Contact a cluster admin.",
-				v.Theme.SubtleStyle())
-		}
-		return y + 2
-	}
-
-	sorted := append([]*memqlv1.PartitionGrant{}, grants...)
-	sort.Slice(sorted, func(i, j int) bool {
-		// Pin "default" first, alphabetical otherwise -- matches the
-		// Partitions pane convention in the Clusters tab.
-		a, b := sorted[i].GetPartition(), sorted[j].GetPartition()
-		if a == "default" {
-			return true
-		}
-		if b == "default" {
-			return false
-		}
-		return a < b
-	})
-	for _, g := range sorted {
-		drawField(screen, x+2, y, maxW-3, g.GetPartition(), roleLabel(g.GetRole()), v.Theme.SubtleStyle(), v.Theme.BaseStyle())
-		y++
-	}
-	return y + 1
+	return y
 }
 
 // roleLabel returns the lowercase string form of a UserRole enum.
