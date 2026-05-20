@@ -1,0 +1,34 @@
+name: Feature request
+description: Propose a new feature or enhancement for memQL Cockpit
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        memQL Cockpit is pre-1.0. For larger changes (new tabs, new worker
+        modes, gRPC contract changes), please discuss the design here before
+        opening a PR.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the use case or pain point. Concrete is better than abstract.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should change in the TUI, worker, or CLI? A sketch is fine.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you weighed and why this one wins.
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Links, references, related issues.
