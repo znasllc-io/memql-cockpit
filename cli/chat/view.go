@@ -225,7 +225,10 @@ func (v *View) refreshSpaces() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	res, err := qc.Execute(ctx, `concept==v1:cognition:space; payload.status=="active"`)
+	// Named primitive — the engine returns the user's active spaces
+	// already filtered by per-row authz. The cockpit must never
+	// inline raw concept queries; primitives are the contract.
+	res, err := qc.Execute(ctx, `queryActiveSpaces({})`)
 	if err != nil {
 		if v.OnStatus != nil {
 			v.OnStatus("load spaces: " + err.Error())
@@ -323,7 +326,9 @@ func (v *View) refreshUtterances() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	q := fmt.Sprintf(`concept==v1:cognition:utterance; payload.spaceId==%q`, spaceID)
+	// Named primitive — querySpaceUtterances returns utterances for
+	// the given space already shape-projected to utteranceFull.
+	q := fmt.Sprintf(`querySpaceUtterances({spaceId: %q})`, spaceID)
 	res, err := qc.Execute(ctx, q)
 	if err != nil {
 		if v.OnStatus != nil {
@@ -632,7 +637,14 @@ func (v *View) togglePTT() {
 }
 
 // normalizeRows accepts the protojson-decoded Execute result and
-// returns it as a flat []map[string]any of row records.
+// returns it as a flat []map[string]any of row records. The Chat
+// tab only calls named query primitives (queryActiveSpaces,
+// querySpaceUtterances) -- both shape-wrapped -- so the protojson
+// shape is `{"data": [...]}` where each entry is a flat row. Raw
+// concept queries are intentionally not used here: the cockpit
+// consumes the engine through its named-primitive contract so the
+// engine is free to evolve the bundle shape without breaking the
+// client (see znasllc-io/memql-cockpit#49).
 func normalizeRows(res any) []map[string]any {
 	if res == nil {
 		return nil
@@ -647,7 +659,6 @@ func normalizeRows(res any) []map[string]any {
 		}
 		return out
 	case map[string]any:
-		// Engine may wrap arrays in {"rows": [...]} or similar.
 		for _, key := range []string{"rows", "results", "items", "data"} {
 			if arr, ok := x[key].([]any); ok {
 				out := make([]map[string]any, 0, len(arr))
