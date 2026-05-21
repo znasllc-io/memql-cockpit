@@ -55,6 +55,14 @@ func TestBaseView_StartRefreshLoop_TicksRepeatedly(t *testing.T) {
 // goroutine exits when ctx is canceled. Counts calls before vs.
 // after cancellation; if cancellation didn't take, the count would
 // keep climbing.
+//
+// The drain sleep after cancel() is load-bearing: when the ticker
+// case and ctx.Done() case both become ready in the same select,
+// Go picks one at random, so one extra fn() call can complete
+// AFTER cancel() returns. The test only cares that the loop
+// eventually stops -- not that cancel is observed at the exact
+// instant the goroutine is mid-fn. Sleep > tick interval so any
+// in-flight tick has time to land, then sample pre.
 func TestBaseView_StartRefreshLoop_CancelStopsLoop(t *testing.T) {
 	var b BaseView
 	var calls int64
@@ -65,6 +73,11 @@ func TestBaseView_StartRefreshLoop_CancelStopsLoop(t *testing.T) {
 	// Let it run for ~50ms so a few ticks fire.
 	time.Sleep(50 * time.Millisecond)
 	cancel()
+	// Drain any in-flight tick. 50ms is 5x the tick interval -- if
+	// the loop is still ticking, calls would climb several times
+	// over the drain window. After this sleep, the goroutine has
+	// either exited cleanly or is permanently parked.
+	time.Sleep(50 * time.Millisecond)
 	pre := atomic.LoadInt64(&calls)
 
 	// Wait long enough that, if the loop hadn't stopped, several
