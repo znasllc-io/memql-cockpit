@@ -223,7 +223,11 @@ func TestViewer_HandleEvent_NotFocusedReturnsFalse(t *testing.T) {
 }
 
 // TestViewer_HandleEvent_ScrollKeys covers ↑/↓ + j/k + PgUp/PgDn +
-// Home/End under the focused viewer.
+// Home/End under the focused viewer. Each case is parametrized with
+// the maxScroll value Draw would have stamped -- HandleEvent clamps
+// to [0, maxScroll] on every key press so ScrollY can't drift past
+// the visible end of the content (the bug from
+// memql-cockpit#115).
 func TestViewer_HandleEvent_ScrollKeys(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -231,16 +235,33 @@ func TestViewer_HandleEvent_ScrollKeys(t *testing.T) {
 		ru        rune
 		startScrl int
 		pageCache int
+		maxScroll int
 		wantScrl  int
 	}{
-		{"Down +1", tcell.KeyDown, 0, 0, 0, 1},
-		{"Up -1", tcell.KeyUp, 0, 5, 0, 4},
-		{"Up clamps to 0", tcell.KeyUp, 0, 0, 0, 0},
-		{"PgDn by page", tcell.KeyPgDn, 0, 0, 10, 10},
-		{"PgUp by page", tcell.KeyPgUp, 0, 20, 10, 10},
-		{"Home", tcell.KeyHome, 0, 99, 0, 0},
-		{"k vim up", tcell.KeyRune, 'k', 5, 0, 4},
-		{"j vim down", tcell.KeyRune, 'j', 0, 0, 1},
+		{"Down +1", tcell.KeyDown, 0, 0, 0, 100, 1},
+		{"Up -1", tcell.KeyUp, 0, 5, 0, 100, 4},
+		{"Up clamps to 0", tcell.KeyUp, 0, 0, 0, 0, 0},
+		{"PgDn by page", tcell.KeyPgDn, 0, 0, 10, 100, 10},
+		{"PgUp by page", tcell.KeyPgUp, 0, 20, 10, 100, 10},
+		{"Home", tcell.KeyHome, 0, 99, 0, 100, 0},
+		{"k vim up", tcell.KeyRune, 'k', 5, 0, 100, 4},
+		{"j vim down", tcell.KeyRune, 'j', 0, 0, 100, 1},
+
+		// #115 regression: downward keys clamp to maxScroll so
+		// ScrollY can't drift past the visible end. Pre-fix the
+		// internal counter accumulated phantom presses and KeyUp
+		// then had to drain the dead range before the viewport
+		// moved.
+		{"Down stops at maxScroll", tcell.KeyDown, 0, 7, 0, 7, 7},
+		{"PgDn stops at maxScroll", tcell.KeyPgDn, 0, 5, 10, 7, 7},
+		{"End jumps to maxScroll", tcell.KeyEnd, 0, 0, 0, 42, 42},
+		{"j stops at maxScroll", tcell.KeyRune, 'j', 7, 0, 7, 7},
+
+		// Without a prior Draw (maxScroll = 0), downward keys are
+		// a no-op. Without bounds the widget can't tell where the
+		// content ends; better to do nothing than drift past.
+		{"Down without Draw is no-op", tcell.KeyDown, 0, 0, 0, 0, 0},
+		{"End without Draw is no-op", tcell.KeyEnd, 0, 0, 0, 0, 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -249,6 +270,7 @@ func TestViewer_HandleEvent_ScrollKeys(t *testing.T) {
 				Focused:           true,
 				ScrollY:           tc.startScrl,
 				viewportRowsCache: tc.pageCache,
+				maxScrollCache:    tc.maxScroll,
 			}
 			var ev tcell.Event
 			if tc.key == tcell.KeyRune {
@@ -263,6 +285,32 @@ func TestViewer_HandleEvent_ScrollKeys(t *testing.T) {
 				t.Errorf("ScrollY = %d, want %d", v.ScrollY, tc.wantScrl)
 			}
 		})
+	}
+}
+
+// TestViewer_HandleEvent_DownDoesNotDriftPastMaxScroll is the
+// dedicated regression for memql-cockpit#115. Mashing KeyDown past
+// the bottom of a long detail used to accumulate phantom presses
+// on ScrollY; the next KeyUp had to drain the overshoot before the
+// viewport moved, which to the user read as "arrow keys don't work."
+func TestViewer_HandleEvent_DownDoesNotDriftPastMaxScroll(t *testing.T) {
+	v := Viewer{
+		Lines:             []ViewerLine{{Text: "x"}},
+		Focused:           true,
+		viewportRowsCache: 10,
+		maxScrollCache:    5,
+	}
+	for i := 0; i < 50; i++ {
+		v.HandleEvent(tcell.NewEventKey(tcell.KeyDown, 0, tcell.ModNone))
+	}
+	if v.ScrollY != 5 {
+		t.Fatalf("ScrollY after 50x KeyDown = %d, want 5 (clamped to maxScroll)", v.ScrollY)
+	}
+	// A single KeyUp must immediately move the viewport, not first
+	// drain the overshoot.
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyUp, 0, tcell.ModNone))
+	if v.ScrollY != 4 {
+		t.Errorf("ScrollY after KeyUp = %d, want 4 (KeyUp must take effect immediately)", v.ScrollY)
 	}
 }
 

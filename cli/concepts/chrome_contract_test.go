@@ -367,3 +367,68 @@ func TestPanelChrome_TitleFormat(t *testing.T) {
 	}
 	_ = rowsPaneEnd
 }
+
+// TestDetailViewer_ArrowNav_Enter is the integration regression for
+// memql-cockpit#115. Drives the cockpit's actual event loop:
+// FocusRows -> Enter -> FocusDetail -> KeyDown advances ScrollY.
+// Pre-fix the issue was perceived as "arrow keys don't work" when
+// in fact ScrollY was drifting past maxScroll on mashed presses;
+// the dedicated unit test TestViewer_HandleEvent_DownDoesNotDriftPastMaxScroll
+// in cli/ui covers the inner widget, this one covers the full
+// integration through View.HandleEvent.
+func TestDetailViewer_ArrowNav_Enter(t *testing.T) {
+	v, screen, sim, bounds := makeView(t)
+
+	// Stuff the detail with enough lines to scroll.
+	v.Mu.Lock()
+	v.detailLines = make([]ui.ViewerLine, 80)
+	for i := range v.detailLines {
+		v.detailLines[i] = ui.ViewerLine{Text: "line"}
+	}
+	v.Focus = FocusRows
+	v.Mu.Unlock()
+
+	// Initial paint -- populates viewer.viewportRowsCache + maxScrollCache.
+	drawAndSnapshot(v, screen, sim, bounds)
+
+	// Press Enter from the rows pane -- focus jumps to detail.
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	if v.Focus != FocusDetail {
+		t.Fatalf("Enter on Rows pane: Focus = %d, want FocusDetail (%d)", v.Focus, FocusDetail)
+	}
+	drawAndSnapshot(v, screen, sim, bounds)
+
+	// KeyDown must advance ScrollY past 0.
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyDown, 0, tcell.ModNone))
+	drawAndSnapshot(v, screen, sim, bounds)
+	if v.viewer.ScrollY <= 0 {
+		t.Fatalf("KeyDown in FocusDetail did not advance viewer.ScrollY: got %d", v.viewer.ScrollY)
+	}
+
+	// Mash KeyDown well past the end. ScrollY must clamp to maxScroll,
+	// not drift past -- otherwise KeyUp wouldn't take effect right
+	// away (the bug from #115).
+	for i := 0; i < 200; i++ {
+		v.HandleEvent(tcell.NewEventKey(tcell.KeyDown, 0, tcell.ModNone))
+	}
+	drawAndSnapshot(v, screen, sim, bounds)
+	maxScroll := v.viewer.MaxScroll()
+	if maxScroll == 0 {
+		t.Fatalf("MaxScroll is 0 after Draw of 80-line detail -- fixture too small to exercise scroll")
+	}
+	if v.viewer.ScrollY != maxScroll {
+		t.Errorf("ScrollY after mashed KeyDown = %d, want %d (clamped to maxScroll)", v.viewer.ScrollY, maxScroll)
+	}
+
+	// A SINGLE KeyUp must immediately move the viewport up.
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyUp, 0, tcell.ModNone))
+	if v.viewer.ScrollY != maxScroll-1 {
+		t.Errorf("ScrollY after single KeyUp = %d, want %d (KeyUp must take effect immediately)", v.viewer.ScrollY, maxScroll-1)
+	}
+
+	// Esc returns to the Rows pane.
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyEsc, 0, tcell.ModNone))
+	if v.Focus != FocusRows {
+		t.Errorf("Esc in FocusDetail: Focus = %d, want FocusRows (%d)", v.Focus, FocusRows)
+	}
+}
