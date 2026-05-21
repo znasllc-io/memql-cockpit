@@ -61,6 +61,16 @@ type View struct {
 	plans []map[string]any
 	tasks []map[string]any
 
+	// agentSkillEvents indexes the v1:agents:skillChangeEvent rows
+	// fetched for the currently-selected plan's ownerAgentId,
+	// newest first. cockpit#125 surfaces these in the Task Detail
+	// pane so an operator can correlate planner mintSkill /
+	// extendSpecialist actions with the underlying skill-attach
+	// events. Re-fetched whenever the plan selection moves; empty
+	// for plans whose ownerAgentId is unset or whose agent has no
+	// skill history.
+	agentSkillEvents []map[string]any
+
 	// Focus + transient flags.
 	Focus    FocusPane
 	fetching bool
@@ -227,6 +237,33 @@ func (v *View) RefreshTasksForSelected() {
 		return getInt(rows[i], "seq") < getInt(rows[j], "seq")
 	})
 
+	// Skill-event history (cockpit#125): re-fetch the plan owner's
+	// skillChangeEvent rows so the Task Detail pane can surface the
+	// per-agent attach timeline. Best-effort -- a cluster running a
+	// pre-Phase-3 memql returns "function not found" and we render
+	// without the section. Issued in the same Refresh window as
+	// tasks so the detail pane stays consistent.
+	var skillEvents []map[string]any
+	v.Mu.RLock()
+	agentId := ""
+	if v.planList.Selected >= 0 && v.planList.Selected < len(v.plans) {
+		agentId = getString(v.plans[v.planList.Selected], "ownerAgentId")
+	}
+	v.Mu.RUnlock()
+	if agentId != "" {
+		eventsRes, err := qc.SkillChangeEventsForAgent(ctx,
+			client.SkillChangeEventsForAgentArgs{TargetAgentId: agentId})
+		if err == nil {
+			skillEvents = eventsRes.Rows()
+			sort.SliceStable(skillEvents, func(i, j int) bool {
+				return getString(skillEvents[i], "createdAt") > getString(skillEvents[j], "createdAt")
+			})
+		}
+		// Silently skip on error -- the query is brand-new and an
+		// older cluster won't have it; we don't want a banner every
+		// 3s for that.
+	}
+
 	v.Mu.Lock()
 	defer v.Mu.Unlock()
 	v.tasks = rows
@@ -235,6 +272,7 @@ func (v *View) RefreshTasksForSelected() {
 		v.taskList.Selected = 0
 		v.taskList.ScrollY = 0
 	}
+	v.agentSkillEvents = skillEvents
 }
 
 // ---------------------------------------------------------------------------
@@ -677,7 +715,126 @@ func (v *View) buildTaskDetailLines(task, plan map[string]any, innerWidth int) [
 	}
 	addBlock("metrics", prettyJSON(task["metrics"]))
 
+	// Skill events: cockpit#125 surfaces the plan owner's skill-
+	// attach timeline + any pending mintSkill approval card here.
+	// Section renders only when there's something meaningful to
+	// show (pending mint OR at least one skillChangeEvent for the
+	// owner agent); skipped silently otherwise so non-skill plans
+	// don't pay the visual cost.
+	v.renderSkillEventsSection(&lines, plan, addSection, addKV, plain)
+
 	return lines
+}
+
+// renderSkillEventsSection appends the cockpit#125 surfaces to the
+// task detail pane:
+//
+//   - Pending mintSkill approval card: when the plan is parked in
+//     awaitingFeedback with feedbackReason="mint_skill_approval_required",
+//     render a one-liner pointing at the canvas card id and call out
+//     the awaiting-user-action state.
+//   - skillChangeEvent timeline: append-only history of the plan
+//     owner agent's skill attaches (newest first, capped at 12 rows
+//     to keep the pane scrollable). Each entry shows changeKind,
+//     skillId, the planner-or-user actor, and the originating Plan
+//     id (which may or may not equal the currently-selected Plan).
+//
+// Empty / pre-Phase-3 clusters render nothing; the helper is a no-op
+// when v.agentSkillEvents is empty and there's no pending mint.
+func (v *View) renderSkillEventsSection(
+	lines *[]ui.DetailLine,
+	plan map[string]any,
+	addSection func(string),
+	addKV func(string, string),
+	plain func(string) ui.DetailLine,
+) {
+	const eventCap = 12
+	pendingMintCardId, pendingMintSlug, hasPending := pendingMintApproval(plan)
+	events := v.agentSkillEvents
+	if !hasPending && len(events) == 0 {
+		return
+	}
+
+	addSection("skill events")
+	if hasPending {
+		addKV("pending mint", pendingMintSlug)
+		addKV("approval card", pendingMintCardId)
+		*lines = append(*lines, plain("  awaiting user action on the canvas card -- "))
+		*lines = append(*lines, plain("  Approve / Approve-and-allow / Reject"))
+	}
+	if len(events) == 0 {
+		return
+	}
+	if hasPending {
+		*lines = append(*lines, plain(""))
+	}
+	*lines = append(*lines, plain("  recent attach history (newest first):"))
+	limit := len(events)
+	if limit > eventCap {
+		limit = eventCap
+	}
+	for i := 0; i < limit; i++ {
+		ev := events[i]
+		kind := getString(ev, "changeKind")
+		if kind == "" {
+			kind = "attached"
+		}
+		skillId := getString(ev, "skillId")
+		actor := getString(ev, "actorAgentId")
+		if actor == "" {
+			actor = getString(ev, "actorUserId")
+		}
+		if actor == "" {
+			actor = "(unknown actor)"
+		}
+		when := shortenTimestamp(getString(ev, "createdAt"))
+		evPlanId := getString(ev, "planId")
+		var planMarker string
+		if evPlanId != "" && evPlanId == getString(plan, "id") {
+			planMarker = " [this plan]"
+		} else if evPlanId != "" {
+			planMarker = " (plan " + evPlanId + ")"
+		}
+		*lines = append(*lines, plain(fmt.Sprintf("  - %s  %s  %s  by %s%s",
+			when, kind, skillId, actor, planMarker)))
+	}
+	if len(events) > eventCap {
+		*lines = append(*lines, plain(fmt.Sprintf("  ... +%d older events", len(events)-eventCap)))
+	}
+}
+
+// pendingMintApproval extracts the mintSkill canvas-card lineage when
+// the plan is parked awaiting the user's approve / reject. The
+// memql#159 mint handler stamps:
+//   - feedbackReason="mint_skill_approval_required"
+//   - canvasState row with id "mint-skill-approval-<planId>-<skillSlug>"
+//
+// We derive cardId from planId + the slug the planner emitted; that
+// slug lives on plan.feedbackRequest.skillSlug (the mint handler is
+// the only writer of that field, so its presence is the load-bearing
+// signal). Returns ("", "", false) when no pending mint is signaled.
+func pendingMintApproval(plan map[string]any) (cardId, skillSlug string, ok bool) {
+	if getString(plan, "feedbackReason") != "mint_skill_approval_required" {
+		return "", "", false
+	}
+	planId := getString(plan, "id")
+	if planId == "" {
+		return "", "", false
+	}
+	fbReq, _ := plan["feedbackRequest"].(map[string]any)
+	if fbReq != nil {
+		if s := getString(fbReq, "skillSlug"); s != "" {
+			skillSlug = s
+		}
+	}
+	if skillSlug == "" {
+		// Plan parked without the slug stamped (older mint handler
+		// version, or the field-name evolved); surface the bare
+		// reason so the operator at least sees the pending state.
+		return "(card id derivable from plan + slug)", "(unknown slug)", true
+	}
+	cardId = fmt.Sprintf("mint-skill-approval-%s-%s", planId, skillSlug)
+	return cardId, skillSlug, true
 }
 
 // prettyJSON serializes v with two-space indentation.
