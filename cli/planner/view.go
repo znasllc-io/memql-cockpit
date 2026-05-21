@@ -550,8 +550,9 @@ func (v *View) drawTaskDetail(screen *ui.Screen, bounds ui.Rect) {
 // to unit-test against fixture rows. innerWidth bounds each
 // JSON/string field's wrap so the detail pane never overflows.
 //
-// Section markers ("─ name ─") use LineHeader so they pop visually;
-// body content uses LinePlain.
+// Section markers ("─ name ─") use LineSection (subtle+bold) so they
+// recede into the chrome rather than competing with the accent color
+// reserved for LineHeader; body content uses LinePlain.
 func (v *View) buildTaskDetailLines(task, plan map[string]any, innerWidth int) []ui.DetailLine {
 	if innerWidth < 16 {
 		innerWidth = 16
@@ -559,7 +560,7 @@ func (v *View) buildTaskDetailLines(task, plan map[string]any, innerWidth int) [
 	var lines []ui.DetailLine
 
 	plain := func(s string) ui.DetailLine { return ui.DetailLine{Kind: ui.LinePlain, Text: s} }
-	header := func(s string) ui.DetailLine { return ui.DetailLine{Kind: ui.LineHeader, Text: s} }
+	section := func(s string) ui.DetailLine { return ui.DetailLine{Kind: ui.LineSection, Text: s} }
 
 	addKV := func(label, value string) {
 		if value == "" {
@@ -580,7 +581,7 @@ func (v *View) buildTaskDetailLines(task, plan map[string]any, innerWidth int) [
 		if len(lines) > 0 {
 			lines = append(lines, plain(""))
 		}
-		lines = append(lines, header("─ "+name+" ─"))
+		lines = append(lines, section("─ "+name+" ─"))
 	}
 	addBlock := func(name string, body string) {
 		body = strings.TrimSpace(body)

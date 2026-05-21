@@ -370,7 +370,8 @@ func (v *View) drawDetail(screen *ui.Screen, bounds ui.Rect) {
 }
 
 // buildDetailLines flattens the agent record into the right pane's
-// display block.
+// display block. Section markers ("─ name ─") use LineSection
+// (subtle+bold) so they recede into the chrome.
 func (v *View) buildDetailLines(a map[string]any, innerWidth int) []ui.DetailLine {
 	if innerWidth < 16 {
 		innerWidth = 16
@@ -378,7 +379,7 @@ func (v *View) buildDetailLines(a map[string]any, innerWidth int) []ui.DetailLin
 	var lines []ui.DetailLine
 
 	plain := func(s string) ui.DetailLine { return ui.DetailLine{Kind: ui.LinePlain, Text: s} }
-	header := func(s string) ui.DetailLine { return ui.DetailLine{Kind: ui.LineHeader, Text: s} }
+	section := func(s string) ui.DetailLine { return ui.DetailLine{Kind: ui.LineSection, Text: s} }
 
 	addKV := func(label, value string) {
 		if value == "" {
@@ -403,7 +404,7 @@ func (v *View) buildDetailLines(a map[string]any, innerWidth int) []ui.DetailLin
 		if len(lines) > 0 {
 			lines = append(lines, plain(""))
 		}
-		lines = append(lines, header("─ "+name+" ─"))
+		lines = append(lines, section("─ "+name+" ─"))
 	}
 	addList := func(values []string, empty string) {
 		if len(values) == 0 {

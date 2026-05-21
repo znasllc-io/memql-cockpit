@@ -32,6 +32,13 @@ const (
 	// (The reusable read-only viewer in #50 will add wrap support
 	// for syntax-aware variants.)
 	LineKV
+
+	// LineSection is a muted-but-bold marker for the "─ name ─"
+	// dividers planner / agents use to chunk a detail pane into
+	// blocks. Renders in theme.SubtleStyle().Bold(true) so the
+	// marker recedes into the chrome rather than competing with
+	// LineHeader's accent emphasis. Wrapped like LinePlain.
+	LineSection
 )
 
 // DetailLine is one logical line in a DetailPane. For LinePlain /
@@ -228,6 +235,8 @@ func (d *DetailPane) flatten(innerW int, theme Theme) []renderedRow {
 		switch ln.Kind {
 		case LineHeader:
 			out = wrapInto(out, ln.Text, innerW, theme.AccentStyle().Bold(true))
+		case LineSection:
+			out = wrapInto(out, ln.Text, innerW, theme.SubtleStyle().Bold(true))
 		case LineDim:
 			out = wrapInto(out, ln.Text, innerW, theme.SubtleStyle())
 		case LineKV:
