@@ -33,6 +33,7 @@ import (
 	"github.com/znasllc-io/memql/component/node"
 	nodev1 "github.com/znasllc-io/memql/component/node/gen"
 	"github.com/znasllc-io/memql/sdk/go/client"
+	"github.com/znasllc-io/memql/sdk/go/sense"
 )
 
 // AppConfig holds initialization parameters for the application.
@@ -1168,6 +1169,17 @@ func (a *App) wireConcepts() {
 
 	a.getQueries = getQueries
 	a.conceptsView.QueryClient = getQueries
+	// Same dispatcher-binding pattern as QueryClient: every call
+	// resolves against whichever cluster is active right now, so a
+	// cluster switch transparently retargets Sense too. Returns nil
+	// when no cluster is connected; the concepts View handles that.
+	a.conceptsView.SenseClient = func() *sense.Client {
+		d := a.activeDispatcher()
+		if d == nil {
+			return nil
+		}
+		return sense.NewClient(d)
+	}
 	a.conceptsView.OnStatus = func(msg string) {
 		if a.notifications != nil {
 			a.notifications.Sync("concepts", ui.SeverityWarning, msg)

@@ -1,0 +1,372 @@
+package ui
+
+import (
+	"github.com/gdamore/tcell/v2"
+)
+
+// HighlightSpan is one styled segment inside a ViewerLine. Coordinates
+// are rune-based (Start inclusive, End exclusive) over the line's
+// Text. Spans never carry the gutter -- they're indexed against the
+// line's raw text, not the rendered row.
+//
+// Overlap rule: when spans overlap, later spans in the slice win for
+// the overlapping runes. Callers that produce spans from a tokenizer
+// can rely on this to layer per-token styling over a base style.
+type HighlightSpan struct {
+	Start int // first rune index covered (inclusive)
+	End   int // last rune index covered (exclusive)
+	Style tcell.Style
+}
+
+// ViewerLine is one source line in a Viewer. Text is the raw line
+// content (no embedded newlines -- callers split on '\n' before
+// constructing the slice). Spans is optional per-line highlighting.
+// Block groups consecutive lines with the same id under a single
+// subtle background band; id 0 means "no block."
+type ViewerLine struct {
+	Text  string
+	Spans []HighlightSpan
+	Block int
+}
+
+// Viewer is a reusable read-only viewer panel for showing returned
+// MemQL data (or any line-oriented text) without the horizontal
+// overflow LinePlain/DetailPane allow. Differences from DetailPane:
+//
+//  1. **Line numbers** -- a right-aligned subtle gutter on every
+//     source line. Continuation rows for a wrapped line render a
+//     blank gutter so the eye can scan numbers cleanly.
+//  2. **Hard wrap** -- lines longer than the inner content width
+//     break mid-token. No rune can render past the right edge. (The
+//     old WrapText helper breaks on whitespace only and lets long
+//     JSON values escape, which is the bug closed in #50.)
+//  3. **Block tinting** -- consecutive lines sharing a non-zero
+//     Block id receive a subtle background tint so logical sections
+//     scan as bands.
+//  4. **Highlight spans** -- per-line rune ranges painted in the
+//     supplied style; everything outside a span renders in BaseStyle.
+//
+// The viewer is read-only: no cursor, no editing surface, no input
+// beyond scroll keys. Selection / copy is the terminal's job.
+type Viewer struct {
+	Lines        []ViewerLine
+	ScrollY      int
+	Focused      bool
+	EmptyMessage string
+
+	// viewportRowsCache is populated by Draw so HandleEvent's PgUp /
+	// PgDn can size their jumps using the bounds Draw last saw.
+	// Unexported because callers don't construct Viewer with it set;
+	// it's a pure draw-to-event side channel.
+	viewportRowsCache int
+}
+
+// gutterWidth is the number of cells reserved for the line-number
+// column (4 digits + 1 trailing space). Hard-coded because every
+// realistic concept-row payload fits well under 10,000 lines; if a
+// surface ever needs 5-digit gutters we'll widen this and revisit
+// the alignment math in renderRow.
+const gutterWidth = 5
+
+// Draw paints the viewer into bounds. Auto-clamps ScrollY so callers
+// don't have to track it across resizes (same contract as DetailPane
+// + ListPane).
+func (v *Viewer) Draw(screen *Screen, bounds Rect, theme Theme) {
+	if screen == nil || bounds.Width <= 0 || bounds.Height <= 0 {
+		return
+	}
+	if bounds.Width < gutterWidth+2 {
+		// Too narrow to render anything useful; bail out so we don't
+		// paint a corrupted half-gutter.
+		return
+	}
+
+	if len(v.Lines) == 0 {
+		if v.EmptyMessage != "" {
+			y := bounds.Y + bounds.Height/2
+			screen.DrawText(bounds.X+1, y, bounds.Width-2, v.EmptyMessage, theme.SubtleStyle())
+		}
+		return
+	}
+
+	// Reserve one column for the scrollbar so the rightmost cell
+	// doesn't get overwritten when content overflows.
+	innerW := bounds.Width - 1
+	if innerW < gutterWidth+1 {
+		innerW = gutterWidth + 1
+	}
+	contentW := innerW - gutterWidth
+	if contentW < 1 {
+		return
+	}
+
+	rows := v.flatten(contentW, theme)
+	v.viewportRowsCache = bounds.Height
+
+	maxScroll := len(rows) - bounds.Height
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if v.ScrollY > maxScroll {
+		v.ScrollY = maxScroll
+	}
+	if v.ScrollY < 0 {
+		v.ScrollY = 0
+	}
+
+	scrollbarVisible := len(rows) > bounds.Height
+	end := v.ScrollY + bounds.Height
+	if end > len(rows) {
+		end = len(rows)
+	}
+
+	for i := v.ScrollY; i < end; i++ {
+		r := rows[i]
+		y := bounds.Y + (i - v.ScrollY)
+		// Block tint covers the entire inner width (gutter + content)
+		// so the band reads as one continuous chrome stripe.
+		if r.blockBG != nil {
+			screen.FillRect(bounds.X, y, innerW, 1, *r.blockBG)
+		}
+		v.drawRow(screen, theme, bounds.X, y, contentW, r)
+	}
+
+	if scrollbarVisible {
+		DrawScrollbar(screen, theme, bounds, v.ScrollY, len(rows))
+	}
+}
+
+// renderedViewerRow is one terminal row in flattened form. lineNum > 0
+// means "draw N right-aligned in the gutter"; 0 means continuation
+// (blank gutter). Runes carries the slice of (char, style) pairs that
+// occupy the content area. blockBG, when non-nil, is the background
+// style to fill the whole row with before painting the runes (so
+// block-tinted bands span the gutter too).
+type renderedViewerRow struct {
+	lineNum int
+	runes   []styledRune
+	blockBG *tcell.Style
+}
+
+type styledRune struct {
+	r     rune
+	style tcell.Style
+}
+
+func (v *Viewer) drawRow(screen *Screen, theme Theme, x, y, contentW int, r renderedViewerRow) {
+	gutterStyle := theme.SubtleStyle()
+	if r.blockBG != nil {
+		gutterStyle = gutterStyle.Background(extractBG(*r.blockBG))
+	}
+	if r.lineNum > 0 {
+		// Right-align: format up to gutterWidth-1 digits, one trailing
+		// space. For lineNums > 9999 we truncate visually -- realistic
+		// concept rows don't get there.
+		num := formatLineNum(r.lineNum, gutterWidth-1)
+		screen.DrawText(x, y, gutterWidth, num+" ", gutterStyle)
+	} else {
+		// Continuation row -- blank gutter, but keep the trailing
+		// space cell painted so the block-tint background extends
+		// uniformly.
+		for i := 0; i < gutterWidth; i++ {
+			screen.SetCell(x+i, y, ' ', gutterStyle)
+		}
+	}
+
+	for i, sr := range r.runes {
+		if i >= contentW {
+			break
+		}
+		style := sr.style
+		if r.blockBG != nil {
+			style = style.Background(extractBG(*r.blockBG))
+		}
+		screen.SetCell(x+gutterWidth+i, y, sr.r, style)
+	}
+}
+
+// flatten expands ViewerLines into rendered rows. Each source line
+// produces one or more rows depending on the rune count relative to
+// contentW (the inner content width after the gutter is subtracted).
+func (v *Viewer) flatten(contentW int, theme Theme) []renderedViewerRow {
+	if contentW < 1 {
+		contentW = 1
+	}
+	base := theme.BaseStyle()
+	out := make([]renderedViewerRow, 0, len(v.Lines))
+
+	// Block tinting: a single subtle-ish background slightly darker
+	// than BG so consecutive same-block rows read as a band.
+	blockTint := tcell.StyleDefault.Foreground(theme.FG).Background(tcell.NewRGBColor(28, 28, 33))
+
+	for idx, ln := range v.Lines {
+		runes := styleRunes(ln.Text, ln.Spans, base)
+
+		// Decide block tint -- supplied at line granularity, applied
+		// to every rendered row of that line.
+		var bg *tcell.Style
+		if ln.Block != 0 {
+			b := blockTint
+			bg = &b
+		}
+
+		// Empty source line -- still emit one row so blank separators
+		// render as expected. Line number 0 (continuation) feels
+		// wrong for the FIRST row of an empty line, so we still stamp
+		// the source line number; the row's runes slice is empty.
+		if len(runes) == 0 {
+			out = append(out, renderedViewerRow{
+				lineNum: idx + 1,
+				runes:   nil,
+				blockBG: bg,
+			})
+			continue
+		}
+
+		// Hard-wrap by rune count -- no whitespace bias. This is the
+		// behaviour that closes #50: a 200-char JSON blob with zero
+		// spaces still wraps at contentW.
+		first := true
+		for start := 0; start < len(runes); start += contentW {
+			end := start + contentW
+			if end > len(runes) {
+				end = len(runes)
+			}
+			row := renderedViewerRow{
+				runes:   runes[start:end],
+				blockBG: bg,
+			}
+			if first {
+				row.lineNum = idx + 1
+				first = false
+			}
+			out = append(out, row)
+		}
+	}
+	return out
+}
+
+// styleRunes converts a source line + its spans into a styled-rune
+// slice in source order. Runes not covered by any span receive the
+// base style; overlapping spans resolve "later wins" per HighlightSpan
+// doc.
+func styleRunes(text string, spans []HighlightSpan, base tcell.Style) []styledRune {
+	if text == "" {
+		return nil
+	}
+	rs := []rune(text)
+	out := make([]styledRune, len(rs))
+	for i, r := range rs {
+		out[i] = styledRune{r: r, style: base}
+	}
+	for _, sp := range spans {
+		lo, hi := sp.Start, sp.End
+		if lo < 0 {
+			lo = 0
+		}
+		if hi > len(rs) {
+			hi = len(rs)
+		}
+		for i := lo; i < hi; i++ {
+			out[i].style = sp.Style
+		}
+	}
+	return out
+}
+
+// HandleEvent processes scroll keys when Focused is true. Returns
+// true if the event was consumed. Bindings mirror DetailPane so the
+// muscle memory transfers across surfaces.
+func (v *Viewer) HandleEvent(ev tcell.Event) bool {
+	if !v.Focused {
+		return false
+	}
+	key, ok := ev.(*tcell.EventKey)
+	if !ok {
+		return false
+	}
+	page := v.viewportRowsCache
+	if page <= 0 {
+		page = 1
+	}
+	switch key.Key() {
+	case tcell.KeyUp:
+		v.ScrollY--
+		v.clampScroll()
+		return true
+	case tcell.KeyDown:
+		v.ScrollY++
+		return true
+	case tcell.KeyPgUp:
+		v.ScrollY -= page
+		v.clampScroll()
+		return true
+	case tcell.KeyPgDn:
+		v.ScrollY += page
+		return true
+	case tcell.KeyHome:
+		v.ScrollY = 0
+		return true
+	case tcell.KeyEnd:
+		v.ScrollY = 1<<30 - 1
+		return true
+	case tcell.KeyRune:
+		switch key.Rune() {
+		case 'k':
+			v.ScrollY--
+			v.clampScroll()
+			return true
+		case 'j':
+			v.ScrollY++
+			return true
+		}
+	}
+	return false
+}
+
+func (v *Viewer) clampScroll() {
+	if v.ScrollY < 0 {
+		v.ScrollY = 0
+	}
+}
+
+// formatLineNum right-pads a 1-indexed line number to width cells
+// (leading spaces). Numbers wider than `width` truncate to "####"
+// rather than break alignment.
+func formatLineNum(n, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	digits := []byte{}
+	for n > 0 {
+		digits = append([]byte{byte('0' + n%10)}, digits...)
+		n /= 10
+	}
+	if len(digits) == 0 {
+		digits = []byte{'0'}
+	}
+	if len(digits) > width {
+		out := make([]byte, width)
+		for i := range out {
+			out[i] = '#'
+		}
+		return string(out)
+	}
+	pad := width - len(digits)
+	buf := make([]byte, width)
+	for i := 0; i < pad; i++ {
+		buf[i] = ' '
+	}
+	copy(buf[pad:], digits)
+	return string(buf)
+}
+
+// extractBG pulls the background color off a tcell.Style. tcell
+// doesn't expose a direct getter on Style, so we use Decompose. Lifted
+// here as a small helper because we apply block-tint backgrounds to
+// spans that already carry token-fg colors -- swapping the bg without
+// touching the fg keeps token highlighting intact under the tint.
+func extractBG(style tcell.Style) tcell.Color {
+	_, bg, _ := style.Decompose()
+	return bg
+}
