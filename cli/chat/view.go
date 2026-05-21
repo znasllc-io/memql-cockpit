@@ -458,7 +458,7 @@ func hintsForSpaces() string {
 func hintsForUtterances() string {
 	bar := ui.HintBar{Chips: []ui.HintChip{
 		{Key: "↑/↓", Label: "Scroll"},
-		{Key: "v", Label: "PTT"},
+		{Key: "V", Label: "PTT"},
 		{Key: "Tab", Label: "Cycle"},
 	}}
 	return bar.String()
