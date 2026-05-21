@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/gdamore/tcell/v2"
-	"github.com/znasllc-io/memql-cockpit/cli/agents"
 	"github.com/znasllc-io/memql-cockpit/cli/auth"
 	"github.com/znasllc-io/memql-cockpit/cli/chat"
 	"github.com/znasllc-io/memql-cockpit/cli/cluster"
@@ -78,7 +77,7 @@ type App struct {
 	// viewed is the cluster the topology pane is currently rendering
 	// (follows arrow-key highlight).
 	// selected is the cluster the user has chosen as their "working
-	// cluster" via Enter. Drives the Explorer / Agents tabs.
+	// cluster" via Enter. Drives the Concepts / Planner tabs.
 	// Auto-set to the first cluster that successfully connects on
 	// startup (typically "local").
 	viewed   string
@@ -88,7 +87,6 @@ type App struct {
 	conceptsView *concepts.View
 	clustersView *cluster.ClustersView
 	plannerView  *planner.View
-	agentsView   *agents.View
 	chatView     *chat.View
 	settingsView *settings.View
 
@@ -128,20 +126,22 @@ func NewApp(cfg AppConfig) *App {
 	conceptsView := concepts.NewView(theme)
 	clustersView := cluster.NewClustersView(theme)
 	plannerView := planner.NewView(theme)
-	agentsView := agents.NewView(theme)
 	chatView := chat.NewView(theme)
 
 	// Clusters comes first -- it's the starting context for the session.
 	// Chat sits next (F2) because the daily-space conversation is the
-	// primary surface users open after connecting; Concepts / Planner /
-	// Agents follow as operations-console reads, and Settings stays
-	// last.
+	// primary surface users open after connecting; Concepts / Planner
+	// follow as operations-console reads, and Settings stays last.
+	//
+	// Agents tab retired 2026-05-21 (memql-cockpit#126): every v1:agents:agent
+	// row is browseable via the Concepts tab now, and the @displayCard
+	// hints rendered there give a better surface than the custom
+	// agents view did.
 	tabBar := ui.NewTabBar(theme,
 		ui.Tab{Name: "Clusters", Content: clustersView},
 		ui.Tab{Name: "Chat", Content: chatView},
 		ui.Tab{Name: "Concepts", Content: conceptsView},
 		ui.Tab{Name: "Planner", Content: plannerView},
-		ui.Tab{Name: "Agents", Content: agentsView},
 		ui.Tab{Name: "Settings", Content: settingsView},
 	)
 	tabBar.SetActive(0)
@@ -159,7 +159,6 @@ func NewApp(cfg AppConfig) *App {
 		conceptsView:  conceptsView,
 		clustersView:  clustersView,
 		plannerView:   plannerView,
-		agentsView:    agentsView,
 		chatView:      chatView,
 		settingsView:  settingsView,
 		helpOverlay:   ui.NewHelpOverlay(theme),
@@ -539,7 +538,6 @@ func (a *App) connect() {
 	a.wireConcepts()
 	a.wireCluster()
 	a.wirePlanner()
-	a.wireAgents()
 	a.wireChat()
 
 	for _, cfg := range configs {
@@ -997,7 +995,7 @@ func (a *App) viewedEntry() *connEntry {
 
 // setViewed updates which cluster the topology pane renders.
 // Called by OnHighlight (arrow keys). No side effects on the
-// Explorer / Agents workspace -- those follow a.selected, which
+// Concepts / Planner workspace -- those follow a.selected, which
 // is a separate concept changed by OnEnter, not arrow keys.
 func (a *App) setViewed(name string) {
 	a.poolMu.Lock()
@@ -1033,14 +1031,14 @@ func (a *App) setViewed(name string) {
 }
 
 // setSelected promotes a cluster to "my working cluster" -- drives
-// Explorer/Agents. Called by OnEnter. If the entry is in
+// Concepts/Planner. Called by OnEnter. If the entry is in
 // stateFailed, also kicks a manual Retry so Enter on a dead cluster
 // means "I want this to come back". Persists the choice to
 // clusters.yaml so the next launch restores it.
 func (a *App) setSelected(name string) {
 	// Only CONNECTED clusters can become the working cluster.
 	// Selecting a still-dialing or unreachable cluster has no useful
-	// effect (Explorer/Agents are gated on a connected
+	// effect (Concepts/Planner are gated on a connected
 	// dispatcher anyway), so Enter is a no-op for those rows. The
 	// hint strip already hides "Enter:Select" in those states; this
 	// is the matching guard at the action layer.
@@ -1227,44 +1225,12 @@ func (a *App) wirePlanner() {
 	a.plannerView.StartRefreshLoop(a.quitCh, 3*time.Second)
 }
 
-// wireAgents connects the Agents tab callbacks to the gRPC client.
-// Same getQueries closure pattern as wireConcepts / wirePlanner: every
-// call resolves against the currently active dispatcher so a cluster
-// switch is transparent to the view. Kicks off a background refresh
-// loop on a longer interval than the Planner since agents change at
-// human pace (create / edit / soft-delete from CoPresent), not at
-// task-execution pace.
-func (a *App) wireAgents() {
-	if a.agentsView == nil {
-		return
-	}
-	getQueries := func() *client.QueryClient {
-		d := a.activeDispatcher()
-		if d == nil {
-			return nil
-		}
-		return client.NewQueryClient(d)
-	}
-	a.agentsView.QueryClient = getQueries
-	a.agentsView.OnStatus = func(msg string) {
-		if a.notifications != nil {
-			a.notifications.Sync("agents", ui.SeverityWarning, msg)
-		}
-	}
-	a.agentsView.OnRedraw = func() {
-		if a.screen != nil {
-			a.screen.PostEvent(tcell.NewEventInterrupt(nil))
-		}
-	}
-	a.agentsView.StartRefreshLoop(a.quitCh, 10*time.Second)
-}
-
 // wireChat connects the Chat tab to the gRPC client. The chat view
 // polls v1:cognition:space + v1:cognition:utterance every 3s and
 // renders the single-chat-per-space stream. OnRedraw posts an
 // EventInterrupt after each refresh so the event loop repaints the
 // new data without waiting for a keystroke -- same pattern as
-// wirePlanner / wireAgents.
+// wirePlanner.
 func (a *App) wireChat() {
 	if a.chatView == nil {
 		return
@@ -1645,7 +1611,7 @@ func (a *App) wireClustersCallbacks() {
 	}
 
 	// OnEnter fires when the user presses Enter on a row. Promotes
-	// that cluster to "selected" (drives Explorer / Agents) and,
+	// that cluster to "selected" (drives Concepts / Planner) and,
 	// if its pool entry is in stateFailed, kicks a manual retry.
 	a.clustersView.OnEnter = func(clusterName string) {
 		a.setSelected(clusterName)
@@ -1882,7 +1848,7 @@ func (a *App) wireClustersCallbacks() {
 }
 
 // updateTabGating sets the GatedMessage on the cluster-dependent tabs
-// (Concepts, Planner, Agents) based on whether the user's selected
+// (Concepts, Planner) based on whether the user's selected
 // cluster has a live connection. Called from draw() so state changes
 // show up on the next repaint.
 func (a *App) updateTabGating() {
@@ -1890,9 +1856,6 @@ func (a *App) updateTabGating() {
 		a.conceptsView.GatedMessage = msg
 		if a.plannerView != nil {
 			a.plannerView.GatedMessage = msg
-		}
-		if a.agentsView != nil {
-			a.agentsView.GatedMessage = msg
 		}
 	}
 	name := a.selectedName()
@@ -2095,7 +2058,7 @@ func (a *App) draw() {
 	contentHeight := h - 4
 
 	contentBounds := ui.Rect{X: 0, Y: 2, Width: w, Height: contentHeight}
-	// Gate Explorer / Agents on the selected cluster being
+	// Gate Concepts / Planner on the selected cluster being
 	// connected. When it isn't, those views render a centered
 	// "not available" message instead of their usual content.
 	a.updateTabGating()
