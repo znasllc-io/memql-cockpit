@@ -115,11 +115,21 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
    planner). The one mutation that remains is R:Run on a queued
    plan -- flips it to running via mutationStartPlan. Gated on a
    connected, selected cluster.
-5. **Settings (F5)** -- credentials, theme, version
+5. **Workers (F5)** -- computer-use consent dashboard. Long-lived
+   `watch` connection to `~/.memql/worker.sock` renders the active
+   consent window state + a live audit tail of every worker tool
+   dispatch (newest first, capped at 256). `G` opens the duration
+   picker, `R` revokes immediately. NOT gated on a cluster connection
+   -- the IPC is local-host between cockpit processes. Per
+   memql-cockpit#64. A global `Ctrl+E` kill switch in `dispatchEvent`
+   calls into `workersView.Revoke()` from any tab without making the
+   operator switch tabs first.
+6. **Settings (F6)** -- credentials, theme, version
 
 Concepts, Planner, and Chat are all gated on a connected, selected
 cluster -- they show a placeholder message until the user presses
-Enter on a cluster row in the Clusters tab.
+Enter on a cluster row in the Clusters tab. Workers is NOT gated on
+a cluster -- it speaks to the local worker daemon over a Unix socket.
 
 ### Concepts tab layout
 
@@ -210,11 +220,12 @@ via `Cancel()` does NOT trigger reconnect; only `Unexpected()` does.
 ## Key Bindings
 
 ### Global
-| Key      | Action                              |
-|----------|-------------------------------------|
-| F1..F5   | Switch tab                          |
-| Ctrl+Q   | Quit                                |
-| Ctrl+T   | Cycle theme                         |
+| Key      | Action                                                         |
+|----------|----------------------------------------------------------------|
+| F1..F6   | Switch tab                                                     |
+| Ctrl+Q   | Quit                                                           |
+| Ctrl+T   | Cycle theme                                                    |
+| Ctrl+E   | Computer-use kill switch (revoke worker consent from any tab)  |
 
 ### Clusters tab (Cluster Manager focus)
 | Key   | Action                                              |
@@ -270,6 +281,7 @@ via `Cancel()` does NOT trigger reconnect; only `Unexpected()` does.
 | `concepts/`              | Concepts tab (concept picker + row list + generic renderer)   |
 | `planner/`               | Planner tab (read-only plan list + task list + detail; R:Run)  |
 | `chat/`                  | Chat tab (space list + utterance scroll + `v`:PTT via memql-sdk-go voice.PushToTalk) |
+| `workers/`               | Workers tab (computer-use consent dashboard + live audit tail; subscribes to `~/.memql/worker.sock`). Hosts the global Ctrl+E kill switch path. |
 | `editor/`                | Reusable text editor with Sense integration                   |
 | `settings/`              | Settings tab                                                  |
 | `ui/`                    | Theme, screen, tab bar, layout primitives                     |

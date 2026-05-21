@@ -26,6 +26,7 @@ import (
 	"github.com/znasllc-io/memql-cockpit/cli/settings"
 	"github.com/znasllc-io/memql-cockpit/cli/splash"
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
+	"github.com/znasllc-io/memql-cockpit/cli/workers"
 	genesiswizard "github.com/znasllc-io/memql-cockpit/cli/wizard/genesis"
 	"github.com/znasllc-io/memql-cockpit/cli/wizard/runlocal"
 	corgenesis "github.com/znasllc-io/memql/component/genesis"
@@ -88,6 +89,7 @@ type App struct {
 	clustersView *cluster.ClustersView
 	plannerView  *planner.View
 	chatView     *chat.View
+	workersView  *workers.View
 	settingsView *settings.View
 
 	// getQueries returns a QueryClient bound to the currently active
@@ -127,11 +129,16 @@ func NewApp(cfg AppConfig) *App {
 	clustersView := cluster.NewClustersView(theme)
 	plannerView := planner.NewView(theme)
 	chatView := chat.NewView(theme)
+	workersView := workers.NewView(theme)
 
 	// Clusters comes first -- it's the starting context for the session.
 	// Chat sits next (F2) because the daily-space conversation is the
 	// primary surface users open after connecting; Concepts / Planner
-	// follow as operations-console reads, and Settings stays last.
+	// follow as operations-console reads. Workers (F5) hosts the
+	// computer-use consent dashboard + live audit tail introduced in
+	// memql-cockpit#64 -- not gated on a cluster connection because
+	// it talks to a local worker daemon over a Unix socket, not over
+	// the cluster gRPC. Settings stays last.
 	//
 	// Agents tab retired 2026-05-21 (memql-cockpit#126): every v1:agents:agent
 	// row is browseable via the Concepts tab now, and the @displayCard
@@ -142,6 +149,7 @@ func NewApp(cfg AppConfig) *App {
 		ui.Tab{Name: "Chat", Content: chatView},
 		ui.Tab{Name: "Concepts", Content: conceptsView},
 		ui.Tab{Name: "Planner", Content: plannerView},
+		ui.Tab{Name: "Workers", Content: workersView},
 		ui.Tab{Name: "Settings", Content: settingsView},
 	)
 	tabBar.SetActive(0)
@@ -160,6 +168,7 @@ func NewApp(cfg AppConfig) *App {
 		clustersView:  clustersView,
 		plannerView:   plannerView,
 		chatView:      chatView,
+		workersView:   workersView,
 		settingsView:  settingsView,
 		helpOverlay:   ui.NewHelpOverlay(theme),
 		tabCrashes:    make(map[string]*crash.Report),
@@ -388,6 +397,17 @@ func (a *App) dispatchEvent(ev tcell.Event) bool {
 			return false
 		}
 
+		// Ctrl+E is the global computer-use kill switch from any
+		// tab. Calls workersView.Revoke() over the consent socket;
+		// the response surfaces as a notification. Available even
+		// while a modal is open in the Workers tab so the operator
+		// can always cut access in one keystroke without first
+		// closing whatever else they were doing. Per memql-cockpit#64.
+		if ev.Key() == tcell.KeyCtrlE {
+			a.handleKillSwitch()
+			return false
+		}
+
 		// Help overlay consumes Escape when visible.
 		if a.helpOverlay.Visible {
 			if ev.Key() == tcell.KeyEscape {
@@ -456,6 +476,35 @@ func (a *App) dispatchEvent(ev tcell.Event) bool {
 		}
 	}
 	return false
+}
+
+// handleKillSwitch is the global Ctrl+E action. Calls
+// workersView.Revoke synchronously (the socket op is local-host
+// and fast) and surfaces the outcome on the notification feed.
+// No-op (with an explanatory notification) when no window is
+// currently open, so the operator gets honest feedback instead of
+// a silent shrug.
+func (a *App) handleKillSwitch() {
+	if a.workersView == nil {
+		return
+	}
+	if !a.workersView.IsGranted() {
+		if a.notifications != nil {
+			a.notifications.Sync("workers", ui.SeverityInfo, "Kill switch: no consent window was open -- nothing to revoke.")
+		}
+		a.draw()
+		return
+	}
+	go func() {
+		if err := a.workersView.Revoke(); err != nil {
+			if a.notifications != nil {
+				a.notifications.Sync("workers", ui.SeverityError, fmt.Sprintf("Kill switch: revoke failed: %v", err))
+			}
+		} else if a.notifications != nil {
+			a.notifications.Sync("workers", ui.SeverityInfo, "Kill switch: computer-use consent revoked.")
+		}
+		a.postRedraw()
+	}()
 }
 
 // Quit signals the application to shut down. Closes every pool
@@ -539,6 +588,7 @@ func (a *App) connect() {
 	a.wireCluster()
 	a.wirePlanner()
 	a.wireChat()
+	a.wireWorkers()
 
 	for _, cfg := range configs {
 		a.openEntry(cfg)
@@ -1223,6 +1273,31 @@ func (a *App) wirePlanner() {
 		}
 	}
 	a.plannerView.StartRefreshLoop(a.quitCh, 3*time.Second)
+}
+
+// wireWorkers connects the Workers tab's OnRedraw to the central
+// redraw queue and starts the long-lived Watch goroutine that
+// streams consent events from the local worker daemon. No
+// QueryClient -- the Workers view talks to a per-user Unix socket
+// (~/.memql/worker.sock), not the cluster's gRPC plane, so it
+// works even when no cluster is connected.
+func (a *App) wireWorkers() {
+	if a.workersView == nil {
+		return
+	}
+	a.workersView.OnStatus = func(msg string) {
+		if a.notifications != nil {
+			a.notifications.Sync("workers", ui.SeverityWarning, msg)
+		}
+	}
+	a.workersView.OnRedraw = a.postRedraw
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-a.quitCh
+		cancel()
+		a.workersView.Stop()
+	}()
+	a.workersView.Start(ctx)
 }
 
 // wireChat connects the Chat tab to the gRPC client. The chat view
