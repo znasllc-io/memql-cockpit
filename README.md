@@ -85,9 +85,21 @@ memql-cockpit worker consent status                # show current state
 memql-cockpit worker consent watch                 # live tail of grant/revoke/dispatch events
 ```
 
-The `--strict` flag on `grant` is honored on the wire (and recorded
-in events) but the per-action approval surface it implies ships as
-a follow-up under memql-cockpit#64.
+The `--strict` flag on `grant` enables **per-action approval** on
+the high-risk subset (`workerComputer.key_type` +
+`workerComputer.mouse_click`). When strict is on, those two actions
+block on a per-call approval -- the worker emits an
+`approval_requested` event over `watch`, the operator clicks Allow
+or Deny in the Workers tab, and the worker either admits or rejects
+the call. Approvals time out and default to deny after 30 seconds.
+Revoking the consent window also cancels every pending approval.
+
+Other ClassInteract actions (`exec`, `fs_write`, `mouse_move`,
+`key_press`) stay admitted by the standing window under strict
+mode -- typed text and non-region-confined mouse clicks are the
+calls the spec singles out as load-bearing for the second consent
+decision. The region-confined `mouse_click` exemption from the
+original spec has no design yet; revisit when that concept lands.
 
 #### Workers tab (in-cockpit dashboard)
 
@@ -102,10 +114,16 @@ and renders:
 - In-pane Grant / Revoke: `G` opens a duration picker
   (5 min / 1 hour / 8 hours), `S` toggles strict before submitting,
   `Enter` grants; `R` revokes immediately.
+- **Strict-mode per-action approval**: when a strict window is open
+  and the agent calls `key_type` or `mouse_click`, the worker
+  blocks and the tab pops a modal naming the tool + action. Press
+  `A` to ALLOW once, `D` to DENY. Multiple pending approvals queue
+  FIFO; the modal cycles through them as you respond.
 
 A global kill switch — **`Ctrl+E` from any tab** — calls the same
 `revoke` op without making the user switch to the Workers tab
-first. The notification feed surfaces the outcome.
+first. The notification feed surfaces the outcome. Revoke cancels
+every pending strict-mode approval too.
 
 Reference: memql-cockpit#64.
 

@@ -2,6 +2,7 @@ package workers
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,8 +29,16 @@ type fakeClient struct {
 	revokeResp consent.Response
 	revokeErr  error
 
-	grantCalls  []grantCall
-	revokeCalls int32
+	approveResp consent.Response
+	approveErr  error
+
+	denyResp consent.Response
+	denyErr  error
+
+	grantCalls   []grantCall
+	revokeCalls  int32
+	approveCalls []string
+	denyCalls    []string
 
 	// watch hooks. lines are delivered in order to the callback;
 	// the call blocks until ctx is canceled (mirroring the real
@@ -63,6 +72,24 @@ func (f *fakeClient) Revoke() (consent.Response, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.revokeResp, f.revokeErr
+}
+
+func (f *fakeClient) Approve(id string) (consent.Response, error) {
+	f.mu.Lock()
+	f.approveCalls = append(f.approveCalls, id)
+	resp := f.approveResp
+	err := f.approveErr
+	f.mu.Unlock()
+	return resp, err
+}
+
+func (f *fakeClient) Deny(id string) (consent.Response, error) {
+	f.mu.Lock()
+	f.denyCalls = append(f.denyCalls, id)
+	resp := f.denyResp
+	err := f.denyErr
+	f.mu.Unlock()
+	return resp, err
 }
 
 func (f *fakeClient) Watch(ctx context.Context, onEvent func([]byte)) error {
@@ -496,4 +523,284 @@ func waitForRevokeCount(t *testing.T, fc *fakeClient, want int32) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %d revoke calls", want)
+}
+
+// --- 64-B: strict-mode approval queue + modal ---
+
+// TestApprovalQueue_EventRequestedAppends pins the Watch-side wire:
+// an EventApprovalRequested broadcast lands in the local queue and
+// the modal renders.
+func TestApprovalQueue_EventRequestedAppends(t *testing.T) {
+	v, screen, sim, bounds := makeView(t)
+	v.applyEvent(consent.Event{
+		At:         time.Now().UTC(),
+		Kind:       consent.EventApprovalRequested,
+		Tool:       "workerComputer",
+		Action:     "key_type",
+		Class:      consent.ClassInteract,
+		ApprovalId: "abc123def456",
+	})
+
+	v.Mu.RLock()
+	queueLen := len(v.approvalQueue)
+	v.Mu.RUnlock()
+	if queueLen != 1 {
+		t.Fatalf("expected 1 entry in approval queue, got %d", queueLen)
+	}
+
+	rows := drawAndSnapshot(v, screen, sim, bounds)
+	joined := strings.Join(rows, "\n")
+	if !strings.Contains(joined, "STRICT-MODE APPROVAL REQUIRED") {
+		t.Errorf("approval modal title missing: %q", joined)
+	}
+	if !strings.Contains(joined, "workerComputer.key_type") {
+		t.Errorf("approval modal must show tool.action: %q", joined)
+	}
+}
+
+// TestApprovalQueue_EventResolvedRemoves: when the worker
+// broadcasts an EventApprovalResolved for an id we have queued,
+// it drops out of the queue (handles foreign Allow + timeout +
+// revoke).
+func TestApprovalQueue_EventResolvedRemoves(t *testing.T) {
+	v, _, _, _ := makeView(t)
+	for i, id := range []string{"id-1", "id-2", "id-3"} {
+		v.applyEvent(consent.Event{
+			At:         time.Now().UTC(),
+			Kind:       consent.EventApprovalRequested,
+			Tool:       "workerComputer",
+			Action:     "mouse_click",
+			ApprovalId: id,
+		})
+		_ = i
+	}
+
+	v.applyEvent(consent.Event{
+		At:         time.Now().UTC(),
+		Kind:       consent.EventApprovalResolved,
+		ApprovalId: "id-2",
+	})
+
+	v.Mu.RLock()
+	defer v.Mu.RUnlock()
+	if len(v.approvalQueue) != 2 {
+		t.Fatalf("expected 2 entries after resolving id-2, got %d", len(v.approvalQueue))
+	}
+	for _, e := range v.approvalQueue {
+		if e.id == "id-2" {
+			t.Errorf("id-2 should have been removed; queue=%+v", v.approvalQueue)
+		}
+	}
+	if v.approvalQueue[0].id != "id-1" {
+		t.Errorf("FIFO broken; head=%q, want id-1", v.approvalQueue[0].id)
+	}
+}
+
+// TestApprovalQueue_RevokeClears: EventRevoked drops every pending
+// entry. Worker side already denies them; the TUI mirrors that
+// so the operator doesn't see a stale modal.
+func TestApprovalQueue_RevokeClears(t *testing.T) {
+	v, _, _, _ := makeView(t)
+	v.applyEvent(consent.Event{
+		Kind: consent.EventApprovalRequested, ApprovalId: "x", Tool: "workerComputer", Action: "key_type",
+	})
+	v.applyEvent(consent.Event{
+		Kind: consent.EventApprovalRequested, ApprovalId: "y", Tool: "workerComputer", Action: "mouse_click",
+	})
+	v.applyEvent(consent.Event{Kind: consent.EventRevoked})
+	v.Mu.RLock()
+	defer v.Mu.RUnlock()
+	if len(v.approvalQueue) != 0 {
+		t.Errorf("Revoke must clear the queue; got %d entries", len(v.approvalQueue))
+	}
+}
+
+// TestApprovalQueue_SeedFromPending: a Watch reconnect Response
+// carrying Pending[] seeds the queue. Survives a brief socket
+// disconnect without dropping on-screen modals.
+func TestApprovalQueue_SeedFromPending(t *testing.T) {
+	v, _, _, _ := makeView(t)
+	// Pre-populate with one stale entry.
+	v.applyEvent(consent.Event{
+		Kind: consent.EventApprovalRequested, ApprovalId: "stale", Tool: "workerComputer", Action: "key_type",
+	})
+
+	v.seedPending([]consent.PendingApprovalInfo{
+		{Id: "fresh-1", Tool: "workerComputer", Action: "key_type", Class: consent.ClassInteract, RequestedAt: time.Now()},
+		{Id: "fresh-2", Tool: "workerComputer", Action: "mouse_click", Class: consent.ClassInteract, RequestedAt: time.Now()},
+	})
+
+	v.Mu.RLock()
+	defer v.Mu.RUnlock()
+	if len(v.approvalQueue) != 2 {
+		t.Fatalf("seedPending must replace queue; got %d", len(v.approvalQueue))
+	}
+	if v.approvalQueue[0].id != "fresh-1" || v.approvalQueue[1].id != "fresh-2" {
+		t.Errorf("seedPending order wrong: %+v", v.approvalQueue)
+	}
+}
+
+// TestApprovalKey_AllowCallsApprove: when the modal is up, pressing
+// A invokes Client.Approve with the head's id.
+func TestApprovalKey_AllowCallsApprove(t *testing.T) {
+	v, _, _, _ := makeView(t)
+	fc := &fakeClient{
+		approveResp: consent.Response{OK: true, Status: consent.Status{Granted: true, Strict: true}},
+	}
+	v.SetClient(fc)
+	v.applyEvent(consent.Event{
+		Kind: consent.EventApprovalRequested, ApprovalId: "head-id",
+		Tool: "workerComputer", Action: "key_type",
+	})
+
+	if consumed := v.HandleEvent(tcell.NewEventKey(tcell.KeyRune, 'a', tcell.ModNone)); !consumed {
+		t.Fatalf("A should be consumed when modal is open")
+	}
+	// Allow async dispatch a moment to land.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		fc.mu.Lock()
+		n := len(fc.approveCalls)
+		fc.mu.Unlock()
+		if n >= 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if len(fc.approveCalls) != 1 || fc.approveCalls[0] != "head-id" {
+		t.Errorf("Approve calls = %+v, want [head-id]", fc.approveCalls)
+	}
+}
+
+// TestApprovalKey_DenyCallsDeny mirrors the Allow path.
+func TestApprovalKey_DenyCallsDeny(t *testing.T) {
+	v, _, _, _ := makeView(t)
+	fc := &fakeClient{
+		denyResp: consent.Response{OK: true, Status: consent.Status{Granted: true, Strict: true}},
+	}
+	v.SetClient(fc)
+	v.applyEvent(consent.Event{
+		Kind: consent.EventApprovalRequested, ApprovalId: "head-id",
+		Tool: "workerComputer", Action: "mouse_click",
+	})
+	if consumed := v.HandleEvent(tcell.NewEventKey(tcell.KeyRune, 'd', tcell.ModNone)); !consumed {
+		t.Fatalf("D should be consumed when modal is open")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		fc.mu.Lock()
+		n := len(fc.denyCalls)
+		fc.mu.Unlock()
+		if n >= 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if len(fc.denyCalls) != 1 || fc.denyCalls[0] != "head-id" {
+		t.Errorf("Deny calls = %+v, want [head-id]", fc.denyCalls)
+	}
+}
+
+// TestApprovalKey_DropsLocallyOnRPCError: if Approve errors (e.g.
+// the worker side already timed out), the local queue head drops
+// so the operator doesn't get stuck on a phantom modal.
+func TestApprovalKey_DropsLocallyOnRPCError(t *testing.T) {
+	v, _, _, _ := makeView(t)
+	fc := &fakeClient{approveErr: fmt.Errorf("simulated rpc error")}
+	v.SetClient(fc)
+	v.applyEvent(consent.Event{
+		Kind: consent.EventApprovalRequested, ApprovalId: "id-x",
+		Tool: "workerComputer", Action: "key_type",
+	})
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyRune, 'a', tcell.ModNone))
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		v.Mu.RLock()
+		empty := len(v.approvalQueue) == 0
+		v.Mu.RUnlock()
+		if empty {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Errorf("approval queue should drop locally on RPC error")
+}
+
+// TestApprovalModal_PreemptsGrantModal pins the precedence rule:
+// a strict-mode approval that lands while the Grant picker is
+// open MUST be the modal the user sees, not the picker.
+func TestApprovalModal_PreemptsGrantModal(t *testing.T) {
+	v, screen, sim, bounds := makeView(t)
+	v.SetClient(&fakeClient{})
+	// Open the grant modal.
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyRune, 'g', tcell.ModNone))
+	v.Mu.RLock()
+	if v.grantModal == nil {
+		v.Mu.RUnlock()
+		t.Fatalf("expected grantModal open")
+	}
+	v.Mu.RUnlock()
+
+	// Now an approval lands.
+	v.applyEvent(consent.Event{
+		Kind: consent.EventApprovalRequested, ApprovalId: "preempt-id",
+		Tool: "workerComputer", Action: "key_type",
+	})
+
+	rows := drawAndSnapshot(v, screen, sim, bounds)
+	joined := strings.Join(rows, "\n")
+	if !strings.Contains(joined, "STRICT-MODE APPROVAL REQUIRED") {
+		t.Errorf("approval modal must paint over the grant picker")
+	}
+
+	// Pressing A while approval is up should hit Approve (not the
+	// grant modal's strict toggle).
+	if consumed := v.HandleEvent(tcell.NewEventKey(tcell.KeyRune, 'a', tcell.ModNone)); !consumed {
+		t.Errorf("A must be consumed by approval modal")
+	}
+}
+
+// TestApprovalQueue_DuplicateRequestIgnored: if the same id arrives
+// twice (broadcast + Pending snapshot race on Watch reconnect),
+// it stays in the queue once.
+func TestApprovalQueue_DuplicateRequestIgnored(t *testing.T) {
+	v, _, _, _ := makeView(t)
+	for i := 0; i < 3; i++ {
+		v.applyEvent(consent.Event{
+			Kind: consent.EventApprovalRequested, ApprovalId: "dup",
+			Tool: "workerComputer", Action: "key_type",
+		})
+	}
+	v.Mu.RLock()
+	defer v.Mu.RUnlock()
+	if len(v.approvalQueue) != 1 {
+		t.Errorf("duplicate broadcasts must coalesce; queue=%d", len(v.approvalQueue))
+	}
+}
+
+// TestChromeContract_ApprovalHints: when an approval is pending,
+// the hint bar shows A:Allow / D:Deny only -- not the regular
+// G:Grant / R:Revoke / Ctrl+E set.
+func TestChromeContract_ApprovalHints(t *testing.T) {
+	v, screen, sim, bounds := makeView(t)
+	v.applyEvent(consent.Event{
+		Kind: consent.EventApprovalRequested, ApprovalId: "hint-test",
+		Tool: "workerComputer", Action: "key_type",
+	})
+	rows := drawAndSnapshot(v, screen, sim, bounds)
+	hint := strings.TrimSpace(rows[len(rows)-1])
+	if !strings.Contains(hint, "A:Allow") {
+		t.Errorf("hint should advertise A:Allow when approval pending: %q", hint)
+	}
+	if !strings.Contains(hint, "D:Deny") {
+		t.Errorf("hint should advertise D:Deny when approval pending: %q", hint)
+	}
+	if strings.Contains(hint, "G:Grant") {
+		t.Errorf("hint must NOT show G:Grant during pending approval: %q", hint)
+	}
 }

@@ -215,3 +215,304 @@ func TestSnapshot_GrantedShowsExpiry(t *testing.T) {
 		t.Error("Snapshot after expiry should report Granted=false")
 	}
 }
+
+// --- 64-B: strict-mode per-action approval ---
+
+// TestStrictMode_KeyTypeBlocksAwaitingApproval drives the load-bearing
+// path: an open strict window admits ClassObserve immediately, but
+// workerComputer.key_type now blocks on a pending approval until an
+// operator clicks Allow.
+func TestStrictMode_KeyTypeBlocksAwaitingApproval(t *testing.T) {
+	m := NewManager()
+	m.SetApprovalTimeout(2 * time.Second)
+	if _, err := m.Grant(time.Hour, true); err != nil {
+		t.Fatalf("Grant strict: %v", err)
+	}
+
+	// ClassObserve under a strict window still admits without a gate.
+	if dec := m.Allows("workerComputer", "screenshot"); !dec.Allowed {
+		t.Errorf("screenshot must still admit under strict: %s", dec.Reason)
+	}
+
+	// key_type blocks; another goroutine watches the pending queue
+	// and Approves it.
+	done := make(chan Decision, 1)
+	go func() {
+		done <- m.Allows("workerComputer", "key_type")
+	}()
+
+	// Poll for the pending entry to land (registration is racy with
+	// the goroutine schedule; 100ms is generous enough not to flake).
+	deadline := time.Now().Add(500 * time.Millisecond)
+	var pending []PendingApprovalInfo
+	for time.Now().Before(deadline) {
+		pending = m.PendingApprovals()
+		if len(pending) == 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("expected 1 pending approval, got %d", len(pending))
+	}
+	if pending[0].Tool != "workerComputer" || pending[0].Action != "key_type" {
+		t.Errorf("pending entry mis-shaped: %+v", pending[0])
+	}
+
+	// Approve and verify the blocked call returns Allowed=true.
+	if err := m.Approve(pending[0].Id); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	select {
+	case dec := <-done:
+		if !dec.Allowed {
+			t.Errorf("key_type after Approve must admit; reason=%s", dec.Reason)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Allows did not return after Approve")
+	}
+	// Pending queue drained.
+	if got := m.PendingApprovals(); len(got) != 0 {
+		t.Errorf("pending queue should be empty after Approve; got %d", len(got))
+	}
+}
+
+// TestStrictMode_MouseClickDeny exercises the deny path -- a denied
+// strict-mode call returns Allowed=false with the deny reason in
+// the Decision.
+func TestStrictMode_MouseClickDeny(t *testing.T) {
+	m := NewManager()
+	m.SetApprovalTimeout(2 * time.Second)
+	if _, err := m.Grant(time.Hour, true); err != nil {
+		t.Fatalf("Grant strict: %v", err)
+	}
+
+	done := make(chan Decision, 1)
+	go func() {
+		done <- m.Allows("workerComputer", "mouse_click")
+	}()
+	pending := waitForPending(t, m, 1)
+	if err := m.Deny(pending[0].Id); err != nil {
+		t.Fatalf("Deny: %v", err)
+	}
+	select {
+	case dec := <-done:
+		if dec.Allowed {
+			t.Error("mouse_click after Deny must reject")
+		}
+		if !strings.Contains(dec.Reason, "denied per-action") {
+			t.Errorf("reject reason should mention per-action denial; got %q", dec.Reason)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Allows did not return after Deny")
+	}
+}
+
+// TestStrictMode_TimeoutDenies pins the timeout safety: an
+// unanswered approval defaults to deny once the timeout fires.
+func TestStrictMode_TimeoutDenies(t *testing.T) {
+	m := NewManager()
+	m.SetApprovalTimeout(40 * time.Millisecond)
+	if _, err := m.Grant(time.Hour, true); err != nil {
+		t.Fatalf("Grant strict: %v", err)
+	}
+	dec := m.Allows("workerComputer", "key_type")
+	if dec.Allowed {
+		t.Error("timeout should default to deny")
+	}
+	if !strings.Contains(dec.Reason, "timed out") {
+		t.Errorf("deny reason should mention timeout; got %q", dec.Reason)
+	}
+	if got := m.PendingApprovals(); len(got) != 0 {
+		t.Errorf("pending queue should be empty after timeout; got %d", len(got))
+	}
+}
+
+// TestStrictMode_RevokeCancelsPending pins the kill-switch
+// behaviour: Revoke must drop every in-flight strict-mode
+// approval. The blocked dispatcher goroutine receives an
+// immediate deny carrying the revoke reason.
+func TestStrictMode_RevokeCancelsPending(t *testing.T) {
+	m := NewManager()
+	m.SetApprovalTimeout(5 * time.Second)
+	if _, err := m.Grant(time.Hour, true); err != nil {
+		t.Fatalf("Grant strict: %v", err)
+	}
+	done := make(chan Decision, 1)
+	go func() {
+		done <- m.Allows("workerComputer", "key_type")
+	}()
+	waitForPending(t, m, 1)
+
+	m.Revoke()
+
+	select {
+	case dec := <-done:
+		if dec.Allowed {
+			t.Error("revoke during pending approval must deny")
+		}
+		if !strings.Contains(dec.Reason, "consent revoked") {
+			t.Errorf("deny reason should mention revoke; got %q", dec.Reason)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Allows did not return after Revoke")
+	}
+}
+
+// TestStrictMode_HighRiskSubset confirms the gate ONLY applies to
+// the key_type + mouse_click subset. The other ClassInteract calls
+// stay admitted by the standing window.
+func TestStrictMode_HighRiskSubset(t *testing.T) {
+	m := NewManager()
+	m.SetApprovalTimeout(40 * time.Millisecond)
+	if _, err := m.Grant(time.Hour, true); err != nil {
+		t.Fatalf("Grant strict: %v", err)
+	}
+	for _, tc := range []struct {
+		tool, action string
+		wantBlocked  bool
+	}{
+		{"workerComputer", "key_type", true},
+		{"workerComputer", "mouse_click", true},
+		{"workerComputer", "key_press", false}, // ClassInteract but NOT high-risk
+		{"workerComputer", "mouse_move", false},
+		{"workerHost", "exec", false}, // ClassInteract but workerHost, not workerComputer
+		{"workerHost", "fs_write", false},
+		{"workerComputer", "screenshot", false}, // ClassObserve
+	} {
+		t.Run(tc.tool+"."+tc.action, func(t *testing.T) {
+			dec := m.Allows(tc.tool, tc.action)
+			if tc.wantBlocked {
+				// blocked subset: with no operator response, the
+				// 40ms timeout fires and the call denies.
+				if dec.Allowed {
+					t.Errorf("high-risk %s.%s must be gated by strict mode", tc.tool, tc.action)
+				}
+			} else {
+				if !dec.Allowed {
+					t.Errorf("non-high-risk %s.%s must admit under strict mode; reason=%s",
+						tc.tool, tc.action, dec.Reason)
+				}
+			}
+		})
+	}
+}
+
+// TestStrictMode_NonStrictBypassesApproval pins that a NON-strict
+// open window still admits key_type / mouse_click without going
+// through the approval gate.
+func TestStrictMode_NonStrictBypassesApproval(t *testing.T) {
+	m := NewManager()
+	m.SetApprovalTimeout(40 * time.Millisecond)
+	if _, err := m.Grant(time.Hour, false); err != nil {
+		t.Fatalf("Grant non-strict: %v", err)
+	}
+	dec := m.Allows("workerComputer", "key_type")
+	if !dec.Allowed {
+		t.Errorf("non-strict window must admit key_type without approval; reason=%s", dec.Reason)
+	}
+}
+
+// TestStrictMode_BroadcastsApprovalRequestedEvent confirms the
+// EventApprovalRequested broadcast lands on subscribers with the
+// id + tool + action populated -- this is the event the TUI's
+// modal queue is driven by.
+func TestStrictMode_BroadcastsApprovalRequestedEvent(t *testing.T) {
+	m := NewManager()
+	m.SetApprovalTimeout(40 * time.Millisecond)
+	// Subscribe BEFORE Grant so the EventGranted broadcast lands
+	// in the channel and we don't race the Subscribe registration.
+	ch, cancel := m.Subscribe()
+	defer cancel()
+	if _, err := m.Grant(time.Hour, true); err != nil {
+		t.Fatalf("Grant strict: %v", err)
+	}
+
+	// Drain the EventGranted broadcast.
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("expected EventGranted before approval flow")
+	}
+
+	go m.Allows("workerComputer", "key_type")
+
+	var requested Event
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case ev := <-ch:
+			if ev.Kind == EventApprovalRequested {
+				requested = ev
+			}
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+		if requested.Kind != "" {
+			break
+		}
+	}
+	if requested.Kind != EventApprovalRequested {
+		t.Fatalf("expected EventApprovalRequested broadcast, got kind=%q", requested.Kind)
+	}
+	if requested.ApprovalId == "" {
+		t.Error("EventApprovalRequested must carry an approval_id")
+	}
+	if requested.Tool != "workerComputer" || requested.Action != "key_type" {
+		t.Errorf("EventApprovalRequested fields wrong: %+v", requested)
+	}
+}
+
+// TestApprove_UnknownIdErrors confirms a stale Allow (after timeout
+// or revoke) reports an error to the TUI so its modal can clear
+// gracefully.
+func TestApprove_UnknownIdErrors(t *testing.T) {
+	m := NewManager()
+	if err := m.Approve("not-a-real-id"); err == nil {
+		t.Error("Approve must error on unknown id")
+	}
+	if err := m.Deny("not-a-real-id"); err == nil {
+		t.Error("Deny must error on unknown id")
+	}
+}
+
+// TestIsHighRiskAction guards the high-risk classifier so accidental
+// classification changes (e.g. dropping mouse_click) fail loudly.
+func TestIsHighRiskAction(t *testing.T) {
+	for _, tc := range []struct {
+		tool, action string
+		want         bool
+	}{
+		{"workerComputer", "key_type", true},
+		{"workerComputer", "mouse_click", true},
+		{"workerComputer", "KEY_TYPE", true}, // case + whitespace tolerant
+		{" workerComputer ", " mouse_click ", true},
+		{"workerComputer", "mouse_move", false},
+		{"workerComputer", "key_press", false},
+		{"workerComputer", "screenshot", false},
+		{"workerHost", "exec", false},
+		{"workerHost", "fs_write", false},
+		{"", "", false},
+	} {
+		if got := isHighRiskAction(tc.tool, tc.action); got != tc.want {
+			t.Errorf("isHighRiskAction(%q, %q) = %v, want %v", tc.tool, tc.action, got, tc.want)
+		}
+	}
+}
+
+// waitForPending polls until at least `n` approvals are pending or
+// the deadline fires. Helper used by the strict-mode tests to avoid
+// duplicating the race-safe poll loop.
+func waitForPending(t *testing.T, m *Manager, n int) []PendingApprovalInfo {
+	t.Helper()
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		pending := m.PendingApprovals()
+		if len(pending) >= n {
+			return pending
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d pending approvals", n)
+	return nil
+}

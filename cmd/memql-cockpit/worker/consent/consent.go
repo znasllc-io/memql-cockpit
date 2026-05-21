@@ -15,12 +15,22 @@
 package consent
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 )
+
+// DefaultApprovalTimeout is the wait the worker gives an operator
+// before defaulting to deny on a strict-mode per-action approval.
+// 30 seconds is the spec's working choice: long enough for an
+// operator at the terminal to read the modal and decide, short
+// enough that an idle worker doesn't park indefinitely on a call
+// the operator has walked away from.
+const DefaultApprovalTimeout = 30 * time.Second
 
 // Class names the broad category a (tool, action) pair belongs to.
 // Used by Classify() to drive both the gate decision (today: same
@@ -92,12 +102,48 @@ type Manager struct {
 
 	subsMu sync.Mutex
 	subs   []chan Event
+
+	// pendingApprovals is the registry of in-flight strict-mode
+	// approval requests. Each entry's channel is single-writer
+	// (the dispatch goroutine that registered it) and multi-reader
+	// (Approve / Deny / Revoke can all unblock it). The map itself
+	// is guarded by approvalsMu. Bounded by concurrent strict-mode
+	// dispatches; the dispatcher hot-path serialises per-worker
+	// today, so this is small in practice.
+	approvalsMu      sync.Mutex
+	pendingApprovals map[string]*pendingApproval
+
+	// approvalTimeout is the per-action approval wait. Configurable
+	// for tests; production uses DefaultApprovalTimeout.
+	approvalTimeout time.Duration
+}
+
+// pendingApproval is the registry entry for a single strict-mode
+// approval awaiting an operator decision. ch is buffered 1 so
+// Approve / Deny / cancelAllPending can deposit a result without
+// blocking on the waiting dispatcher goroutine.
+type pendingApproval struct {
+	id          string
+	tool        string
+	action      string
+	class       Class
+	requestedAt time.Time
+	ch          chan approvalResult
+}
+
+type approvalResult struct {
+	allowed bool
+	reason  string
 }
 
 // NewManager builds a Manager with the live clock. Pass NewManagerWithClock
 // in tests to inject a deterministic time source.
 func NewManager() *Manager {
-	return &Manager{now: func() time.Time { return time.Now().UTC() }}
+	return &Manager{
+		now:              func() time.Time { return time.Now().UTC() },
+		pendingApprovals: make(map[string]*pendingApproval),
+		approvalTimeout:  DefaultApprovalTimeout,
+	}
 }
 
 // NewManagerWithClock is the test-friendly constructor. Passing
@@ -106,7 +152,20 @@ func NewManagerWithClock(clock func() time.Time) *Manager {
 	if clock == nil {
 		clock = func() time.Time { return time.Now().UTC() }
 	}
-	return &Manager{now: clock}
+	return &Manager{
+		now:              clock,
+		pendingApprovals: make(map[string]*pendingApproval),
+		approvalTimeout:  DefaultApprovalTimeout,
+	}
+}
+
+// SetApprovalTimeout overrides the strict-mode per-action approval
+// wait. Tests use this to drive the timeout path deterministically;
+// production sticks with DefaultApprovalTimeout via the constructors.
+func (m *Manager) SetApprovalTimeout(d time.Duration) {
+	m.approvalsMu.Lock()
+	defer m.approvalsMu.Unlock()
+	m.approvalTimeout = d
 }
 
 // Grant opens a consent window of `window` duration starting at
@@ -139,13 +198,22 @@ func (m *Manager) Grant(window time.Duration, strict bool) (time.Time, error) {
 // Revoke closes any active window IMMEDIATELY. No-op when no
 // window is open. Always emits a `revoked` event so subscribers
 // can show the operator intent.
+//
+// In strict mode this also denies every in-flight per-action
+// approval -- the operator pulling the kill switch should mean
+// no pending strict call can sneak through, even if the modal
+// was already on screen and the timeout hadn't fired yet.
 func (m *Manager) Revoke() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.expiresAt = time.Time{}
 	m.window = 0
 	m.strict = false
+	m.mu.Unlock()
+	// broadcast BEFORE cancelling pending so subscribers see the
+	// revoke event first and can prepare to drain their pending
+	// queue.
 	m.broadcast(Event{At: m.now(), Kind: EventRevoked})
+	m.cancelAllPending("consent revoked while strict-mode approval was pending")
 }
 
 // Allows decides whether a single (tool, action) call may run
@@ -187,12 +255,17 @@ func (m *Manager) Allows(tool, action string) Decision {
 		m.recordDispatch(tool, action, class, dec)
 		return dec
 	}
-	// Active window covers this call.
-	if strict && class == ClassInteract {
-		// Per-action strict approval lands in the #64 follow-up.
-		// For now strict mode still admits the call but flags the
-		// event so subscribers can flag the call to the operator.
-		dec := Decision{Allowed: true, Reason: "consent granted (strict mode: per-action approval is a follow-up under #64)"}
+	// Active window covers this call. In strict mode, the high-risk
+	// subset (workerComputer.key_type + workerComputer.mouse_click)
+	// routes through a per-action approval gate: the dispatcher
+	// blocks until an operator clicks Allow / Deny in the Workers
+	// pane, or the wait times out (defaults to deny). Other
+	// ClassInteract calls (exec, fs_write, mouse_move, key_press)
+	// stay admitted by the granted window -- typed text and
+	// non-region-confined clicks are the calls the spec singles out
+	// as load-bearing for the second consent decision.
+	if strict && isHighRiskAction(tool, action) {
+		dec := m.requestApproval(tool, action, class)
 		m.recordDispatch(tool, action, class, dec)
 		return dec
 	}
@@ -220,9 +293,11 @@ func (m *Manager) Snapshot() Status {
 type EventKind string
 
 const (
-	EventGranted  EventKind = "granted"
-	EventRevoked  EventKind = "revoked"
-	EventDispatch EventKind = "dispatch"
+	EventGranted           EventKind = "granted"
+	EventRevoked           EventKind = "revoked"
+	EventDispatch          EventKind = "dispatch"
+	EventApprovalRequested EventKind = "approval_requested"
+	EventApprovalResolved  EventKind = "approval_resolved"
 )
 
 // Event is the audit-tail / state-change record streamed to
@@ -238,6 +313,12 @@ type Event struct {
 	ExpiresAt time.Time     `json:"expires_at,omitempty"`
 	Window    time.Duration `json:"window_ms,omitempty"`
 	Strict    bool          `json:"strict,omitempty"`
+
+	// ApprovalId carries the per-action approval handle on
+	// EventApprovalRequested + EventApprovalResolved events. The
+	// TUI uses it to correlate Allow/Deny responses back to the
+	// blocked dispatcher goroutine.
+	ApprovalId string `json:"approval_id,omitempty"`
 }
 
 // Subscribe returns a channel that receives Manager events plus a
@@ -312,4 +393,209 @@ func Classify(tool, action string) Class {
 		}
 	}
 	return ClassUnknown
+}
+
+// isHighRiskAction names the strict-mode per-action approval subset.
+// Per the #64 spec these are the two actions where a granted-window
+// admission isn't tight enough -- typed text exfiltrates the most
+// data in the shortest time, and a non-region-confined mouse click
+// can fire arbitrary UI affordances. Other ClassInteract actions
+// (exec / fs_write / mouse_move / key_press) stay admitted by the
+// window's standing grant.
+//
+// Region-confined exemption from the spec is deferred -- the
+// codebase has no notion of designated regions today; revisit when
+// that concept lands.
+func isHighRiskAction(tool, action string) bool {
+	if strings.ToLower(strings.TrimSpace(tool)) != "workercomputer" {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case "key_type", "mouse_click":
+		return true
+	}
+	return false
+}
+
+// requestApproval registers a pending strict-mode approval, broadcasts
+// the request event for the TUI to render, and blocks until the
+// operator clicks Allow / Deny -- or the approval times out (defaults
+// to deny). Called from Allows() on the dispatcher hot path.
+//
+// Concurrency: each call gets its own pending entry + result channel
+// so concurrent strict-mode dispatches don't fight over a shared
+// signaller. The pending map's mutex covers add / remove / lookup.
+func (m *Manager) requestApproval(tool, action string, class Class) Decision {
+	id, err := newApprovalId()
+	if err != nil {
+		// Treat ID-mint failure as deny -- safer than admitting an
+		// untracked call we can't correlate a response to.
+		return Decision{
+			Allowed: false,
+			Reason:  fmt.Sprintf("strict mode: failed to mint approval id: %v", err),
+		}
+	}
+
+	m.approvalsMu.Lock()
+	timeout := m.approvalTimeout
+	if timeout <= 0 {
+		timeout = DefaultApprovalTimeout
+	}
+	p := &pendingApproval{
+		id:          id,
+		tool:        tool,
+		action:      action,
+		class:       class,
+		requestedAt: m.now(),
+		ch:          make(chan approvalResult, 1),
+	}
+	m.pendingApprovals[id] = p
+	m.approvalsMu.Unlock()
+
+	// Broadcast AFTER the registration is in place so a fast TUI
+	// response can't race and find the entry missing.
+	m.broadcast(Event{
+		At:         m.now(),
+		Kind:       EventApprovalRequested,
+		Tool:       tool,
+		Action:     action,
+		Class:      class,
+		ApprovalId: id,
+	})
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	var dec Decision
+	select {
+	case res := <-p.ch:
+		dec = Decision{Allowed: res.allowed, Reason: res.reason}
+	case <-timer.C:
+		dec = Decision{
+			Allowed: false,
+			Reason:  fmt.Sprintf("strict-mode approval timed out after %s -- defaulting to deny", timeout),
+		}
+	}
+
+	// Remove the pending entry on resolution. The double-check
+	// guards against a concurrent cancelAllPending that already
+	// drained the same id (e.g. Revoke arriving milliseconds
+	// before Allow).
+	m.approvalsMu.Lock()
+	delete(m.pendingApprovals, id)
+	m.approvalsMu.Unlock()
+
+	// Broadcast the resolution so the TUI can close the modal
+	// even if the operator's response came from a different
+	// surface (e.g. CLI `worker consent approve` from another
+	// terminal -- not yet shipped but the wire's ready).
+	m.broadcast(Event{
+		At:         m.now(),
+		Kind:       EventApprovalResolved,
+		Tool:       tool,
+		Action:     action,
+		Class:      class,
+		Allowed:    dec.Allowed,
+		Reason:     dec.Reason,
+		ApprovalId: id,
+	})
+
+	return dec
+}
+
+// Approve resolves the pending approval with the given id as ALLOW.
+// Returns an error when the id is unknown -- the TUI should treat
+// that as "the request already timed out or was revoked" and clear
+// its modal regardless.
+func (m *Manager) Approve(id string) error {
+	return m.resolvePending(id, approvalResult{
+		allowed: true,
+		reason:  "approved per-action (strict mode)",
+	})
+}
+
+// Deny resolves the pending approval with the given id as DENY.
+// Same error semantics as Approve.
+func (m *Manager) Deny(id string) error {
+	return m.resolvePending(id, approvalResult{
+		allowed: false,
+		reason:  "denied per-action (strict mode)",
+	})
+}
+
+func (m *Manager) resolvePending(id string, res approvalResult) error {
+	m.approvalsMu.Lock()
+	p, ok := m.pendingApprovals[id]
+	m.approvalsMu.Unlock()
+	if !ok {
+		return fmt.Errorf("consent: no pending approval with id %q (already resolved, revoked, or timed out)", id)
+	}
+	select {
+	case p.ch <- res:
+	default:
+		// Channel already had a result deposited (double-resolve
+		// race). Treat as no-op; the requesting goroutine has
+		// what it needs.
+	}
+	return nil
+}
+
+// cancelAllPending denies every in-flight approval. Called from
+// Revoke so the kill switch propagates to strict-mode calls already
+// blocked on the per-action gate.
+func (m *Manager) cancelAllPending(reason string) {
+	m.approvalsMu.Lock()
+	pending := make([]*pendingApproval, 0, len(m.pendingApprovals))
+	for _, p := range m.pendingApprovals {
+		pending = append(pending, p)
+	}
+	m.approvalsMu.Unlock()
+	for _, p := range pending {
+		select {
+		case p.ch <- approvalResult{allowed: false, reason: reason}:
+		default:
+		}
+	}
+}
+
+// PendingApprovals returns a snapshot of currently-pending approval
+// requests. The TUI uses this on Watch reconnect to re-render its
+// queue without waiting for fresh EventApprovalRequested broadcasts
+// (which the worker only emits on registration, not periodically).
+func (m *Manager) PendingApprovals() []PendingApprovalInfo {
+	m.approvalsMu.Lock()
+	defer m.approvalsMu.Unlock()
+	out := make([]PendingApprovalInfo, 0, len(m.pendingApprovals))
+	for _, p := range m.pendingApprovals {
+		out = append(out, PendingApprovalInfo{
+			Id:          p.id,
+			Tool:        p.tool,
+			Action:      p.action,
+			Class:       p.class,
+			RequestedAt: p.requestedAt,
+		})
+	}
+	return out
+}
+
+// PendingApprovalInfo is the public, copy-safe shape of a pending
+// approval. Exposed via Snapshot / PendingApprovals so the TUI never
+// touches the underlying channel.
+type PendingApprovalInfo struct {
+	Id          string    `json:"id"`
+	Tool        string    `json:"tool"`
+	Action      string    `json:"action"`
+	Class       Class     `json:"class"`
+	RequestedAt time.Time `json:"requested_at"`
+}
+
+// newApprovalId mints a fresh approval handle. 8 random bytes
+// (16 hex chars) -- collision-resistant for any realistic pending
+// queue while staying short enough to read in a log line.
+func newApprovalId() (string, error) {
+	var buf [8]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf[:]), nil
 }

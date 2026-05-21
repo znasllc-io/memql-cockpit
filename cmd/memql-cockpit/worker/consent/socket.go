@@ -43,6 +43,13 @@ type Request struct {
 	Op            string `json:"op"`
 	WindowSeconds int    `json:"window_seconds,omitempty"`
 	Strict        bool   `json:"strict,omitempty"`
+
+	// ApprovalId carries the per-action approval handle on
+	// "approve" / "deny" ops. The TUI receives the id on an
+	// EventApprovalRequested broadcast and echoes it back on the
+	// response op. Required for both approve and deny; ignored on
+	// other ops.
+	ApprovalId string `json:"approval_id,omitempty"`
 }
 
 // Response is the unified reply shape for non-WATCH ops.
@@ -50,6 +57,12 @@ type Response struct {
 	OK     bool   `json:"ok"`
 	Error  string `json:"error,omitempty"`
 	Status Status `json:"status,omitempty"`
+
+	// Pending is populated on the initial WATCH response so a
+	// reconnecting TUI can re-render its approval queue without
+	// waiting for the next EventApprovalRequested broadcast.
+	// Empty on every other op.
+	Pending []PendingApprovalInfo `json:"pending,omitempty"`
 }
 
 // Server wraps a Manager with a Unix-socket interface.
@@ -181,6 +194,10 @@ func (s *Server) handle(c net.Conn) {
 		s.handleStatus(c)
 	case "watch":
 		s.handleWatch(c)
+	case "approve":
+		s.handleApprove(c, req)
+	case "deny":
+		s.handleDeny(c, req)
 	default:
 		s.writeResp(c, Response{OK: false, Error: fmt.Sprintf("unknown op %q", req.Op)})
 	}
@@ -207,12 +224,42 @@ func (s *Server) handleStatus(c net.Conn) {
 	s.writeResp(c, Response{OK: true, Status: s.mgr.Snapshot()})
 }
 
+func (s *Server) handleApprove(c net.Conn, req Request) {
+	if req.ApprovalId == "" {
+		s.writeResp(c, Response{OK: false, Error: "approval_id is required"})
+		return
+	}
+	if err := s.mgr.Approve(req.ApprovalId); err != nil {
+		s.writeResp(c, Response{OK: false, Error: err.Error()})
+		return
+	}
+	s.writeResp(c, Response{OK: true, Status: s.mgr.Snapshot()})
+}
+
+func (s *Server) handleDeny(c net.Conn, req Request) {
+	if req.ApprovalId == "" {
+		s.writeResp(c, Response{OK: false, Error: "approval_id is required"})
+		return
+	}
+	if err := s.mgr.Deny(req.ApprovalId); err != nil {
+		s.writeResp(c, Response{OK: false, Error: err.Error()})
+		return
+	}
+	s.writeResp(c, Response{OK: true, Status: s.mgr.Snapshot()})
+}
+
 func (s *Server) handleWatch(c net.Conn) {
 	ch, cancel := s.mgr.Subscribe()
 	defer cancel()
 	// Send the initial state first so the client can render its
-	// dashboard before any events arrive.
-	if err := s.writeResp(c, Response{OK: true, Status: s.mgr.Snapshot()}); err != nil {
+	// dashboard before any events arrive. Includes any pending
+	// approvals already in flight so a reconnecting TUI doesn't
+	// drop on-screen modals.
+	if err := s.writeResp(c, Response{
+		OK:      true,
+		Status:  s.mgr.Snapshot(),
+		Pending: s.mgr.PendingApprovals(),
+	}); err != nil {
 		return
 	}
 	enc := json.NewEncoder(c)
@@ -252,8 +299,9 @@ func DefaultClient() *Client {
 }
 
 // Grant opens a consent window of the requested duration. Strict
-// is currently a no-op enforcement-wise (see Manager.Allows) but
-// is honored on the wire for forward compat.
+// enables the per-action approval gate on the high-risk subset
+// (workerComputer.key_type + workerComputer.mouse_click); see
+// Manager.Allows.
 func (c *Client) Grant(window time.Duration, strict bool) (Response, error) {
 	if window <= 0 {
 		return Response{}, errors.New("client: window must be positive")
@@ -263,6 +311,27 @@ func (c *Client) Grant(window time.Duration, strict bool) (Response, error) {
 
 // Revoke closes any active window.
 func (c *Client) Revoke() (Response, error) { return c.exec(Request{Op: "revoke"}) }
+
+// Approve resolves a strict-mode pending approval as ALLOW. The id
+// comes from an EventApprovalRequested broadcast on the Watch
+// stream. The worker side unblocks the dispatcher and the call
+// proceeds.
+func (c *Client) Approve(id string) (Response, error) {
+	if id == "" {
+		return Response{}, errors.New("client: approval id is required")
+	}
+	return c.exec(Request{Op: "approve", ApprovalId: id})
+}
+
+// Deny resolves a strict-mode pending approval as DENY. The
+// dispatcher's blocked call returns with a typed `consent_required`
+// failure carrying the deny reason.
+func (c *Client) Deny(id string) (Response, error) {
+	if id == "" {
+		return Response{}, errors.New("client: approval id is required")
+	}
+	return c.exec(Request{Op: "deny", ApprovalId: id})
+}
 
 // Status returns the current Manager snapshot.
 func (c *Client) Status() (Response, error) { return c.exec(Request{Op: "status"}) }

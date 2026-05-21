@@ -119,11 +119,18 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
    `watch` connection to `~/.memql/worker.sock` renders the active
    consent window state + a live audit tail of every worker tool
    dispatch (newest first, capped at 256). `G` opens the duration
-   picker, `R` revokes immediately. NOT gated on a cluster connection
-   -- the IPC is local-host between cockpit processes. Per
-   memql-cockpit#64. A global `Ctrl+E` kill switch in `dispatchEvent`
-   calls into `workersView.Revoke()` from any tab without making the
-   operator switch tabs first.
+   picker, `R` revokes immediately. **Strict-mode per-action
+   approval** (64-B): when the granted window has `strict=true` and
+   the agent dispatches `workerComputer.key_type` or `.mouse_click`,
+   the worker blocks awaiting an Allow/Deny in this tab. A modal
+   overlay names the tool + action; `A` allows once, `D` denies.
+   Pending approvals queue FIFO and the modal cycles as the operator
+   responds. The 30-second default timeout (worker side) denies
+   unanswered approvals; Revoke cancels every pending approval too.
+   NOT gated on a cluster connection -- the IPC is local-host between
+   cockpit processes. Per memql-cockpit#64. A global `Ctrl+E` kill
+   switch in `dispatchEvent` calls into `workersView.Revoke()` from
+   any tab without making the operator switch tabs first.
 6. **Settings (F6)** -- credentials, theme, version
 
 Concepts, Planner, and Chat are all gated on a connected, selected
