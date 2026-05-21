@@ -92,11 +92,19 @@ type View struct {
 // each widget close over the view's data slices, so the widgets
 // stay configuration-free at the use site (only Count and Focused
 // are toggled per render).
+//
+// All three list panes use RowsPerItem=2 to match the planner's
+// plan-list visual: primary line carries the most identifying
+// string, dimmed subtitle line carries metadata (description / id +
+// createdAt / etc.).
 func NewView(theme ui.Theme) *View {
 	v := &View{Focus: FocusConcepts}
 	v.Theme = theme
+	v.conceptList.RowsPerItem = 2
 	v.conceptList.Render = v.renderConceptRow
+	v.rowList.RowsPerItem = 2
 	v.rowList.Render = v.renderRowItem
+	v.versionList.RowsPerItem = 2
 	v.versionList.Render = v.renderVersionRow
 	v.conceptList.EmptyMessage = "No concepts loaded."
 	v.rowList.EmptyMessage = "No rows."
@@ -281,22 +289,37 @@ func (v *View) drawDetail(screen *ui.Screen, bounds ui.Rect) {
 	v.drawBottomHints(screen, bounds, hintsForDetail(v))
 }
 
-// renderConceptRow paints one row of the concept picker. ListPane
-// has already filled the row with the selection background when
-// `sel` is true, so we just draw the label.
+// renderConceptRow paints one 2-row concept entry. Primary line is
+// the concept id (`v1:cognition:agent`); subtitle is the concept's
+// description (falling back to type when description is empty).
+// ListPane has already filled both rows with the selection
+// background when `sel` is true.
 func (v *View) renderConceptRow(screen *ui.Screen, bounds ui.Rect, idx int, sel bool, theme ui.Theme) {
 	if idx < 0 || idx >= len(v.Concepts) {
 		return
 	}
-	style := theme.BaseStyle()
+	c := v.Concepts[idx]
+	primary := theme.BaseStyle()
 	if sel {
-		style = theme.SelectionStyle()
+		primary = theme.SelectionStyle()
 	}
-	screen.DrawText(bounds.X+2, bounds.Y, bounds.Width-3, v.Concepts[idx].GetId(), style)
+	sub := primary.Foreground(theme.Subtle)
+
+	screen.DrawText(bounds.X+2, bounds.Y, bounds.Width-3, c.GetId(), primary)
+
+	subStr := c.GetDescription()
+	if subStr == "" {
+		subStr = c.GetType()
+	}
+	if subStr != "" {
+		screen.DrawText(bounds.X+2, bounds.Y+1, bounds.Width-3, subStr, sub)
+	}
 }
 
-// renderRowItem paints one row of the middle pane. idx is into
-// rowMatches, which dereferences back to v.Rows.
+// renderRowItem paints one 2-row entry in the middle pane. idx is
+// into rowMatches, which dereferences back to v.Rows. Primary line
+// is the display label (name/displayName/slug/title/id fallback);
+// subtitle is the row id + shortened createdAt.
 func (v *View) renderRowItem(screen *ui.Screen, bounds ui.Rect, idx int, sel bool, theme ui.Theme) {
 	if idx < 0 || idx >= len(v.rowMatches) {
 		return
@@ -305,29 +328,52 @@ func (v *View) renderRowItem(screen *ui.Screen, bounds ui.Rect, idx int, sel boo
 	if rowIdx < 0 || rowIdx >= len(v.Rows) {
 		return
 	}
-	style := theme.BaseStyle()
+	row := v.Rows[rowIdx]
+	primary := theme.BaseStyle()
 	if sel {
-		style = theme.SelectionStyle()
+		primary = theme.SelectionStyle()
 	}
-	screen.DrawText(bounds.X+2, bounds.Y, bounds.Width-3, rowDisplayLabel(v.Rows[rowIdx]), style)
+	sub := primary.Foreground(theme.Subtle)
+
+	screen.DrawText(bounds.X+2, bounds.Y, bounds.Width-3, rowDisplayLabel(row), primary)
+
+	rowId := getString(row, "id")
+	created := shortenTimestamp(getString(row, "createdAt"))
+	var subStr string
+	switch {
+	case rowId != "" && created != "":
+		subStr = rowId + "  ·  " + created
+	case rowId != "":
+		subStr = rowId
+	case created != "":
+		subStr = created
+	}
+	if subStr != "" {
+		screen.DrawText(bounds.X+2, bounds.Y+1, bounds.Width-3, subStr, sub)
+	}
 }
 
-// renderVersionRow paints one row of the version-history overlay
-// inside the detail pane.
+// renderVersionRow paints one 2-row version-history entry. Primary
+// line is the timestamp + author; subtitle is the provenance kind.
 func (v *View) renderVersionRow(screen *ui.Screen, bounds ui.Rect, idx int, sel bool, theme ui.Theme) {
 	if idx < 0 || idx >= len(v.versionRows) {
 		return
 	}
-	style := theme.BaseStyle()
-	if sel {
-		style = theme.SelectionStyle()
-	}
 	ver := v.versionRows[idx]
-	when := getString(ver, "createdAt")
+	primary := theme.BaseStyle()
+	if sel {
+		primary = theme.SelectionStyle()
+	}
+	sub := primary.Foreground(theme.Subtle)
+
+	when := shortenTimestamp(getString(ver, "createdAt"))
 	who := getString(ver, "createdBy")
-	prov := getString(getMap(ver, "provenance"), "kind")
-	label := fmt.Sprintf("%s  by %s  (%s)", shortenTimestamp(when), who, prov)
-	screen.DrawText(bounds.X, bounds.Y, bounds.Width, label, style)
+	primaryStr := fmt.Sprintf("%s  by %s", when, who)
+	screen.DrawText(bounds.X, bounds.Y, bounds.Width, primaryStr, primary)
+
+	if prov := getString(getMap(ver, "provenance"), "kind"); prov != "" {
+		screen.DrawText(bounds.X+2, bounds.Y+1, bounds.Width-2, prov, sub)
+	}
 }
 
 // drawBottomHints renders the per-pane chrome band anchored to the

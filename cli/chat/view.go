@@ -111,10 +111,14 @@ type utteranceRow struct {
 	CreatedAtMillis int64
 }
 
-// NewView constructs the Chat view.
+// NewView constructs the Chat view. The spaces list uses
+// RowsPerItem=2 to match the planner's plan-list visual: primary
+// line carries name + Today: prefix, dimmed subtitle carries
+// kind + owner.
 func NewView(theme ui.Theme) *View {
 	v := &View{}
 	v.Theme = theme
+	v.spaceList.RowsPerItem = 2
 	v.spaceList.Render = v.renderSpaceRow
 	return v
 }
@@ -396,19 +400,24 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 	ui.DrawBottom(screen, right, subtleStyle, 1, hintsForUtterances())
 }
 
-// renderSpaceRow paints a single space-list row using the marker-
-// prefix convention from the pre-migration code: "* label" for the
-// highlighted space, "  label" otherwise. Daily-kind spaces get a
-// "Today: " prefix on the label.
+// renderSpaceRow paints a 2-row space-list entry. Primary line:
+// marker (`* ` selected / `  ` else) + label, with `Today: ` prefix
+// for daily-kind spaces so the user can tell their daily apart from
+// any other space with the same name. Subtitle: kind + owner in the
+// dimmed planner-style metadata slot.
 func (v *View) renderSpaceRow(screen *ui.Screen, bounds ui.Rect, idx int, sel bool, theme ui.Theme) {
 	if idx < 0 || idx >= len(v.spaces) {
 		return
 	}
 	s := v.spaces[idx]
-	style := theme.SubtleStyle()
+	primary := theme.BaseStyle()
+	if sel {
+		primary = theme.SelectionStyle()
+	}
+	sub := primary.Foreground(theme.Subtle)
+
 	marker := "  "
 	if sel {
-		style = theme.AccentStyle()
 		marker = "* "
 	}
 	label := s.Name
@@ -418,7 +427,20 @@ func (v *View) renderSpaceRow(screen *ui.Screen, bounds ui.Rect, idx int, sel bo
 	if s.Kind == "daily" {
 		label = "Today: " + label
 	}
-	screen.DrawText(bounds.X, bounds.Y, bounds.Width, marker+truncate(label, bounds.Width-2), style)
+	screen.DrawText(bounds.X, bounds.Y, bounds.Width, marker+truncate(label, bounds.Width-2), primary)
+
+	var subStr string
+	switch {
+	case s.Kind != "" && s.OwnerUserId != "":
+		subStr = s.Kind + "  ·  " + s.OwnerUserId
+	case s.Kind != "":
+		subStr = s.Kind
+	case s.OwnerUserId != "":
+		subStr = s.OwnerUserId
+	}
+	if subStr != "" {
+		screen.DrawText(bounds.X+2, bounds.Y+1, bounds.Width-2, subStr, sub)
+	}
 }
 
 // pttStatusLine renders the PTT state strip just above the chrome.
