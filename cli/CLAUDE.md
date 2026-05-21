@@ -495,6 +495,48 @@ bug.
 
 ---
 
+## SDK-only rule
+
+Every wire call from `cli/**` goes through `memql/sdk/go/` --
+`client/` for queries / mutations / subscriptions, `voice/` for
+push-to-talk, `sense/` for editor language intelligence, and
+`worker/` once #117 lands.
+
+What that means concretely:
+
+- **No direct `grpc.NewClient` dials** anywhere under `cli/**`. The
+  SDK owns transport (TLS, auth-token plumbing, request correlation).
+  The remaining worker dial in `cmd/memql-cockpit/internal/worker/`
+  is a known leak tracked in memql#117 -- it will move to
+  `sdk/go/worker/` and the cockpit will dial through that.
+- **No `memqlv1` imports** under `cli/**`. The five current sites
+  (`app.go`, `pool.go`, `settings/view.go`, `concepts/view.go`,
+  `concepts/chrome_contract_test.go`, `settings/settings_race_test.go`)
+  are tracked in memql#115 (SDK C). Once that lands, they go away
+  and stay gone.
+- **No raw DSL strings.** Never `qc.Execute("queryActiveSpaces({})")`
+  and never `qc.Execute("concept==v1:cognition:space; ...")`.
+  Consumers call the typed generated methods on `QueryClient`
+  (`QueryActiveSpaces`, `QueryAllPlans`, etc.). The engine reserves
+  the right to evolve internal projection / bundle shapes without
+  breaking clients -- that promise only holds if cockpit stays on
+  the named-primitive surface. Bypassing it is how
+  memql-cockpit#49 happened.
+
+  The lone exception is the Concepts tab's concept-browser surface
+  (`BrowseConcept`, `GetRowByConceptAndId`). Those are SDK-owned
+  methods, not raw-string escape hatches -- they exist precisely
+  because a concept-agnostic browser has no compile-time named
+  primitive to call.
+
+**If you can't express something through the SDK, the SDK needs to
+grow, not the cockpit.** Open an issue under memql/, add the
+typed method (DSL function -> `make sdk-gen` regenerates the
+client) or the wrapper type, then come back here.
+
+See `memql/sdk/go/CLAUDE.md` for the full SDK contract (named
+primitives, opaque types, generated-code rules, layout).
+
 ## Wire Contract
 
 Every gRPC envelope leaves the CLI carrying:
