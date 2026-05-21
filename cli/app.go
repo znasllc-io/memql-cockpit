@@ -24,6 +24,7 @@ import (
 	"github.com/znasllc-io/memql-cockpit/cli/discovery"
 	"github.com/znasllc-io/memql-cockpit/cli/planner"
 	"github.com/znasllc-io/memql-cockpit/cli/settings"
+	"github.com/znasllc-io/memql-cockpit/cli/skills"
 	"github.com/znasllc-io/memql-cockpit/cli/splash"
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
 	"github.com/znasllc-io/memql-cockpit/cli/workers"
@@ -88,6 +89,7 @@ type App struct {
 	conceptsView *concepts.View
 	clustersView *cluster.ClustersView
 	plannerView  *planner.View
+	skillsView   *skills.View
 	chatView     *chat.View
 	workersView  *workers.View
 	settingsView *settings.View
@@ -128,27 +130,28 @@ func NewApp(cfg AppConfig) *App {
 	conceptsView := concepts.NewView(theme)
 	clustersView := cluster.NewClustersView(theme)
 	plannerView := planner.NewView(theme)
+	skillsView := skills.NewView(theme)
 	chatView := chat.NewView(theme)
 	workersView := workers.NewView(theme)
 
 	// Clusters comes first -- it's the starting context for the session.
 	// Chat sits next (F2) because the daily-space conversation is the
 	// primary surface users open after connecting; Concepts / Planner
-	// follow as operations-console reads. Workers (F5) hosts the
-	// computer-use consent dashboard + live audit tail introduced in
-	// memql-cockpit#64 -- not gated on a cluster connection because
-	// it talks to a local worker daemon over a Unix socket, not over
-	// the cluster gRPC. Settings stays last.
-	//
-	// Agents tab retired 2026-05-21 (memql-cockpit#126): every v1:agents:agent
-	// row is browseable via the Concepts tab now, and the @displayCard
-	// hints rendered there give a better surface than the custom
-	// agents view did.
+	// follow as operations-console reads. Skills (F5) is the read-only
+	// catalog browser for v1:agents:skill rows introduced by memql#158
+	// + memql-cockpit#124 -- agents themselves live under the Concepts
+	// tab now (post the memql-cockpit#126 retire) but the skill catalog
+	// is dense enough to earn its own surface with category + tier
+	// grouping. Workers (F6) hosts the computer-use consent dashboard +
+	// live audit tail introduced in memql-cockpit#64 -- not gated on a
+	// cluster connection because it talks to a local worker daemon over
+	// a Unix socket, not over the cluster gRPC. Settings stays last.
 	tabBar := ui.NewTabBar(theme,
 		ui.Tab{Name: "Clusters", Content: clustersView},
 		ui.Tab{Name: "Chat", Content: chatView},
 		ui.Tab{Name: "Concepts", Content: conceptsView},
 		ui.Tab{Name: "Planner", Content: plannerView},
+		ui.Tab{Name: "Skills", Content: skillsView},
 		ui.Tab{Name: "Workers", Content: workersView},
 		ui.Tab{Name: "Settings", Content: settingsView},
 	)
@@ -167,6 +170,7 @@ func NewApp(cfg AppConfig) *App {
 		conceptsView:  conceptsView,
 		clustersView:  clustersView,
 		plannerView:   plannerView,
+		skillsView:    skillsView,
 		chatView:      chatView,
 		workersView:   workersView,
 		settingsView:  settingsView,
@@ -587,6 +591,7 @@ func (a *App) connect() {
 	a.wireConcepts()
 	a.wireCluster()
 	a.wirePlanner()
+	a.wireSkills()
 	a.wireChat()
 	a.wireWorkers()
 
@@ -1300,6 +1305,35 @@ func (a *App) wireWorkers() {
 	a.workersView.Start(ctx)
 }
 
+// wireSkills connects the Skills tab to the gRPC client. The view
+// polls queryActiveSkillsFull every 30s -- the catalog is small and
+// re-seeded only at cluster startup + via planner mints (Phase 3),
+// so a slower cadence than agents/chat is correct.
+func (a *App) wireSkills() {
+	if a.skillsView == nil {
+		return
+	}
+	getQueries := func() *client.QueryClient {
+		d := a.activeDispatcher()
+		if d == nil {
+			return nil
+		}
+		return client.NewQueryClient(d)
+	}
+	a.skillsView.QueryClient = getQueries
+	a.skillsView.OnStatus = func(msg string) {
+		if a.notifications != nil {
+			a.notifications.Sync("skills", ui.SeverityWarning, msg)
+		}
+	}
+	a.skillsView.OnRedraw = func() {
+		if a.screen != nil {
+			a.screen.PostEvent(tcell.NewEventInterrupt(nil))
+		}
+	}
+	a.skillsView.StartRefreshLoop(a.quitCh, 30*time.Second)
+}
+
 // wireChat connects the Chat tab to the gRPC client. The chat view
 // polls v1:cognition:space + v1:cognition:utterance every 3s and
 // renders the single-chat-per-space stream. OnRedraw posts an
@@ -1923,7 +1957,7 @@ func (a *App) wireClustersCallbacks() {
 }
 
 // updateTabGating sets the GatedMessage on the cluster-dependent tabs
-// (Concepts, Planner) based on whether the user's selected
+// (Concepts, Planner, Skills) based on whether the user's selected
 // cluster has a live connection. Called from draw() so state changes
 // show up on the next repaint.
 func (a *App) updateTabGating() {
@@ -1931,6 +1965,9 @@ func (a *App) updateTabGating() {
 		a.conceptsView.GatedMessage = msg
 		if a.plannerView != nil {
 			a.plannerView.GatedMessage = msg
+		}
+		if a.skillsView != nil {
+			a.skillsView.GatedMessage = msg
 		}
 	}
 	name := a.selectedName()
