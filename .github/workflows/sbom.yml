@@ -1,0 +1,68 @@
+name: sbom
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'go.mod'
+      - 'go.sum'
+
+permissions:
+  contents: read
+
+# Generates a CycloneDX SBOM for the cockpit Go module on every
+# release (and on go.mod / go.sum changes for main). The artifact
+# is uploaded to the release when triggered by a release event and
+# stashed as a workflow artifact otherwise. Mirrors the memql SBOM
+# workflow so the supply-chain story is uniform.
+#
+# memql-cockpit ships two binary variants from one module (headless
+# default + `gui` build tag). The SBOM produced here covers the
+# module-level dependency graph; per-binary SBOMs that reflect the
+# build-tagged subset are a separate exercise tracked in #65 (TBD).
+
+jobs:
+  sbom:
+    name: cyclonedx-gomod
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout memql-cockpit
+        uses: actions/checkout@v6
+        with:
+          path: memql-cockpit
+      - name: Checkout memql (sibling for replace directive)
+        uses: actions/checkout@v6
+        with:
+          repository: znasllc-io/memql
+          path: memql
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          cache: true
+          cache-dependency-path: memql-cockpit/go.sum
+      - name: install cyclonedx-gomod
+        run: go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest
+      - name: generate SBOM
+        working-directory: memql-cockpit
+        run: |
+          mkdir -p sbom
+          cyclonedx-gomod mod -licenses -json -output sbom/memql-cockpit.cdx.json
+          cyclonedx-gomod mod -licenses -output sbom/memql-cockpit.cdx.xml
+      - name: upload SBOM as workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sbom
+          path: memql-cockpit/sbom/
+          retention-days: 90
+      - name: attach SBOM to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            memql-cockpit/sbom/memql-cockpit.cdx.json
+            memql-cockpit/sbom/memql-cockpit.cdx.xml

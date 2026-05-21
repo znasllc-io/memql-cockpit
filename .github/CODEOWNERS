@@ -1,0 +1,31 @@
+# CODEOWNERS for znasllc-io/memql-cockpit
+#
+# Branch-protection on `main` requires code-owner review on every PR
+# that touches a path covered here. Patterns are evaluated last-match-
+# wins; keep the catch-all at the top and the security-sensitive
+# overrides at the bottom.
+
+# Default owner for everything else.
+*                                       @znas-io
+
+# CI / workflows / supply-chain
+/.github/                                @znas-io
+/.gitleaks.toml                          @znas-io
+
+# Cred storage + worker (security-critical — Wave 6 hardening)
+/cli/config/                             @znas-io
+/cli/crash/                              @znas-io
+/cmd/memql-cockpit/internal/worker/      @znas-io
+/cmd/memql-cockpit/internal/lint/        @znas-io
+
+# Computer-use surface (build-tag gated; load-bearing for OSS GUI variant)
+/cmd/memql-cockpit/internal/worker/tools/computer_gui.go    @znas-io
+/cmd/memql-cockpit/internal/worker/tools/tcc_preflight.go   @znas-io
+/cmd/memql-cockpit/internal/worker/tcc_preflight_darwin.go  @znas-io
+/cmd/memql-cockpit/internal/worker/tcc_hook_darwin.go       @znas-io
+
+# Service installers
+/deploy/                                 @znas-io
+/scripts/install/                        @znas-io
+
+/SECURITY.md                             @znas-io
