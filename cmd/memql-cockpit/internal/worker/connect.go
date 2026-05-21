@@ -5,27 +5,24 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/url"
 	"os"
 	"runtime"
-	"strings"
 	"time"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
+	sdkworker "github.com/znasllc-io/memql/sdk/go/worker"
 )
 
 // Connection wraps the bidi gRPC stream the worker maintains against
-// the cluster.
+// the cluster. Transport (dial / TLS / stream opener) is handled by
+// the SDK's worker module; this struct adds the worker-protocol
+// lifecycle on top: Register / RegisterAck capture, heartbeat /
+// tool-result helpers, and the registration metadata the runner
+// reads after Connect.
 type Connection struct {
-	conn   *grpc.ClientConn
-	client memqlv1.WorkerServiceClient
-	stream memqlv1.WorkerService_StreamClient
+	conn   *sdkworker.Connection
 	logger *slog.Logger
 
 	RegistrationId string
@@ -33,84 +30,28 @@ type Connection struct {
 	RegisteredAt   time.Time
 }
 
-// Connect dials the cluster, opens the stream, and registers the
-// worker. Returns the live connection and the registration metadata
-// pulled from the RegisterAck.
+// Connect dials the cluster (via the SDK), opens the stream, and
+// sends the worker-protocol Register handshake. Returns the live
+// connection and the registration metadata pulled from the
+// RegisterAck.
 func Connect(ctx context.Context, cfg Config, logger *slog.Logger) (*Connection, error) {
-	endpoint, useTLS, err := parseClusterURL(cfg.ClusterURL)
+	endpoint, useTLS, err := sdkworker.ParseClusterURL(cfg.ClusterURL)
 	if err != nil {
 		return nil, err
 	}
-	if logger != nil {
-		// Log dial intent at INFO so the operator can see in the
-		// cockpit terminal exactly which cluster + transport this
-		// worker is connecting to. Without this the only visible
-		// signal was "worker registered with cluster" AFTER the
-		// stream + RegisterAck round-trip succeeded -- when the dial
-		// hung or the stream errored before ack, the user saw nothing.
-		logger.Info("worker connecting to cluster",
-			"endpoint", endpoint,
-			"tls", useTLS,
-		)
-	}
-	// Message-size limits: gRPC's default cap is 4 MiB, which is too
-	// tight for workerComputer.screenshot results -- a retina-display
-	// PNG base64-encoded commonly lands at 5-10 MiB. The 4 MiB
-	// default caused mid-stream RST_STREAM (server-side) on every
-	// screenshot, which surfaced on the cockpit side as "worker
-	// stream ended; will reconnect" and on the agent side as
-	// errorCode=worker_disconnected. Bumping both directions to
-	// 32 MiB covers a 6K capture with headroom; the agent gRPC
-	// server has a matching bump in component/grpc/server.go.
-	const maxWorkerMessageSize = 32 * 1024 * 1024
-	dialOpts := []grpc.DialOption{
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(maxWorkerMessageSize),
-			grpc.MaxCallSendMsgSize(maxWorkerMessageSize),
-		),
-	}
-	if useTLS {
-		// Build a proper *tls.Config with ServerName pinned to the
-		// configured FQDN. Without ServerName pinning the TLS
-		// handshake accepts any chain-valid certificate whose name
-		// matches whatever DNS resolved to -- a successful MITM with
-		// a different but chain-valid cert (DNS hijack + Let's Encrypt
-		// for the attacker's hostname) goes unnoticed. Pinning makes
-		// the handshake fail unless the certificate's SAN matches
-		// the operator-configured cluster URL.
-		tlsCfg, terr := buildTLSConfig(endpoint, logger)
-		if terr != nil {
-			return nil, fmt.Errorf("worker.connect: tls config: %w", terr)
-		}
-		dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)))
-	} else {
-		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	}
 
-	conn, err := grpc.NewClient(endpoint, dialOpts...)
+	sdkConn, err := sdkworker.Dial(ctx, sdkworker.DialConfig{
+		Endpoint: endpoint,
+		UseTLS:   useTLS,
+		Token:    cfg.Token,
+		Logger:   logger,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("worker.connect: dial %s: %w", endpoint, err)
-	}
-
-	// IMPORTANT: derive the stream context from the caller's ctx so
-	// stream.Recv() unblocks when the runner's parent ctx is
-	// cancelled (Ctrl+C / Ctrl+Q / SIGTERM). The previous version
-	// used context.Background() here, which left the stream blocked
-	// in Recv() forever after shutdown -- the user saw "worker
-	// shutting down" but the process never actually exited.
-	streamCtx := metadata.AppendToOutgoingContext(ctx, "authorization", "Worker "+cfg.Token)
-
-	client := memqlv1.NewWorkerServiceClient(conn)
-	stream, err := client.Stream(streamCtx)
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("worker.connect: open stream: %w", err)
+		return nil, err
 	}
 
 	c := &Connection{
-		conn:   conn,
-		client: client,
-		stream: stream,
+		conn:   sdkConn,
 		logger: logger,
 	}
 
@@ -138,13 +79,13 @@ func (c *Connection) register(ctx context.Context, cfg Config) error {
 		Version:     cockpitVersion(),
 		BuildTag:    cockpitBuildTag(),
 	}
-	if err := c.stream.Send(&memqlv1.WorkerClientMessage{
+	if err := c.conn.Send(&memqlv1.WorkerClientMessage{
 		Payload: &memqlv1.WorkerClientMessage_Register{Register: register},
 	}); err != nil {
 		return fmt.Errorf("worker.register: send: %w", err)
 	}
 
-	resp, err := c.stream.Recv()
+	resp, err := c.conn.Recv()
 	if err != nil {
 		return fmt.Errorf("worker.register: recv: %w", err)
 	}
@@ -171,17 +112,17 @@ func (c *Connection) register(ctx context.Context, cfg Config) error {
 
 // Send writes a single message on the worker side of the stream.
 func (c *Connection) Send(msg *memqlv1.WorkerClientMessage) error {
-	return c.stream.Send(msg)
+	return c.conn.Send(msg)
 }
 
 // Recv blocks until the next inbound message lands.
 func (c *Connection) Recv() (*memqlv1.WorkerServerMessage, error) {
-	return c.stream.Recv()
+	return c.conn.Recv()
 }
 
 // SendHeartbeat emits a Heartbeat envelope.
 func (c *Connection) SendHeartbeat(active uint32, perCap map[string]uint32) error {
-	return c.stream.Send(&memqlv1.WorkerClientMessage{
+	return c.conn.Send(&memqlv1.WorkerClientMessage{
 		Payload: &memqlv1.WorkerClientMessage_Heartbeat{
 			Heartbeat: &memqlv1.Heartbeat{
 				Ts:                       timestamppb.Now(),
@@ -200,55 +141,17 @@ func (c *Connection) SendToolResult(callId string, success *memqlv1.Success, fai
 	} else if failure != nil {
 		res.Payload = &memqlv1.ToolResult_Failure{Failure: failure}
 	}
-	return c.stream.Send(&memqlv1.WorkerClientMessage{
+	return c.conn.Send(&memqlv1.WorkerClientMessage{
 		Payload: &memqlv1.WorkerClientMessage_ToolResult{ToolResult: res},
 	})
 }
 
-// Close terminates the stream and connection.
+// Close terminates the stream and the underlying SDK connection.
 func (c *Connection) Close() {
 	if c == nil {
 		return
 	}
-	if c.stream != nil {
-		_ = c.stream.CloseSend()
-	}
-	if c.conn != nil {
-		_ = c.conn.Close()
-	}
-}
-
-// parseClusterURL accepts http://, https://, grpc://, grpcs://, or
-// bare host:port. Returns the gRPC dial address (host:port) and a
-// flag indicating whether TLS is required.
-func parseClusterURL(raw string) (endpoint string, useTLS bool, err error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return "", false, errors.New("worker.connect: cluster_url is empty")
-	}
-	if !strings.Contains(raw, "://") {
-		return raw, false, nil
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "", false, fmt.Errorf("worker.connect: parse cluster_url: %w", err)
-	}
-	host := u.Host
-	if host == "" {
-		return "", false, fmt.Errorf("worker.connect: cluster_url missing host: %s", raw)
-	}
-	switch strings.ToLower(u.Scheme) {
-	case "http", "grpc":
-		return host, false, nil
-	case "https", "grpcs":
-		// Default https URLs target :443 -- gRPC default is :443.
-		if !strings.Contains(host, ":") {
-			host = host + ":443"
-		}
-		return host, true, nil
-	default:
-		return host, false, nil
-	}
+	c.conn.Close()
 }
 
 func cockpitVersion() string { return "0.1.0" }
