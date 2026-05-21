@@ -149,7 +149,8 @@ func (d *DetailPane) Draw(screen *Screen, bounds Rect, theme Theme) {
 	}
 
 	if scrollbarVisible {
-		DrawScrollbar(screen, theme, bounds, d.ScrollY, len(flat))
+		// (ScrollY, maxScroll) -- both row-unit. Same pattern as Viewer.
+		DrawScrollbar(screen, theme, bounds, d.ScrollY, maxScroll)
 	}
 }
 
