@@ -342,14 +342,37 @@ regression.
 ### The bands (top -> bottom)
 
 ```
-[title]      Pane title + meta. One row. Counts/positions go here,
-             NOT in a separate bottom footer. Examples:
-                " CLUSTERS "
-                " ROWS: v1:cognition:space (3/12) "
-                " DETAIL (line 4/27) "
-             When a form is open, the title rewrites in place
-             (" ADD CLUSTER ", " EDIT CLUSTER ") -- no second
-             title stacked inside the form.
+[title]      Pane title + cursor/count. One row, split into two
+             halves: the bare pane name flush LEFT (anchored at
+             bounds.X+1), and the cursor/count flush RIGHT (last
+             cell at bounds.X+Width-2). Rendered via `ui.PaneTitle`
+             -- panes must NOT hand-roll the title row. Examples
+             (`·····` is the right-aligned gap, not literal cells):
+
+                 CLUSTERS·······································
+                 CONCEPTS····································1/77
+                 ROWS·······················3/12 filtered from 40
+                 DETAIL·································line 4/27
+                 SPACES········································5
+
+             Rules:
+               * No parentheses around the counter.
+               * No embedded ids, names, or colons in the title --
+                 the title is the pane's identity, not the row it
+                 happens to be showing. `ROWS: v1:cognition:space`
+                 and `CHAT: <spaceName>` are the anti-patterns this
+                 split exists to prevent; the highlighted row in
+                 the adjacent pane already carries that id.
+               * Counter is supplementary. When title + a 2-cell
+                 gap + counter doesn't fit, `ui.PaneTitle` drops
+                 the counter first -- the title wins. Use
+                 `ui.FormatCursor` / `FormatFiltered` / `FormatLine`
+                 / `FormatCount` to build the counter string.
+               * Focused pane renders in accent-bold; unfocused in
+                 subtle-bold. `PaneTitle.Focused` flips both halves.
+               * Form overlay titles rewrite in place
+                 (" ADD CLUSTER ", " EDIT CLUSTER ") -- no second
+                 title stacked inside the form, no counter.
 
 [content]    The scrollable list / detail / form body. Whatever
              vertical space remains after subtracting the title +
