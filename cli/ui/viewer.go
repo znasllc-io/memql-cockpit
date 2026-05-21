@@ -140,7 +140,9 @@ func (v *Viewer) Draw(screen *Screen, bounds Rect, theme Theme) {
 	}
 
 	if scrollbarVisible {
-		DrawScrollbar(screen, theme, bounds, v.ScrollY, len(rows))
+		// (ScrollY, maxScroll) -- both row-unit. The widget needs
+		// `maxPosition`, not `total`, so pass maxScroll directly.
+		DrawScrollbar(screen, theme, bounds, v.ScrollY, maxScroll)
 	}
 }
 

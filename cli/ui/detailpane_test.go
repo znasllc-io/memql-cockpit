@@ -239,16 +239,23 @@ func TestDetailPane_ScrollbarVisibleOnlyWhenOverflow(t *testing.T) {
 			d.Draw(screen, Rect{X: 0, Y: 0, Width: 20, Height: tc.boundsH}, DefaultTheme())
 			sim.Sync()
 
+			// One '■' thumb, no '│' track lines (memql-cockpit#111).
 			has := false
+			trackGlyphs := 0
 			for y := 0; y < tc.boundsH; y++ {
 				ch, _, _, _ := sim.GetContent(19, y)
-				if ch == '│' || ch == '■' {
+				if ch == '■' {
 					has = true
-					break
+				}
+				if ch == '│' {
+					trackGlyphs++
 				}
 			}
 			if has != tc.wantScrollbar {
 				t.Errorf("scrollbar = %v, want %v", has, tc.wantScrollbar)
+			}
+			if trackGlyphs != 0 {
+				t.Errorf("scrollbar column has %d '│' track glyphs; want 0", trackGlyphs)
 			}
 		})
 	}

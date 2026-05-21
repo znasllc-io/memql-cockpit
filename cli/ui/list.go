@@ -116,7 +116,15 @@ func (l *ListPane) Draw(screen *Screen, bounds Rect, theme Theme) {
 			Width:  bounds.Width,
 			Height: viewportItems * rpi,
 		}
-		DrawScrollbar(screen, theme, sbBounds, l.ScrollY, l.Count)
+		// Thumb tracks the user's CURSOR (Selected), not the
+		// viewport top edge. Two reasons: (1) it's the position the
+		// user moves directly, so the thumb stays under their mental
+		// model; (2) it dodges the unit-mismatch bug -- previously
+		// the call was (ScrollY in items, Count in items) but the
+		// widget treated bounds.Height as if it were the totalRows
+		// argument, mixing item-units and row-units. Selected and
+		// Count-1 share the same unit (item index) end-to-end.
+		DrawScrollbar(screen, theme, sbBounds, l.Selected, l.Count-1)
 	}
 }
 

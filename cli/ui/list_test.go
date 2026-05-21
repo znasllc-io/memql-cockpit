@@ -272,17 +272,30 @@ func TestListPane_ScrollbarVisibleOnlyWhenOverflow(t *testing.T) {
 			l.Draw(screen, Rect{X: 0, Y: 0, Width: 20, Height: tc.boundsH}, DefaultTheme())
 			sim.Sync()
 
-			// Scrollbar paints into column W-1 = 19. Track glyph is '│'.
+			// Scrollbar paints exactly one '■' thumb into column W-1.
+			// No track glyphs -- the rest of the column is background
+			// per memql-cockpit#111.
 			hasScrollbar := false
+			thumbCount := 0
+			trackGlyphs := 0
 			for y := 0; y < tc.boundsH; y++ {
 				ch, _, _, _ := sim.GetContent(19, y)
-				if ch == '│' || ch == '■' {
+				if ch == '■' {
 					hasScrollbar = true
-					break
+					thumbCount++
+				}
+				if ch == '│' {
+					trackGlyphs++
 				}
 			}
 			if hasScrollbar != tc.wantScrollbar {
 				t.Errorf("scrollbar visible = %v, want %v", hasScrollbar, tc.wantScrollbar)
+			}
+			if tc.wantScrollbar && thumbCount != 1 {
+				t.Errorf("scrollbar drew %d thumb cells, want exactly 1", thumbCount)
+			}
+			if trackGlyphs != 0 {
+				t.Errorf("scrollbar column has %d track '│' glyphs; want 0 (no track lines)", trackGlyphs)
 			}
 		})
 	}
@@ -315,6 +328,66 @@ func TestListPane_HandleEvent_DownPastViewportScrolls(t *testing.T) {
 	// Item 8 must now be inside the rendered window [ScrollY, ScrollY+5).
 	if l.Selected < l.ScrollY || l.Selected >= l.ScrollY+5 {
 		t.Errorf("Selected %d not in viewport [%d, %d)", l.Selected, l.ScrollY, l.ScrollY+5)
+	}
+}
+
+// TestListPane_ScrollbarThumbReachesBottomAtLastSelection is the
+// regression net for memql-cockpit#111. Pre-fix the scrollbar
+// passed (ScrollY, Count) -- item-units for both, but the widget
+// internally compared Count against bounds.Height (row-units).
+// For a 2-rows-per-item list with Count=77 and viewportItems=15,
+// the thumb maxed out at ScrollY=47 even though the actual scroll
+// range went to ScrollY=62, then sat pinned at the bottom for the
+// remaining 15 items. Switched to passing (Selected, Count-1) so
+// the thumb tracks the user's cursor with units that line up
+// end-to-end.
+func TestListPane_ScrollbarThumbReachesBottomAtLastSelection(t *testing.T) {
+	// 77-item list, 2 rows per item, 30 rows of bounds -> 15 items
+	// visible. Without the fix the thumb saturated well before the
+	// last item.
+	const W = 30
+	const H = 30
+	screen, sim := makeListSim(t, W, H)
+	defer sim.Fini()
+
+	l := ListPane{
+		Count:       77,
+		RowsPerItem: 2,
+		Selected:    76, // last item
+		Render: func(s *Screen, b Rect, idx int, sel bool, theme Theme) {
+			s.DrawText(b.X+1, b.Y, b.Width-1, fmt.Sprintf("item-%d", idx), theme.BaseStyle())
+		},
+	}
+	l.Draw(screen, Rect{X: 0, Y: 0, Width: W, Height: H}, DefaultTheme())
+	sim.Sync()
+
+	// Thumb at the LAST row of the scrollbar column.
+	scrollbarCol := W - 1
+	lastRow := H - 1
+	ch, _, _, _ := sim.GetContent(scrollbarCol, lastRow)
+	if ch != '■' {
+		t.Errorf("thumb not at bottom of scrollbar when Selected=Count-1 (col %d, row %d): got %q",
+			scrollbarCol, lastRow, string(ch))
+
+		// Diagnostic: find where the thumb actually landed.
+		for y := 0; y < H; y++ {
+			c, _, _, _ := sim.GetContent(scrollbarCol, y)
+			if c == '■' {
+				t.Logf("thumb landed at row %d (last row is %d)", y, lastRow)
+				break
+			}
+		}
+	}
+
+	// Sanity: thumb at the TOP when Selected=0.
+	l.Selected = 0
+	sim.Clear()
+	l.Draw(screen, Rect{X: 0, Y: 0, Width: W, Height: H}, DefaultTheme())
+	sim.Sync()
+	ch, _, _, _ = sim.GetContent(scrollbarCol, 0)
+	if ch != '■' {
+		t.Errorf("thumb not at top of scrollbar when Selected=0: got %q at (col %d, row 0)",
+			string(ch), scrollbarCol)
 	}
 }
 

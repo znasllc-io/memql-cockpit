@@ -64,50 +64,60 @@ func VisibleRange(offset, totalRows, viewportH int) (int, int) {
 	return offset, end
 }
 
-// DrawScrollbar paints a 1-column position indicator on the
-// rightmost column of bounds (bounds.X + bounds.Width - 1). The
-// track uses a subtle pipe glyph; a SINGLE accent-colored square
-// marks the current scroll position, sliding linearly from the top
-// of the track (offset = 0) to the bottom (offset = maxOffset).
-// No-op when all rows fit (totalRows <= viewportH).
+// DrawScrollbar paints a single accent-colored thumb (`■`) on the
+// rightmost column of bounds (`bounds.X + bounds.Width - 1`). No
+// track lines -- the rest of the column stays at whatever the
+// caller left there (typically the pane background), which reads
+// as a single moving square instead of competing vertical bars
+// against the pane borders.
 //
-// A single-cell indicator reads more cleanly than a proportional
-// thumb at narrow widths -- the extra information about "window
-// size" from a proportional thumb doesn't pay for the visual
-// noise of multiple stacked block glyphs.
-func DrawScrollbar(screen *Screen, theme Theme, bounds Rect, offset, totalRows int) {
+// `pos` and `maxPos` are in caller-defined units (the units have
+// to match each other, but the widget doesn't care which they
+// are). The two ways the units are used in practice:
+//
+//   - ListPane passes (Selected, Count-1) -- item index. The
+//     thumb tracks the user's cursor, which is what they
+//     actually navigate by. Pre-fix the unit-mismatched math
+//     (offset in items, viewport in rows-per-item) caused the
+//     thumb to hit the bottom of the column at ~ScrollY = 47
+//     when the actual max was ~62 in a 2-rows-per-item list,
+//     then stay pinned for the remaining presses. Bound to
+//     Selected, the mapping is straightforward and stable.
+//   - Viewer / DetailPane pass (ScrollY, maxScroll) -- both in
+//     rendered-row units (post-wrap). There's no cursor in
+//     those widgets, so the viewport's top-edge offset is the
+//     right input.
+//
+// Returns immediately when maxPos <= 0 -- nothing to indicate.
+func DrawScrollbar(screen *Screen, theme Theme, bounds Rect, pos, maxPos int) {
 	if screen == nil || bounds.Width <= 0 || bounds.Height <= 0 {
 		return
 	}
-	viewportH := bounds.Height
-	if totalRows <= viewportH {
+	if maxPos <= 0 {
 		return
+	}
+	if pos < 0 {
+		pos = 0
+	}
+	if pos > maxPos {
+		pos = maxPos
 	}
 
 	col := bounds.X + bounds.Width - 1
-	trackStyle := tcell.StyleDefault.Foreground(theme.Subtle).Background(theme.BG)
 	thumbStyle := tcell.StyleDefault.Foreground(theme.Accent).Background(theme.BG).Bold(true)
 
-	// Track: a dim pipe down the column. Thumb will overdraw one cell.
-	for i := 0; i < viewportH; i++ {
-		screen.SetCell(col, bounds.Y+i, '│', trackStyle)
-	}
-
-	// Position the 1-cell thumb. Map offset in [0, maxOff] to a row
-	// index in [0, viewportH-1]. At the top (offset == 0) the
-	// indicator sits on the first track cell; at the bottom
-	// (offset == maxOff) it sits on the last. When maxOff is 0 we
-	// wouldn't be drawing the scrollbar at all (guarded above).
-	maxOff := totalRows - viewportH
-	thumbY := 0
-	if maxOff > 0 {
-		thumbY = offset * (viewportH - 1) / maxOff
-	}
+	// Map pos in [0, maxPos] -> thumbY in [0, height-1]. At pos == 0
+	// the thumb sits on the first column row; at pos == maxPos it
+	// sits on the last. Integer division rounds toward zero, which
+	// means intermediate positions can land on a slightly lower row
+	// than a true proportional placement would suggest -- acceptable
+	// at single-cell resolution.
+	thumbY := pos * (bounds.Height - 1) / maxPos
 	if thumbY < 0 {
 		thumbY = 0
 	}
-	if thumbY >= viewportH {
-		thumbY = viewportH - 1
+	if thumbY >= bounds.Height {
+		thumbY = bounds.Height - 1
 	}
 	screen.SetCell(col, bounds.Y+thumbY, '■', thumbStyle)
 }
