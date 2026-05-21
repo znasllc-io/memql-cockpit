@@ -385,6 +385,13 @@ Rules:
   whitespace-free verb or noun (use CamelCase for compounds:
   `Esc:ClearSearch`, `Esc:CloseVersions`). `Enter:Save` not
   `Enter: Save` and not `Enter (Save)`.
+- **Single-letter keys are UPPERCASE** -- `R:Refresh` not `r:Refresh`,
+  `V:PTT` not `v:PTT`. Keystroke handlers stay case-tolerant
+  (`'v' || 'V'`), but the chip displays the canonical uppercase form
+  so it reads as a single recognizable shape across every pane.
+  Multi-key combos (`↑/↓`, `PgUp/PgDn`) and named keys (`Esc`,
+  `Enter`, `Tab`) keep their natural casing; this rule applies to
+  single-letter alphabetic keys only.
 - **Two-space separator** between chips. Single space would visually
   merge into the labels; commas/pipes have been tried and read worse.
 - **Context-aware.** A chip only appears when the action it

@@ -381,7 +381,7 @@ func hintsForRows(v *View) paneHint {
 		{Key: "↑/↓", Label: "Move"},
 		{Key: "Enter", Label: "Detail"},
 		{Key: "", Label: "Search"},
-		{Key: "v", Label: "Versions"},
+		{Key: "V", Label: "Versions"},
 		{Key: "Tab", Label: "Cycle"},
 		{Key: "Esc", Label: "ClearSearch", Disabled: v.rowFilter == ""},
 	}}
