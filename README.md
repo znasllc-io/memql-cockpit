@@ -96,10 +96,18 @@ Revoking the consent window also cancels every pending approval.
 
 Other ClassInteract actions (`exec`, `fs_write`, `mouse_move`,
 `key_press`) stay admitted by the standing window under strict
-mode -- typed text and non-region-confined mouse clicks are the
-calls the spec singles out as load-bearing for the second consent
-decision. The region-confined `mouse_click` exemption from the
-original spec has no design yet; revisit when that concept lands.
+mode -- typed text and mouse clicks are the calls the spec singles
+out as load-bearing for the second consent decision.
+
+**Region exemption.** A strict grant can carry an optional
+screen-coordinate region rect. A `mouse_click` whose cursor falls
+INSIDE the region is admitted without the per-action approval
+modal -- the operator pre-authorised that zone of the screen.
+Clicks outside the region still pop the Allow/Deny modal.
+`key_type` has no cursor coordinate, so the region exemption never
+applies to it -- typed text stays fully gated under strict mode.
+The region is set in the Workers-tab Grant flow (see below); the
+CLI `grant` path always uses plain strict mode (no region).
 
 #### Workers tab (in-cockpit dashboard)
 
@@ -114,11 +122,18 @@ and renders:
 - In-pane Grant / Revoke: `G` opens a duration picker
   (5 min / 1 hour / 8 hours), `S` toggles strict before submitting,
   `Enter` grants; `R` revokes immediately.
+- **Region picker** (strict grants only): after toggling strict on,
+  `Enter` opens a region picker — a schematic of the screen with a
+  box you move with the arrow keys and resize with Shift+Arrows.
+  `Enter` grants with that region as the in-region exemption rect;
+  `N` skips the region (strict grant that gates every high-risk
+  call); `Esc` steps back to the duration picker.
 - **Strict-mode per-action approval**: when a strict window is open
-  and the agent calls `key_type` or `mouse_click`, the worker
-  blocks and the tab pops a modal naming the tool + action. Press
-  `A` to ALLOW once, `D` to DENY. Multiple pending approvals queue
-  FIFO; the modal cycles through them as you respond.
+  and the agent calls `key_type`, or a `mouse_click` outside the
+  region, the worker blocks and the tab pops a modal naming the
+  tool + action. Press `A` to ALLOW once, `D` to DENY. Multiple
+  pending approvals queue FIFO; the modal cycles through them as
+  you respond.
 
 A global kill switch — **`Ctrl+E` from any tab** — calls the same
 `revoke` op without making the user switch to the Workers tab

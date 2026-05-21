@@ -22,8 +22,13 @@ import (
 // the consent manager whether a tool dispatch may run right now.
 // Pulled out as an interface so tests can wire a stub without
 // pulling in the full consent package surface.
+//
+// AllowsAt carries the cursor position so the strict-mode region
+// exemption (memql-cockpit#131) can fire for workerComputer.mouse_click.
+// Allows is the no-cursor convenience for every other call.
 type ConsentGate interface {
 	Allows(tool, action string) consent.Decision
+	AllowsAt(tool, action string, cursor consent.CursorPoint) consent.Decision
 }
 
 // Dispatcher is the cockpit-side tool dispatcher. Implements
@@ -124,7 +129,21 @@ func (d *Dispatcher) Dispatch(ctx context.Context, dispatch *memqlv1.ToolDispatc
 	// hint about how to open one. When d.consent == nil (no gate
 	// wired, e.g. legacy tests) we behave the pre-#64 way.
 	if d.consent != nil {
-		dec := d.consent.Allows(tool, action)
+		// For workerComputer.mouse_click, resolve the live cursor
+		// position so the strict-mode region exemption can fire
+		// (memql-cockpit#131). mouse_click carries no coordinates of
+		// its own -- positioning happens via a preceding mouse_move
+		// -- so the region check reads where the cursor actually is
+		// at dispatch time. cursorLocation() is GUI-build-backed;
+		// the headless stub returns Known=false, which AllowsAt
+		// treats as out-of-region (falls through to the gate).
+		var dec consent.Decision
+		if tool == "workerComputer" && action == "mouse_click" {
+			cx, cy, ok := cursorLocation()
+			dec = d.consent.AllowsAt(tool, action, consent.CursorPoint{X: cx, Y: cy, Known: ok})
+		} else {
+			dec = d.consent.Allows(tool, action)
+		}
 		if !dec.Allowed {
 			elapsedMs := time.Since(startedAt).Milliseconds()
 			d.logger.Warn("worker tool dispatch FAIL (consent_required)",

@@ -149,6 +149,16 @@ func guiCursorPosition(_ map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	return successComputerJSON(map[string]any{"x": x, "y": y}, fmt.Sprintf("(%d,%d)", x, y), 0), nil
 }
 
+// cursorLocation reports the live cursor position for the consent
+// gate's strict-mode region exemption (memql-cockpit#131). The
+// dispatcher calls it just before gating a workerComputer.mouse_click
+// so an in-region click can skip the per-action approval modal.
+// Always Known=true on the GUI build; the headless stub returns false.
+func cursorLocation() (x, y int, known bool) {
+	x, y = robotgo.Location()
+	return x, y, true
+}
+
 func guiMouseMove(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	x := argInt(args, "x", -1)
 	y := argInt(args, "y", -1)

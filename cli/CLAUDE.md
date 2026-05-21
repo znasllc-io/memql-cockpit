@@ -127,10 +127,20 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
    Pending approvals queue FIFO and the modal cycles as the operator
    responds. The 30-second default timeout (worker side) denies
    unanswered approvals; Revoke cancels every pending approval too.
-   NOT gated on a cluster connection -- the IPC is local-host between
-   cockpit processes. Per memql-cockpit#64. A global `Ctrl+E` kill
-   switch in `dispatchEvent` calls into `workersView.Revoke()` from
-   any tab without making the operator switch tabs first.
+   **Region exemption** (#131): a strict grant can carry a
+   screen-coordinate region rect. Toggling strict on in the Grant
+   modal makes `Enter` advance to a region picker (schematic of the
+   screen + an arrow-key-movable / Shift+Arrow-resizable box);
+   `Enter` grants with the region, `N` skips it, `Esc` steps back.
+   A `mouse_click` whose cursor is inside the region skips the
+   approval gate; out-of-region clicks + all `key_type` still gate.
+   The region is a static rect in a fixed 1920x1080 reference space
+   -- the worker has no window-bounds API yet (window_list /
+   window_focus are stubs). NOT gated on a cluster connection --
+   the IPC is local-host between cockpit processes. Per
+   memql-cockpit#64. A global `Ctrl+E` kill switch in
+   `dispatchEvent` calls into `workersView.Revoke()` from any tab
+   without making the operator switch tabs first.
 6. **Settings (F6)** -- credentials, theme, version
 
 Concepts, Planner, and Chat are all gated on a connected, selected

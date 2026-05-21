@@ -34,7 +34,7 @@ func TestManager_GrantedWindowAdmits(t *testing.T) {
 	clk := newFakeClock(time.Unix(1_700_000_000, 0).UTC())
 	m := NewManagerWithClock(clk.Now)
 
-	if _, err := m.Grant(time.Hour, false); err != nil {
+	if _, err := m.Grant(time.Hour, false, nil); err != nil {
 		t.Fatalf("Grant: %v", err)
 	}
 
@@ -57,7 +57,7 @@ func TestManager_RevokeImmediatelyDenies(t *testing.T) {
 	clk := newFakeClock(time.Unix(1_700_000_000, 0).UTC())
 	m := NewManagerWithClock(clk.Now)
 
-	if _, err := m.Grant(time.Hour, false); err != nil {
+	if _, err := m.Grant(time.Hour, false, nil); err != nil {
 		t.Fatalf("Grant: %v", err)
 	}
 	if dec := m.Allows("workerHost", "exec"); !dec.Allowed {
@@ -78,7 +78,7 @@ func TestManager_WindowExpiryDenies(t *testing.T) {
 	clk := newFakeClock(start)
 	m := NewManagerWithClock(clk.Now)
 
-	if _, err := m.Grant(10*time.Minute, false); err != nil {
+	if _, err := m.Grant(10*time.Minute, false, nil); err != nil {
 		t.Fatalf("Grant: %v", err)
 	}
 	// Mid-window: admit.
@@ -101,12 +101,12 @@ func TestManager_SecondGrantOverwrites(t *testing.T) {
 	clk := newFakeClock(time.Unix(1_700_000_000, 0).UTC())
 	m := NewManagerWithClock(clk.Now)
 
-	if _, err := m.Grant(time.Hour, false); err != nil {
+	if _, err := m.Grant(time.Hour, false, nil); err != nil {
 		t.Fatalf("Grant 1: %v", err)
 	}
 	first := m.Snapshot().ExpiresAt
 	clk.advance(5 * time.Minute)
-	if _, err := m.Grant(2*time.Hour, true); err != nil {
+	if _, err := m.Grant(2*time.Hour, true, nil); err != nil {
 		t.Fatalf("Grant 2: %v", err)
 	}
 	second := m.Snapshot().ExpiresAt
@@ -120,10 +120,10 @@ func TestManager_SecondGrantOverwrites(t *testing.T) {
 
 func TestManager_NegativeWindowRejected(t *testing.T) {
 	m := NewManager()
-	if _, err := m.Grant(0, false); err == nil {
+	if _, err := m.Grant(0, false, nil); err == nil {
 		t.Error("Grant(0) should reject")
 	}
-	if _, err := m.Grant(-time.Second, false); err == nil {
+	if _, err := m.Grant(-time.Second, false, nil); err == nil {
 		t.Error("Grant(-1s) should reject")
 	}
 }
@@ -134,7 +134,7 @@ func TestManager_SubscribeReceivesEvents(t *testing.T) {
 	ch, cancel := m.Subscribe()
 	defer cancel()
 
-	if _, err := m.Grant(time.Hour, false); err != nil {
+	if _, err := m.Grant(time.Hour, false, nil); err != nil {
 		t.Fatalf("Grant: %v", err)
 	}
 	m.Allows("workerHost", "exec")
@@ -196,7 +196,7 @@ func TestSnapshot_GrantedShowsExpiry(t *testing.T) {
 	if snap := m.Snapshot(); snap.Granted {
 		t.Fatal("Snapshot before any Grant should report Granted=false")
 	}
-	if _, err := m.Grant(30*time.Minute, true); err != nil {
+	if _, err := m.Grant(30*time.Minute, true, nil); err != nil {
 		t.Fatalf("Grant: %v", err)
 	}
 	snap := m.Snapshot()
@@ -225,7 +225,7 @@ func TestSnapshot_GrantedShowsExpiry(t *testing.T) {
 func TestStrictMode_KeyTypeBlocksAwaitingApproval(t *testing.T) {
 	m := NewManager()
 	m.SetApprovalTimeout(2 * time.Second)
-	if _, err := m.Grant(time.Hour, true); err != nil {
+	if _, err := m.Grant(time.Hour, true, nil); err != nil {
 		t.Fatalf("Grant strict: %v", err)
 	}
 
@@ -283,7 +283,7 @@ func TestStrictMode_KeyTypeBlocksAwaitingApproval(t *testing.T) {
 func TestStrictMode_MouseClickDeny(t *testing.T) {
 	m := NewManager()
 	m.SetApprovalTimeout(2 * time.Second)
-	if _, err := m.Grant(time.Hour, true); err != nil {
+	if _, err := m.Grant(time.Hour, true, nil); err != nil {
 		t.Fatalf("Grant strict: %v", err)
 	}
 
@@ -313,7 +313,7 @@ func TestStrictMode_MouseClickDeny(t *testing.T) {
 func TestStrictMode_TimeoutDenies(t *testing.T) {
 	m := NewManager()
 	m.SetApprovalTimeout(40 * time.Millisecond)
-	if _, err := m.Grant(time.Hour, true); err != nil {
+	if _, err := m.Grant(time.Hour, true, nil); err != nil {
 		t.Fatalf("Grant strict: %v", err)
 	}
 	dec := m.Allows("workerComputer", "key_type")
@@ -335,7 +335,7 @@ func TestStrictMode_TimeoutDenies(t *testing.T) {
 func TestStrictMode_RevokeCancelsPending(t *testing.T) {
 	m := NewManager()
 	m.SetApprovalTimeout(5 * time.Second)
-	if _, err := m.Grant(time.Hour, true); err != nil {
+	if _, err := m.Grant(time.Hour, true, nil); err != nil {
 		t.Fatalf("Grant strict: %v", err)
 	}
 	done := make(chan Decision, 1)
@@ -365,7 +365,7 @@ func TestStrictMode_RevokeCancelsPending(t *testing.T) {
 func TestStrictMode_HighRiskSubset(t *testing.T) {
 	m := NewManager()
 	m.SetApprovalTimeout(40 * time.Millisecond)
-	if _, err := m.Grant(time.Hour, true); err != nil {
+	if _, err := m.Grant(time.Hour, true, nil); err != nil {
 		t.Fatalf("Grant strict: %v", err)
 	}
 	for _, tc := range []struct {
@@ -404,7 +404,7 @@ func TestStrictMode_HighRiskSubset(t *testing.T) {
 func TestStrictMode_NonStrictBypassesApproval(t *testing.T) {
 	m := NewManager()
 	m.SetApprovalTimeout(40 * time.Millisecond)
-	if _, err := m.Grant(time.Hour, false); err != nil {
+	if _, err := m.Grant(time.Hour, false, nil); err != nil {
 		t.Fatalf("Grant non-strict: %v", err)
 	}
 	dec := m.Allows("workerComputer", "key_type")
@@ -424,7 +424,7 @@ func TestStrictMode_BroadcastsApprovalRequestedEvent(t *testing.T) {
 	// in the channel and we don't race the Subscribe registration.
 	ch, cancel := m.Subscribe()
 	defer cancel()
-	if _, err := m.Grant(time.Hour, true); err != nil {
+	if _, err := m.Grant(time.Hour, true, nil); err != nil {
 		t.Fatalf("Grant strict: %v", err)
 	}
 
@@ -515,4 +515,193 @@ func waitForPending(t *testing.T, m *Manager, n int) []PendingApprovalInfo {
 	}
 	t.Fatalf("timed out waiting for %d pending approvals", n)
 	return nil
+}
+
+// --- 131: strict-mode region exemption ---
+
+// TestRegion_Contains pins the half-open rect containment used by
+// the in-region exemption.
+func TestRegion_Contains(t *testing.T) {
+	r := Region{X: 100, Y: 100, W: 200, H: 150}
+	cases := []struct {
+		px, py int
+		want   bool
+	}{
+		{100, 100, true},  // top-left corner inside
+		{299, 249, true},  // last interior pixel
+		{300, 249, false}, // right edge exclusive
+		{299, 250, false}, // bottom edge exclusive
+		{200, 175, true},  // interior
+		{99, 175, false},  // left of region
+		{200, 99, false},  // above region
+		{0, 0, false},
+	}
+	for _, c := range cases {
+		if got := r.Contains(c.px, c.py); got != c.want {
+			t.Errorf("Region%+v.Contains(%d,%d) = %v, want %v", r, c.px, c.py, got, c.want)
+		}
+	}
+	// Zero-area regions contain nothing.
+	if (Region{X: 10, Y: 10, W: 0, H: 50}).Contains(10, 10) {
+		t.Error("zero-width region must contain nothing")
+	}
+	if (Region{X: 10, Y: 10, W: 50, H: 0}).Contains(10, 10) {
+		t.Error("zero-height region must contain nothing")
+	}
+}
+
+// TestRegion_InRegionClickSkipsApproval: a strict grant carrying a
+// region admits a mouse_click whose cursor is inside the rect
+// WITHOUT going through the per-action approval gate.
+func TestRegion_InRegionClickSkipsApproval(t *testing.T) {
+	m := NewManager()
+	// Tiny timeout: if the call wrongly hit the approval gate the
+	// test would still finish fast (deny), and the assertion below
+	// catches the wrong outcome.
+	m.SetApprovalTimeout(40 * time.Millisecond)
+	region := &Region{X: 100, Y: 100, W: 400, H: 300}
+	if _, err := m.Grant(time.Hour, true, region); err != nil {
+		t.Fatalf("Grant strict+region: %v", err)
+	}
+	// Cursor inside the region.
+	dec := m.AllowsAt("workerComputer", "mouse_click", CursorPoint{X: 250, Y: 200, Known: true})
+	if !dec.Allowed {
+		t.Errorf("in-region click must admit without approval; reason=%s", dec.Reason)
+	}
+	if !strings.Contains(dec.Reason, "in-region") {
+		t.Errorf("admit reason should name the in-region exemption; got %q", dec.Reason)
+	}
+}
+
+// TestRegion_OutOfRegionClickGated: a click outside the region
+// still routes through the approval gate (here: times out -> deny).
+func TestRegion_OutOfRegionClickGated(t *testing.T) {
+	m := NewManager()
+	m.SetApprovalTimeout(40 * time.Millisecond)
+	region := &Region{X: 100, Y: 100, W: 400, H: 300}
+	if _, err := m.Grant(time.Hour, true, region); err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	// Cursor far outside the region.
+	dec := m.AllowsAt("workerComputer", "mouse_click", CursorPoint{X: 1000, Y: 900, Known: true})
+	if dec.Allowed {
+		t.Error("out-of-region click must be gated (timed out -> deny here)")
+	}
+	if !strings.Contains(dec.Reason, "timed out") {
+		t.Errorf("out-of-region click should have hit the approval gate; got %q", dec.Reason)
+	}
+}
+
+// TestRegion_UnknownCursorGated: an unknown cursor (headless build,
+// or a non-mouse_click path) can never be in-region -- it falls
+// through to the gate even with a region set.
+func TestRegion_UnknownCursorGated(t *testing.T) {
+	m := NewManager()
+	m.SetApprovalTimeout(40 * time.Millisecond)
+	region := &Region{X: 0, Y: 0, W: 9999, H: 9999} // covers everything
+	if _, err := m.Grant(time.Hour, true, region); err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	dec := m.AllowsAt("workerComputer", "mouse_click", CursorPoint{Known: false})
+	if dec.Allowed {
+		t.Error("unknown cursor must be gated even with an all-covering region")
+	}
+}
+
+// TestRegion_KeyTypeAlwaysGated: key_type carries no cursor, so the
+// region exemption never applies to it -- it stays gated under
+// strict mode even when a region is set and would otherwise cover
+// the whole screen.
+func TestRegion_KeyTypeAlwaysGated(t *testing.T) {
+	m := NewManager()
+	m.SetApprovalTimeout(40 * time.Millisecond)
+	region := &Region{X: 0, Y: 0, W: 9999, H: 9999}
+	if _, err := m.Grant(time.Hour, true, region); err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	// Even with a cursor that's "in region", key_type ignores it.
+	dec := m.AllowsAt("workerComputer", "key_type", CursorPoint{X: 10, Y: 10, Known: true})
+	if dec.Allowed {
+		t.Error("key_type must stay gated under strict mode regardless of region")
+	}
+}
+
+// TestRegion_NonStrictIgnoresRegion: a non-strict grant drops any
+// region passed to it -- there's no gate to exempt from.
+func TestRegion_NonStrictIgnoresRegion(t *testing.T) {
+	m := NewManager()
+	region := &Region{X: 0, Y: 0, W: 100, H: 100}
+	if _, err := m.Grant(time.Hour, false, region); err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	if snap := m.Snapshot(); snap.Region != nil {
+		t.Errorf("non-strict grant must not carry a region; got %+v", snap.Region)
+	}
+	// A click anywhere still admits (non-strict window).
+	dec := m.AllowsAt("workerComputer", "mouse_click", CursorPoint{X: 5000, Y: 5000, Known: true})
+	if !dec.Allowed {
+		t.Errorf("non-strict window must admit any click; reason=%s", dec.Reason)
+	}
+}
+
+// TestRegion_StrictNoRegionGatesAll: a strict grant with NO region
+// gates every high-risk call -- the 64-B behaviour, unchanged.
+func TestRegion_StrictNoRegionGatesAll(t *testing.T) {
+	m := NewManager()
+	m.SetApprovalTimeout(40 * time.Millisecond)
+	if _, err := m.Grant(time.Hour, true, nil); err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	dec := m.AllowsAt("workerComputer", "mouse_click", CursorPoint{X: 50, Y: 50, Known: true})
+	if dec.Allowed {
+		t.Error("strict + no region must gate every mouse_click")
+	}
+}
+
+// TestRegion_SnapshotAndEventCarryRegion confirms the region rides
+// the Status snapshot + the EventGranted broadcast so the TUI can
+// render it.
+func TestRegion_SnapshotAndEventCarryRegion(t *testing.T) {
+	m := NewManager()
+	ch, cancel := m.Subscribe()
+	defer cancel()
+	region := &Region{X: 12, Y: 34, W: 56, H: 78}
+	if _, err := m.Grant(time.Hour, true, region); err != nil {
+		t.Fatalf("Grant: %v", err)
+	}
+	snap := m.Snapshot()
+	if snap.Region == nil || *snap.Region != *region {
+		t.Errorf("Snapshot.Region = %+v, want %+v", snap.Region, region)
+	}
+	select {
+	case ev := <-ch:
+		if ev.Kind != EventGranted {
+			t.Fatalf("expected EventGranted, got %q", ev.Kind)
+		}
+		if ev.Region == nil || *ev.Region != *region {
+			t.Errorf("EventGranted.Region = %+v, want %+v", ev.Region, region)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no EventGranted broadcast")
+	}
+}
+
+// TestIsMouseClick guards the click classifier the region exemption
+// keys off.
+func TestIsMouseClick(t *testing.T) {
+	for _, c := range []struct {
+		tool, action string
+		want         bool
+	}{
+		{"workerComputer", "mouse_click", true},
+		{"workerComputer", "MOUSE_CLICK", true},
+		{" workerComputer ", " mouse_click ", true},
+		{"workerComputer", "key_type", false},
+		{"workerComputer", "mouse_move", false},
+		{"workerHost", "exec", false},
+	} {
+		if got := isMouseClick(c.tool, c.action); got != c.want {
+			t.Errorf("isMouseClick(%q,%q) = %v, want %v", c.tool, c.action, got, c.want)
+		}
+	}
 }

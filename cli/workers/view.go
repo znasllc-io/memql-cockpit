@@ -71,7 +71,7 @@ var grantPresets = []grantPreset{
 // standing up a real socket.
 type Client interface {
 	Status() (consent.Response, error)
-	Grant(window time.Duration, strict bool) (consent.Response, error)
+	Grant(window time.Duration, strict bool, region *consent.Region) (consent.Response, error)
 	Revoke() (consent.Response, error)
 	Approve(id string) (consent.Response, error)
 	Deny(id string) (consent.Response, error)
@@ -140,10 +140,43 @@ type View struct {
 	cancel    context.CancelFunc
 }
 
-// grantModalState is the transient state for the duration picker.
+// grantStage is the two-step state of the Grant modal. A non-strict
+// grant submits straight from the duration stage; a strict grant
+// advances to the region stage where the operator optionally draws
+// the in-region exemption rect (memql-cockpit#131).
+type grantStage int
+
+const (
+	grantStageDuration grantStage = iota
+	grantStageRegion
+)
+
+// regionRefWidth / regionRefHeight are the reference screen
+// dimensions the region picker's schematic + clamp use. The worker
+// has no window-bounds API to report the real screen size today
+// (see memql-cockpit#131), so the picker works in a fixed 1920x1080
+// reference space. The numeric x/y/w/h the operator sets are
+// absolute screen pixels regardless -- an operator on a differently
+// sized display can still nudge to the right absolute numbers; the
+// schematic is only a rough visual aid. A live screenshot underlay
+// + real screen size is documented future polish.
+const (
+	regionRefWidth  = 1920
+	regionRefHeight = 1080
+	regionNudge     = 20 // px step for arrow-key move / resize
+)
+
+// grantModalState is the transient state for the Grant modal.
 type grantModalState struct {
-	selected int  // index into grantPresets
-	strict   bool // toggled with 's' before submitting
+	stage    grantStage
+	selected int  // index into grantPresets (duration stage)
+	strict   bool // toggled with 's' (duration stage)
+	region   consent.Region
+	// hasRegion is false until the operator first touches the
+	// region picker; a strict grant submitted with hasRegion=false
+	// carries no region (gate-all). Seeded true with a sensible
+	// default rect the moment the region stage opens.
+	hasRegion bool
 }
 
 // approvalEntry is one queued strict-mode approval awaiting an
@@ -657,11 +690,21 @@ func (v *View) drawChrome(screen *ui.Screen, bounds ui.Rect) {
 		{Key: "↑/↓", Label: "Scroll", Disabled: len(v.events) == 0},
 	}
 	if v.grantModal != nil {
-		chips = []ui.HintChip{
-			{Key: "↑/↓", Label: "Pick"},
-			{Key: "S", Label: v.strictChipLabel()},
-			{Key: "Enter", Label: "Grant"},
-			{Key: "Esc", Label: "Cancel"},
+		if v.grantModal.stage == grantStageRegion {
+			chips = []ui.HintChip{
+				{Key: "↑/↓/←/→", Label: "Move"},
+				{Key: "Shift+Arrows", Label: "Resize"},
+				{Key: "Enter", Label: "Grant"},
+				{Key: "N", Label: "NoRegion"},
+				{Key: "Esc", Label: "Back"},
+			}
+		} else {
+			chips = []ui.HintChip{
+				{Key: "↑/↓", Label: "Pick"},
+				{Key: "S", Label: v.strictChipLabel()},
+				{Key: "Enter", Label: "Grant"},
+				{Key: "Esc", Label: "Cancel"},
+			}
 		}
 	}
 	if len(v.approvalQueue) > 0 {
@@ -736,14 +779,17 @@ func (v *View) strictChipLabel() string {
 	return "Strict:Off"
 }
 
-// drawGrantModal overlays a small bordered panel near the bottom of
-// the pane listing the duration presets. The selected preset is
-// highlighted; pressing Enter calls Client.Grant with that duration.
+// drawGrantModal overlays the Grant modal. Two stages: the duration
+// picker, and (for a strict grant) the region picker.
 func (v *View) drawGrantModal(screen *ui.Screen, bounds ui.Rect) {
 	if v.grantModal == nil {
 		return
 	}
-	// Geometry: 4 + len(presets) rows tall, ~40 cols wide, centered.
+	if v.grantModal.stage == grantStageRegion {
+		v.drawRegionStage(screen, bounds)
+		return
+	}
+	// Duration stage: bordered panel listing the presets.
 	modalH := len(grantPresets) + 4
 	modalW := 44
 	if modalW > bounds.Width-4 {
@@ -776,9 +822,92 @@ func (v *View) drawGrantModal(screen *ui.Screen, bounds ui.Rect) {
 
 	strictLine := "Strict mode: off  (S to toggle)"
 	if v.grantModal.strict {
-		strictLine = "Strict mode: ON   (S to toggle)"
+		strictLine = "Strict mode: ON   (S -> region picker next)"
 	}
 	screen.DrawText(x+2, y+modalH-2, modalW-4, strictLine, v.Theme.SubtleStyle())
+}
+
+// drawRegionStage renders the strict-mode region picker: a schematic
+// of the reference screen with the in-region exemption box drawn
+// inside it, plus the live numeric x/y/w/h. Arrow keys move the box,
+// Shift+Arrow resize.
+func (v *View) drawRegionStage(screen *ui.Screen, bounds ui.Rect) {
+	m := v.grantModal
+	modalW := 56
+	modalH := 16
+	if modalW > bounds.Width-4 {
+		modalW = bounds.Width - 4
+	}
+	if modalH > bounds.Height-4 {
+		modalH = bounds.Height - 4
+	}
+	x := bounds.X + (bounds.Width-modalW)/2
+	y := bounds.Y + (bounds.Height-modalH)/2
+	if y < bounds.Y+1 {
+		y = bounds.Y + 1
+	}
+
+	screen.FillRect(x, y, modalW, modalH, v.Theme.BaseStyle())
+	screen.DrawBox(x, y, modalW, modalH, v.Theme.AccentStyle())
+	screen.DrawText(x+2, y, 26, " STRICT-MODE REGION ", v.Theme.AccentStyle().Bold(true))
+
+	// Schematic: a sub-box representing the reference screen. Leave
+	// margins inside the modal; the box is the screen, the inner
+	// fill is the region rect scaled into it.
+	schemX := x + 2
+	schemY := y + 2
+	schemW := modalW - 4
+	schemH := modalH - 8
+	if schemW > 4 && schemH > 2 {
+		screen.DrawBox(schemX, schemY, schemW, schemH, v.Theme.SubtleStyle())
+		// Map the region rect (in regionRef space) into the
+		// schematic interior.
+		innerW := schemW - 2
+		innerH := schemH - 2
+		rx := schemX + 1 + scaleClamp(m.region.X, regionRefWidth, innerW)
+		ry := schemY + 1 + scaleClamp(m.region.Y, regionRefHeight, innerH)
+		rw := scaleClamp(m.region.W, regionRefWidth, innerW)
+		rh := scaleClamp(m.region.H, regionRefHeight, innerH)
+		if rw < 1 {
+			rw = 1
+		}
+		if rh < 1 {
+			rh = 1
+		}
+		// Keep the drawn box inside the schematic interior.
+		if rx+rw > schemX+1+innerW {
+			rw = schemX + 1 + innerW - rx
+		}
+		if ry+rh > schemY+1+innerH {
+			rh = schemY + 1 + innerH - ry
+		}
+		if rw > 0 && rh > 0 {
+			screen.FillRect(rx, ry, rw, rh, v.Theme.SelectionStyle())
+		}
+	}
+
+	// Numeric readout + hint, anchored to the last two interior rows.
+	coordLine := fmt.Sprintf("x=%d  y=%d  w=%d  h=%d   (absolute screen px, ref %dx%d)",
+		m.region.X, m.region.Y, m.region.W, m.region.H, regionRefWidth, regionRefHeight)
+	screen.DrawText(x+2, y+modalH-3, modalW-4, coordLine, v.Theme.BaseStyle())
+	hint := "Arrows:Move  Shift+Arrows:Resize  Enter:Grant  N:NoRegion  Esc:Back"
+	screen.DrawText(x+2, y+modalH-2, modalW-4, hint, v.Theme.SubtleStyle())
+}
+
+// scaleClamp maps a value from [0, refMax] onto [0, target],
+// clamping the result into [0, target].
+func scaleClamp(v, refMax, target int) int {
+	if refMax <= 0 || target <= 0 {
+		return 0
+	}
+	out := v * target / refMax
+	if out < 0 {
+		return 0
+	}
+	if out > target {
+		return target
+	}
+	return out
 }
 
 // HandleEvent routes a tcell event into the view. Returns true when
@@ -918,6 +1047,10 @@ func (v *View) handleModalKey(key *tcell.EventKey) bool {
 		v.Mu.Unlock()
 		return false
 	}
+	if m.stage == grantStageRegion {
+		return v.handleRegionStageKey(key, m)
+	}
+	// Duration stage.
 	switch key.Key() {
 	case tcell.KeyEscape:
 		v.grantModal = nil
@@ -941,10 +1074,26 @@ func (v *View) handleModalKey(key *tcell.EventKey) bool {
 	case tcell.KeyEnter:
 		picked := grantPresets[m.selected]
 		strict := m.strict
+		if strict {
+			// Strict grant -> advance to the region picker stage
+			// instead of granting immediately. Seed a sensible
+			// default rect (centered third of the reference screen).
+			m.stage = grantStageRegion
+			m.region = consent.Region{
+				X: regionRefWidth / 3,
+				Y: regionRefHeight / 3,
+				W: regionRefWidth / 3,
+				H: regionRefHeight / 3,
+			}
+			m.hasRegion = false // not yet confirmed by the operator
+			v.Mu.Unlock()
+			v.Redraw()
+			return true
+		}
 		v.grantModal = nil
 		v.Mu.Unlock()
 		v.Redraw()
-		go v.doGrant(picked.Duration, strict)
+		go v.doGrant(picked.Duration, false, nil)
 		return true
 	case tcell.KeyRune:
 		if r := key.Rune(); r == 's' || r == 'S' {
@@ -958,9 +1107,104 @@ func (v *View) handleModalKey(key *tcell.EventKey) bool {
 	return false
 }
 
+// handleRegionStageKey drives the strict-mode region picker. Arrow
+// keys move the box; Shift+Arrow resize it. Enter grants WITH the
+// region; N grants strict with NO region (gate every high-risk
+// call); Esc steps back to the duration stage. Caller holds v.Mu;
+// this function releases it on every return path.
+func (v *View) handleRegionStageKey(key *tcell.EventKey, m *grantModalState) bool {
+	shift := key.Modifiers()&tcell.ModShift != 0
+	switch key.Key() {
+	case tcell.KeyEscape:
+		// Back to the duration stage (not a full cancel -- the
+		// operator can re-pick the duration or toggle strict off).
+		m.stage = grantStageDuration
+		v.Mu.Unlock()
+		v.Redraw()
+		return true
+	case tcell.KeyUp:
+		if shift {
+			m.region.H = clampMin(m.region.H-regionNudge, regionNudge)
+		} else {
+			m.region.Y = clampMin(m.region.Y-regionNudge, 0)
+		}
+		m.hasRegion = true
+		v.Mu.Unlock()
+		v.Redraw()
+		return true
+	case tcell.KeyDown:
+		if shift {
+			m.region.H += regionNudge
+		} else {
+			m.region.Y += regionNudge
+		}
+		m.hasRegion = true
+		v.Mu.Unlock()
+		v.Redraw()
+		return true
+	case tcell.KeyLeft:
+		if shift {
+			m.region.W = clampMin(m.region.W-regionNudge, regionNudge)
+		} else {
+			m.region.X = clampMin(m.region.X-regionNudge, 0)
+		}
+		m.hasRegion = true
+		v.Mu.Unlock()
+		v.Redraw()
+		return true
+	case tcell.KeyRight:
+		if shift {
+			m.region.W += regionNudge
+		} else {
+			m.region.X += regionNudge
+		}
+		m.hasRegion = true
+		v.Mu.Unlock()
+		v.Redraw()
+		return true
+	case tcell.KeyEnter:
+		picked := grantPresets[m.selected]
+		region := m.region
+		hasRegion := m.hasRegion
+		v.grantModal = nil
+		v.Mu.Unlock()
+		v.Redraw()
+		if hasRegion {
+			r := region
+			go v.doGrant(picked.Duration, true, &r)
+		} else {
+			// Operator advanced to the region stage but never
+			// touched the box -- treat as "strict, no region".
+			go v.doGrant(picked.Duration, true, nil)
+		}
+		return true
+	case tcell.KeyRune:
+		if r := key.Rune(); r == 'n' || r == 'N' {
+			// Skip the region: strict grant that gates every
+			// high-risk call.
+			picked := grantPresets[m.selected]
+			v.grantModal = nil
+			v.Mu.Unlock()
+			v.Redraw()
+			go v.doGrant(picked.Duration, true, nil)
+			return true
+		}
+	}
+	v.Mu.Unlock()
+	return false
+}
+
+// clampMin returns the larger of v and lo.
+func clampMin(v, lo int) int {
+	if v < lo {
+		return lo
+	}
+	return v
+}
+
 func (v *View) openGrantModal() {
 	v.Mu.Lock()
-	v.grantModal = &grantModalState{}
+	v.grantModal = &grantModalState{stage: grantStageDuration}
 	v.Mu.Unlock()
 	v.Redraw()
 }
@@ -970,14 +1214,14 @@ func (v *View) openGrantModal() {
 // the Watch stream's `granted` event; we still apply the immediate
 // Response to the status block so the UI doesn't have to wait a
 // roundtrip for the audit event to land.
-func (v *View) doGrant(window time.Duration, strict bool) {
+func (v *View) doGrant(window time.Duration, strict bool, region *consent.Region) {
 	v.Mu.RLock()
 	c := v.client
 	v.Mu.RUnlock()
 	if c == nil {
 		return
 	}
-	resp, err := c.Grant(window, strict)
+	resp, err := c.Grant(window, strict, region)
 	if err != nil {
 		v.Notify(fmt.Sprintf("Grant failed: %v", err))
 		v.markDisconnected(err)
