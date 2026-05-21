@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
-	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
+	"github.com/znasllc-io/memql/sdk/go/client"
 )
 
 // TestSettingsView_NoRaceUnderConcurrentMutate is the race test for
@@ -28,7 +28,7 @@ func TestSettingsView_NoRaceUnderConcurrentMutate(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < iters; i++ {
-			v.SetMyAccess("local", &memqlv1.MyAccessResult{
+			v.SetMyAccess("local", &client.AccessSummary{
 				// Bare struct -- the test cares about the assignment
 				// being atomic, not the contents.
 			})

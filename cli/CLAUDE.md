@@ -516,11 +516,12 @@ What that means concretely:
   The remaining worker dial in `cmd/memql-cockpit/internal/worker/`
   is a known leak tracked in memql#117 -- it will move to
   `sdk/go/worker/` and the cockpit will dial through that.
-- **No `memqlv1` imports** under `cli/**`. The five current sites
+- **No `memqlv1` imports** under `cli/**`. The previous leak set
   (`app.go`, `pool.go`, `settings/view.go`, `concepts/view.go`,
   `concepts/chrome_contract_test.go`, `settings/settings_race_test.go`)
-  are tracked in memql#115 (SDK C). Once that lands, they go away
-  and stay gone.
+  migrated to the SDK-owned wrapper types in memql#115. The rule is
+  now load-bearing -- the next `memqlv1` import has to either belong
+  inside the SDK or be added with a justification.
 - **No raw DSL strings.** Never `qc.Execute("queryActiveSpaces({})")`
   and never `qc.Execute("concept==v1:cognition:space; ...")`.
   Consumers call the typed generated methods on `QueryClient`

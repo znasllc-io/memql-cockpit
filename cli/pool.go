@@ -14,7 +14,6 @@ import (
 	"github.com/znasllc-io/memql-cockpit/cli/auth"
 	"github.com/znasllc-io/memql-cockpit/cli/cluster"
 	"github.com/znasllc-io/memql-cockpit/cli/config"
-	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 	nodev1 "github.com/znasllc-io/memql/component/node/gen"
 	"github.com/znasllc-io/memql/sdk/go/client"
 )
@@ -101,7 +100,7 @@ type connEntry struct {
 	Conn      *client.Connection
 	SubMgr    *client.SubscriptionManager
 	SubId     string
-	Events    <-chan *memqlv1.EventNotification
+	Events    <-chan client.Event
 	Nodes     []cluster.NodeInfo
 	NodeTypes []cluster.NodeTypeInfo // seeded order from queryClusterNodeTypes; drives topology row layout
 	State     entryState
@@ -555,7 +554,7 @@ func (e *connEntry) dialOnce(ctx context.Context) error {
 	sm := client.NewSubscriptionManager(conn.Dispatcher())
 	subCtx := context.Background()
 	subId, events, err := sm.Subscribe(subCtx,
-		memqlv1.SubscriptionKind_SUBSCRIPTION_KIND_GRAPH_EVENTS,
+		client.SubscriptionKindGraphEvents,
 		"node.created.v1:cluster:node",
 	)
 	if err != nil {
