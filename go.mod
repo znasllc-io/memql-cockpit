@@ -3,6 +3,7 @@ module github.com/znasllc-io/memql-cockpit
 go 1.26.1
 
 require (
+	github.com/99designs/keyring v1.2.2
 	github.com/gdamore/tcell/v2 v2.13.9
 	github.com/gen2brain/malgo v0.11.25
 	github.com/go-vgo/robotgo v1.0.2
@@ -16,14 +17,13 @@ require (
 
 require (
 	github.com/99designs/go-keychain v0.0.0-20191008050251-8e49817e8af4 // indirect
-	github.com/99designs/keyring v1.2.2 // indirect
 	github.com/anthropics/anthropic-sdk-go v1.27.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/danieljoos/wincred v1.1.2 // indirect
 	github.com/dblohm7/wingoes v0.0.0-20250822163801-6d8e6105c62d // indirect
 	github.com/dgraph-io/ristretto v0.2.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/dvsekhvalnov/jose2go v1.5.0 // indirect
+	github.com/dvsekhvalnov/jose2go v1.7.0 // indirect
 	github.com/ebitengine/purego v0.10.0 // indirect
 	github.com/gdamore/encoding v1.0.1 // indirect
 	github.com/gen2brain/shm v0.2.1 // indirect
