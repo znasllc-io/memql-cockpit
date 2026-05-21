@@ -4,6 +4,12 @@
 // renderer (right). Backed by ListConcepts + ExecuteQuery; no
 // per-concept renderer (Hybrid C: walk the payload + metadata
 // generically so new concepts work the day they're declared).
+//
+// This file is the canonical reference for the TUI composable-widget
+// refactor (epic #81). Every other view migration follows the same
+// shape: embed ui.BaseView, swap hand-rolled list/detail loops for
+// ui.ListPane / ui.DetailPane, swap inline hint composition for
+// ui.HintBar.
 package concepts
 
 import (
@@ -12,7 +18,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
@@ -34,45 +39,35 @@ const (
 // View renders the Concepts tab.
 //
 // Thread-safety. The view is mutated from two distinct goroutine
-// classes:
-//   - the tcell event-loop goroutine (key handlers, HandleEvent)
-//   - background fetcher goroutines (refreshConcepts wires
-//     QueryClient + SetConcepts from a `go ...` spawn in app.go)
-//
-// Draw runs from the event-loop goroutine. Without locking, a
-// background fetcher that calls SetConcepts (which clears Rows +
-// rebuilds rowMatches) while Draw is mid-render through rowMatches
-// produces a stale-index crash: idx came from a valid matches
-// slice, then Rows was emptied before the v.Rows[idx] read. The
-// mu RWMutex eliminates that window -- mutators take Lock(),
-// Draw takes RLock().
+// classes: the tcell event-loop goroutine (key handlers,
+// HandleEvent) and background fetcher goroutines (SetConcepts +
+// refreshRowsFromCurrent from a `go ...` spawn in app.go). Draw
+// runs from the event-loop goroutine and takes a read lock for the
+// whole frame; mutators take a write lock. The mutex lives in the
+// embedded ui.BaseView -- see cli/ui/baseview.go for the rationale.
 type View struct {
-	mu    sync.RWMutex
-	Theme ui.Theme
+	ui.BaseView // Mu / Theme / GatedMessage / OnStatus / OnRedraw
 
-	// Concept registry (left pane).
-	Concepts        []*memqlv1.ConceptInfo
-	conceptSelected int
-	conceptScrollY  int
+	// Concept registry (left pane). Source slice owned by the view;
+	// conceptList consumes it via index callbacks.
+	Concepts []*memqlv1.ConceptInfo
 
-	// Loaded rows for the selected concept (middle pane).
-	Rows        []map[string]any
-	rowFilter   string // text from the search box
-	rowMatches  []int  // indices into Rows that match rowFilter (cached)
-	rowSelected int
-	rowScrollY  int
+	// Loaded rows for the selected concept (middle pane). rowMatches
+	// is the filtered index slice driven by rowFilter; rowList renders
+	// against matches, not Rows directly.
+	Rows       []map[string]any
+	rowFilter  string
+	rowMatches []int
 
-	// Detail (right pane).
-	detailLines  []string
-	detailScroll int
+	// Detail (right pane) -- generic structured render of the
+	// highlighted row's payload + provenance.
+	detailLines []ui.DetailLine
 
 	// Version overlay -- when versionsOpen is true the detail pane
 	// shows the time-series of versions for the selected row instead
 	// of the current snapshot.
-	versionsOpen    bool
-	versionRows     []map[string]any
-	versionSelected int
-	versionScrollY  int
+	versionsOpen bool
+	versionRows  []map[string]any
 
 	Focus    FocusPane
 	searchOn bool
@@ -82,35 +77,42 @@ type View struct {
 	// (which also flips GatedMessage on for the placeholder).
 	QueryClient func() *client.QueryClient
 
-	// GatedMessage, when non-empty, replaces the layout with a
-	// centered "not available" message. Set by the app layer when
-	// the selected cluster has no live connection.
-	GatedMessage string
-
-	// onStatus is set by the app layer so the view can push
-	// transient errors to the notification bar without importing
-	// the app package.
-	OnStatus func(msg string)
+	// Widgets (composable from cli/ui/). These hold Selected / ScrollY
+	// state internally so the view no longer carries
+	// conceptSelected / rowSelected / detailScroll fields. Render
+	// callbacks close over v.Concepts / v.Rows / v.rowMatches /
+	// v.detailLines.
+	conceptList ui.ListPane
+	rowList     ui.ListPane
+	versionList ui.ListPane
+	detailPane  ui.DetailPane
 }
 
-// NewView creates an empty Concepts view.
+// NewView creates an empty Concepts view. Renderer callbacks for
+// each widget close over the view's data slices, so the widgets
+// stay configuration-free at the use site (only Count and Focused
+// are toggled per render).
 func NewView(theme ui.Theme) *View {
-	return &View{
-		Theme: theme,
-		Focus: FocusConcepts,
-	}
+	v := &View{Focus: FocusConcepts}
+	v.Theme = theme
+	v.conceptList.Render = v.renderConceptRow
+	v.rowList.Render = v.renderRowItem
+	v.versionList.Render = v.renderVersionRow
+	v.conceptList.EmptyMessage = "No concepts loaded."
+	v.rowList.EmptyMessage = "No rows."
+	v.versionList.EmptyMessage = "No version history for this row."
+	v.detailPane.EmptyMessage = "Select a row to see its rendered detail."
+	return v
 }
 
 // SetConcepts replaces the concept registry. Sorting is `domain:entity`
-// alphabetical so cognition/agents/etc. stay grouped.
-//
-// Safe to call from a background goroutine -- holds the write lock
-// while replacing the concept list AND while refreshRowsFromCurrent
-// runs (which clears + re-fills Rows). Draw is blocked the whole time
-// so it never observes a torn intermediate state.
+// alphabetical so cognition/agents/etc. stay grouped. Safe to call
+// from a background goroutine -- the write lock covers the slice
+// swap AND the chained refreshRowsFromCurrentLocked call so Draw
+// can't observe a torn intermediate.
 func (v *View) SetConcepts(concepts []*memqlv1.ConceptInfo) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.Mu.Lock()
+	defer v.Mu.Unlock()
 	v.Concepts = make([]*memqlv1.ConceptInfo, 0, len(concepts))
 	for _, c := range concepts {
 		if c == nil {
@@ -121,18 +123,19 @@ func (v *View) SetConcepts(concepts []*memqlv1.ConceptInfo) {
 	sort.Slice(v.Concepts, func(i, j int) bool {
 		return v.Concepts[i].GetId() < v.Concepts[j].GetId()
 	})
-	if v.conceptSelected >= len(v.Concepts) {
-		v.conceptSelected = 0
+	v.conceptList.Count = len(v.Concepts)
+	if v.conceptList.Selected >= len(v.Concepts) {
+		v.conceptList.Selected = 0
 	}
 	v.refreshRowsFromCurrentLocked()
 }
 
 // Draw renders the Concepts tab. Holds the read lock for the whole
-// frame so concurrent mutators (SetConcepts from a background fetch)
-// can't tear v.Rows / v.rowMatches mid-render.
+// frame so concurrent mutators (SetConcepts from a background
+// fetch) can't tear v.Rows / v.rowMatches mid-render.
 func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
+	v.Mu.RLock()
+	defer v.Mu.RUnlock()
 	if v.GatedMessage != "" {
 		v.drawGated(screen, bounds)
 		return
@@ -147,7 +150,8 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 	rowBounds := panes[1]
 	detailBounds := panes[2]
 
-	// Dividers (single-cell box-drawing chars; safe at pane edges).
+	// Single-cell box-drawing dividers (safe at pane edges per the
+	// Layout-edge glyph rule in cli/CLAUDE.md).
 	divStyle := v.Theme.SubtleStyle()
 	for _, x := range []int{conceptBounds.X + conceptBounds.Width - 1, rowBounds.X + rowBounds.Width - 1} {
 		for y := bounds.Y; y < bounds.Y+bounds.Height; y++ {
@@ -174,6 +178,20 @@ func (v *View) drawGated(screen *ui.Screen, bounds ui.Rect) {
 	screen.DrawText(lineX, midY, bounds.Width-1, v.GatedMessage, v.Theme.SubtleStyle())
 }
 
+// paneChromeBounds returns the inner Rect for a pane's scrollable
+// content area: skip the title row at the top and the chrome row
+// at the bottom. Used by all three panes so chrome layout stays
+// consistent across the tab.
+func paneChromeBounds(bounds ui.Rect) ui.Rect {
+	const chromeH = 1
+	listTop := bounds.Y + 2
+	listHeight := bounds.Height - 2 - chromeH
+	if listHeight < 1 {
+		listHeight = 1
+	}
+	return ui.Rect{X: bounds.X, Y: listTop, Width: bounds.Width, Height: listHeight}
+}
+
 func (v *View) drawConceptList(screen *ui.Screen, bounds ui.Rect) {
 	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, v.Theme.BaseStyle())
 
@@ -183,39 +201,13 @@ func (v *View) drawConceptList(screen *ui.Screen, bounds ui.Rect) {
 	}
 	title := " CONCEPTS "
 	if c := len(v.Concepts); c > 0 {
-		title = fmt.Sprintf(" CONCEPTS (%d/%d) ", v.conceptSelected+1, c)
+		title = fmt.Sprintf(" CONCEPTS (%d/%d) ", v.conceptList.Selected+1, c)
 	}
 	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, titleStyle)
 
-	if len(v.Concepts) == 0 {
-		v.drawCentered(screen, bounds, "No concepts loaded.")
-		v.drawBottomHints(screen, bounds, hintsForConcepts(v))
-		return
-	}
-
-	// Reserve one bottom row for the action-hint chrome band.
-	const chromeH = 1
-	listTop := bounds.Y + 2
-	listHeight := bounds.Height - 2 - chromeH
-	if listHeight < 1 {
-		listHeight = 1
-	}
-
-	v.clampConceptScroll(listHeight)
-
-	for i := 0; i < listHeight && v.conceptScrollY+i < len(v.Concepts); i++ {
-		idx := v.conceptScrollY + i
-		c := v.Concepts[idx]
-		y := listTop + i
-
-		style := v.Theme.BaseStyle()
-		if idx == v.conceptSelected {
-			style = tcell.StyleDefault.Foreground(v.Theme.FG).Background(tcell.NewRGBColor(40, 44, 52))
-		}
-		screen.FillRect(bounds.X, y, bounds.Width, 1, style)
-		label := c.GetId()
-		screen.DrawText(bounds.X+2, y, bounds.Width-3, label, style)
-	}
+	v.conceptList.Count = len(v.Concepts)
+	v.conceptList.Focused = v.Focus == FocusConcepts
+	v.conceptList.Draw(screen, paneChromeBounds(bounds), v.Theme)
 
 	v.drawBottomHints(screen, bounds, hintsForConcepts(v))
 }
@@ -228,53 +220,26 @@ func (v *View) drawRowList(screen *ui.Screen, bounds ui.Rect) {
 		titleStyle = v.Theme.AccentStyle().Bold(true)
 	}
 	conceptId := ""
-	if v.conceptSelected >= 0 && v.conceptSelected < len(v.Concepts) {
-		conceptId = v.Concepts[v.conceptSelected].GetId()
+	if v.conceptList.Selected >= 0 && v.conceptList.Selected < len(v.Concepts) {
+		conceptId = v.Concepts[v.conceptList.Selected].GetId()
 	}
 	matches := v.rowMatches
 	title := " ROWS "
 	if conceptId != "" {
 		switch {
 		case len(matches) < len(v.Rows):
-			title = fmt.Sprintf(" ROWS: %s (%d/%d filtered from %d) ", conceptId, v.rowSelected+1, len(matches), len(v.Rows))
+			title = fmt.Sprintf(" ROWS: %s (%d/%d filtered from %d) ", conceptId, v.rowList.Selected+1, len(matches), len(v.Rows))
 		case len(matches) > 0:
-			title = fmt.Sprintf(" ROWS: %s (%d/%d) ", conceptId, v.rowSelected+1, len(matches))
+			title = fmt.Sprintf(" ROWS: %s (%d/%d) ", conceptId, v.rowList.Selected+1, len(matches))
 		default:
 			title = " ROWS: " + conceptId + " "
 		}
 	}
 	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, titleStyle)
 
-	// Reserve one bottom row for the chrome band (action hints or
-	// active search input). The list grows up from above the chrome.
-	const chromeH = 1
-	if len(v.Rows) == 0 {
-		v.drawCentered(screen, ui.Rect{X: bounds.X, Y: bounds.Y + 2, Width: bounds.Width, Height: bounds.Height - 2 - chromeH}, "No rows.")
-		v.drawBottomHints(screen, bounds, hintsForRows(v))
-		return
-	}
-
-	listTop := bounds.Y + 2
-	listHeight := bounds.Height - 2 - chromeH
-	if listHeight < 1 {
-		listHeight = 1
-	}
-
-	v.clampRowScroll(listHeight)
-
-	for i := 0; i < listHeight && v.rowScrollY+i < len(matches); i++ {
-		idx := matches[v.rowScrollY+i]
-		row := v.Rows[idx]
-		y := listTop + i
-
-		style := v.Theme.BaseStyle()
-		if v.rowScrollY+i == v.rowSelected {
-			style = tcell.StyleDefault.Foreground(v.Theme.FG).Background(tcell.NewRGBColor(40, 44, 52))
-		}
-		screen.FillRect(bounds.X, y, bounds.Width, 1, style)
-		label := rowDisplayLabel(row)
-		screen.DrawText(bounds.X+2, y, bounds.Width-3, label, style)
-	}
+	v.rowList.Count = len(matches)
+	v.rowList.Focused = v.Focus == FocusRows && !v.searchOn
+	v.rowList.Draw(screen, paneChromeBounds(bounds), v.Theme)
 
 	v.drawBottomHints(screen, bounds, hintsForRows(v))
 }
@@ -288,83 +253,89 @@ func (v *View) drawDetail(screen *ui.Screen, bounds ui.Rect) {
 	}
 	title := " DETAIL "
 	if v.versionsOpen {
-		title = fmt.Sprintf(" VERSIONS (%d/%d) ", v.versionSelected+1, len(v.versionRows))
+		title = fmt.Sprintf(" VERSIONS (%d/%d) ", v.versionList.Selected+1, len(v.versionRows))
 	} else if n := len(v.detailLines); n > 0 {
-		title = fmt.Sprintf(" DETAIL (line %d/%d) ", v.detailScroll+1, n)
+		title = fmt.Sprintf(" DETAIL (line %d/%d) ", v.detailPane.ScrollY+1, n)
 	}
 	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, titleStyle)
 
+	inner := paneChromeBounds(bounds)
+	// Reserve a two-cell left gutter so detail content doesn't crowd
+	// the pane divider on the left.
+	inner.X += 1
+	inner.Width -= 1
+	if inner.Width < 1 {
+		inner.Width = 1
+	}
+
 	if v.versionsOpen {
-		v.drawVersionsList(screen, bounds)
-		return
+		v.versionList.Count = len(v.versionRows)
+		v.versionList.Focused = v.Focus == FocusDetail
+		v.versionList.Draw(screen, inner, v.Theme)
+	} else {
+		v.detailPane.Lines = v.detailLines
+		v.detailPane.Focused = v.Focus == FocusDetail
+		v.detailPane.Draw(screen, inner, v.Theme)
 	}
 
-	if len(v.detailLines) == 0 {
-		v.drawCentered(screen, bounds, "Select a row to see its rendered detail.")
-		v.drawBottomHints(screen, bounds, hintsForDetail(v))
-		return
-	}
-
-	// Reserve one bottom row for the action-hint chrome band.
-	const chromeH = 1
-	contentTop := bounds.Y + 2
-	contentH := bounds.Height - 2 - chromeH
-	if contentH < 1 {
-		contentH = 1
-	}
-	v.clampDetailScroll(contentH)
-	for i := 0; i < contentH && v.detailScroll+i < len(v.detailLines); i++ {
-		screen.DrawText(bounds.X+2, contentTop+i, bounds.Width-3, v.detailLines[v.detailScroll+i], v.Theme.BaseStyle())
-	}
 	v.drawBottomHints(screen, bounds, hintsForDetail(v))
 }
 
-func (v *View) drawVersionsList(screen *ui.Screen, bounds ui.Rect) {
-	if len(v.versionRows) == 0 {
-		v.drawCentered(screen, bounds, "No version history for this row.")
-		v.drawBottomHints(screen, bounds, hintsForDetail(v))
+// renderConceptRow paints one row of the concept picker. ListPane
+// has already filled the row with the selection background when
+// `sel` is true, so we just draw the label.
+func (v *View) renderConceptRow(screen *ui.Screen, bounds ui.Rect, idx int, sel bool, theme ui.Theme) {
+	if idx < 0 || idx >= len(v.Concepts) {
 		return
 	}
-	const chromeH = 1
-	contentTop := bounds.Y + 2
-	contentH := bounds.Height - 2 - chromeH
-	if contentH < 1 {
-		contentH = 1
+	style := theme.BaseStyle()
+	if sel {
+		style = theme.SelectionStyle()
 	}
-	for i := 0; i < contentH && v.versionScrollY+i < len(v.versionRows); i++ {
-		idx := v.versionScrollY + i
-		ver := v.versionRows[idx]
-		y := contentTop + i
-		style := v.Theme.BaseStyle()
-		if idx == v.versionSelected {
-			style = tcell.StyleDefault.Foreground(v.Theme.FG).Background(tcell.NewRGBColor(40, 44, 52))
-		}
-		screen.FillRect(bounds.X, y, bounds.Width, 1, style)
-		when := getString(ver, "createdAt")
-		who := getString(ver, "createdBy")
-		prov := getString(getMap(ver, "provenance"), "kind")
-		label := fmt.Sprintf("%s  by %s  (%s)", shortenTimestamp(when), who, prov)
-		screen.DrawText(bounds.X+2, y, bounds.Width-3, label, style)
-	}
-	v.drawBottomHints(screen, bounds, hintsForDetail(v))
+	screen.DrawText(bounds.X+2, bounds.Y, bounds.Width-3, v.Concepts[idx].GetId(), style)
 }
 
-func (v *View) drawCentered(screen *ui.Screen, bounds ui.Rect, msg string) {
-	midY := bounds.Y + bounds.Height/2
-	lineX := bounds.X + (bounds.Width-len(msg))/2
-	if lineX < bounds.X+1 {
-		lineX = bounds.X + 1
+// renderRowItem paints one row of the middle pane. idx is into
+// rowMatches, which dereferences back to v.Rows.
+func (v *View) renderRowItem(screen *ui.Screen, bounds ui.Rect, idx int, sel bool, theme ui.Theme) {
+	if idx < 0 || idx >= len(v.rowMatches) {
+		return
 	}
-	screen.DrawText(lineX, midY, bounds.Width-1, msg, v.Theme.SubtleStyle())
+	rowIdx := v.rowMatches[idx]
+	if rowIdx < 0 || rowIdx >= len(v.Rows) {
+		return
+	}
+	style := theme.BaseStyle()
+	if sel {
+		style = theme.SelectionStyle()
+	}
+	screen.DrawText(bounds.X+2, bounds.Y, bounds.Width-3, rowDisplayLabel(v.Rows[rowIdx]), style)
+}
+
+// renderVersionRow paints one row of the version-history overlay
+// inside the detail pane.
+func (v *View) renderVersionRow(screen *ui.Screen, bounds ui.Rect, idx int, sel bool, theme ui.Theme) {
+	if idx < 0 || idx >= len(v.versionRows) {
+		return
+	}
+	style := theme.BaseStyle()
+	if sel {
+		style = theme.SelectionStyle()
+	}
+	ver := v.versionRows[idx]
+	when := getString(ver, "createdAt")
+	who := getString(ver, "createdBy")
+	prov := getString(getMap(ver, "provenance"), "kind")
+	label := fmt.Sprintf("%s  by %s  (%s)", shortenTimestamp(when), who, prov)
+	screen.DrawText(bounds.X, bounds.Y, bounds.Width, label, style)
 }
 
 // drawBottomHints renders the per-pane chrome band anchored to the
 // last row of bounds. Implements the panel chrome contract documented
 // in cli/CLAUDE.md "Panel chrome contract": action hints live at the
-// bottom in `Key:Action` format, separated by two spaces. Search input
-// rides the same band -- when active for the rows pane the hint is
-// replaced with `:search <query>_` in accent style. Title-bar
-// counters do the work of the old per-pane count footers.
+// bottom in `Key:Label` format, separated by two spaces. Search
+// input rides the same band -- when active for the rows pane the
+// hint is replaced with `:search <query>_` in accent style.
 func (v *View) drawBottomHints(screen *ui.Screen, bounds ui.Rect, hint paneHint) {
 	if hint.text == "" {
 		return
@@ -378,7 +349,9 @@ func (v *View) drawBottomHints(screen *ui.Screen, bounds ui.Rect, hint paneHint)
 
 // paneHint is what drawBottomHints renders. accent=true is reserved
 // for the active-search prompt so it visually stands out from the
-// regular subtle action-hint strip.
+// regular subtle action-hint strip. Kept as a struct (not just a
+// HintBar) because the search-active prompt is a literal string
+// rendered in accent style -- not a chip set.
 type paneHint struct {
 	text   string
 	accent bool
@@ -388,7 +361,12 @@ func hintsForConcepts(v *View) paneHint {
 	if len(v.Concepts) == 0 {
 		return paneHint{text: "Tab:Cycle"}
 	}
-	return paneHint{text: "↑/↓:Move  Enter:Open  Tab:Cycle"}
+	bar := ui.HintBar{Chips: []ui.HintChip{
+		{Key: "↑/↓", Label: "Move"},
+		{Key: "Enter", Label: "Open"},
+		{Key: "Tab", Label: "Cycle"},
+	}}
+	return paneHint{text: bar.String()}
 }
 
 func hintsForRows(v *View) paneHint {
@@ -399,35 +377,48 @@ func hintsForRows(v *View) paneHint {
 		// search".
 		return paneHint{text: ":search " + v.rowFilter + "_", accent: true}
 	}
-	parts := []string{"↑/↓:Move", "Enter:Detail", ":Search", "v:Versions", "Tab:Cycle"}
-	if v.rowFilter != "" {
-		parts = append(parts, "Esc:ClearSearch")
-	}
-	return paneHint{text: strings.Join(parts, "  ")}
+	bar := ui.HintBar{Chips: []ui.HintChip{
+		{Key: "↑/↓", Label: "Move"},
+		{Key: "Enter", Label: "Detail"},
+		{Key: "", Label: "Search"},
+		{Key: "v", Label: "Versions"},
+		{Key: "Tab", Label: "Cycle"},
+		{Key: "Esc", Label: "ClearSearch", Disabled: v.rowFilter == ""},
+	}}
+	return paneHint{text: bar.String()}
 }
 
 func hintsForDetail(v *View) paneHint {
 	if v.versionsOpen {
-		return paneHint{text: "↑/↓:Move  Esc:CloseVersions  Tab:Cycle"}
+		bar := ui.HintBar{Chips: []ui.HintChip{
+			{Key: "↑/↓", Label: "Move"},
+			{Key: "Esc", Label: "CloseVersions"},
+			{Key: "Tab", Label: "Cycle"},
+		}}
+		return paneHint{text: bar.String()}
 	}
-	return paneHint{text: "↑/↓:Scroll  PgUp/PgDn:Page  Esc:Back  Tab:Cycle"}
+	bar := ui.HintBar{Chips: []ui.HintChip{
+		{Key: "↑/↓", Label: "Scroll"},
+		{Key: "PgUp/PgDn", Label: "Page"},
+		{Key: "Esc", Label: "Back"},
+		{Key: "Tab", Label: "Cycle"},
+	}}
+	return paneHint{text: bar.String()}
 }
 
 // HandleEvent processes keyboard input for the Concepts tab. Takes
 // the write lock for the duration so a concurrent Draw + a concurrent
 // background SetConcepts both observe a stable, fully-applied state
-// transition. The inner handlers use the *Locked variants since the
-// lock is already held.
+// transition.
 func (v *View) HandleEvent(ev tcell.Event) bool {
 	keyEv, ok := ev.(*tcell.EventKey)
 	if !ok {
 		return false
 	}
 
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.Mu.Lock()
+	defer v.Mu.Unlock()
 
-	// When the search box is active, keys go to the search box first.
 	if v.searchOn {
 		return v.handleSearchKeyLocked(keyEv)
 	}
@@ -437,10 +428,8 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 		return true
 	}
 
-	// `:` anywhere -> jump to search. Mirrors the panel chrome
-	// contract: the bottom-band hint advertises `:Search`, and the
-	// active prompt renders as `:search <query>_` in the same band.
-	// `/` is intentionally NOT a trigger -- see cli/CLAUDE.md.
+	// `:` -> jump to search per the chrome contract. `/` is
+	// reserved and intentionally a no-op here.
 	if keyEv.Key() == tcell.KeyRune && keyEv.Rune() == ':' {
 		v.Focus = FocusRows
 		v.searchOn = true
@@ -452,11 +441,10 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 			v.versionsOpen = false
 		} else {
 			// openVersions takes its own lock; drop ours before calling
-			// to avoid a self-deadlock. State coherence is preserved
-			// because openVersions reads the same fields we just set.
-			v.mu.Unlock()
+			// to avoid a self-deadlock.
+			v.Mu.Unlock()
 			v.openVersions()
-			v.mu.Lock()
+			v.Mu.Lock()
 		}
 		return true
 	}
@@ -473,20 +461,18 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 }
 
 func (v *View) handleConceptListKeyLocked(ev *tcell.EventKey) bool {
-	switch ev.Key() {
-	case tcell.KeyUp:
-		if v.conceptSelected > 0 {
-			v.conceptSelected--
+	// Delegate nav keys to ListPane. ListPane.Focused is set during
+	// Draw, but HandleEvent gates on it -- set it here too so the
+	// keys consume even if Draw hasn't happened since the focus flip.
+	v.conceptList.Focused = true
+	prev := v.conceptList.Selected
+	if v.conceptList.HandleEvent(ev) {
+		if v.conceptList.Selected != prev {
 			v.refreshRowsFromCurrentLocked()
 		}
 		return true
-	case tcell.KeyDown:
-		if v.conceptSelected < len(v.Concepts)-1 {
-			v.conceptSelected++
-			v.refreshRowsFromCurrentLocked()
-		}
-		return true
-	case tcell.KeyEnter:
+	}
+	if ev.Key() == tcell.KeyEnter {
 		v.refreshRowsFromCurrentLocked()
 		v.Focus = FocusRows
 		return true
@@ -495,29 +481,23 @@ func (v *View) handleConceptListKeyLocked(ev *tcell.EventKey) bool {
 }
 
 func (v *View) handleRowListKeyLocked(ev *tcell.EventKey) bool {
-	matches := v.rowMatches
+	v.rowList.Focused = true
+	prev := v.rowList.Selected
+	if v.rowList.HandleEvent(ev) {
+		if v.rowList.Selected != prev {
+			v.refreshDetailFromCurrentLocked()
+		}
+		return true
+	}
 	switch ev.Key() {
-	case tcell.KeyUp:
-		if v.rowSelected > 0 {
-			v.rowSelected--
-			v.refreshDetailFromCurrentLocked()
-		}
-		return true
-	case tcell.KeyDown:
-		if v.rowSelected < len(matches)-1 {
-			v.rowSelected++
-			v.refreshDetailFromCurrentLocked()
-		}
-		return true
 	case tcell.KeyEnter:
 		v.refreshDetailFromCurrentLocked()
 		v.Focus = FocusDetail
 		return true
 	case tcell.KeyEsc:
 		// Esc clears an active filter so the user can get back to the
-		// full row list without re-typing through the search box. The
-		// `Esc:Clear search` chip in the bottom hint band advertises
-		// this affordance; the chip only shows when rowFilter != "".
+		// full row list without re-typing through the search box.
+		// The `Esc:ClearSearch` chip is gated on rowFilter != "".
 		if v.rowFilter != "" {
 			v.rowFilter = ""
 			v.recomputeRowMatchesLocked()
@@ -529,32 +509,22 @@ func (v *View) handleRowListKeyLocked(ev *tcell.EventKey) bool {
 }
 
 func (v *View) handleDetailKeyLocked(ev *tcell.EventKey) bool {
-	switch ev.Key() {
-	case tcell.KeyUp:
-		if v.detailScroll > 0 {
-			v.detailScroll--
+	if v.versionsOpen {
+		v.versionList.Focused = true
+		if v.versionList.HandleEvent(ev) {
+			return true
 		}
-		return true
-	case tcell.KeyDown:
-		v.detailScroll++
-		return true
-	case tcell.KeyPgUp:
-		v.detailScroll -= 10
-		if v.detailScroll < 0 {
-			v.detailScroll = 0
-		}
-		return true
-	case tcell.KeyPgDn:
-		v.detailScroll += 10
-		return true
-	case tcell.KeyHome:
-		v.detailScroll = 0
-		return true
-	case tcell.KeyEsc:
-		if v.versionsOpen {
+		if ev.Key() == tcell.KeyEsc {
 			v.versionsOpen = false
 			return true
 		}
+		return false
+	}
+	v.detailPane.Focused = true
+	if v.detailPane.HandleEvent(ev) {
+		return true
+	}
+	if ev.Key() == tcell.KeyEsc {
 		v.Focus = FocusRows
 		return true
 	}
@@ -581,46 +551,46 @@ func (v *View) handleSearchKeyLocked(ev *tcell.EventKey) bool {
 }
 
 // refreshRowsFromCurrent is the exported (lock-taking) wrapper for
-// callers that aren't already holding the write lock. Most event-loop
-// handlers go through here; SetConcepts calls the *Locked variant
-// directly since it already holds the lock.
+// callers that aren't already holding the write lock.
 func (v *View) refreshRowsFromCurrent() {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.Mu.Lock()
+	defer v.Mu.Unlock()
 	v.refreshRowsFromCurrentLocked()
 }
 
 // refreshRowsFromCurrentLocked reloads rows for the currently-
 // selected concept via the active QueryClient. Caller MUST hold
-// v.mu (write). Runs the network call synchronously while holding
-// the lock -- Draw blocks for the duration. For local clusters this
-// is sub-100ms; remote slow clusters will manifest as a brief UI
-// stall, which is correct behavior (the data is what's stalling, not
-// the UI) and is preferable to either a torn read or a spinner-state
-// flash. The async-with-spinner version is a future cleanup, not a
-// hot path bug.
+// v.Mu (write). Synchronous network call inside the lock is
+// intentional -- see the original comment in the pre-migration
+// view; the async-with-spinner variant is a separate cleanup, not a
+// hot-path bug.
 func (v *View) refreshRowsFromCurrentLocked() {
 	v.Rows = nil
 	v.detailLines = nil
-	v.rowSelected = 0
-	v.rowScrollY = 0
+	v.rowList.Selected = 0
+	v.rowList.ScrollY = 0
+	v.detailPane.ScrollY = 0
 	v.versionsOpen = false
 	if v.QueryClient == nil {
 		v.rowMatches = nil
+		v.rowList.Count = 0
 		return
 	}
-	if v.conceptSelected < 0 || v.conceptSelected >= len(v.Concepts) {
+	if v.conceptList.Selected < 0 || v.conceptList.Selected >= len(v.Concepts) {
 		v.rowMatches = nil
+		v.rowList.Count = 0
 		return
 	}
 	qc := v.QueryClient()
 	if qc == nil {
 		v.rowMatches = nil
+		v.rowList.Count = 0
 		return
 	}
-	conceptId := v.Concepts[v.conceptSelected].GetId()
+	conceptId := v.Concepts[v.conceptList.Selected].GetId()
 	if conceptId == "" {
 		v.rowMatches = nil
+		v.rowList.Count = 0
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
@@ -643,22 +613,21 @@ func (v *View) refreshRowsFromCurrentLocked() {
 }
 
 func (v *View) refreshDetailFromCurrent() {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.Mu.Lock()
+	defer v.Mu.Unlock()
 	v.refreshDetailFromCurrentLocked()
 }
 
 func (v *View) refreshDetailFromCurrentLocked() {
-	v.detailScroll = 0
+	v.detailPane.ScrollY = 0
 	matches := v.rowMatches
-	if v.rowSelected < 0 || v.rowSelected >= len(matches) {
+	if v.rowList.Selected < 0 || v.rowList.Selected >= len(matches) {
 		v.detailLines = nil
 		return
 	}
-	idx := matches[v.rowSelected]
+	idx := matches[v.rowList.Selected]
 	if idx < 0 || idx >= len(v.Rows) {
 		// Defensive: matches was computed against an older v.Rows.
-		// Shouldn't happen under the lock but cheap to guard.
 		v.detailLines = nil
 		return
 	}
@@ -668,24 +637,24 @@ func (v *View) refreshDetailFromCurrentLocked() {
 // openVersions fetches the time-series history for the selected row
 // (concept + id) and swaps the detail pane into the version-list view.
 func (v *View) openVersions() {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.Mu.Lock()
+	defer v.Mu.Unlock()
 	if v.QueryClient == nil {
 		return
 	}
 	matches := v.rowMatches
-	if v.rowSelected < 0 || v.rowSelected >= len(matches) {
+	if v.rowList.Selected < 0 || v.rowList.Selected >= len(matches) {
 		return
 	}
-	idx := matches[v.rowSelected]
+	idx := matches[v.rowList.Selected]
 	if idx < 0 || idx >= len(v.Rows) {
 		return
 	}
 	row := v.Rows[idx]
 	rowId := getString(row, "id")
 	conceptId := getString(row, "concept")
-	if conceptId == "" && v.conceptSelected >= 0 && v.conceptSelected < len(v.Concepts) {
-		conceptId = v.Concepts[v.conceptSelected].GetId()
+	if conceptId == "" && v.conceptList.Selected >= 0 && v.conceptList.Selected < len(v.Concepts) {
+		conceptId = v.Concepts[v.conceptList.Selected].GetId()
 	}
 	if rowId == "" || conceptId == "" {
 		return
@@ -696,9 +665,7 @@ func (v *View) openVersions() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
-	// Admin-surface escape hatch (see refreshRows for context). The
-	// version-history pane needs the time-series tail of one row,
-	// which is intrinsically concept-agnostic.
+	// Admin-surface escape hatch (see refreshRows for context).
 	res, err := qc.GetRowByConceptAndId(ctx, conceptId, rowId)
 	if err != nil {
 		if v.OnStatus != nil {
@@ -710,14 +677,15 @@ func (v *View) openVersions() {
 	sort.Slice(v.versionRows, func(i, j int) bool {
 		return getString(v.versionRows[i], "createdAt") > getString(v.versionRows[j], "createdAt")
 	})
-	v.versionSelected = 0
-	v.versionScrollY = 0
+	v.versionList.Selected = 0
+	v.versionList.ScrollY = 0
+	v.versionList.Count = len(v.versionRows)
 	v.versionsOpen = true
 }
 
 func (v *View) recomputeRowMatches() {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.Mu.Lock()
+	defer v.Mu.Unlock()
 	v.recomputeRowMatchesLocked()
 }
 
@@ -729,47 +697,11 @@ func (v *View) recomputeRowMatchesLocked() {
 			v.rowMatches = append(v.rowMatches, idx)
 		}
 	}
-	if v.rowSelected >= len(v.rowMatches) {
-		v.rowSelected = 0
+	if v.rowList.Selected >= len(v.rowMatches) {
+		v.rowList.Selected = 0
 	}
+	v.rowList.Count = len(v.rowMatches)
 	v.refreshDetailFromCurrentLocked()
-}
-
-func (v *View) clampConceptScroll(visibleRows int) {
-	if v.conceptSelected < v.conceptScrollY {
-		v.conceptScrollY = v.conceptSelected
-	}
-	if v.conceptSelected >= v.conceptScrollY+visibleRows {
-		v.conceptScrollY = v.conceptSelected - visibleRows + 1
-	}
-	if v.conceptScrollY < 0 {
-		v.conceptScrollY = 0
-	}
-}
-
-func (v *View) clampRowScroll(visibleRows int) {
-	if v.rowSelected < v.rowScrollY {
-		v.rowScrollY = v.rowSelected
-	}
-	if v.rowSelected >= v.rowScrollY+visibleRows {
-		v.rowScrollY = v.rowSelected - visibleRows + 1
-	}
-	if v.rowScrollY < 0 {
-		v.rowScrollY = 0
-	}
-}
-
-func (v *View) clampDetailScroll(visibleRows int) {
-	maxScroll := len(v.detailLines) - visibleRows
-	if maxScroll < 0 {
-		maxScroll = 0
-	}
-	if v.detailScroll > maxScroll {
-		v.detailScroll = maxScroll
-	}
-	if v.detailScroll < 0 {
-		v.detailScroll = 0
-	}
 }
 
 // --- pure helpers --------------------------------------------------
@@ -831,47 +763,54 @@ func getMap(m map[string]any, key string) map[string]any {
 // --- generic renderer (Hybrid C) -----------------------------------
 
 // renderRowDetail walks the row map and emits a human-readable
-// declaration-style block. No concept-specific knowledge: every field
-// renders the same way, so a brand-new concept is browsable the day
-// it's declared. Sections: intrinsics (id, concept, createdBy,
-// createdAt), payload (with nested object/array indentation),
-// provenance (the engine intrinsic).
-func renderRowDetail(row map[string]any) []string {
+// declaration-style block. No concept-specific knowledge: every
+// field renders the same way, so a brand-new concept is browsable
+// the day it's declared. Sections: intrinsics, payload, provenance.
+//
+// Each source line becomes one LinePlain DetailLine -- the existing
+// detail visual stays bit-for-bit identical. Header / KV styling on
+// top of this lives in a follow-up (the reusable read-only viewer
+// in #50 builds on DetailPane).
+func renderRowDetail(row map[string]any) []ui.DetailLine {
 	if row == nil {
 		return nil
 	}
-	var lines []string
+	var lines []ui.DetailLine
 
-	lines = append(lines, "INTRINSICS")
+	lines = append(lines, plain("INTRINSICS"))
 	for _, key := range []string{"id", "concept", "type", "createdBy", "createdAt"} {
 		if v := getString(row, key); v != "" {
-			lines = append(lines, fmt.Sprintf("  %-12s %s", key, v))
+			lines = append(lines, plain(fmt.Sprintf("  %-12s %s", key, v)))
 		}
 	}
 
 	if payload := getMap(row, "payload"); payload != nil {
-		lines = append(lines, "")
-		lines = append(lines, "PAYLOAD")
+		lines = append(lines, plain(""))
+		lines = append(lines, plain("PAYLOAD"))
 		lines = append(lines, renderObject(payload, 1)...)
 	}
 
 	if meta := getMap(row, "metadata"); meta != nil {
 		if prov := getMap(meta, "provenance"); prov != nil {
-			lines = append(lines, "")
-			lines = append(lines, "PROVENANCE")
+			lines = append(lines, plain(""))
+			lines = append(lines, plain("PROVENANCE"))
 			lines = append(lines, renderObject(prov, 1)...)
 		}
 	}
 	if prov := getMap(row, "provenance"); prov != nil {
-		lines = append(lines, "")
-		lines = append(lines, "PROVENANCE")
+		lines = append(lines, plain(""))
+		lines = append(lines, plain("PROVENANCE"))
 		lines = append(lines, renderObject(prov, 1)...)
 	}
 
 	return lines
 }
 
-func renderObject(obj map[string]any, depth int) []string {
+func plain(text string) ui.DetailLine {
+	return ui.DetailLine{Kind: ui.LinePlain, Text: text}
+}
+
+func renderObject(obj map[string]any, depth int) []ui.DetailLine {
 	if obj == nil {
 		return nil
 	}
@@ -881,38 +820,38 @@ func renderObject(obj map[string]any, depth int) []string {
 	}
 	sort.Strings(keys)
 	indent := strings.Repeat("  ", depth)
-	var lines []string
+	var lines []ui.DetailLine
 	for _, k := range keys {
 		v := obj[k]
 		switch val := v.(type) {
 		case map[string]any:
-			lines = append(lines, fmt.Sprintf("%s%s:", indent, k))
+			lines = append(lines, plain(fmt.Sprintf("%s%s:", indent, k)))
 			lines = append(lines, renderObject(val, depth+1)...)
 		case []any:
-			lines = append(lines, fmt.Sprintf("%s%s: (%d items)", indent, k, len(val)))
+			lines = append(lines, plain(fmt.Sprintf("%s%s: (%d items)", indent, k, len(val))))
 			lines = append(lines, renderArray(val, depth+1)...)
 		default:
-			lines = append(lines, fmt.Sprintf("%s%-20s %s", indent, k+":", renderScalar(val)))
+			lines = append(lines, plain(fmt.Sprintf("%s%-20s %s", indent, k+":", renderScalar(val))))
 		}
 	}
 	return lines
 }
 
-func renderArray(arr []any, depth int) []string {
+func renderArray(arr []any, depth int) []ui.DetailLine {
 	indent := strings.Repeat("  ", depth)
-	var lines []string
+	var lines []ui.DetailLine
 	limit := 10
 	for i, v := range arr {
 		if i >= limit {
-			lines = append(lines, fmt.Sprintf("%s... (%d more)", indent, len(arr)-limit))
+			lines = append(lines, plain(fmt.Sprintf("%s... (%d more)", indent, len(arr)-limit)))
 			break
 		}
 		switch val := v.(type) {
 		case map[string]any:
-			lines = append(lines, fmt.Sprintf("%s[%d]:", indent, i))
+			lines = append(lines, plain(fmt.Sprintf("%s[%d]:", indent, i)))
 			lines = append(lines, renderObject(val, depth+1)...)
 		default:
-			lines = append(lines, fmt.Sprintf("%s[%d] %s", indent, i, renderScalar(val)))
+			lines = append(lines, plain(fmt.Sprintf("%s[%d] %s", indent, i, renderScalar(val))))
 		}
 	}
 	return lines

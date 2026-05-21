@@ -227,19 +227,9 @@ func (d *DetailPane) flatten(innerW int, theme Theme) []renderedRow {
 	for _, ln := range d.Lines {
 		switch ln.Kind {
 		case LineHeader:
-			for _, w := range WrapText(ln.Text, innerW) {
-				out = append(out, renderedRow{
-					text:  w,
-					style: theme.AccentStyle().Bold(true),
-				})
-			}
+			out = wrapInto(out, ln.Text, innerW, theme.AccentStyle().Bold(true))
 		case LineDim:
-			for _, w := range WrapText(ln.Text, innerW) {
-				out = append(out, renderedRow{
-					text:  w,
-					style: theme.SubtleStyle(),
-				})
-			}
+			out = wrapInto(out, ln.Text, innerW, theme.SubtleStyle())
 		case LineKV:
 			// KV is a single-row two-segment render. No wrap.
 			out = append(out, renderedRow{
@@ -249,13 +239,23 @@ func (d *DetailPane) flatten(innerW int, theme Theme) []renderedRow {
 				kvOnly: true,
 			})
 		default: // LinePlain (zero value of DetailLineKind)
-			for _, w := range WrapText(ln.Text, innerW) {
-				out = append(out, renderedRow{
-					text:  w,
-					style: theme.BaseStyle(),
-				})
-			}
+			out = wrapInto(out, ln.Text, innerW, theme.BaseStyle())
 		}
+	}
+	return out
+}
+
+// wrapInto appends one or more rendered rows for a single source
+// line. Empty source text emits exactly one blank rendered row --
+// callers use blank lines as section separators (e.g. between
+// INTRINSICS / PAYLOAD / PROVENANCE blocks), so dropping them would
+// visually collapse sections together.
+func wrapInto(out []renderedRow, text string, innerW int, style tcell.Style) []renderedRow {
+	if text == "" {
+		return append(out, renderedRow{text: "", style: style})
+	}
+	for _, w := range WrapText(text, innerW) {
+		out = append(out, renderedRow{text: w, style: style})
 	}
 	return out
 }
