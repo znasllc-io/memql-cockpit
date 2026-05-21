@@ -21,14 +21,14 @@ import (
 // Config is the worker run mode configuration. Backed by
 // ~/.memql/worker.yaml; CLI flags / env vars override.
 type Config struct {
-	ClusterURL  string            `yaml:"cluster_url"`
-	Token       string            `yaml:"token"`
-	Name        string            `yaml:"name"`
-	Labels      map[string]string `yaml:"labels"`
-	Concurrency map[string]uint32 `yaml:"concurrency"`
-	StateDir    string            `yaml:"state_dir"`
-	LogLevel    string            `yaml:"log_level"`
-	Capabilities []string         `yaml:"capabilities"`
+	ClusterURL   string            `yaml:"cluster_url"`
+	Token        string            `yaml:"token"`
+	Name         string            `yaml:"name"`
+	Labels       map[string]string `yaml:"labels"`
+	Concurrency  map[string]uint32 `yaml:"concurrency"`
+	StateDir     string            `yaml:"state_dir"`
+	LogLevel     string            `yaml:"log_level"`
+	Capabilities []string          `yaml:"capabilities"`
 }
 
 // Defaults returns a Config seeded with sensible defaults for the
@@ -41,8 +41,8 @@ func Defaults() Config {
 		LogLevel: "info",
 		StateDir: defaultStateDir(),
 		Labels: map[string]string{
-			"os":   runtime.GOOS,
-			"arch": runtime.GOARCH,
+			"os":       runtime.GOOS,
+			"arch":     runtime.GOARCH,
 			"hostname": hostname,
 		},
 		Concurrency: map[string]uint32{

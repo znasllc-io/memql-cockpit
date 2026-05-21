@@ -125,10 +125,10 @@ func dispatchLint(args []string) int {
 // Report is the structured view of a lint run, suitable for JSON
 // output or human-rendering.
 type Report struct {
-	Root     string           `json:"root"`
-	Files    int              `json:"files"`
-	Order    []string         `json:"order,omitempty"`
-	Errors   []Diagnostic     `json:"errors,omitempty"`
+	Root   string       `json:"root"`
+	Files  int          `json:"files"`
+	Order  []string     `json:"order,omitempty"`
+	Errors []Diagnostic `json:"errors,omitempty"`
 }
 
 // Diagnostic carries one error from the load pipeline. Level is
@@ -238,4 +238,3 @@ func printUsage() {
 	fmt.Println("  1  diagnostics found")
 	fmt.Println("  2  invalid usage / filesystem error")
 }
-

@@ -14,15 +14,15 @@ import (
 //
 // Resolution priority:
 //  1. cluster.PAT      -> the literal PAT string (no expiry; revocation
-//                         is server-side via /me/tokens or /admin/tokens)
+//     is server-side via /me/tokens or /admin/tokens)
 //  2. cached + fresh   -> return cached access token
 //  3. cached + expired -> if a refresh token is cached, hit
-//                         /auth/refresh and roll the pair forward.
-//                         Success = silent, no browser. invalid_grant
-//                         (refresh expired/revoked) falls through to (4).
-//                         Transient errors (5xx, network) also fall
-//                         through but DO NOT delete the cached token,
-//                         so a later retry can succeed silently.
+//     /auth/refresh and roll the pair forward.
+//     Success = silent, no browser. invalid_grant
+//     (refresh expired/revoked) falls through to (4).
+//     Transient errors (5xx, network) also fall
+//     through but DO NOT delete the cached token,
+//     so a later retry can succeed silently.
 //  4. fresh login      -> open browser, mint a new pair, cache, return.
 //
 // Every path goes through the identity service. There is NO

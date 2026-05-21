@@ -11,8 +11,8 @@ import (
 // does.
 func TestSanitizeForCrashLog_StripsKnownTokens(t *testing.T) {
 	cases := []struct {
-		name      string
-		input     string
+		name           string
+		input          string
 		mustNotContain string
 		mustContain    string
 	}{

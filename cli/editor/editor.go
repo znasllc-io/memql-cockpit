@@ -14,12 +14,12 @@ const gutterWidth = 5 // line numbers + diagnostic icon
 
 // Editor is a text editor component with syntax highlighting and diagnostics.
 type Editor struct {
-	Buffer      *Buffer
-	Theme       ui.Theme
-	CursorLine  int // 0-based
-	CursorCol   int // 0-based
-	ScrollY     int // first visible line
-	ScrollX     int // horizontal scroll offset
+	Buffer     *Buffer
+	Theme      ui.Theme
+	CursorLine int // 0-based
+	CursorCol  int // 0-based
+	ScrollY    int // first visible line
+	ScrollX    int // horizontal scroll offset
 
 	// Sense data (updated asynchronously from gRPC).
 	Tokens      []sense.Token

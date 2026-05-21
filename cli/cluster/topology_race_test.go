@@ -107,4 +107,3 @@ func snapshotForRace(v *View) (nodes int, types int, edges int, disc bool) {
 	}
 	return
 }
-

@@ -446,5 +446,5 @@ func (w *wizard) drawBody(px, py, panelW int, lines []string) {
 }
 
 func (w *wizard) drawHint(px, py, panelW int, hint string) {
-	w.screen.DrawText(px+4, py+/*panelHeight is 20, hint at row -2*/ 18, panelW-8, hint, w.theme.SubtleStyle())
+	w.screen.DrawText(px+4, py+ /*panelHeight is 20, hint at row -2*/ 18, panelW-8, hint, w.theme.SubtleStyle())
 }

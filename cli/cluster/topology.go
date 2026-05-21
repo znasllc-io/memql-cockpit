@@ -138,7 +138,6 @@ func (v *View) SetNodeTypes(types []NodeTypeInfo) {
 	v.NodeTypes = types
 }
 
-
 // ApplyNodeUpdate merges a single-node change into the topology model. If
 // the node already exists (matched by ID, or by Type for single-node-per-
 // type deployments) its record is updated in place; otherwise it is

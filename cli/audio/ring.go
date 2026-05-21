@@ -13,11 +13,11 @@ import (
 // dropped if the consumer falls behind, bounded to the configured
 // capacity. close() unblocks any pending Read with io.EOF.
 type ringReader struct {
-	mu       sync.Mutex
-	cond     *sync.Cond
-	buf      []byte
-	cap      int
-	closed   bool
+	mu     sync.Mutex
+	cond   *sync.Cond
+	buf    []byte
+	cap    int
+	closed bool
 }
 
 func newRingReader(capacity int) *ringReader {

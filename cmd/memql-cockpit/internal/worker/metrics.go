@@ -27,8 +27,8 @@ import (
 type Metrics struct {
 	startedAt time.Time
 
-	callsTotal      atomic.Int64
-	callsByOutcome  map[string]*atomic.Int64
+	callsTotal       atomic.Int64
+	callsByOutcome   map[string]*atomic.Int64
 	callsByOutcomeMu sync.RWMutex
 
 	durationBucketsMs []int64
@@ -38,7 +38,7 @@ type Metrics struct {
 
 	reconnects atomic.Int64
 
-	server *http.Server
+	server   *http.Server
 	listener net.Listener
 }
 
