@@ -73,6 +73,8 @@ type Client interface {
 	Status() (consent.Response, error)
 	Grant(window time.Duration, strict bool) (consent.Response, error)
 	Revoke() (consent.Response, error)
+	Approve(id string) (consent.Response, error)
+	Deny(id string) (consent.Response, error)
 	Watch(ctx context.Context, onEvent func([]byte)) error
 }
 
@@ -114,6 +116,17 @@ type View struct {
 	// grantModal is non-nil while the Grant modal is open.
 	grantModal *grantModalState
 
+	// approvalQueue is the FIFO of strict-mode per-action approval
+	// requests received over the Watch stream and not yet resolved
+	// by Allow/Deny. The head of the queue is the modal the user
+	// sees; as they resolve one, the next becomes active.
+	//
+	// Entries seen via EventApprovalRequested append to the tail;
+	// EventApprovalResolved removes by id (covers the timeout +
+	// revoke + foreign-resolver paths even when the local Allow/
+	// Deny RPC didn't fire).
+	approvalQueue []approvalEntry
+
 	// auditList drives scroll/cursor over the audit ring.
 	auditList ui.ListPane
 
@@ -131,6 +144,16 @@ type View struct {
 type grantModalState struct {
 	selected int  // index into grantPresets
 	strict   bool // toggled with 's' before submitting
+}
+
+// approvalEntry is one queued strict-mode approval awaiting an
+// operator decision in the Workers pane.
+type approvalEntry struct {
+	id          string
+	tool        string
+	action      string
+	class       consent.Class
+	requestedAt time.Time
 }
 
 // NewView creates an empty Workers view. The Client defaults to
@@ -244,8 +267,32 @@ func (v *View) onWatchLine(line []byte) {
 			return
 		}
 		v.applyStatus(resp.Status, resp.OK, resp.Error)
+		// Watch's initial response carries the current pending queue
+		// so reconnects don't drop on-screen approvals.
+		if resp.OK && len(resp.Pending) > 0 {
+			v.seedPending(resp.Pending)
+		}
 		return
 	}
+}
+
+// seedPending replaces the local approval queue with the worker's
+// current pending list. Called on Watch reconnect so the modal
+// state survives a brief socket disconnect.
+func (v *View) seedPending(pending []consent.PendingApprovalInfo) {
+	v.Mu.Lock()
+	v.approvalQueue = v.approvalQueue[:0]
+	for _, p := range pending {
+		v.approvalQueue = append(v.approvalQueue, approvalEntry{
+			id:          p.Id,
+			tool:        p.Tool,
+			action:      p.Action,
+			class:       p.Class,
+			requestedAt: p.RequestedAt,
+		})
+	}
+	v.Mu.Unlock()
+	v.Redraw()
 }
 
 func (v *View) applyEvent(ev consent.Event) {
@@ -265,6 +312,27 @@ func (v *View) applyEvent(ev consent.Event) {
 		}
 	case consent.EventRevoked:
 		v.status = consent.Status{Granted: false}
+		// Revoke cancels every pending approval on the worker side.
+		// Mirror that in the TUI so the operator doesn't keep a
+		// stale modal up against an already-denied call.
+		v.approvalQueue = nil
+	case consent.EventApprovalRequested:
+		// Append unless already queued (broadcast + Pending snapshot
+		// on Watch reconnect can race).
+		if ev.ApprovalId != "" && !v.approvalQueueContainsLocked(ev.ApprovalId) {
+			v.approvalQueue = append(v.approvalQueue, approvalEntry{
+				id:          ev.ApprovalId,
+				tool:        ev.Tool,
+				action:      ev.Action,
+				class:       ev.Class,
+				requestedAt: ev.At,
+			})
+		}
+	case consent.EventApprovalResolved:
+		// The worker side resolved the approval (could be us, a
+		// timeout, a revoke, or a foreign caller). Drop it from
+		// the queue regardless of source.
+		v.removeFromApprovalQueueLocked(ev.ApprovalId)
 	}
 
 	// Append to the audit ring. Bounded length.
@@ -275,6 +343,31 @@ func (v *View) applyEvent(ev consent.Event) {
 	v.auditList.Count = len(v.events)
 	v.Mu.Unlock()
 	v.Redraw()
+}
+
+// approvalQueueContainsLocked checks the queue for an existing
+// entry with the given id. Caller must hold v.Mu (write or read).
+func (v *View) approvalQueueContainsLocked(id string) bool {
+	for _, a := range v.approvalQueue {
+		if a.id == id {
+			return true
+		}
+	}
+	return false
+}
+
+// removeFromApprovalQueueLocked drops the entry with the given id.
+// No-op when the id isn't present. Caller must hold v.Mu (write).
+func (v *View) removeFromApprovalQueueLocked(id string) {
+	if id == "" {
+		return
+	}
+	for i, a := range v.approvalQueue {
+		if a.id == id {
+			v.approvalQueue = append(v.approvalQueue[:i], v.approvalQueue[i+1:]...)
+			return
+		}
+	}
 }
 
 func (v *View) applyStatus(s consent.Status, ok bool, errMsg string) {
@@ -357,6 +450,12 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 	v.drawChrome(screen, bounds)
 	if v.grantModal != nil {
 		v.drawGrantModal(screen, bounds)
+	}
+	// Approval modal is the highest-priority overlay: a strict-mode
+	// per-action approval that arrives while the grant picker is
+	// open MUST pre-empt the picker. Pull the head of the queue.
+	if len(v.approvalQueue) > 0 {
+		v.drawApprovalModal(screen, bounds, v.approvalQueue[0])
 	}
 }
 
@@ -565,8 +664,69 @@ func (v *View) drawChrome(screen *ui.Screen, bounds ui.Rect) {
 			{Key: "Esc", Label: "Cancel"},
 		}
 	}
+	if len(v.approvalQueue) > 0 {
+		// Approval modal hint set takes precedence; the other chips
+		// would mislead since the operator's keys are routed to the
+		// approval modal first.
+		chips = []ui.HintChip{
+			{Key: "A", Label: "Allow"},
+			{Key: "D", Label: "Deny"},
+		}
+	}
 	bar := ui.HintBar{Chips: chips}
 	bar.Draw(screen, bounds, v.Theme)
+}
+
+// drawApprovalModal renders the strict-mode per-action approval
+// modal. Sits on top of everything else in the pane (including
+// the grant modal). Shows the request id (short), tool + action,
+// class, age, and queue depth so the operator knows whether
+// another approval is right behind this one.
+func (v *View) drawApprovalModal(screen *ui.Screen, bounds ui.Rect, head approvalEntry) {
+	modalH := 8
+	modalW := 60
+	if modalW > bounds.Width-4 {
+		modalW = bounds.Width - 4
+	}
+	if modalH > bounds.Height-4 {
+		modalH = bounds.Height - 4
+	}
+	x := bounds.X + (bounds.Width-modalW)/2
+	y := bounds.Y + (bounds.Height-modalH)/2
+	if y < bounds.Y+1 {
+		y = bounds.Y + 1
+	}
+
+	screen.FillRect(x, y, modalW, modalH, v.Theme.BaseStyle())
+	screen.DrawBox(x, y, modalW, modalH, v.Theme.AccentStyle())
+	title := " STRICT-MODE APPROVAL REQUIRED "
+	screen.DrawText(x+2, y, len(title), title, v.Theme.AccentStyle().Bold(true))
+
+	// Body lines.
+	lines := []string{
+		fmt.Sprintf("Tool / action:  %s.%s", head.tool, head.action),
+		fmt.Sprintf("Class:          %s", classText(head.class)),
+		fmt.Sprintf("Requested:      %s ago", formatDuration(time.Since(head.requestedAt))),
+	}
+	if extra := len(v.approvalQueue) - 1; extra > 0 {
+		lines = append(lines, fmt.Sprintf("Queue:          %d more pending after this one", extra))
+	}
+	lines = append(lines, "", "Press A to ALLOW once, or D to DENY.")
+	for i, ln := range lines {
+		if i+1 >= modalH-1 {
+			break
+		}
+		screen.DrawText(x+2, y+1+i, modalW-4, ln, v.Theme.BaseStyle())
+	}
+}
+
+// classText is the display string for the Class column. Empty
+// class falls back to "-" so the modal layout stays stable.
+func classText(c consent.Class) string {
+	if c == "" {
+		return "-"
+	}
+	return string(c)
 }
 
 func (v *View) strictChipLabel() string {
@@ -624,10 +784,13 @@ func (v *View) drawGrantModal(screen *ui.Screen, bounds ui.Rect) {
 // HandleEvent routes a tcell event into the view. Returns true when
 // the event was consumed.
 //
-// When the Grant modal is open, the modal consumes all key events
-// (Esc closes it, Enter submits, ↑/↓ pick a preset, S toggles strict).
-// Otherwise the view consumes G / R for the action keys, and forwards
-// ↑/↓/PgUp/PgDn/etc. to the audit ListPane for scrolling.
+// Precedence:
+//  1. Approval modal (strict-mode per-action): A=Allow, D=Deny.
+//     Pre-empts everything else so a strict approval can't get
+//     hidden behind a stale grant picker.
+//  2. Grant modal: ↑/↓ pick, S toggles strict, Enter grants, Esc cancels.
+//  3. Audit list: G opens the grant modal, R revokes, scroll keys
+//     forward to ListPane.
 func (v *View) HandleEvent(ev tcell.Event) bool {
 	key, ok := ev.(*tcell.EventKey)
 	if !ok {
@@ -635,13 +798,100 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 	}
 
 	v.Mu.Lock()
+	approvalOpen := len(v.approvalQueue) > 0
 	modalOpen := v.grantModal != nil
 	v.Mu.Unlock()
 
+	if approvalOpen {
+		return v.handleApprovalKey(key)
+	}
 	if modalOpen {
 		return v.handleModalKey(key)
 	}
 	return v.handleListKey(key)
+}
+
+// handleApprovalKey routes A / D against the head of the approval
+// queue. The actual socket round-trip runs in a goroutine so the
+// event loop never blocks; the EventApprovalResolved broadcast
+// from the worker is what eventually pops the queue (so a
+// foreign Allow / timeout / revoke is also visible).
+func (v *View) handleApprovalKey(key *tcell.EventKey) bool {
+	if key.Key() != tcell.KeyRune {
+		return false
+	}
+	v.Mu.RLock()
+	if len(v.approvalQueue) == 0 {
+		v.Mu.RUnlock()
+		return false
+	}
+	head := v.approvalQueue[0]
+	v.Mu.RUnlock()
+
+	switch key.Rune() {
+	case 'a', 'A':
+		go v.doApprove(head.id)
+		return true
+	case 'd', 'D':
+		go v.doDeny(head.id)
+		return true
+	}
+	return false
+}
+
+// doApprove / doDeny call the consent client. The result event
+// (EventApprovalResolved) flows back through the Watch stream and
+// drops the entry from the queue -- we DON'T eagerly pop here so
+// foreign resolvers stay correctly serialised.
+func (v *View) doApprove(id string) {
+	v.Mu.RLock()
+	c := v.client
+	v.Mu.RUnlock()
+	if c == nil {
+		return
+	}
+	resp, err := c.Approve(id)
+	if err != nil {
+		v.Notify(fmt.Sprintf("Approve failed: %v", err))
+		// Drop the entry locally so the modal doesn't get stuck on
+		// an id the worker doesn't know (timed out, revoked,
+		// already resolved).
+		v.dropApprovalLocally(id)
+		return
+	}
+	if !resp.OK {
+		v.Notify(fmt.Sprintf("Approve rejected: %s", resp.Error))
+		v.dropApprovalLocally(id)
+	}
+}
+
+func (v *View) doDeny(id string) {
+	v.Mu.RLock()
+	c := v.client
+	v.Mu.RUnlock()
+	if c == nil {
+		return
+	}
+	resp, err := c.Deny(id)
+	if err != nil {
+		v.Notify(fmt.Sprintf("Deny failed: %v", err))
+		v.dropApprovalLocally(id)
+		return
+	}
+	if !resp.OK {
+		v.Notify(fmt.Sprintf("Deny rejected: %s", resp.Error))
+		v.dropApprovalLocally(id)
+	}
+}
+
+// dropApprovalLocally removes an approval entry without waiting
+// for the worker's resolved broadcast. Used on the error / not-OK
+// paths so the modal doesn't lock the operator out.
+func (v *View) dropApprovalLocally(id string) {
+	v.Mu.Lock()
+	v.removeFromApprovalQueueLocked(id)
+	v.Mu.Unlock()
+	v.Redraw()
 }
 
 func (v *View) handleListKey(key *tcell.EventKey) bool {
