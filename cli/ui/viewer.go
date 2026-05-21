@@ -55,10 +55,17 @@ type Viewer struct {
 	EmptyMessage string
 
 	// viewportRowsCache is populated by Draw so HandleEvent's PgUp /
-	// PgDn can size their jumps using the bounds Draw last saw.
-	// Unexported because callers don't construct Viewer with it set;
-	// it's a pure draw-to-event side channel.
+	// PgDn can size their jumps using the bounds Draw last saw, and
+	// maxScrollCache so KeyDown / KeyEnd / KeyPgDn can stop ScrollY
+	// at the last valid position instead of overshooting. The
+	// overshoot bug was visible to users as "arrow keys stop
+	// scrolling": ScrollY drifted past the displayable max, and
+	// KeyUp had to decrement back through the dead range before the
+	// viewport moved -- looked like a stuck cursor. Unexported
+	// because callers don't construct Viewer with these set; they're
+	// pure draw-to-event side channels.
 	viewportRowsCache int
+	maxScrollCache    int
 }
 
 // gutterWidth is the number of cells reserved for the line-number
@@ -107,6 +114,7 @@ func (v *Viewer) Draw(screen *Screen, bounds Rect, theme Theme) {
 	if maxScroll < 0 {
 		maxScroll = 0
 	}
+	v.maxScrollCache = maxScroll
 	if v.ScrollY > maxScroll {
 		v.ScrollY = maxScroll
 	}
@@ -277,6 +285,15 @@ func styleRunes(text string, spans []HighlightSpan, base tcell.Style) []styledRu
 // HandleEvent processes scroll keys when Focused is true. Returns
 // true if the event was consumed. Bindings mirror DetailPane so the
 // muscle memory transfers across surfaces.
+//
+// Both edges of the scroll range are clamped on every key press
+// (using the maxScroll the last Draw observed). Pre-fix the
+// downward keys (KeyDown / KeyPgDn / KeyEnd / 'j') let ScrollY
+// drift past the displayable max -- visually a no-op, but the
+// internal counter accumulated phantom presses and KeyUp then had
+// to decrement back through the dead range before the viewport
+// moved. To the user that read as "arrow keys do nothing"; see
+// memql-cockpit#115.
 func (v *Viewer) HandleEvent(ev tcell.Event) bool {
 	if !v.Focused {
 		return false
@@ -296,6 +313,7 @@ func (v *Viewer) HandleEvent(ev tcell.Event) bool {
 		return true
 	case tcell.KeyDown:
 		v.ScrollY++
+		v.clampScroll()
 		return true
 	case tcell.KeyPgUp:
 		v.ScrollY -= page
@@ -303,12 +321,14 @@ func (v *Viewer) HandleEvent(ev tcell.Event) bool {
 		return true
 	case tcell.KeyPgDn:
 		v.ScrollY += page
+		v.clampScroll()
 		return true
 	case tcell.KeyHome:
 		v.ScrollY = 0
 		return true
 	case tcell.KeyEnd:
-		v.ScrollY = 1<<30 - 1
+		v.ScrollY = v.maxScrollCache
+		v.clampScroll()
 		return true
 	case tcell.KeyRune:
 		switch key.Rune() {
@@ -318,15 +338,35 @@ func (v *Viewer) HandleEvent(ev tcell.Event) bool {
 			return true
 		case 'j':
 			v.ScrollY++
+			v.clampScroll()
 			return true
 		}
 	}
 	return false
 }
 
+// MaxScroll returns the largest valid ScrollY observed during the
+// most recent Draw -- i.e. the scroll offset at which the last
+// content row is just visible at the bottom of the viewport.
+// Returns 0 before the first Draw, when the content fits in the
+// viewport, or when there are no lines. Useful for callers that
+// need to coordinate with the viewer's scroll state (e.g. testing
+// scroll bindings against the actual content size).
+func (v *Viewer) MaxScroll() int {
+	return v.maxScrollCache
+}
+
+// clampScroll clamps ScrollY to [0, maxScrollCache]. maxScrollCache
+// is set by Draw; before the first Draw it's 0, which makes every
+// scroll a no-op until a frame has been painted. That's the desired
+// behavior -- without a known viewport the widget can't tell where
+// the scroll range ends.
 func (v *Viewer) clampScroll() {
 	if v.ScrollY < 0 {
 		v.ScrollY = 0
+	}
+	if v.ScrollY > v.maxScrollCache {
+		v.ScrollY = v.maxScrollCache
 	}
 }
 
