@@ -50,6 +50,11 @@ type Request struct {
 	// response op. Required for both approve and deny; ignored on
 	// other ops.
 	ApprovalId string `json:"approval_id,omitempty"`
+
+	// Region is the optional strict-mode in-region exemption rect
+	// on the "grant" op (memql-cockpit#131). Nil = no region.
+	// Ignored on every other op and on non-strict grants.
+	Region *Region `json:"region,omitempty"`
 }
 
 // Response is the unified reply shape for non-WATCH ops.
@@ -208,7 +213,7 @@ func (s *Server) handleGrant(c net.Conn, req Request) {
 		s.writeResp(c, Response{OK: false, Error: "window_seconds must be > 0"})
 		return
 	}
-	if _, err := s.mgr.Grant(time.Duration(req.WindowSeconds)*time.Second, req.Strict); err != nil {
+	if _, err := s.mgr.Grant(time.Duration(req.WindowSeconds)*time.Second, req.Strict, req.Region); err != nil {
 		s.writeResp(c, Response{OK: false, Error: err.Error()})
 		return
 	}
@@ -301,12 +306,21 @@ func DefaultClient() *Client {
 // Grant opens a consent window of the requested duration. Strict
 // enables the per-action approval gate on the high-risk subset
 // (workerComputer.key_type + workerComputer.mouse_click); see
-// Manager.Allows.
-func (c *Client) Grant(window time.Duration, strict bool) (Response, error) {
+// Manager.AllowsAt.
+//
+// region is the optional strict-mode in-region exemption rect
+// (memql-cockpit#131); pass nil for none. It's ignored unless
+// strict is true.
+func (c *Client) Grant(window time.Duration, strict bool, region *Region) (Response, error) {
 	if window <= 0 {
 		return Response{}, errors.New("client: window must be positive")
 	}
-	return c.exec(Request{Op: "grant", WindowSeconds: int(window.Seconds()), Strict: strict})
+	return c.exec(Request{
+		Op:            "grant",
+		WindowSeconds: int(window.Seconds()),
+		Strict:        strict,
+		Region:        region,
+	})
 }
 
 // Revoke closes any active window.

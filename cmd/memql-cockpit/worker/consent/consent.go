@@ -63,6 +63,48 @@ type Decision struct {
 	Reason  string
 }
 
+// Region is an optional screen-coordinate rectangle attached to a
+// strict-mode grant (memql-cockpit#131). When a region is set, a
+// strict-mode `workerComputer.mouse_click` whose cursor falls
+// INSIDE the rect is admitted WITHOUT the per-action approval gate
+// -- the operator pre-authorised that zone of the screen. Clicks
+// outside the rect still route through the Allow/Deny modal.
+//
+// The region is a static screen rect because the worker has no
+// window-bounds API today (window_list / window_focus are stubs).
+// A window-relative or per-app region is future work once that API
+// lands. key_type carries no spatial coordinate, so the region
+// exemption never applies to it -- typed text stays fully gated
+// under strict mode.
+type Region struct {
+	X int `json:"x"`
+	Y int `json:"y"`
+	W int `json:"w"`
+	H int `json:"h"`
+}
+
+// Contains reports whether the point (px, py) falls inside the
+// region. Half-open on the far edges (standard rect containment):
+// the top-left corner is inside, the bottom-right corner is not.
+// A zero-or-negative-area region contains nothing.
+func (r Region) Contains(px, py int) bool {
+	if r.W <= 0 || r.H <= 0 {
+		return false
+	}
+	return px >= r.X && px < r.X+r.W && py >= r.Y && py < r.Y+r.H
+}
+
+// CursorPoint is the cursor position the dispatcher passes to
+// AllowsAt for a region check. Known is false when the caller has
+// no position info (headless build, or any non-mouse_click call) --
+// an unknown cursor can never be in-region, so it falls through to
+// the standard gate.
+type CursorPoint struct {
+	X     int
+	Y     int
+	Known bool
+}
+
 // Status is a point-in-time snapshot of the manager's state.
 // Exposed via the IPC `status` op and the TUI's would-be Workers
 // pane.
@@ -78,10 +120,13 @@ type Status struct {
 	// 12m of a 1h window" without doing the subtraction itself.
 	Window time.Duration `json:"window_ms,omitempty"`
 	// Strict reports whether the active window requires per-action
-	// approval for ClassInteract calls. v1 ships the flag in the
-	// wire shape but enforces it as a no-op -- the foreground
-	// per-call approval surface ships as a follow-up under #64.
+	// approval for the high-risk subset (workerComputer.key_type +
+	// workerComputer.mouse_click).
 	Strict bool `json:"strict,omitempty"`
+	// Region is the optional in-region exemption rect for strict
+	// mode (memql-cockpit#131). Nil when no region was set on the
+	// grant -- strict mode then gates every high-risk call.
+	Region *Region `json:"region,omitempty"`
 }
 
 // Manager holds the active-window state machine plus a small
@@ -95,6 +140,9 @@ type Manager struct {
 	expiresAt time.Time
 	window    time.Duration
 	strict    bool
+	// region is the optional strict-mode in-region exemption rect.
+	// Nil = no region (strict gates every high-risk call).
+	region *Region
 
 	// now is the time source. Tests inject a fixed clock; production
 	// passes nil and we fall back to time.Now.UTC.
@@ -174,8 +222,12 @@ func (m *Manager) SetApprovalTimeout(d time.Duration) {
 // recent decision wins. Returns the absolute expiry time so
 // callers can log it.
 //
+// region is the optional strict-mode in-region exemption rect
+// (memql-cockpit#131); pass nil for no region. It's only
+// meaningful when strict is true -- a non-strict grant ignores it.
+//
 // Window <= 0 errors out (use Revoke to close immediately).
-func (m *Manager) Grant(window time.Duration, strict bool) (time.Time, error) {
+func (m *Manager) Grant(window time.Duration, strict bool, region *Region) (time.Time, error) {
 	if window <= 0 {
 		return time.Time{}, errors.New("consent: window must be positive")
 	}
@@ -185,12 +237,20 @@ func (m *Manager) Grant(window time.Duration, strict bool) (time.Time, error) {
 	m.expiresAt = exp
 	m.window = window
 	m.strict = strict
+	// Region is only meaningful under strict mode; drop it on a
+	// non-strict grant so Snapshot doesn't advertise a dead rect.
+	if strict {
+		m.region = region
+	} else {
+		m.region = nil
+	}
 	m.broadcast(Event{
 		At:        m.now(),
 		Kind:      EventGranted,
 		ExpiresAt: exp,
 		Window:    window,
 		Strict:    strict,
+		Region:    m.region,
 	})
 	return exp, nil
 }
@@ -208,6 +268,7 @@ func (m *Manager) Revoke() {
 	m.expiresAt = time.Time{}
 	m.window = 0
 	m.strict = false
+	m.region = nil
 	m.mu.Unlock()
 	// broadcast BEFORE cancelling pending so subscribers see the
 	// revoke event first and can prepare to drain their pending
@@ -226,12 +287,29 @@ func (m *Manager) Revoke() {
 // `consent_required` failure message.
 //
 // Emits a `dispatch` event regardless of outcome so subscribers
-// (the future Workers pane) can render a live audit tail.
+// (the Workers pane) can render a live audit tail.
+//
+// Allows is the no-cursor entry point -- it's equivalent to
+// AllowsAt with an unknown cursor. Use it for every call except
+// workerComputer.mouse_click; that one should go through AllowsAt
+// with the cursor position so the strict-mode region exemption
+// (memql-cockpit#131) can fire.
 func (m *Manager) Allows(tool, action string) Decision {
+	return m.AllowsAt(tool, action, CursorPoint{})
+}
+
+// AllowsAt is Allows with a cursor position. The dispatcher passes
+// the live cursor for workerComputer.mouse_click so that, under a
+// strict grant carrying a region, an in-region click skips the
+// per-action approval gate. For every other call the cursor is
+// CursorPoint{} (Known=false) and AllowsAt behaves exactly like
+// the old Allows.
+func (m *Manager) AllowsAt(tool, action string, cursor CursorPoint) Decision {
 	class := Classify(tool, action)
 	m.mu.RLock()
 	exp := m.expiresAt
 	strict := m.strict
+	region := m.region
 	m.mu.RUnlock()
 
 	now := m.now()
@@ -261,10 +339,24 @@ func (m *Manager) Allows(tool, action string) Decision {
 	// blocks until an operator clicks Allow / Deny in the Workers
 	// pane, or the wait times out (defaults to deny). Other
 	// ClassInteract calls (exec, fs_write, mouse_move, key_press)
-	// stay admitted by the granted window -- typed text and
-	// non-region-confined clicks are the calls the spec singles out
-	// as load-bearing for the second consent decision.
+	// stay admitted by the granted window.
 	if strict && isHighRiskAction(tool, action) {
+		// Region exemption (memql-cockpit#131): a mouse_click whose
+		// cursor falls inside the grant's region is pre-authorised
+		// and skips the approval gate. key_type has no cursor so it
+		// never qualifies -- isMouseClick gates that. An unknown
+		// cursor (headless, or the dispatcher didn't resolve it)
+		// also falls through to the gate.
+		if region != nil && isMouseClick(tool, action) && cursor.Known && region.Contains(cursor.X, cursor.Y) {
+			dec := Decision{
+				Allowed: true,
+				Reason: fmt.Sprintf(
+					"consent granted -- in-region click at (%d,%d) within strict-mode region [%d,%d %dx%d]",
+					cursor.X, cursor.Y, region.X, region.Y, region.W, region.H),
+			}
+			m.recordDispatch(tool, action, class, dec)
+			return dec
+		}
 		dec := m.requestApproval(tool, action, class)
 		m.recordDispatch(tool, action, class, dec)
 		return dec
@@ -286,6 +378,7 @@ func (m *Manager) Snapshot() Status {
 		ExpiresAt: m.expiresAt,
 		Window:    m.window,
 		Strict:    m.strict,
+		Region:    m.region,
 	}
 }
 
@@ -319,6 +412,11 @@ type Event struct {
 	// TUI uses it to correlate Allow/Deny responses back to the
 	// blocked dispatcher goroutine.
 	ApprovalId string `json:"approval_id,omitempty"`
+
+	// Region carries the strict-mode in-region exemption rect on
+	// EventGranted events (memql-cockpit#131). Nil when the grant
+	// set no region.
+	Region *Region `json:"region,omitempty"`
 }
 
 // Subscribe returns a channel that receives Manager events plus a
@@ -415,6 +513,15 @@ func isHighRiskAction(tool, action string) bool {
 		return true
 	}
 	return false
+}
+
+// isMouseClick reports whether (tool, action) is the one high-risk
+// call the region exemption can apply to. key_type carries no
+// cursor coordinate, so the region check is meaningless for it --
+// it stays fully gated under strict mode regardless of region.
+func isMouseClick(tool, action string) bool {
+	return strings.ToLower(strings.TrimSpace(tool)) == "workercomputer" &&
+		strings.ToLower(strings.TrimSpace(action)) == "mouse_click"
 }
 
 // requestApproval registers a pending strict-mode approval, broadcasts

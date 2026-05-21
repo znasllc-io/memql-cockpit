@@ -57,7 +57,7 @@ func TestSocket_StatusRoundTrip(t *testing.T) {
 func TestSocket_GrantThenStatus(t *testing.T) {
 	_, _, client := setupTestServer(t)
 
-	r, err := client.Grant(30*time.Minute, false)
+	r, err := client.Grant(30*time.Minute, false, nil)
 	if err != nil {
 		t.Fatalf("Grant: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestSocket_GrantThenStatus(t *testing.T) {
 func TestSocket_RevokeViaIPC(t *testing.T) {
 	_, _, client := setupTestServer(t)
 
-	if _, err := client.Grant(time.Hour, false); err != nil {
+	if _, err := client.Grant(time.Hour, false, nil); err != nil {
 		t.Fatalf("Grant: %v", err)
 	}
 	r, err := client.Revoke()
@@ -90,7 +90,7 @@ func TestSocket_RevokeViaIPC(t *testing.T) {
 
 func TestSocket_GrantNegativeRejected(t *testing.T) {
 	_, _, client := setupTestServer(t)
-	_, err := client.Grant(-time.Second, false)
+	_, err := client.Grant(-time.Second, false, nil)
 	if err == nil {
 		t.Error("client must reject negative window pre-dial")
 	}
@@ -101,7 +101,7 @@ func TestSocket_GrantThroughManagerVisibleToServer(t *testing.T) {
 
 	// Grant directly on the manager (simulating a TUI thread holding
 	// the Manager pointer) and confirm the IPC reports it.
-	if _, err := mgr.Grant(time.Hour, true); err != nil {
+	if _, err := mgr.Grant(time.Hour, true, nil); err != nil {
 		t.Fatalf("Grant: %v", err)
 	}
 	r, err := client.Status()
@@ -144,7 +144,7 @@ func TestSocket_WatchStreamsEvents(t *testing.T) {
 	// events; the server pushes an initial snapshot then events.
 	time.Sleep(100 * time.Millisecond)
 
-	if _, err := mgr.Grant(time.Hour, false); err != nil {
+	if _, err := mgr.Grant(time.Hour, false, nil); err != nil {
 		t.Fatalf("Grant: %v", err)
 	}
 	mgr.Allows("workerHost", "exec")

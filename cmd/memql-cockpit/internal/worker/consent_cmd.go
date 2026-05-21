@@ -83,7 +83,12 @@ func handleConsentGrant(args []string) {
 		fmt.Fprintf(os.Stderr, "WARNING: long window (%s) -- consider a shorter duration for security.\n", *window)
 	}
 
-	resp, err := consentClient().Grant(*window, *strict)
+	// The CLI grant path never sets a strict-mode region -- the
+	// in-region exemption (memql-cockpit#131) is configured through
+	// the TUI Workers-pane region picker, which needs the visual
+	// box-draw surface to be usable. CLI callers get plain strict
+	// mode (every high-risk call gated).
+	resp, err := consentClient().Grant(*window, *strict, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 		fmt.Fprintln(os.Stderr, "Hint: is the worker running? Start it with `memql-cockpit worker run`.")

@@ -19,10 +19,20 @@ import (
 type fakeGate struct {
 	decision consent.Decision
 	calls    int
+	// lastCursor records the cursor passed to the most recent
+	// AllowsAt call so a test can assert the dispatcher resolved
+	// the cursor for mouse_click.
+	lastCursor consent.CursorPoint
 }
 
 func (g *fakeGate) Allows(tool, action string) consent.Decision {
 	g.calls++
+	return g.decision
+}
+
+func (g *fakeGate) AllowsAt(tool, action string, cursor consent.CursorPoint) consent.Decision {
+	g.calls++
+	g.lastCursor = cursor
 	return g.decision
 }
 
@@ -138,7 +148,7 @@ func TestDispatcher_ConsentGate_EndToEndWithManager(t *testing.T) {
 	}
 
 	// Grant: admit (unknown_action surfaces from the inner dispatch).
-	if _, err := mgr.Grant(getTestWindow(t), false); err != nil {
+	if _, err := mgr.Grant(getTestWindow(t), false, nil); err != nil {
 		t.Fatalf("Grant: %v", err)
 	}
 	_, failure = d.Dispatch(context.Background(), dispatch)
@@ -157,4 +167,36 @@ func TestDispatcher_ConsentGate_EndToEndWithManager(t *testing.T) {
 func getTestWindow(t *testing.T) time.Duration {
 	t.Helper()
 	return time.Hour
+}
+
+// TestDispatcher_MouseClickRoutesThroughAllowsAt confirms a
+// workerComputer.mouse_click goes through the cursor-aware
+// AllowsAt path (memql-cockpit#131) rather than plain Allows --
+// that's what lets the strict-mode region exemption fire. On this
+// non-gui test build cursorLocation() reports Known=false, which
+// is the correct headless behaviour.
+func TestDispatcher_MouseClickRoutesThroughAllowsAt(t *testing.T) {
+	gate := &fakeGate{decision: consent.Decision{Allowed: false, Reason: "gated"}}
+	d := NewDispatcher(quietLogger(), DefaultPolicy(), gate)
+
+	dispatch := &memqlv1.ToolDispatch{
+		Tool:     "workerComputer",
+		Action:   "mouse_click",
+		ArgsJson: []byte(`{"mouse_click":{"button":"left"}}`),
+		CallId:   "test-region-1",
+	}
+	_, failure := d.Dispatch(context.Background(), dispatch)
+	if failure == nil || failure.GetErrorCode() != "consent_required" {
+		t.Fatalf("expected consent_required failure; got %+v", failure)
+	}
+	if gate.calls != 1 {
+		t.Errorf("gate should be consulted once; got %d", gate.calls)
+	}
+	// AllowsAt sets lastCursor. The headless build's cursorLocation
+	// stub reports Known=false -- assert the dispatcher took the
+	// AllowsAt path (lastCursor was written) and carried the
+	// headless sentinel.
+	if gate.lastCursor.Known {
+		t.Errorf("headless build must report Known=false cursor; got %+v", gate.lastCursor)
+	}
 }

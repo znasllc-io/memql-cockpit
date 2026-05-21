@@ -50,6 +50,7 @@ type fakeClient struct {
 type grantCall struct {
 	window time.Duration
 	strict bool
+	region *consent.Region
 }
 
 func (f *fakeClient) Status() (consent.Response, error) {
@@ -58,9 +59,9 @@ func (f *fakeClient) Status() (consent.Response, error) {
 	return f.statusResp, f.statusErr
 }
 
-func (f *fakeClient) Grant(window time.Duration, strict bool) (consent.Response, error) {
+func (f *fakeClient) Grant(window time.Duration, strict bool, region *consent.Region) (consent.Response, error) {
 	f.mu.Lock()
-	f.grantCalls = append(f.grantCalls, grantCall{window: window, strict: strict})
+	f.grantCalls = append(f.grantCalls, grantCall{window: window, strict: strict, region: region})
 	resp := f.grantResp
 	err := f.grantErr
 	f.mu.Unlock()
@@ -313,8 +314,19 @@ func TestGrantModalKeyFlow(t *testing.T) {
 		t.Errorf("strict toggle should report ON: %q", joined)
 	}
 
-	// Enter submits.
+	// Enter at the duration stage with strict ON advances to the
+	// region picker stage (memql-cockpit#131) -- it does NOT grant
+	// yet.
 	v.HandleEvent(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	v.Mu.RLock()
+	atRegionStage := v.grantModal != nil && v.grantModal.stage == grantStageRegion
+	v.Mu.RUnlock()
+	if !atRegionStage {
+		t.Fatalf("strict + Enter should advance to the region picker stage")
+	}
+	// Press N to skip the region (strict grant, gate every
+	// high-risk call) -- that's the grant this test asserts.
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyRune, 'n', tcell.ModNone))
 	// doGrant runs in a goroutine; give it a moment to land.
 	waitForGrantCall(t, fc, 1)
 
@@ -327,6 +339,9 @@ func TestGrantModalKeyFlow(t *testing.T) {
 	}
 	if !calls[0].strict {
 		t.Errorf("expected strict=true")
+	}
+	if calls[0].region != nil {
+		t.Errorf("N (no region) should grant with a nil region, got %+v", calls[0].region)
 	}
 
 	// Modal should be closed.
@@ -802,5 +817,190 @@ func TestChromeContract_ApprovalHints(t *testing.T) {
 	}
 	if strings.Contains(hint, "G:Grant") {
 		t.Errorf("hint must NOT show G:Grant during pending approval: %q", hint)
+	}
+}
+
+// --- 131: strict-mode region picker ---
+
+// openRegionStage drives the Grant modal to the region stage:
+// G (open) -> S (strict on) -> Enter (advance). Returns the view
+// already at grantStageRegion.
+func openRegionStage(t *testing.T, v *View) {
+	t.Helper()
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyRune, 'g', tcell.ModNone))
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyRune, 's', tcell.ModNone))
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	v.Mu.RLock()
+	defer v.Mu.RUnlock()
+	if v.grantModal == nil || v.grantModal.stage != grantStageRegion {
+		t.Fatalf("expected region stage; grantModal=%+v", v.grantModal)
+	}
+}
+
+// TestRegionStage_StrictEnterAdvances: strict + Enter opens the
+// region picker rather than granting.
+func TestRegionStage_StrictEnterAdvances(t *testing.T) {
+	v, screen, sim, bounds := makeView(t)
+	fc := &fakeClient{}
+	v.SetClient(fc)
+	openRegionStage(t, v)
+
+	rows := drawAndSnapshot(v, screen, sim, bounds)
+	joined := strings.Join(rows, "\n")
+	if !strings.Contains(joined, "STRICT-MODE REGION") {
+		t.Errorf("region picker title missing: %q", joined)
+	}
+	// No grant fired yet.
+	if len(snapshotGrantCalls(fc)) != 0 {
+		t.Errorf("advancing to region stage must not grant yet")
+	}
+}
+
+// TestRegionStage_ArrowsMoveResize: arrow keys move the box,
+// Shift+Arrow resize it.
+func TestRegionStage_ArrowsMoveResize(t *testing.T) {
+	v, _, _, _ := makeView(t)
+	v.SetClient(&fakeClient{})
+	openRegionStage(t, v)
+
+	v.Mu.RLock()
+	start := v.grantModal.region
+	v.Mu.RUnlock()
+
+	// Right arrow moves X by +regionNudge.
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyRight, 0, tcell.ModNone))
+	// Down arrow moves Y by +regionNudge.
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyDown, 0, tcell.ModNone))
+	// Shift+Right grows W by +regionNudge.
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyRight, 0, tcell.ModShift))
+	// Shift+Down grows H by +regionNudge.
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyDown, 0, tcell.ModShift))
+
+	v.Mu.RLock()
+	got := v.grantModal.region
+	v.Mu.RUnlock()
+	if got.X != start.X+regionNudge {
+		t.Errorf("Right arrow: X = %d, want %d", got.X, start.X+regionNudge)
+	}
+	if got.Y != start.Y+regionNudge {
+		t.Errorf("Down arrow: Y = %d, want %d", got.Y, start.Y+regionNudge)
+	}
+	if got.W != start.W+regionNudge {
+		t.Errorf("Shift+Right: W = %d, want %d", got.W, start.W+regionNudge)
+	}
+	if got.H != start.H+regionNudge {
+		t.Errorf("Shift+Down: H = %d, want %d", got.H, start.H+regionNudge)
+	}
+}
+
+// TestRegionStage_EnterGrantsWithRegion: after moving the box,
+// Enter grants with the region rect.
+func TestRegionStage_EnterGrantsWithRegion(t *testing.T) {
+	v, _, _, _ := makeView(t)
+	fc := &fakeClient{grantResp: consent.Response{OK: true, Status: consent.Status{Granted: true, Strict: true}}}
+	v.SetClient(fc)
+	openRegionStage(t, v)
+
+	// Nudge the box once so hasRegion latches true.
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyRight, 0, tcell.ModNone))
+	v.Mu.RLock()
+	want := v.grantModal.region
+	v.Mu.RUnlock()
+
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	waitForGrantCall(t, fc, 1)
+
+	calls := snapshotGrantCalls(fc)
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 grant call, got %d", len(calls))
+	}
+	if !calls[0].strict {
+		t.Error("region-stage grant must be strict")
+	}
+	if calls[0].region == nil {
+		t.Fatalf("region-stage Enter must grant WITH a region")
+	}
+	if *calls[0].region != want {
+		t.Errorf("granted region = %+v, want %+v", *calls[0].region, want)
+	}
+}
+
+// TestRegionStage_NoRegionGrantsNil: pressing N skips the region --
+// strict grant, nil region (gate every high-risk call).
+func TestRegionStage_NoRegionGrantsNil(t *testing.T) {
+	v, _, _, _ := makeView(t)
+	fc := &fakeClient{grantResp: consent.Response{OK: true, Status: consent.Status{Granted: true, Strict: true}}}
+	v.SetClient(fc)
+	openRegionStage(t, v)
+	// Even if the operator nudged the box, N discards it.
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyRight, 0, tcell.ModNone))
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyRune, 'n', tcell.ModNone))
+	waitForGrantCall(t, fc, 1)
+
+	calls := snapshotGrantCalls(fc)
+	if len(calls) != 1 || !calls[0].strict {
+		t.Fatalf("expected 1 strict grant, got %+v", calls)
+	}
+	if calls[0].region != nil {
+		t.Errorf("N must grant with nil region, got %+v", calls[0].region)
+	}
+}
+
+// TestRegionStage_EscGoesBack: Esc from the region stage steps
+// back to the duration stage (not a full cancel).
+func TestRegionStage_EscGoesBack(t *testing.T) {
+	v, _, _, _ := makeView(t)
+	fc := &fakeClient{}
+	v.SetClient(fc)
+	openRegionStage(t, v)
+
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyEscape, 0, tcell.ModNone))
+	v.Mu.RLock()
+	defer v.Mu.RUnlock()
+	if v.grantModal == nil {
+		t.Fatalf("Esc from region stage must NOT close the modal entirely")
+	}
+	if v.grantModal.stage != grantStageDuration {
+		t.Errorf("Esc from region stage should return to the duration stage")
+	}
+	if len(snapshotGrantCalls(fc)) != 0 {
+		t.Errorf("Esc must not grant")
+	}
+}
+
+// TestRegionStage_UntouchedAdvanceGrantsNil: if the operator
+// advances to the region stage but presses Enter WITHOUT nudging
+// the box, the grant carries no region (treated as "strict, no
+// region" rather than the seeded default rect).
+func TestRegionStage_UntouchedAdvanceGrantsNil(t *testing.T) {
+	v, _, _, _ := makeView(t)
+	fc := &fakeClient{grantResp: consent.Response{OK: true, Status: consent.Status{Granted: true, Strict: true}}}
+	v.SetClient(fc)
+	openRegionStage(t, v)
+	// Enter immediately, no nudges.
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	waitForGrantCall(t, fc, 1)
+	calls := snapshotGrantCalls(fc)
+	if calls[0].region != nil {
+		t.Errorf("untouched region stage + Enter should grant nil region, got %+v", calls[0].region)
+	}
+}
+
+// TestRegionStage_NonStrictSkipsPicker: a NON-strict grant submits
+// straight from the duration stage -- no region picker.
+func TestRegionStage_NonStrictSkipsPicker(t *testing.T) {
+	v, _, _, _ := makeView(t)
+	fc := &fakeClient{grantResp: consent.Response{OK: true, Status: consent.Status{Granted: true}}}
+	v.SetClient(fc)
+	// G then Enter -- no S, so strict stays off.
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyRune, 'g', tcell.ModNone))
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	waitForGrantCall(t, fc, 1)
+	calls := snapshotGrantCalls(fc)
+	if len(calls) != 1 || calls[0].strict {
+		t.Fatalf("expected 1 non-strict grant, got %+v", calls)
+	}
+	if calls[0].region != nil {
+		t.Errorf("non-strict grant must carry nil region")
 	}
 }
