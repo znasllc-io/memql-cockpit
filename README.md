@@ -64,6 +64,33 @@ Cluster config lives at `~/.memql/clusters.yaml`; worker config at
 `~/.memql/worker.yaml`. The install scripts under `scripts/install/`
 register a LaunchAgent (macOS) or systemd user service (Linux).
 
+### Computer-use consent gate
+
+Every `workerHost` / `workerComputer` tool call dispatched against a
+running worker passes through a **per-host consent gate**. Without
+an active operator-granted window, the worker rejects the call with
+`consent_required` -- the agent cannot drive shell / fs / mouse /
+keyboard on your machine until you say so.
+
+The worker starts a local control socket at
+`~/.memql/worker.sock` (mode 0600, owner-only). Use the
+`memql-cockpit worker consent ...` subcommand from a different
+terminal to manage windows:
+
+```bash
+memql-cockpit worker consent grant --window=1h     # open a 1-hour window
+memql-cockpit worker consent grant --window=5m     # open a 5-minute window
+memql-cockpit worker consent revoke                # close immediately
+memql-cockpit worker consent status                # show current state
+memql-cockpit worker consent watch                 # live tail of grant/revoke/dispatch events
+```
+
+The `--strict` flag on `grant` is honored on the wire (and recorded
+in events) but the per-action approval surface it implies ships as
+a follow-up under memql-cockpit#64.
+
+Reference: memql-cockpit#64.
+
 ### Credential storage
 
 OAuth access + refresh tokens are stored via a pluggable

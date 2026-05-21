@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/internal/worker/consent"
 	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/internal/worker/tools"
 	"github.com/znasllc-io/memql/component/identity/workerpairing"
 )
@@ -199,7 +200,20 @@ func runConfiguredWorker(clusterURL, token, name string, logger *slog.Logger) er
 		logger.Warn("policy load failed; using defaults", "error", err)
 		policy = tools.DefaultPolicy()
 	}
-	dispatcher := tools.NewDispatcher(logger, policy)
+
+	// Consent gate (memql-cockpit#64). See cli.go's handleRun for
+	// the design notes; same wiring applies on the pair-then-run
+	// path.
+	consentMgr := consent.NewManager()
+	consentSrv := consent.NewServer(consentMgr, consent.DefaultSocketPath(), logger)
+	consentCtx, consentCancel := context.WithCancel(context.Background())
+	if err := consentSrv.Listen(consentCtx); err != nil {
+		logger.Warn("consent socket failed to start; running with default-deny gate but no IPC control",
+			"error", err)
+	}
+	defer consentCancel()
+
+	dispatcher := tools.NewDispatcher(logger, policy, consentMgr)
 
 	metrics := NewMetrics()
 	if err := metrics.Listen(9100); err != nil {
