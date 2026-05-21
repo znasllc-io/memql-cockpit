@@ -38,6 +38,12 @@ Required:
 Options:
     --name <name>             Worker name (default: hostname)
     --gui                     Install the GUI variant (memql-cockpit-gui)
+    --user-local              Install under \$HOME/.memql/bin instead of
+                              /usr/local/bin. Use when sudo isn't
+                              available (CI, restricted environments).
+                              Provides weaker isolation -- a compromised
+                              user account can swap the binary without
+                              privilege escalation.
     --download-base <url>     Override binary download base URL
     --force                   Overwrite existing worker.yaml
     --no-service              Skip LaunchAgent installation
@@ -53,6 +59,7 @@ function parse_args() {
     DOWNLOAD_BASE="$DEFAULT_DOWNLOAD_BASE"
     FORCE="no"
     INSTALL_SERVICE="yes"
+    INSTALL_MODE="system"  # default: sudo-gated /usr/local/bin (#66)
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -60,6 +67,7 @@ function parse_args() {
             --cluster)       CLUSTER_URL="$2"; shift 2 ;;
             --name)          NAME="$2"; shift 2 ;;
             --gui)           FLAVOUR="gui"; shift ;;
+            --user-local)    INSTALL_MODE="user-local"; shift ;;
             --download-base) DOWNLOAD_BASE="$2"; shift 2 ;;
             --force)         FORCE="yes"; shift ;;
             --no-service)    INSTALL_SERVICE="no"; shift ;;
@@ -87,20 +95,14 @@ function install_binary() {
     local binary
     binary="$(binary_name_for "$FLAVOUR")"
     local url="${DOWNLOAD_BASE}/${binary}"
-    local dest_dir="${HOME}/.memql/bin"
-    mkdir -p "$dest_dir"
-    local dest="${dest_dir}/${binary}"
-    download_binary "$url" "$dest"
-
-    # Symlink the friendly name.
-    local friendly
+    local friendly_name
     if [[ "$FLAVOUR" == "gui" ]]; then
-        friendly="${dest_dir}/memql-cockpit-gui"
+        friendly_name="memql-cockpit-gui"
     else
-        friendly="${dest_dir}/memql-cockpit"
+        friendly_name="memql-cockpit"
     fi
-    ln -sf "$dest" "$friendly"
-    INSTALLED_BINARY="$friendly"
+    install_binary_with_mode "$INSTALL_MODE" "$url" "$binary" "$friendly_name"
+    INSTALLED_BINARY="$INSTALL_BINARY_FRIENDLY"
 }
 
 function write_config() {
