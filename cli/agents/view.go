@@ -19,6 +19,8 @@
 //
 // All three queries live in memql/dsl/{agents,knowledge,planner}/queries.memql
 // and are loaded by every BFF / node binary as part of the core DSL tree.
+//
+// Migrated to the cli/ui widget layer (epic #81).
 package agents
 
 import (
@@ -27,7 +29,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
@@ -48,95 +49,62 @@ const (
 const focusPaneCount = 2
 
 // maxRecentPlans bounds the "recent plans" section of the detail
-// pane. Plans are an unbounded set; rendering them all would push
-// other sections off the visible viewport on busy partitions.
+// pane.
 const maxRecentPlans = 10
 
 // View is the Agents tab. Locking mirrors the Planner / Concepts
 // views: write lock on data mutations, read lock on Draw.
 type View struct {
-	mu    sync.RWMutex
-	Theme ui.Theme
+	ui.BaseView // Mu / Theme / GatedMessage / OnStatus / OnRedraw
 
-	// Agent catalog + selection.
-	agents   []map[string]any
-	selected int
-	scrollY  int
+	// Agent catalog. Selection / scroll lives in the widgets below.
+	agents []map[string]any
 
 	// Plans across the partition (filtered per-agent at render time).
-	// Refreshed on the same tick as agents so the detail pane sees
-	// reasonably-fresh attribution without a per-agent query.
 	plans []map[string]any
 
 	// knowledgeDomain id -> displayName for resolving
 	// capabilities.domains[]. Empty for agents whose domain ids
-	// don't match any row (the renderer falls back to the raw id).
+	// don't match any row.
 	domainNames map[string]string
-
-	// Vertical scroll offset for the detail pane. Reset to 0 when
-	// the selected agent changes.
-	detailScrollY int
 
 	Focus FocusPane
 
-	// fetching coalesces overlapping refresh ticks (slow cluster,
-	// fast tick).
+	// fetching coalesces overlapping refresh ticks.
 	fetching bool
 
 	// Plumbing.
 	QueryClient func() *client.QueryClient
 
-	// GatedMessage, when non-empty, replaces the layout with a
-	// centered "not available" notice (cluster not connected, etc).
-	GatedMessage string
-
-	// OnStatus surfaces transient errors to the notification bar.
-	OnStatus func(msg string)
-
-	// OnRedraw is posted by the background refresher when new data
-	// has landed so the event loop redraws without a key press.
-	OnRedraw func()
+	// Widgets.
+	agentList  ui.ListPane
+	detailPane ui.DetailPane
 }
 
 // NewView creates a fresh Agents view focused on the list pane.
 func NewView(theme ui.Theme) *View {
-	return &View{
-		Theme: theme,
-		Focus: FocusList,
-	}
+	v := &View{Focus: FocusList}
+	v.Theme = theme
+	v.agentList.RowsPerItem = 2
+	v.agentList.Render = v.renderAgentRow
+	return v
 }
 
-// StartRefreshLoop polls the underlying queries on the given interval
-// until the stop channel closes. Safe to call once at app-init after
-// the cluster wiring is in place. Mirrors planner.View.StartRefreshLoop.
+// StartRefreshLoop polls the underlying queries on the given
+// interval until the stop channel closes. Wraps BaseView's
+// context-based helper so the legacy stop-channel API stays stable
+// for app.go.
 func (v *View) StartRefreshLoop(stop <-chan struct{}, interval time.Duration) {
+	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		// Immediate refresh on launch so the first paint after the
-		// user opens the tab isn't blank.
-		v.Refresh()
-		if v.OnRedraw != nil {
-			v.OnRedraw()
-		}
-		t := time.NewTicker(interval)
-		defer t.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-t.C:
-				v.Refresh()
-				if v.OnRedraw != nil {
-					v.OnRedraw()
-				}
-			}
-		}
+		<-stop
+		cancel()
 	}()
+	v.BaseView.StartRefreshLoop(ctx, interval, v.Refresh)
 }
 
 // Refresh re-pulls the agent catalog, knowledge-domain lookup, and
-// partition-wide plan list. Safe from any goroutine. Soft-fails per
-// query: a missing knowledge tree on the cluster shouldn't prevent
-// the agent list from rendering.
+// partition-wide plan list. Safe from any goroutine.
 func (v *View) Refresh() {
 	if v.QueryClient == nil {
 		return
@@ -146,17 +114,17 @@ func (v *View) Refresh() {
 		return
 	}
 
-	v.mu.Lock()
+	v.Mu.Lock()
 	if v.fetching {
-		v.mu.Unlock()
+		v.Mu.Unlock()
 		return
 	}
 	v.fetching = true
-	v.mu.Unlock()
+	v.Mu.Unlock()
 	defer func() {
-		v.mu.Lock()
+		v.Mu.Lock()
 		v.fetching = false
-		v.mu.Unlock()
+		v.Mu.Unlock()
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
@@ -181,9 +149,7 @@ func (v *View) Refresh() {
 
 	// Knowledge domains are best-effort: an older cluster might not
 	// have the knowledge DSL loaded. Failure becomes an empty lookup
-	// table, not a hard fail. queryListKnowledgeDomains projects
-	// through shape knowledgeDomainFull, which flattens fields to the
-	// row top level -- read row.name, NOT row.payload.name.
+	// table, not a hard fail.
 	domainNames := map[string]string{}
 	if domRes, err := qc.QueryListKnowledgeDomains(ctx, client.QueryListKnowledgeDomainsArgs{}); err == nil {
 		for _, row := range domRes.Rows() {
@@ -199,9 +165,7 @@ func (v *View) Refresh() {
 		}
 	}
 
-	// Plans likewise best-effort: filtering client-side by
-	// ownerAgentId means a missing planner DSL just blanks the
-	// "recent tasks" section.
+	// Plans likewise best-effort.
 	var planRows []map[string]any
 	if planRes, err := qc.QueryAllPlans(ctx, client.QueryAllPlansArgs{}); err == nil {
 		planRows = planRes.Rows()
@@ -210,15 +174,16 @@ func (v *View) Refresh() {
 		})
 	}
 
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.Mu.Lock()
+	defer v.Mu.Unlock()
 	v.agents = agentRows
 	v.domainNames = domainNames
 	v.plans = planRows
-	if v.selected >= len(v.agents) {
-		v.selected = 0
-		v.scrollY = 0
-		v.detailScrollY = 0
+	v.agentList.Count = len(v.agents)
+	if v.agentList.Selected >= len(v.agents) {
+		v.agentList.Selected = 0
+		v.agentList.ScrollY = 0
+		v.detailPane.ScrollY = 0
 	}
 }
 
@@ -229,18 +194,15 @@ func (v *View) Refresh() {
 // Draw paints the tab. Holds the read lock so concurrent refreshes
 // can't tear the underlying slices mid-paint.
 func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
+	v.Mu.RLock()
+	defer v.Mu.RUnlock()
 
 	if v.GatedMessage != "" {
 		v.drawGated(screen, bounds, v.GatedMessage)
 		return
 	}
 
-	// Two columns: list (35%) + detail (65%). The list pane wants
-	// enough width for a name + role tag on one line at typical
-	// terminal widths; the detail pane needs the rest for the
-	// section blocks (capabilities, knowledge, plans).
+	// Two columns: list (35%) + detail (65%).
 	panes := ui.FlexColumn(bounds, []ui.FlexItem{
 		{Flex: 0.35, MinSize: 28},
 		{Flex: 0.65, MinSize: 32},
@@ -248,9 +210,7 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 	listBounds := panes[0]
 	detailBounds := panes[1]
 
-	// Vertical divider between the two columns. Single box-drawing
-	// char per row keeps the layout-edge glyph rule (cli/CLAUDE.md
-	// "Layout-edge glyph rule") safe -- '│' is EAW=Na.
+	// Single box-drawing divider (safe at layout edge -- EAW=Na).
 	divStyle := v.Theme.SubtleStyle()
 	for y := bounds.Y; y < bounds.Y+bounds.Height; y++ {
 		screen.SetCell(listBounds.X+listBounds.Width-1, y, '│', divStyle)
@@ -285,6 +245,18 @@ func (v *View) drawGated(screen *ui.Screen, bounds ui.Rect, msg string) {
 	}
 }
 
+// paneChromeBounds returns the inner Rect for a pane's scrollable
+// content area: skip title + chrome row.
+func paneChromeBounds(bounds ui.Rect) ui.Rect {
+	const chromeH = 1
+	listTop := bounds.Y + 2
+	listH := bounds.Height - 2 - chromeH
+	if listH < 1 {
+		listH = 1
+	}
+	return ui.Rect{X: bounds.X, Y: listTop, Width: bounds.Width, Height: listH}
+}
+
 func (v *View) drawList(screen *ui.Screen, bounds ui.Rect) {
 	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, v.Theme.BaseStyle())
 
@@ -294,94 +266,72 @@ func (v *View) drawList(screen *ui.Screen, bounds ui.Rect) {
 	}
 	title := " AGENTS "
 	if n := len(v.agents); n > 0 {
-		title = fmt.Sprintf(" AGENTS (%d/%d) ", v.selected+1, n)
+		title = fmt.Sprintf(" AGENTS (%d/%d) ", v.agentList.Selected+1, n)
 	}
 	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, titleStyle)
 
 	if len(v.agents) == 0 {
 		drawCentered(screen, v.Theme, bounds,
 			"No agents found in this partition. Agents are created from CoPresent (CreateAgentModal) or seeded by platform automations.")
-		ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1, "R:Refresh  Tab:Cycle")
+		ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1, hintsForListEmpty())
 		return
 	}
 
-	const chromeH = 1
-	listTop := bounds.Y + 2
-	listH := bounds.Height - 2 - chromeH
-	if listH < 1 {
-		listH = 1
+	v.agentList.Count = len(v.agents)
+	v.agentList.Focused = v.Focus == FocusList
+	v.agentList.Draw(screen, paneChromeBounds(bounds), v.Theme)
+
+	ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1, hintsForList())
+}
+
+// renderAgentRow paints a 2-row agent entry. Primary line: marker
+// + name + optional [SYS] tag. Subtitle: role · roleSlug · tool count.
+func (v *View) renderAgentRow(screen *ui.Screen, bounds ui.Rect, idx int, sel bool, theme ui.Theme) {
+	if idx < 0 || idx >= len(v.agents) {
+		return
 	}
-
-	// Two rows per agent: primary (name + active/deleted marker) +
-	// subtitle (role/roleSlug + tool count). Same shape the planner
-	// list uses for plans.
-	rowsPerAgent := 2
-	maxVisible := listH / rowsPerAgent
-	if maxVisible < 1 {
-		maxVisible = 1
+	a := v.agents[idx]
+	primary := theme.BaseStyle()
+	if sel {
+		primary = theme.SelectionStyle()
 	}
-	v.clampListScroll(maxVisible)
+	sub := primary.Foreground(theme.Subtle)
 
-	for i := 0; i < maxVisible && v.scrollY+i < len(v.agents); i++ {
-		idx := v.scrollY + i
-		a := v.agents[idx]
-		y := listTop + i*rowsPerAgent
-
-		style := v.Theme.BaseStyle()
-		if idx == v.selected {
-			style = tcell.StyleDefault.Foreground(v.Theme.FG).Background(tcell.NewRGBColor(40, 44, 52))
-		}
-		screen.FillRect(bounds.X, y, bounds.Width, 1, style)
-		screen.FillRect(bounds.X, y+1, bounds.Width, 1, style)
-
-		name := getString(a, "name")
-		if name == "" {
-			name = "(unnamed)"
-		}
-		// Active row marker is a strictly single-width ASCII glyph
-		// per the layout-edge glyph rule. '*' for active selected,
-		// blank otherwise; deleted agents (queryAllAgents already
-		// filters them out) would render with '-' for distinction
-		// but we shouldn't see any.
-		marker := " "
-		if boolFrom(a, "active") {
-			marker = "*"
-		}
-		// [SYS] tag flags platform-infrastructure agents (kind=="system",
-		// e.g. MemQL Planner / MemQL Trainer). Their seeds set autoJoin
-		// false and they never join cognition spaces, but the cockpit
-		// surfaces them here so operators can confirm they exist + see
-		// their config. The tag keeps them visually separable from
-		// user-level agents (kind=="user" or empty -- the latter is
-		// the legacy default for rows pre-dating the field).
-		primary := fmt.Sprintf("%s %s", marker, name)
-		if getString(a, "kind") == "system" {
-			primary = fmt.Sprintf("%s %s  [SYS]", marker, name)
-		}
-		screen.DrawText(bounds.X+1, y, bounds.Width-2, primary, style)
-
-		role := getString(a, "role")
-		roleSlug := getString(a, "roleSlug")
-		var sub string
-		switch {
-		case role != "" && roleSlug != "":
-			sub = fmt.Sprintf("%s · %s", role, roleSlug)
-		case roleSlug != "":
-			sub = roleSlug
-		case role != "":
-			sub = role
-		default:
-			sub = "(no role)"
-		}
-		caps := mapFrom(a, "capabilities")
-		if tools := stringSliceFrom(caps, "tools"); len(tools) > 0 {
-			sub = fmt.Sprintf("%s · %d tools", sub, len(tools))
-		}
-		screen.DrawText(bounds.X+3, y+1, bounds.Width-4, sub, dimify(style, v.Theme.Subtle))
+	name := getString(a, "name")
+	if name == "" {
+		name = "(unnamed)"
 	}
+	// Active row marker is a strictly single-width ASCII glyph per
+	// the layout-edge glyph rule. '*' for active, blank otherwise.
+	marker := " "
+	if boolFrom(a, "active") {
+		marker = "*"
+	}
+	// [SYS] tag flags platform-infrastructure agents.
+	primaryStr := fmt.Sprintf("%s %s", marker, name)
+	if getString(a, "kind") == "system" {
+		primaryStr = fmt.Sprintf("%s %s  [SYS]", marker, name)
+	}
+	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, primaryStr, primary)
 
-	ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1,
-		"↑/↓:Move  Enter:Detail  R:Refresh  Tab:Cycle")
+	role := getString(a, "role")
+	roleSlug := getString(a, "roleSlug")
+	var subStr string
+	switch {
+	case role != "" && roleSlug != "":
+		subStr = fmt.Sprintf("%s · %s", role, roleSlug)
+	case roleSlug != "":
+		subStr = roleSlug
+	case role != "":
+		subStr = role
+	default:
+		subStr = "(no role)"
+	}
+	caps := mapFrom(a, "capabilities")
+	if tools := stringSliceFrom(caps, "tools"); len(tools) > 0 {
+		subStr = fmt.Sprintf("%s · %d tools", subStr, len(tools))
+	}
+	screen.DrawText(bounds.X+3, bounds.Y+1, bounds.Width-4, subStr, sub)
 }
 
 func (v *View) drawDetail(screen *ui.Screen, bounds ui.Rect) {
@@ -393,59 +343,42 @@ func (v *View) drawDetail(screen *ui.Screen, bounds ui.Rect) {
 	}
 	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, " AGENT DETAIL ", titleStyle)
 
-	if len(v.agents) == 0 || v.selected < 0 || v.selected >= len(v.agents) {
+	if len(v.agents) == 0 || v.agentList.Selected < 0 || v.agentList.Selected >= len(v.agents) {
 		drawCentered(screen, v.Theme, bounds,
 			"Select an agent from the list to see its capabilities, knowledge surface, and recent plans.")
-		ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1, "Tab:Cycle")
+		ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1, hintsForDetailEmpty())
 		return
 	}
 
-	a := v.agents[v.selected]
-	lines := v.buildDetailLines(a, bounds.Width-3)
+	a := v.agents[v.agentList.Selected]
+	innerW := bounds.Width - 3
+	if innerW < 16 {
+		innerW = 16
+	}
+	v.detailPane.Lines = v.buildDetailLines(a, innerW)
+	v.detailPane.Focused = v.Focus == FocusDetail
 
-	const chromeH = 1
-	bodyTop := bounds.Y + 2
-	bodyH := bounds.Height - 2 - chromeH
-	if bodyH < 1 {
-		bodyH = 1
+	inner := paneChromeBounds(bounds)
+	inner.X += 1
+	inner.Width -= 1
+	if inner.Width < 1 {
+		inner.Width = 1
 	}
+	v.detailPane.Draw(screen, inner, v.Theme)
 
-	maxScroll := len(lines) - bodyH
-	if maxScroll < 0 {
-		maxScroll = 0
-	}
-	if v.detailScrollY > maxScroll {
-		v.detailScrollY = maxScroll
-	}
-	if v.detailScrollY < 0 {
-		v.detailScrollY = 0
-	}
-
-	for i := 0; i < bodyH && v.detailScrollY+i < len(lines); i++ {
-		line := lines[v.detailScrollY+i]
-		style := v.Theme.BaseStyle()
-		if strings.HasPrefix(line, "─") {
-			style = v.Theme.SubtleStyle().Bold(true)
-		}
-		screen.DrawText(bounds.X+2, bodyTop+i, bounds.Width-3, line, style)
-	}
-
-	hint := "↑/↓:Scroll  Esc:List  Tab:Cycle"
-	if maxScroll == 0 {
-		hint = "Esc:List  Tab:Cycle"
-	}
-	ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1, hint)
+	ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1, hintsForDetail())
 }
 
 // buildDetailLines flattens the agent record into the right pane's
-// display block: identity, role, capabilities, provider, knowledge
-// (domains + live), and recent plan attribution. Pure function for
-// easy unit-testing.
-func (v *View) buildDetailLines(a map[string]any, innerWidth int) []string {
+// display block.
+func (v *View) buildDetailLines(a map[string]any, innerWidth int) []ui.DetailLine {
 	if innerWidth < 16 {
 		innerWidth = 16
 	}
-	var lines []string
+	var lines []ui.DetailLine
+
+	plain := func(s string) ui.DetailLine { return ui.DetailLine{Kind: ui.LinePlain, Text: s} }
+	header := func(s string) ui.DetailLine { return ui.DetailLine{Kind: ui.LineHeader, Text: s} }
 
 	addKV := func(label, value string) {
 		if value == "" {
@@ -453,33 +386,33 @@ func (v *View) buildDetailLines(a map[string]any, innerWidth int) []string {
 		}
 		line := fmt.Sprintf("  %-16s %s", label+":", value)
 		if len(line) <= innerWidth {
-			lines = append(lines, line)
+			lines = append(lines, plain(line))
 			return
 		}
 		wrapped := ui.WrapText(value, innerWidth-20)
 		if len(wrapped) == 0 {
-			lines = append(lines, line)
+			lines = append(lines, plain(line))
 			return
 		}
-		lines = append(lines, fmt.Sprintf("  %-16s %s", label+":", wrapped[0]))
+		lines = append(lines, plain(fmt.Sprintf("  %-16s %s", label+":", wrapped[0])))
 		for _, cont := range wrapped[1:] {
-			lines = append(lines, strings.Repeat(" ", 20)+cont)
+			lines = append(lines, plain(strings.Repeat(" ", 20)+cont))
 		}
 	}
 	addSection := func(name string) {
 		if len(lines) > 0 {
-			lines = append(lines, "")
+			lines = append(lines, plain(""))
 		}
-		lines = append(lines, "─ "+name+" ─")
+		lines = append(lines, header("─ "+name+" ─"))
 	}
 	addList := func(values []string, empty string) {
 		if len(values) == 0 {
-			lines = append(lines, "  "+empty)
+			lines = append(lines, plain("  "+empty))
 			return
 		}
 		for _, val := range values {
 			for _, w := range ui.WrapText("- "+val, innerWidth-2) {
-				lines = append(lines, "  "+w)
+				lines = append(lines, plain("  "+w))
 			}
 		}
 	}
@@ -490,27 +423,19 @@ func (v *View) buildDetailLines(a map[string]any, innerWidth int) []string {
 		}
 		for _, raw := range strings.Split(body, "\n") {
 			if raw == "" {
-				lines = append(lines, "")
+				lines = append(lines, plain(""))
 				continue
 			}
 			for _, w := range ui.WrapText(raw, innerWidth-2) {
-				lines = append(lines, "  "+w)
+				lines = append(lines, plain("  "+w))
 			}
 		}
 	}
 
-	// Identity. Shape-wrapped queries (queryAllAgents → agentFull)
-	// flatten the projected fields to row top level -- read row.name,
-	// NOT row.payload.name. Intrinsics (id, createdAt, createdBy)
-	// likewise sit at the top level via the row.* aliases in the
-	// shape file.
+	// Identity.
 	addSection("identity")
 	addKV("name", getString(a, "name"))
 	addKV("id", getString(a, "id"))
-	// kind = "system" | "user". Surfaced near the top of identity so
-	// it's the first signal an operator reads about an agent. Empty
-	// for legacy rows pre-dating the field; render those as user since
-	// the schema default is "user".
 	kindVal := getString(a, "kind")
 	if kindVal == "" {
 		kindVal = "user (default)"
@@ -522,14 +447,11 @@ func (v *View) buildDetailLines(a map[string]any, innerWidth int) []string {
 	addKV("owner user", getString(a, "ownerUserId"))
 	addKV("created", shortenTimestamp(getString(a, "createdAt")))
 	if desc := getString(a, "description"); desc != "" {
-		lines = append(lines, "")
+		lines = append(lines, plain(""))
 		addBlock(desc)
 	}
 
-	// Capabilities + tools. capabilities.tools[] is the SI-callable
-	// surface the agent has access to; capabilities.{vision, claw,
-	// voiceToVoice, ...} are coarser modality flags. Both are useful
-	// at a glance.
+	// Capabilities + tools.
 	addSection("capabilities")
 	caps := mapFrom(a, "capabilities")
 	addKV("vision", boolLabel(boolFrom(caps, "vision")))
@@ -537,26 +459,20 @@ func (v *View) buildDetailLines(a map[string]any, innerWidth int) []string {
 	addKV("avatar", boolLabel(boolFrom(caps, "avatar")))
 	addKV("lip-sync", boolLabel(boolFrom(caps, "lipSync")))
 	addKV("claw (coding)", boolLabel(boolFrom(caps, "claw")))
-	lines = append(lines, "")
-	lines = append(lines, "  tools / integrations:")
+	lines = append(lines, plain(""))
+	lines = append(lines, plain("  tools / integrations:"))
 	addList(stringSliceFrom(caps, "tools"), "(none)")
 	if kw := stringSliceFrom(caps, "keywords"); len(kw) > 0 {
-		lines = append(lines, "")
-		lines = append(lines, "  keywords:")
+		lines = append(lines, plain(""))
+		lines = append(lines, plain("  keywords:"))
 		addList(kw, "")
 	}
 
-	// Knowledge surface. capabilities.domains[] is a list of
-	// knowledgeDomain ids that the cognition scoring engine uses for
-	// relevance matching. We resolve them against the
-	// queryListKnowledgeDomains lookup so the user reads a name
-	// rather than a raw id; if a domain is missing from the lookup
-	// (cluster without knowledge DSL, or a stale row), we fall back
-	// to the raw id verbatim.
+	// Knowledge domains.
 	addSection("knowledge domains")
 	domains := stringSliceFrom(caps, "domains")
 	if len(domains) == 0 {
-		lines = append(lines, "  (no domains attached)")
+		lines = append(lines, plain("  (no domains attached)"))
 	} else {
 		labels := make([]string, 0, len(domains))
 		for _, id := range domains {
@@ -569,25 +485,19 @@ func (v *View) buildDetailLines(a map[string]any, innerWidth int) []string {
 		addList(labels, "")
 	}
 
-	// "Live knowledge" today is layered onto the agent through its
-	// role (agentRole.lockedLiveKnowledgeIds). We don't have that
-	// row in hand here, but we can surface anything stamped onto the
-	// agent itself under capabilities.liveKnowledge / liveSources
-	// when present so the section is at least non-empty when the
-	// data exists. Empty otherwise.
+	// Live knowledge.
 	addSection("live knowledge")
 	live := stringSliceFrom(caps, "liveKnowledge")
 	if len(live) == 0 {
 		live = stringSliceFrom(caps, "liveSources")
 	}
 	if len(live) == 0 {
-		lines = append(lines, "  (no live knowledge sources)")
+		lines = append(lines, plain("  (no live knowledge sources)"))
 	} else {
 		addList(live, "")
 	}
 
-	// Provider config: the actual LLM the agent runs on. The router
-	// resolves provider > model > policyName in that order.
+	// Provider config.
 	addSection("provider")
 	provider := mapFrom(a, "providerConfig")
 	llm := mapFrom(provider, "llm")
@@ -599,16 +509,12 @@ func (v *View) buildDetailLines(a map[string]any, innerWidth int) []string {
 		addKV("voice", vid)
 	}
 
-	// Recent plans owned by this agent -- the closest stand-in for
-	// "tasks the agent has worked on" we can render without a
-	// per-agent server query. Plans carry status + goal + createdAt,
-	// which is enough for the user to recognize what the agent has
-	// been busy with.
+	// Recent plans owned by this agent.
 	addSection(fmt.Sprintf("recent plans (top %d)", maxRecentPlans))
 	agentID := getString(a, "id")
 	matched := v.plansForAgent(agentID, maxRecentPlans)
 	if len(matched) == 0 {
-		lines = append(lines, "  (no plans recorded for this agent)")
+		lines = append(lines, plain("  (no plans recorded for this agent)"))
 	} else {
 		for _, p := range matched {
 			goal := getString(p, "goal")
@@ -620,20 +526,17 @@ func (v *View) buildDetailLines(a map[string]any, innerWidth int) []string {
 			}
 			status := getString(p, "status")
 			when := shortenTimestamp(getString(p, "createdAt"))
-			header := fmt.Sprintf("- [%s] %s", status, when)
-			for _, w := range ui.WrapText(header, innerWidth-2) {
-				lines = append(lines, "  "+w)
+			headerLine := fmt.Sprintf("- [%s] %s", status, when)
+			for _, w := range ui.WrapText(headerLine, innerWidth-2) {
+				lines = append(lines, plain("  "+w))
 			}
 			for _, w := range ui.WrapText(goal, innerWidth-4) {
-				lines = append(lines, "    "+w)
+				lines = append(lines, plain("    "+w))
 			}
 		}
 	}
 
 	// Raw row as a fallback when an operator wants the full picture.
-	// agentFull projects fields flat at the row top level, so the
-	// raw dump IS the row map itself (skipping intrinsics already
-	// shown in the identity section keeps the block focused).
 	skip := map[string]bool{
 		"id": true, "createdAt": true, "createdBy": true,
 		"concept": true, "type": true, "schema": true,
@@ -649,8 +552,8 @@ func (v *View) buildDetailLines(a map[string]any, innerWidth int) []string {
 	}
 	if raw := prettyJSON(extras); raw != "" && raw != "{}" {
 		addSection("other fields")
-		for _, raw := range strings.Split(raw, "\n") {
-			lines = append(lines, "  "+raw)
+		for _, rawLine := range strings.Split(raw, "\n") {
+			lines = append(lines, plain("  "+rawLine))
 		}
 	}
 
@@ -658,10 +561,7 @@ func (v *View) buildDetailLines(a map[string]any, innerWidth int) []string {
 }
 
 // plansForAgent returns up to `limit` plans whose ownerAgentId
-// matches agentID, in createdAt-descending order (the underlying
-// v.plans slice is already sorted that way). planFull is a
-// flat-projecting shape, so ownerAgentId is at row.ownerAgentId.
-// Caller must hold the read lock.
+// matches agentID. Caller must hold the read lock.
 func (v *View) plansForAgent(agentID string, limit int) []map[string]any {
 	if agentID == "" || len(v.plans) == 0 {
 		return nil
@@ -680,6 +580,43 @@ func (v *View) plansForAgent(agentID string, limit int) []map[string]any {
 }
 
 // ---------------------------------------------------------------------------
+// Hints
+// ---------------------------------------------------------------------------
+
+func hintsForList() string {
+	bar := ui.HintBar{Chips: []ui.HintChip{
+		{Key: "↑/↓", Label: "Move"},
+		{Key: "Enter", Label: "Detail"},
+		{Key: "R", Label: "Refresh"},
+		{Key: "Tab", Label: "Cycle"},
+	}}
+	return bar.String()
+}
+
+func hintsForListEmpty() string {
+	bar := ui.HintBar{Chips: []ui.HintChip{
+		{Key: "R", Label: "Refresh"},
+		{Key: "Tab", Label: "Cycle"},
+	}}
+	return bar.String()
+}
+
+func hintsForDetail() string {
+	bar := ui.HintBar{Chips: []ui.HintChip{
+		{Key: "↑/↓", Label: "Scroll"},
+		{Key: "PgUp/PgDn", Label: "Page"},
+		{Key: "Esc", Label: "List"},
+		{Key: "Tab", Label: "Cycle"},
+	}}
+	return bar.String()
+}
+
+func hintsForDetailEmpty() string {
+	bar := ui.HintBar{Chips: []ui.HintChip{{Key: "Tab", Label: "Cycle"}}}
+	return bar.String()
+}
+
+// ---------------------------------------------------------------------------
 // Input handling
 // ---------------------------------------------------------------------------
 
@@ -690,23 +627,19 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 		return false
 	}
 
-	// Tab cycles focus regardless of which pane is active.
+	// Tab cycles focus regardless of pane.
 	if keyEv.Key() == tcell.KeyTab {
-		v.mu.Lock()
+		v.Mu.Lock()
 		v.Focus = (v.Focus + 1) % FocusPane(focusPaneCount)
-		v.mu.Unlock()
+		v.Mu.Unlock()
 		return true
 	}
 
-	// R triggers a manual refresh from any focus. Useful when the
-	// background tick is too slow for an operator who just edited
-	// the agent in CoPresent.
+	// R triggers a manual refresh.
 	if keyEv.Key() == tcell.KeyRune && (keyEv.Rune() == 'r' || keyEv.Rune() == 'R') {
 		go func() {
 			v.Refresh()
-			if v.OnRedraw != nil {
-				v.OnRedraw()
-			}
+			v.Redraw()
 		}()
 		return true
 	}
@@ -721,68 +654,33 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 }
 
 func (v *View) handleListKey(ev *tcell.EventKey) bool {
-	switch ev.Key() {
-	case tcell.KeyUp:
-		v.mu.Lock()
-		if v.selected > 0 {
-			v.selected--
-			v.detailScrollY = 0
+	v.Mu.Lock()
+	defer v.Mu.Unlock()
+	v.agentList.Focused = true
+	prev := v.agentList.Selected
+	if v.agentList.HandleEvent(ev) {
+		if v.agentList.Selected != prev {
+			// Reset detail scroll so a fresh agent starts at the top.
+			v.detailPane.ScrollY = 0
 		}
-		v.mu.Unlock()
 		return true
-	case tcell.KeyDown:
-		v.mu.Lock()
-		if v.selected < len(v.agents)-1 {
-			v.selected++
-			v.detailScrollY = 0
-		}
-		v.mu.Unlock()
-		return true
-	case tcell.KeyEnter:
-		v.mu.Lock()
+	}
+	if ev.Key() == tcell.KeyEnter {
 		v.Focus = FocusDetail
-		v.mu.Unlock()
 		return true
 	}
 	return false
 }
 
 func (v *View) handleDetailKey(ev *tcell.EventKey) bool {
-	switch ev.Key() {
-	case tcell.KeyUp:
-		v.mu.Lock()
-		if v.detailScrollY > 0 {
-			v.detailScrollY--
-		}
-		v.mu.Unlock()
+	v.Mu.Lock()
+	defer v.Mu.Unlock()
+	v.detailPane.Focused = true
+	if v.detailPane.HandleEvent(ev) {
 		return true
-	case tcell.KeyDown:
-		v.mu.Lock()
-		v.detailScrollY++
-		v.mu.Unlock()
-		return true
-	case tcell.KeyPgUp:
-		v.mu.Lock()
-		v.detailScrollY -= 10
-		if v.detailScrollY < 0 {
-			v.detailScrollY = 0
-		}
-		v.mu.Unlock()
-		return true
-	case tcell.KeyPgDn:
-		v.mu.Lock()
-		v.detailScrollY += 10
-		v.mu.Unlock()
-		return true
-	case tcell.KeyHome:
-		v.mu.Lock()
-		v.detailScrollY = 0
-		v.mu.Unlock()
-		return true
-	case tcell.KeyEsc:
-		v.mu.Lock()
+	}
+	if ev.Key() == tcell.KeyEsc {
 		v.Focus = FocusList
-		v.mu.Unlock()
 		return true
 	}
 	return false
@@ -791,21 +689,6 @@ func (v *View) handleDetailKey(ev *tcell.EventKey) bool {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-func (v *View) clampListScroll(maxVisible int) {
-	if maxVisible < 1 {
-		maxVisible = 1
-	}
-	if v.selected < v.scrollY {
-		v.scrollY = v.selected
-	}
-	if v.selected >= v.scrollY+maxVisible {
-		v.scrollY = v.selected - maxVisible + 1
-	}
-	if v.scrollY < 0 {
-		v.scrollY = 0
-	}
-}
 
 func drawCentered(screen *ui.Screen, theme ui.Theme, bounds ui.Rect, msg string) {
 	innerW := bounds.Width - 2
@@ -835,10 +718,6 @@ func drawCentered(screen *ui.Screen, theme ui.Theme, bounds ui.Rect, msg string)
 		}
 		screen.DrawText(lineX, y, bounds.Width-1, line, theme.SubtleStyle())
 	}
-}
-
-func dimify(style tcell.Style, dim tcell.Color) tcell.Style {
-	return style.Foreground(dim)
 }
 
 func mapFrom(m map[string]any, key string) map[string]any {
