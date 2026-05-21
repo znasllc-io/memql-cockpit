@@ -48,6 +48,17 @@ const (
 // maxUtterances bounds how many rows we keep in memory per refresh.
 const maxUtterances = 200
 
+// pttSilenceWindow is how long without a new partial transcript
+// counts as "user stopped talking" and triggers an auto-stop on the
+// recording. Long enough to ride out a thinking pause between
+// sentences (4s), short enough that a forgotten Ctrl+Space doesn't
+// leave the mic open indefinitely.
+const pttSilenceWindow = 4 * time.Second
+
+// pttWatchdogTick is how often the silence watchdog re-checks
+// time-since-last-partial. Smaller = snappier release, more CPU.
+const pttWatchdogTick = 500 * time.Millisecond
+
 // View is the Chat tab. Mutated from both the event-loop goroutine
 // (HandleEvent) and the background refresher (refreshLoop).
 type View struct {
@@ -63,12 +74,13 @@ type View struct {
 	Dispatcher func() *client.Dispatcher
 
 	// PTT state, surfaced in the chat-pane title strip.
-	pttActive    bool
-	pttPartial   string
-	pttFinal     string
-	pttStatus    string // "" | "listening" | "transcribing" | "done" | "error: <msg>"
-	pttCancel    context.CancelFunc
-	pttStopAudio func() error
+	pttActive        bool
+	pttPartial       string
+	pttFinal         string
+	pttStatus        string // "" | "listening" | "transcribing" | "done" | "error: <msg>"
+	pttCancel        context.CancelFunc
+	pttStopAudio     func() error
+	pttLastPartialAt time.Time // tracked by OnPartial; drives silence auto-stop
 
 	spaces []spaceRow
 	// userPickedSpace tracks whether the user has manually selected a
@@ -451,7 +463,7 @@ func (v *View) pttStatusLine() string {
 		if v.pttPartial != "" {
 			return "[mic] " + truncate(v.pttPartial, 240)
 		}
-		return "[mic] listening... (press v again to stop)"
+		return "[mic] listening... (Ctrl+Space again to stop)"
 	case "transcribing":
 		if v.pttPartial != "" {
 			return "[mic] transcribing... " + truncate(v.pttPartial, 200)
@@ -480,7 +492,7 @@ func hintsForSpaces() string {
 func hintsForUtterances() string {
 	bar := ui.HintBar{Chips: []ui.HintChip{
 		{Key: "↑/↓", Label: "Scroll"},
-		{Key: "V", Label: "PTT"},
+		{Key: "Ctrl+Space", Label: "Talk"},
 		{Key: "Tab", Label: "Cycle"},
 	}}
 	return bar.String()
@@ -493,10 +505,16 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 		return false
 	}
 
-	// `v` toggles push-to-talk capture. Handled OUTSIDE the locked
-	// switch below because startPTT / stopPTT manage their own
-	// locking and spawn goroutines.
-	if kev.Key() == tcell.KeyRune && (kev.Rune() == 'v' || kev.Rune() == 'V') {
+	// Ctrl+Space toggles push-to-talk capture: first press starts a
+	// recording session, second press stops it. Bare-space hold-to-
+	// talk (the Claude-app pattern) doesn't work in terminals --
+	// tcell 2.13.8 opts out of the Kitty keyboard protocol's key-
+	// release events, so there's no "release" signal to bind. Ctrl+
+	// Space avoids the literal-space-typing conflict that bare space
+	// would have once an utterance composer ships. Handled OUTSIDE
+	// the locked switch below because startPTT / stopPTT manage
+	// their own locking and spawn goroutines.
+	if kev.Key() == tcell.KeyCtrlSpace {
 		v.togglePTT()
 		return true
 	}
@@ -581,8 +599,15 @@ func (v *View) togglePTT() {
 	v.pttStatus = "listening"
 	v.pttCancel = cancel
 	v.pttStopAudio = stopAudio
+	v.pttLastPartialAt = time.Now() // start the silence window from now
 	v.Mu.Unlock()
 	v.Redraw()
+
+	// Silence watchdog: stops recording if no partial transcript
+	// has arrived for pttSilenceWindow. Catches a forgotten
+	// Ctrl+Space and the "I'm done talking" case where the user
+	// just stops speaking.
+	go v.pttSilenceWatchdog(ctx)
 
 	go func() {
 		defer func() {
@@ -605,6 +630,7 @@ func (v *View) togglePTT() {
 			OnPartial: func(p voice.PartialTranscript) {
 				v.Mu.Lock()
 				v.pttPartial = p.Text
+				v.pttLastPartialAt = time.Now() // refresh the watchdog
 				v.Mu.Unlock()
 				v.Redraw()
 			},
@@ -619,6 +645,53 @@ func (v *View) togglePTT() {
 		v.Mu.Unlock()
 		v.Redraw()
 	}()
+}
+
+// pttSilenceWatchdog runs while a PTT session is active. Every
+// pttWatchdogTick it checks how long it's been since the last
+// partial transcript; once that gap exceeds pttSilenceWindow, it
+// asks the audio reader to close, which lets PushToTalk see EOF
+// and finalize the transcript via the same path the manual second
+// Ctrl+Space takes.
+//
+// Exits when ctx is canceled (manual stop already happened) or when
+// the recording is no longer active (audio goroutine cleaned up
+// first).
+func (v *View) pttSilenceWatchdog(ctx context.Context) {
+	ticker := time.NewTicker(pttWatchdogTick)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			v.Mu.RLock()
+			active := v.pttActive
+			lastAt := v.pttLastPartialAt
+			stopAudio := v.pttStopAudio
+			status := v.pttStatus
+			v.Mu.RUnlock()
+			if !active {
+				return
+			}
+			// Only trigger from "listening" -- once the user has
+			// already pressed Ctrl+Space to stop (status = "transcribing")
+			// the audio stream is closing on its own; don't double-trip.
+			if status != "listening" {
+				continue
+			}
+			if time.Since(lastAt) > pttSilenceWindow {
+				v.Mu.Lock()
+				v.pttStatus = "transcribing"
+				v.Mu.Unlock()
+				if stopAudio != nil {
+					_ = stopAudio()
+				}
+				v.Redraw()
+				return
+			}
+		}
+	}
 }
 
 func parseMillis(v any) int64 {
