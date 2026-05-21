@@ -14,7 +14,6 @@ package concepts
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -24,6 +23,7 @@ import (
 
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
 	"github.com/znasllc-io/memql/sdk/go/client"
+	"github.com/znasllc-io/memql/sdk/go/sense"
 )
 
 // FocusPane identifies which pane has keyboard focus.
@@ -58,9 +58,16 @@ type View struct {
 	rowFilter  string
 	rowMatches []int
 
-	// Detail (right pane) -- generic structured render of the
-	// highlighted row's payload + provenance.
-	detailLines []ui.DetailLine
+	// Detail (right pane) -- pseudo-MemQL render of the highlighted
+	// row, syntax-highlighted via Sense and laid out by the reusable
+	// ui.Viewer widget (line numbers, hard-wrap, block tinting).
+	detailLines []ui.ViewerLine
+
+	// detailCacheRowId is the id of the row whose tokens currently
+	// drive detailLines. We re-tokenize only when the highlighted row
+	// changes, not on every redraw -- Sense calls are gRPC round-trips
+	// and the cockpit redraws aggressively on focus/scroll changes.
+	detailCacheRowId string
 
 	// Version overlay -- when versionsOpen is true the detail pane
 	// shows the time-series of versions for the selected row instead
@@ -76,6 +83,12 @@ type View struct {
 	// (which also flips GatedMessage on for the placeholder).
 	QueryClient func() *client.QueryClient
 
+	// SenseClient returns a sense client bound to the active cluster's
+	// dispatcher, or nil when no cluster is connected. The viewer
+	// degrades gracefully when this is nil -- no spans, but the
+	// content still wraps + numbers + tints as expected.
+	SenseClient func() *sense.Client
+
 	// Widgets (composable from cli/ui/). These hold Selected / ScrollY
 	// state internally so the view no longer carries
 	// conceptSelected / rowSelected / detailScroll fields. Render
@@ -84,7 +97,7 @@ type View struct {
 	conceptList ui.ListPane
 	rowList     ui.ListPane
 	versionList ui.ListPane
-	detailPane  ui.DetailPane
+	viewer      ui.Viewer
 }
 
 // NewView creates an empty Concepts view. Renderer callbacks for
@@ -108,7 +121,7 @@ func NewView(theme ui.Theme) *View {
 	v.conceptList.EmptyMessage = "No concepts loaded."
 	v.rowList.EmptyMessage = "No rows."
 	v.versionList.EmptyMessage = "No version history for this row."
-	v.detailPane.EmptyMessage = "Select a row to see its rendered detail."
+	v.viewer.EmptyMessage = "Select a row to see its rendered detail."
 	return v
 }
 
@@ -262,7 +275,7 @@ func (v *View) drawDetail(screen *ui.Screen, bounds ui.Rect) {
 	if v.versionsOpen {
 		title = fmt.Sprintf(" VERSIONS (%d/%d) ", v.versionList.Selected+1, len(v.versionRows))
 	} else if n := len(v.detailLines); n > 0 {
-		title = fmt.Sprintf(" DETAIL (line %d/%d) ", v.detailPane.ScrollY+1, n)
+		title = fmt.Sprintf(" DETAIL (line %d/%d) ", v.viewer.ScrollY+1, n)
 	}
 	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, titleStyle)
 
@@ -280,9 +293,9 @@ func (v *View) drawDetail(screen *ui.Screen, bounds ui.Rect) {
 		v.versionList.Focused = v.Focus == FocusDetail
 		v.versionList.Draw(screen, inner, v.Theme)
 	} else {
-		v.detailPane.Lines = v.detailLines
-		v.detailPane.Focused = v.Focus == FocusDetail
-		v.detailPane.Draw(screen, inner, v.Theme)
+		v.viewer.Lines = v.detailLines
+		v.viewer.Focused = v.Focus == FocusDetail
+		v.viewer.Draw(screen, inner, v.Theme)
 	}
 
 	v.drawBottomHints(screen, bounds, hintsForDetail(v))
@@ -565,8 +578,8 @@ func (v *View) handleDetailKeyLocked(ev *tcell.EventKey) bool {
 		}
 		return false
 	}
-	v.detailPane.Focused = true
-	if v.detailPane.HandleEvent(ev) {
+	v.viewer.Focused = true
+	if v.viewer.HandleEvent(ev) {
 		return true
 	}
 	if ev.Key() == tcell.KeyEsc {
@@ -612,9 +625,10 @@ func (v *View) refreshRowsFromCurrent() {
 func (v *View) refreshRowsFromCurrentLocked() {
 	v.Rows = nil
 	v.detailLines = nil
+	v.detailCacheRowId = ""
 	v.rowList.Selected = 0
 	v.rowList.ScrollY = 0
-	v.detailPane.ScrollY = 0
+	v.viewer.ScrollY = 0
 	v.versionsOpen = false
 	if v.QueryClient == nil {
 		v.rowMatches = nil
@@ -664,19 +678,69 @@ func (v *View) refreshDetailFromCurrent() {
 }
 
 func (v *View) refreshDetailFromCurrentLocked() {
-	v.detailPane.ScrollY = 0
+	v.viewer.ScrollY = 0
 	matches := v.rowMatches
 	if v.rowList.Selected < 0 || v.rowList.Selected >= len(matches) {
 		v.detailLines = nil
+		v.detailCacheRowId = ""
 		return
 	}
 	idx := matches[v.rowList.Selected]
 	if idx < 0 || idx >= len(v.Rows) {
 		// Defensive: matches was computed against an older v.Rows.
 		v.detailLines = nil
+		v.detailCacheRowId = ""
 		return
 	}
-	v.detailLines = renderRowDetail(v.Rows[idx])
+	row := v.Rows[idx]
+	rowId := getString(row, "id")
+
+	// Skip re-tokenization when the highlighted row hasn't changed.
+	// Draw fires often (focus changes, scrolls in OTHER panes, timer
+	// wakeups); each pass through here would otherwise issue a fresh
+	// Sense round-trip.
+	if rowId != "" && rowId == v.detailCacheRowId && len(v.detailLines) > 0 {
+		return
+	}
+
+	tokens := v.tokenizeRowLocked(row)
+	v.detailLines = rowToViewerLines(row, tokens, v.Theme)
+	v.detailCacheRowId = rowId
+}
+
+// tokenizeRowLocked calls Sense.Tokenize on the row's serialized form
+// and returns the token slice. Returns nil (no spans) when no Sense
+// client is wired or the call fails -- the viewer renders the raw
+// text without highlighting, which is degraded but not broken.
+//
+// Caller MUST hold v.Mu. The Sense call goes out under the lock,
+// matching the existing refreshRowsFromCurrentLocked pattern; the
+// timeout caps the worst-case stall at 2s.
+func (v *View) tokenizeRowLocked(row map[string]any) []sense.Token {
+	if v.SenseClient == nil {
+		return nil
+	}
+	sc := v.SenseClient()
+	if sc == nil {
+		return nil
+	}
+	source := serializeRow(row).text
+	if source == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	tokens, err := sc.Tokenize(ctx, source)
+	if err != nil {
+		// Status callback is optional; surface a non-fatal hint so the
+		// user knows highlighting is unavailable. Don't return early --
+		// the viewer copes with empty tokens.
+		if v.OnStatus != nil {
+			v.OnStatus(fmt.Sprintf("syntax highlighting unavailable: %v", err))
+		}
+		return nil
+	}
+	return tokens
 }
 
 // openVersions fetches the time-series history for the selected row
@@ -805,120 +869,7 @@ func getMap(m map[string]any, key string) map[string]any {
 	return out
 }
 
-// --- generic renderer (Hybrid C) -----------------------------------
-
-// renderRowDetail walks the row map and emits a human-readable
-// declaration-style block. No concept-specific knowledge: every
-// field renders the same way, so a brand-new concept is browsable
-// the day it's declared. Sections: intrinsics, payload, provenance.
-//
-// Each source line becomes one LinePlain DetailLine -- the existing
-// detail visual stays bit-for-bit identical. Header / KV styling on
-// top of this lives in a follow-up (the reusable read-only viewer
-// in #50 builds on DetailPane).
-func renderRowDetail(row map[string]any) []ui.DetailLine {
-	if row == nil {
-		return nil
-	}
-	var lines []ui.DetailLine
-
-	lines = append(lines, plain("INTRINSICS"))
-	for _, key := range []string{"id", "concept", "type", "createdBy", "createdAt"} {
-		if v := getString(row, key); v != "" {
-			lines = append(lines, plain(fmt.Sprintf("  %-12s %s", key, v)))
-		}
-	}
-
-	if payload := getMap(row, "payload"); payload != nil {
-		lines = append(lines, plain(""))
-		lines = append(lines, plain("PAYLOAD"))
-		lines = append(lines, renderObject(payload, 1)...)
-	}
-
-	if meta := getMap(row, "metadata"); meta != nil {
-		if prov := getMap(meta, "provenance"); prov != nil {
-			lines = append(lines, plain(""))
-			lines = append(lines, plain("PROVENANCE"))
-			lines = append(lines, renderObject(prov, 1)...)
-		}
-	}
-	if prov := getMap(row, "provenance"); prov != nil {
-		lines = append(lines, plain(""))
-		lines = append(lines, plain("PROVENANCE"))
-		lines = append(lines, renderObject(prov, 1)...)
-	}
-
-	return lines
-}
-
-func plain(text string) ui.DetailLine {
-	return ui.DetailLine{Kind: ui.LinePlain, Text: text}
-}
-
-func renderObject(obj map[string]any, depth int) []ui.DetailLine {
-	if obj == nil {
-		return nil
-	}
-	keys := make([]string, 0, len(obj))
-	for k := range obj {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	indent := strings.Repeat("  ", depth)
-	var lines []ui.DetailLine
-	for _, k := range keys {
-		v := obj[k]
-		switch val := v.(type) {
-		case map[string]any:
-			lines = append(lines, plain(fmt.Sprintf("%s%s:", indent, k)))
-			lines = append(lines, renderObject(val, depth+1)...)
-		case []any:
-			lines = append(lines, plain(fmt.Sprintf("%s%s: (%d items)", indent, k, len(val))))
-			lines = append(lines, renderArray(val, depth+1)...)
-		default:
-			lines = append(lines, plain(fmt.Sprintf("%s%-20s %s", indent, k+":", renderScalar(val))))
-		}
-	}
-	return lines
-}
-
-func renderArray(arr []any, depth int) []ui.DetailLine {
-	indent := strings.Repeat("  ", depth)
-	var lines []ui.DetailLine
-	limit := 10
-	for i, v := range arr {
-		if i >= limit {
-			lines = append(lines, plain(fmt.Sprintf("%s... (%d more)", indent, len(arr)-limit)))
-			break
-		}
-		switch val := v.(type) {
-		case map[string]any:
-			lines = append(lines, plain(fmt.Sprintf("%s[%d]:", indent, i)))
-			lines = append(lines, renderObject(val, depth+1)...)
-		default:
-			lines = append(lines, plain(fmt.Sprintf("%s[%d] %s", indent, i, renderScalar(val))))
-		}
-	}
-	return lines
-}
-
-func renderScalar(v any) string {
-	if v == nil {
-		return "null"
-	}
-	switch t := v.(type) {
-	case string:
-		return t
-	case bool:
-		if t {
-			return "true"
-		}
-		return "false"
-	default:
-		b, err := json.Marshal(v)
-		if err != nil {
-			return fmt.Sprintf("%v", v)
-		}
-		return string(b)
-	}
-}
+// Row → MemQL declaration rendering lives in render.go (the new
+// pseudo-MemQL serializer that feeds the Viewer widget). The old
+// LinePlain-based renderer here is retired -- the Viewer-driven path
+// in render.go is the only one now.
