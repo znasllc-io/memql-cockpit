@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"sync"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/znasllc-io/memql-cockpit/cli/config"
@@ -38,16 +37,22 @@ const (
 // Thread-safety: SetClusters / SetConnected / SetRowStatus are called
 // from pool-lifecycle goroutines whenever a cluster's dial state
 // changes; the tcell event loop concurrently calls Draw + HandleEvent.
-// mu serializes writers (Lock) against Draw (RLock). The embedded
-// Topology view owns its own mu, so locking here is per-row state
-// only (Clusters slice, Selected, SelectedCluster, form state) --
-// nested re-entry through Topology.Draw etc. happens outside this
-// view's lock.
+// Mu (inherited from ui.BaseView) serializes writers (Lock) against
+// Draw (RLock). The embedded Topology view owns its own mu, so
+// locking here is per-row state only (Clusters slice, Selected,
+// SelectedCluster, form state) -- nested re-entry through
+// Topology.Draw etc. happens outside this view's lock.
+//
+// Migrated to the cli/ui widget layer (epic #81). Hint composition
+// uses ui.HintBar; the inline selection-background RGB literal is
+// gone in favor of Theme.SelectionStyle(). The cluster list itself
+// stays hand-rolled because the sticky-pinned local-row layout
+// (separator + scroll-scoped-to-rest) doesn't fit ui.ListPane's
+// uniform-rows model; that's a separate follow-up.
 type ClustersView struct {
-	mu       sync.RWMutex
-	Theme    ui.Theme
-	Focus    FocusPane
-	Topology *View // node topology diagram (right pane)
+	ui.BaseView // Mu / Theme / GatedMessage / OnStatus / OnRedraw
+	Focus       FocusPane
+	Topology    *View // node topology diagram (right pane)
 
 	// Cluster management state.
 	Clusters     []ClusterStatus
@@ -226,10 +231,10 @@ func formStateFromConfig(c config.ClusterConfig) addFormState {
 // The "local" cluster is always present and cannot be deleted.
 func NewClustersView(theme ui.Theme) *ClustersView {
 	v := &ClustersView{
-		Theme:    theme,
 		Topology: NewView(theme),
 		Focus:    FocusManagement,
 	}
+	v.Theme = theme
 	// Ensure local cluster is always in the list.
 	v.Clusters = []ClusterStatus{{
 		Config: LocalClusterConfig(),
@@ -241,8 +246,8 @@ func NewClustersView(theme ui.Theme) *ClustersView {
 // SetClusters updates the cluster list, ensuring "local" is always first.
 // Preserves "connecting" status for any cluster currently being connected to.
 func (v *ClustersView) SetClusters(clusters []ClusterStatus) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.Mu.Lock()
+	defer v.Mu.Unlock()
 	// Build a map of current statuses to preserve.
 	oldStatus := make(map[string]ClusterStatus)
 	for _, c := range v.Clusters {
@@ -311,8 +316,8 @@ func (v *ClustersView) fireOnHighlight() {
 // SetConnected marks a cluster as connected / unreachable in the row
 // list. Called by the app layer from a pool entry's lifecycle.
 func (v *ClustersView) SetConnected(name string, connected bool, nodeId, nodeVer string) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.Mu.Lock()
+	defer v.Mu.Unlock()
 	v.ActiveCluster = name
 	v.Connected = connected
 	for i := range v.Clusters {
@@ -332,8 +337,8 @@ func (v *ClustersView) SetConnected(name string, connected bool, nodeId, nodeVer
 // Used by the pool lifecycle to reflect connecting / backoff / failed
 // transitions without touching NodeId / NodeVer.
 func (v *ClustersView) SetRowStatus(name, status string) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.Mu.Lock()
+	defer v.Mu.Unlock()
 	for i := range v.Clusters {
 		if v.Clusters[i].Config.Name == name {
 			v.Clusters[i].Status = status
@@ -346,8 +351,8 @@ func (v *ClustersView) SetRowStatus(name, status string) {
 // SetConnected / SetRowStatus) can't tear the Clusters slice or
 // per-row Status mid-render.
 func (v *ClustersView) Draw(screen *ui.Screen, bounds ui.Rect) {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
+	v.Mu.RLock()
+	defer v.Mu.RUnlock()
 	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, v.Theme.BaseStyle())
 
 	panes := ui.FlexColumn(bounds, []ui.FlexItem{
@@ -471,7 +476,7 @@ func (v *ClustersView) drawManagement(screen *ui.Screen, bounds ui.Rect) {
 	drawClusterRow := func(cs ClusterStatus, dataIdx int, rowY int) {
 		rowStyle := v.Theme.BaseStyle()
 		if dataIdx == v.Selected {
-			rowStyle = tcell.StyleDefault.Foreground(v.Theme.FG).Background(tcell.NewRGBColor(40, 44, 52))
+			rowStyle = v.Theme.SelectionStyle()
 		}
 		screen.FillRect(bounds.X, rowY, bounds.Width, 1, rowStyle)
 
@@ -601,44 +606,6 @@ func (v *ClustersView) drawManagement(screen *ui.Screen, bounds ui.Rect) {
 	// follow this pattern.
 	subtle := v.Theme.SubtleStyle()
 	warnStyle := tcell.StyleDefault.Foreground(v.Theme.Warning).Background(v.Theme.BG)
-	canDelete := v.Selected >= 0 && v.Selected < len(v.Clusters) && v.Clusters[v.Selected].Config.Name != "local"
-	// Action hints. E:Edit is hidden on the local row -- local's
-	// config comes from the genesis envelope, not the form.
-	hint := "A:Add"
-	if v.Selected >= 0 && v.Selected < len(v.Clusters) && v.Clusters[v.Selected].Config.Name != "local" {
-		hint += "  E:Edit"
-	}
-	if v.OnEntryState != nil && v.Selected >= 0 && v.Selected < len(v.Clusters) {
-		name := v.Clusters[v.Selected].Config.Name
-		alreadySelected := name == v.SelectedCluster
-		if state, _, _, ok := v.OnEntryState(name); ok {
-			switch state {
-			case "connected":
-				if !alreadySelected {
-					hint += "  Enter:Select"
-				}
-			case "connecting", "backoff":
-				hint += "  Esc:Cancel"
-			case "failed":
-				hint += "  R:Retry"
-			case "needs-auth":
-				// Authorize is the only useful next action on an
-				// unconfigured row -- Enter:Select / R:Retry would
-				// both fail until issuer+client_id are wired.
-				hint += "  L:Authorize"
-			case "needs-login":
-				// Row is configured; only the token is missing.
-				// L triggers the OAuth flow directly (no form),
-				// distinct from needs-auth's L:Authorize.
-				hint += "  L:Login"
-			}
-		}
-		// No state at all (no pool entry yet, e.g. for a row added
-		// in the current frame): don't claim Enter does anything.
-	}
-	if canDelete {
-		hint += "  D:Del"
-	}
 
 	if v.confirmDelete && v.Selected >= 0 && v.Selected < len(v.Clusters) {
 		name := v.Clusters[v.Selected].Config.Name
@@ -648,7 +615,61 @@ func (v *ClustersView) drawManagement(screen *ui.Screen, bounds ui.Rect) {
 		)
 		return
 	}
-	ui.DrawBottom(screen, bounds, subtle, 1, hint)
+	ui.DrawBottom(screen, bounds, subtle, 1, v.hintsForManagement())
+}
+
+// hintsForManagement builds the context-aware action-hint band for
+// the cluster manager pane. Every chip is gated on the row's state
+// (and the pool's lifecycle state via OnEntryState) so the bar only
+// advertises actions that work right now -- per the chrome contract's
+// "Hints that lie rot trust" rule.
+//
+// Caller must hold the read lock.
+func (v *ClustersView) hintsForManagement() string {
+	canEdit := v.Selected >= 0 && v.Selected < len(v.Clusters) && v.Clusters[v.Selected].Config.Name != "local"
+	canDelete := canEdit // same predicate today; kept distinct so future divergence (e.g. soft-delete on local) lands one chip at a time
+
+	// Lifecycle chips are mutually exclusive -- a row is in at most
+	// one of (connected / connecting / failed / needs-auth /
+	// needs-login). Compute booleans for each and let the HintBar
+	// omit the disabled ones.
+	var (
+		canSelect    bool // Enter:Select
+		canCancel    bool // Esc:Cancel
+		canRetry     bool // R:Retry
+		canAuthorize bool // L:Authorize
+		canLogin     bool // L:Login
+	)
+	if v.OnEntryState != nil && v.Selected >= 0 && v.Selected < len(v.Clusters) {
+		name := v.Clusters[v.Selected].Config.Name
+		alreadySelected := name == v.SelectedCluster
+		if state, _, _, ok := v.OnEntryState(name); ok {
+			switch state {
+			case "connected":
+				canSelect = !alreadySelected
+			case "connecting", "backoff":
+				canCancel = true
+			case "failed":
+				canRetry = true
+			case "needs-auth":
+				canAuthorize = true
+			case "needs-login":
+				canLogin = true
+			}
+		}
+	}
+
+	bar := ui.HintBar{Chips: []ui.HintChip{
+		{Key: "A", Label: "Add"},
+		{Key: "E", Label: "Edit", Disabled: !canEdit},
+		{Key: "Enter", Label: "Select", Disabled: !canSelect},
+		{Key: "Esc", Label: "Cancel", Disabled: !canCancel},
+		{Key: "R", Label: "Retry", Disabled: !canRetry},
+		{Key: "L", Label: "Authorize", Disabled: !canAuthorize},
+		{Key: "L", Label: "Login", Disabled: !canLogin},
+		{Key: "D", Label: "Del", Disabled: !canDelete},
+	}}
+	return bar.String()
 }
 
 func (v *ClustersView) drawAddForm(screen *ui.Screen, x, y, maxW int, bounds ui.Rect) {
@@ -762,8 +783,8 @@ func (v *ClustersView) FormOpen() bool {
 // state. The Topology sub-view owns its own lock and is dispatched
 // without this lock held -- the routing fan-out is state-free.
 func (v *ClustersView) HandleEvent(ev tcell.Event) bool {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.Mu.Lock()
+	defer v.Mu.Unlock()
 	keyEv, ok := ev.(*tcell.EventKey)
 	if !ok {
 		return false

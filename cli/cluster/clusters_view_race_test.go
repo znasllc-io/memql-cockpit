@@ -75,7 +75,7 @@ func TestClustersView_NoRaceUnderConcurrentMutate(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < iters*2; i++ {
-			v.mu.RLock()
+			v.Mu.RLock()
 			for _, c := range v.Clusters {
 				_ = c.Config.Name
 				_ = c.Status
@@ -84,7 +84,7 @@ func TestClustersView_NoRaceUnderConcurrentMutate(t *testing.T) {
 			}
 			_ = v.SelectedCluster
 			_ = v.ActiveCluster
-			v.mu.RUnlock()
+			v.Mu.RUnlock()
 		}
 	}()
 
