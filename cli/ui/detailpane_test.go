@@ -60,13 +60,14 @@ func TestDetailPane_RendersAllLineKinds(t *testing.T) {
 			{Kind: LineHeader, Text: "PROVIDER"},
 			{Kind: LinePlain, Text: "anthropic"},
 			{Kind: LineDim, Text: "----"},
+			{Kind: LineSection, Text: "─ identity ─"},
 			{Kind: LineKV, Key: "Endpoint", Value: "localhost:9000"},
 		},
 	}
 	d.Draw(screen, Rect{X: 0, Y: 0, Width: 40, Height: 10}, DefaultTheme())
 	sim.Sync()
 
-	wants := []string{"PROVIDER", "anthropic", "----", "Endpoint:", "localhost:9000"}
+	wants := []string{"PROVIDER", "anthropic", "----", "─ identity ─", "Endpoint:", "localhost:9000"}
 	for _, want := range wants {
 		found := false
 		for y := 0; y < 10; y++ {
@@ -250,6 +251,51 @@ func TestDetailPane_ScrollbarVisibleOnlyWhenOverflow(t *testing.T) {
 				t.Errorf("scrollbar = %v, want %v", has, tc.wantScrollbar)
 			}
 		})
+	}
+}
+
+// TestDetailPane_LineSectionStyleDiffersFromHeader confirms that
+// LineSection paints in subtle+bold (the pre-migration visual the
+// section markers had under planner / agents) while LineHeader keeps
+// its accent+bold semantics -- the whole point of #93.
+func TestDetailPane_LineSectionStyleDiffersFromHeader(t *testing.T) {
+	screen, sim := makeDetailSim(t, 40, 4)
+	defer sim.Fini()
+
+	d := DetailPane{Lines: []DetailLine{
+		{Kind: LineHeader, Text: "HEADERX"},
+		{Kind: LineSection, Text: "SECTION"},
+	}}
+	d.Draw(screen, Rect{X: 0, Y: 0, Width: 40, Height: 4}, DefaultTheme())
+	sim.Sync()
+
+	theme := DefaultTheme()
+	wantHeaderFG, _, _ := theme.AccentStyle().Bold(true).Decompose()
+	wantSectionFG, _, _ := theme.SubtleStyle().Bold(true).Decompose()
+
+	// Probe the first painted cell of each row -- both rows start at
+	// x=0 because flatten emits one rendered row per source line for
+	// wrap-style kinds.
+	_, _, headerStyle, _ := sim.GetContent(0, 0)
+	_, _, sectionStyle, _ := sim.GetContent(0, 1)
+
+	hFG, _, hAttr := headerStyle.Decompose()
+	sFG, _, sAttr := sectionStyle.Decompose()
+
+	if hFG != wantHeaderFG {
+		t.Errorf("LineHeader FG = %v, want %v (theme.Accent)", hFG, wantHeaderFG)
+	}
+	if sFG != wantSectionFG {
+		t.Errorf("LineSection FG = %v, want %v (theme.Subtle)", sFG, wantSectionFG)
+	}
+	if hAttr&tcell.AttrBold == 0 {
+		t.Error("LineHeader missing Bold attr")
+	}
+	if sAttr&tcell.AttrBold == 0 {
+		t.Error("LineSection missing Bold attr")
+	}
+	if hFG == sFG {
+		t.Error("LineHeader and LineSection paint the same FG -- the whole point is they differ")
 	}
 }
 
