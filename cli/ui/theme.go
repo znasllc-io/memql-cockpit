@@ -70,6 +70,16 @@ func (t Theme) SubtleStyle() tcell.Style {
 	return tcell.StyleDefault.Foreground(t.Subtle).Background(t.BG)
 }
 
+// SelectionStyle returns the highlighted-row style: default FG on a
+// slightly-lighter-than-BG slate so the cursor row reads at a glance
+// without overwhelming the rest of the pane. Used by ListPane and
+// any pane rendering a selectable list. Matches the dark-slate
+// hardcoded in concepts/agents/planner today; centralizing it here
+// is what lets the migration drop those inline RGB literals.
+func (t Theme) SelectionStyle() tcell.Style {
+	return tcell.StyleDefault.Foreground(t.FG).Background(tcell.NewRGBColor(40, 44, 52))
+}
+
 // ErrorStyle returns error-colored text on default BG.
 func (t Theme) ErrorStyle() tcell.Style {
 	return tcell.StyleDefault.Foreground(t.Error).Background(t.BG)
