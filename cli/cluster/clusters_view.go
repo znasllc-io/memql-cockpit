@@ -43,21 +43,28 @@ const (
 // SelectedCluster, form state) -- nested re-entry through
 // Topology.Draw etc. happens outside this view's lock.
 //
-// Migrated to the cli/ui widget layer (epic #81). Hint composition
-// uses ui.HintBar; the inline selection-background RGB literal is
-// gone in favor of Theme.SelectionStyle(). The cluster list itself
-// stays hand-rolled because the sticky-pinned local-row layout
-// (separator + scroll-scoped-to-rest) doesn't fit ui.ListPane's
-// uniform-rows model; that's a separate follow-up.
+// Migrated to the cli/ui widget layer. Hint composition uses
+// ui.HintBar; the inline selection-background RGB literal is gone
+// in favor of Theme.SelectionStyle(); the cluster list itself uses
+// ui.ListPane with RowsPerItem=2 (primary: status icon + name,
+// subtitle: endpoint + status) so every list-bearing pane in the
+// cockpit reads with the same primary/subtitle rhythm. "local"
+// stays sorted first via the slice order (see SetClusters) but no
+// longer holds the viewport across scroll.
 type ClustersView struct {
 	ui.BaseView // Mu / Theme / GatedMessage / OnStatus / OnRedraw
 	Focus       FocusPane
 	Topology    *View // node topology diagram (right pane)
 
 	// Cluster management state.
-	Clusters     []ClusterStatus
-	Selected     int // index of the currently-highlighted row (arrow keys)
-	scrollOffset int // first visible row index inside the scrollable viewport
+	Clusters []ClusterStatus
+	Selected int // index of the currently-highlighted row (arrow keys)
+
+	// clusterList renders the management pane's cluster list.
+	// RowsPerItem=2 matches the planner/agents/concepts/chat lists.
+	// Selected/ScrollY live in the widget; the view syncs Selected
+	// before each Draw and reads it back after HandleEvent.
+	clusterList ui.ListPane
 
 	// SelectedCluster is the name of the cluster the user has chosen
 	// as their "working cluster" (via Enter). It's a separate concept
@@ -235,6 +242,8 @@ func NewClustersView(theme ui.Theme) *ClustersView {
 		Focus:    FocusManagement,
 	}
 	v.Theme = theme
+	v.clusterList.RowsPerItem = 2
+	v.clusterList.Render = v.renderClusterRow
 	// Ensure local cluster is always in the list.
 	v.Clusters = []ClusterStatus{{
 		Config: LocalClusterConfig(),
@@ -411,9 +420,6 @@ func (v *ClustersView) drawManagement(screen *ui.Screen, bounds ui.Rect) {
 		v.drawAddForm(screen, x, y, maxW, bounds)
 		return
 	}
-	// Pane title (CLUSTERS) above is the only header -- the previous
-	// "CLUSTER MANAGER" subtitle was redundant noise.
-	//
 	// Layout below the title is a three-band stack, bottom-up:
 	//
 	//   [chrome]     -- hints or delete-confirmation prompt (chromeH)
@@ -423,9 +429,9 @@ func (v *ClustersView) drawManagement(screen *ui.Screen, bounds ui.Rect) {
 	//   [list]       -- scrollable cluster list (whatever remains)
 	//
 	// Fixed height is reserved for gap + detail + chrome so the list
-	// can't grow into them when the cluster count balloons. When the
-	// list exceeds its viewport we scroll + draw an accent-colored
-	// indicator via ui.DrawScrollbar.
+	// can't grow into them when the cluster count balloons. The list
+	// itself is a ui.ListPane with RowsPerItem=2 -- matches every
+	// other list-bearing pane in the cockpit.
 	const detailMaxH = 5 // divider + Endpoint + Auth + Status + (retry|Node)
 	const chromeGapH = 1 // clear row above the action hints
 	chromeH := 1
@@ -440,96 +446,20 @@ func (v *ClustersView) drawManagement(screen *ui.Screen, bounds ui.Rect) {
 		viewportH = 1
 	}
 
-	// "local" is pinned at index 0 as a sticky header when there's at
-	// least one other cluster; a subtle ── divider separates it from
-	// the sorted rest so the list visually groups "the always-there
-	// fallback" apart from "whatever you've added". Scrolling only
-	// affects the rest; the pinned row + divider stay put.
-	hasPinned := len(v.Clusters) > 0 && v.Clusters[0].Config.Name == "local"
-	hasRest := len(v.Clusters) > 1
-	headerH := 0
-	if hasPinned && hasRest {
-		headerH = 2
+	// Sync Selected -> widget, paint, then read back. ListPane owns
+	// ScrollY across renders; the view stays out of the scroll math.
+	v.clusterList.Count = len(v.Clusters)
+	if v.Selected < 0 || v.Selected >= len(v.Clusters) {
+		v.Selected = 0
 	}
-	scrollH := viewportH - headerH
-	if scrollH < 1 {
-		scrollH = 1
-	}
-
-	// Scroll math is on "rest" (non-pinned) indices when we have a
-	// sticky header; otherwise it's on the full list.
-	restTotal := len(v.Clusters)
-	dataOffset := 0 // index shift from scroll-index to data-index
-	if headerH > 0 {
-		restTotal = len(v.Clusters) - 1
-		dataOffset = 1
-	}
-	restSelected := v.Selected - dataOffset
-	if restSelected < 0 {
-		// Selected sits on the pinned row -- leave the scroll where it is
-		// but keep it clamped to the valid range.
-		v.scrollOffset = ui.ScrollTo(v.scrollOffset, 0, restTotal, scrollH)
-	} else {
-		v.scrollOffset = ui.ScrollTo(v.scrollOffset, restSelected, restTotal, scrollH)
-	}
-
-	drawClusterRow := func(cs ClusterStatus, dataIdx int, rowY int) {
-		rowStyle := v.Theme.BaseStyle()
-		if dataIdx == v.Selected {
-			rowStyle = v.Theme.SelectionStyle()
-		}
-		screen.FillRect(bounds.X, rowY, bounds.Width, 1, rowStyle)
-
-		if dataIdx == v.Selected {
-			screen.SetCell(x, rowY, '▸', rowStyle.Foreground(v.Theme.Accent))
-		}
-		icon, color := clusterStatusIcon(cs.Status, v.Theme)
-		screen.SetCell(x+2, rowY, icon, rowStyle.Foreground(color))
-
-		nameStyle := rowStyle
-		if cs.Config.Name == v.SelectedCluster {
-			nameStyle = rowStyle.Foreground(v.Theme.Accent).Bold(true)
-		}
-		screen.DrawText(x+4, rowY, maxW-5, cs.Config.Display(), nameStyle)
-
-		if cs.Config.Name == v.SelectedCluster {
-			// `*` is strictly single-cell. The previous `◆` glyph
-			// renders as East Asian Ambiguous (2 cells wide on many
-			// terminal/font combos) and its overflow column nudged
-			// the right-pane divider one cell over on selected rows.
-			// See cli/CLAUDE.md "Layout-edge glyph rule".
-			markerX := bounds.X + bounds.Width - 2
-			screen.SetCell(markerX, rowY, '*', rowStyle.Foreground(v.Theme.Accent).Bold(true))
-		}
-	}
-
-	// Sticky header: pinned row + divider stay at the top of the
-	// viewport regardless of scroll. Only drawn when there are
-	// non-pinned items to separate from.
-	if headerH > 0 {
-		drawClusterRow(v.Clusters[0], 0, viewportTop)
-		screen.DrawHLine(bounds.X+1, viewportTop+1, bounds.Width-2, '─', v.Theme.SubtleStyle())
-	}
-
-	// Scrollable rest.
-	restStart, restEnd := ui.VisibleRange(v.scrollOffset, restTotal, scrollH)
-	for j := restStart; j < restEnd; j++ {
-		dataIdx := j + dataOffset
-		rowY := viewportTop + headerH + (j - restStart)
-		drawClusterRow(v.Clusters[dataIdx], dataIdx, rowY)
-	}
-
-	// If no sticky header but only pinned-or-empty, still render the
-	// single-cluster case via the scrollable path (restTotal captures
-	// that already; the loop above covers it).
-
-	// Accent-colored scrollbar scoped to the scrollable region.
-	if headerH > 0 || !hasPinned {
-		ui.DrawScrollbar(screen, v.Theme,
-			ui.Rect{X: bounds.X, Y: viewportTop + headerH, Width: bounds.Width, Height: scrollH},
-			v.scrollOffset, restTotal,
-		)
-	}
+	v.clusterList.Selected = v.Selected
+	v.clusterList.Focused = v.Focus == FocusManagement
+	v.clusterList.Draw(screen, ui.Rect{
+		X:      bounds.X,
+		Y:      viewportTop,
+		Width:  bounds.Width,
+		Height: viewportH,
+	}, v.Theme)
 
 	// Detail block for the selected cluster, pinned to the rows just
 	// above the chrome gap. Rows that have nothing to show stay blank
@@ -616,6 +546,62 @@ func (v *ClustersView) drawManagement(screen *ui.Screen, bounds ui.Rect) {
 		return
 	}
 	ui.DrawBottom(screen, bounds, subtle, 1, v.hintsForManagement())
+}
+
+// renderClusterRow paints a 2-row cluster-list entry. Primary line:
+// status icon + cluster name + optional '*' marker on the right
+// edge for the currently-selected working cluster (v.SelectedCluster).
+// Subtitle line: endpoint + status text in the dimmed planner-style
+// metadata slot. ListPane fills both rows with the SelectionStyle
+// background when sel is true, so the renderer just paints text.
+func (v *ClustersView) renderClusterRow(screen *ui.Screen, bounds ui.Rect, idx int, sel bool, theme ui.Theme) {
+	if idx < 0 || idx >= len(v.Clusters) {
+		return
+	}
+	cs := v.Clusters[idx]
+	primary := theme.BaseStyle()
+	if sel {
+		primary = theme.SelectionStyle()
+	}
+	sub := primary.Foreground(theme.Subtle)
+
+	// Status icon at column 1 (in the icon's own color, BG matches the
+	// row so the selection background still reads correctly).
+	icon, color := clusterStatusIcon(cs.Status, theme)
+	screen.SetCell(bounds.X+1, bounds.Y, icon, primary.Foreground(color))
+
+	// Name in accent + bold when this row is the active working
+	// cluster, otherwise inherits the row's primary style.
+	nameStyle := primary
+	if cs.Config.Name == v.SelectedCluster {
+		nameStyle = primary.Foreground(theme.Accent).Bold(true)
+	}
+	screen.DrawText(bounds.X+3, bounds.Y, bounds.Width-4, cs.Config.Display(), nameStyle)
+
+	// `*` marker on the right edge of the primary row for the active
+	// working cluster. Strictly single-cell ASCII per the layout-edge
+	// glyph rule in cli/CLAUDE.md.
+	if cs.Config.Name == v.SelectedCluster {
+		markerX := bounds.X + bounds.Width - 2
+		screen.SetCell(markerX, bounds.Y, '*', primary.Foreground(theme.Accent).Bold(true))
+	}
+
+	// Subtitle: "endpoint · status". Compose what's available so the
+	// row reads usefully on partially-configured clusters too.
+	endpoint := strings.TrimSpace(cs.Config.Endpoint)
+	status := strings.TrimSpace(cs.Status)
+	var subStr string
+	switch {
+	case endpoint != "" && status != "":
+		subStr = endpoint + "  ·  " + status
+	case endpoint != "":
+		subStr = endpoint
+	case status != "":
+		subStr = status
+	}
+	if subStr != "" {
+		screen.DrawText(bounds.X+3, bounds.Y+1, bounds.Width-4, subStr, sub)
+	}
 }
 
 // hintsForManagement builds the context-aware action-hint band for
@@ -819,20 +805,22 @@ func (v *ClustersView) HandleEvent(ev tcell.Event) bool {
 		return v.Topology.HandleEvent(ev)
 	}
 
+	// Try the cluster list widget first for navigation keys (Up/Down,
+	// PgUp/PgDn, Home/End, j/k). If consumed and Selected moved,
+	// re-fire OnHighlight so the topology pane follows.
+	v.clusterList.Focused = true
+	v.clusterList.Count = len(v.Clusters)
+	v.clusterList.Selected = v.Selected
+	if v.clusterList.HandleEvent(keyEv) {
+		if v.clusterList.Selected != v.Selected {
+			v.Selected = v.clusterList.Selected
+			v.fireOnHighlight()
+		}
+		return true
+	}
+
 	// Management pane keys.
 	switch keyEv.Key() {
-	case tcell.KeyUp:
-		if v.Selected > 0 {
-			v.Selected--
-			v.fireOnHighlight()
-		}
-		return true
-	case tcell.KeyDown:
-		if v.Selected < len(v.Clusters)-1 {
-			v.Selected++
-			v.fireOnHighlight()
-		}
-		return true
 	case tcell.KeyEnter:
 		// Pick the highlighted cluster as the user's "working
 		// cluster" (drives Explorer / Agents). If the entry is
