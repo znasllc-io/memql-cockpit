@@ -153,6 +153,80 @@ func TestSerializeRow_NilInputDoesNotPanic(t *testing.T) {
 	}
 }
 
+// TestSerializeRow_FullWireShape pins the rendering of a row in the
+// shape RawNodes returns -- intrinsics at the top level, NESTED
+// payload + provenance maps. Regression net for memql-cockpit#113,
+// where the detail viewer was showing only id + createdAt because
+// the SDK's Rows() was flattening payload and dropping the rest of
+// the wire fields; the cockpit now calls RawNodes() so this is the
+// shape serializeRow sees in production.
+func TestSerializeRow_FullWireShape(t *testing.T) {
+	row := map[string]any{
+		"id":        "v1:agents:agent:40920a36-911a-4fb2-b69a-fadfc3919915",
+		"concept":   "v1:agents:agent",
+		"type":      "memoryNode",
+		"schema":    map[string]any{"version": "1"},
+		"createdBy": "system",
+		"createdAt": "2026-05-21T04:44:42Z",
+		"payload": map[string]any{
+			"name":        "Faye",
+			"description": "An HR specialist agent",
+			"role":        "specialist",
+			"roleSlug":    "hr",
+			"active":      true,
+		},
+		"provenance": map[string]any{
+			"kind":      "system",
+			"sourceRef": "v1:platform:seed",
+		},
+	}
+
+	got := serializeRow(row)
+	body := got.text
+
+	// Every payload field must appear -- this is the load-bearing
+	// regression case. Pre-fix the entire payload block was missing
+	// because the SDK flattened it away.
+	for _, want := range []string{
+		`name: "Faye"`,
+		`description: "An HR specialist agent"`,
+		`role: "specialist"`,
+		`roleSlug: "hr"`,
+		`active: true`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("payload field missing from serialized output: %q\n--- got ---\n%s", want, body)
+		}
+	}
+
+	// Intrinsics that Rows() drops but RawNodes() preserves must
+	// also surface in the detail viewer.
+	for _, want := range []string{
+		`createdBy: "system"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("intrinsic missing from serialized output: %q\n--- got ---\n%s", want, body)
+		}
+	}
+
+	// Provenance fields must render under the provenance block.
+	for _, want := range []string{
+		`kind: "system"`,
+		`sourceRef: "v1:platform:seed"`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("provenance field missing from serialized output: %q\n--- got ---\n%s", want, body)
+		}
+	}
+
+	// Sanity: must NOT silently fall into the "id + createdAt only"
+	// empty-block degenerate shape that #113 was reporting.
+	if strings.Count(body, "\n") < 8 {
+		t.Errorf("serialized output suspiciously short (%d lines) -- the full row should render at least the header + 5 intrinsic-or-payload lines + 2 provenance lines + closing brace:\n%s",
+			strings.Count(body, "\n"), body)
+	}
+}
+
 // TestRowToViewerLines_NoSpansWithoutTokens confirms the row renders
 // as plain text (no Spans) when Sense returned no tokens. The viewer
 // still gets blocks + numbered lines, just no per-token coloring.

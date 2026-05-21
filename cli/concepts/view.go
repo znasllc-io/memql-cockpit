@@ -649,7 +649,14 @@ func (v *View) refreshRowsFromCurrentLocked() {
 		v.recomputeRowMatchesLocked()
 		return
 	}
-	v.Rows = res.Rows()
+	// RawNodes (NOT Rows) preserves the full nested wire shape --
+	// `payload`, `metadata`, `provenance`, and the `type` / `schema`
+	// / `createdBy` intrinsics survive. Rows() flattens the bundle
+	// and drops all of those, which is right for typed named
+	// primitives but wrong for an inspector tool. The detail
+	// viewer + row search filter + display label all expect the
+	// nested form. See memql/sdk/go/client/support.go.
+	v.Rows = res.RawNodes()
 	v.recomputeRowMatchesLocked()
 	v.refreshDetailFromCurrentLocked()
 }
@@ -765,7 +772,10 @@ func (v *View) openVersions() {
 		}
 		return
 	}
-	v.versionRows = res.Rows()
+	// RawNodes preserves createdBy + provenance, which the version
+	// row renderer (renderVersionRow) reads directly. Rows() would
+	// flatten them away.
+	v.versionRows = res.RawNodes()
 	sort.Slice(v.versionRows, func(i, j int) bool {
 		return getString(v.versionRows[i], "createdAt") > getString(v.versionRows[j], "createdAt")
 	})
