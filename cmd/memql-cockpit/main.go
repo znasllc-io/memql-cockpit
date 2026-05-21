@@ -81,6 +81,9 @@ func main() {
 		case "worker":
 			worker.HandleCommand(os.Args[2:])
 			return
+		case "creds":
+			handleCredsCmd(os.Args[2:])
+			return
 		case "genesis":
 			// Removed: genesis setup lives in the TUI's first-launch
 			// wizard now. Catch the legacy invocation so anyone with
@@ -125,6 +128,17 @@ func main() {
 	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	// Pick the active credential store and install it for the rest of
+	// the cockpit to route through (cli/config.LoadToken / SaveToken /
+	// DeleteToken). Auto-probe prefers the OS keyring; MEMQL_COCKPIT_CRED_STORE
+	// can force "file" or "keyring". See memql-cockpit#65.
+	credStore, credErr := config.Resolve(config.ResolveOptions{Logger: logger})
+	if credErr != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", credErr)
+		os.Exit(1)
+	}
+	config.SetActiveStore(credStore)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -391,6 +405,7 @@ func printUsage() {
 	fmt.Println("  memql-cockpit login <cluster>          Re-authenticate an existing cluster")
 	fmt.Println("  memql-cockpit logout <cluster>         Remove cached credentials")
 	fmt.Println("  memql-cockpit worker <subcommand>      Run as a memql worker (computer-use)")
+	fmt.Println("  memql-cockpit creds <subcommand>       Inspect / migrate the credential store")
 	fmt.Println("  memql-cockpit lint [path]              Validate a .memql file or DSL tree")
 	fmt.Println("")
 	fmt.Println("FIRST-TIME SETUP")
