@@ -14,25 +14,41 @@ import (
 	"time"
 
 	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
+
+	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/internal/worker/consent"
 )
+
+// ConsentGate is the narrow interface the dispatcher uses to ask
+// the consent manager whether a tool dispatch may run right now.
+// Pulled out as an interface so tests can wire a stub without
+// pulling in the full consent package surface.
+type ConsentGate interface {
+	Allows(tool, action string) consent.Decision
+}
 
 // Dispatcher is the cockpit-side tool dispatcher. Implements
 // internal/worker.ToolDispatcher.
 type Dispatcher struct {
-	logger *slog.Logger
-	policy *Policy
+	logger  *slog.Logger
+	policy  *Policy
+	consent ConsentGate
 }
 
 // NewDispatcher constructs a Dispatcher. The policy controls
 // allow/deny decisions for shell exec / fs / http tools.
-func NewDispatcher(logger *slog.Logger, policy *Policy) *Dispatcher {
+//
+// When consentGate is nil, the dispatcher behaves the pre-#64 way
+// (every dispatched call runs). When non-nil, every call passes
+// through the gate first; a denied decision short-circuits with a
+// `consent_required` failure carrying the gate's reason string.
+func NewDispatcher(logger *slog.Logger, policy *Policy, consentGate ConsentGate) *Dispatcher {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	if policy == nil {
 		policy = DefaultPolicy()
 	}
-	return &Dispatcher{logger: logger, policy: policy}
+	return &Dispatcher{logger: logger, policy: policy, consent: consentGate}
 }
 
 // Dispatch routes a ToolDispatch to its handler.
@@ -99,6 +115,30 @@ func (d *Dispatcher) Dispatch(ctx context.Context, dispatch *memqlv1.ToolDispatc
 			"error", err,
 		)
 		return nil, &memqlv1.Failure{ErrorCode: "bad_request", ErrorMessage: err.Error()}
+	}
+
+	// Consent gate (memql-cockpit#64). Every workerHost /
+	// workerComputer call passes through the per-host consent
+	// manager. Without an active operator-granted window the call
+	// short-circuits with `consent_required` carrying the gate's
+	// hint about how to open one. When d.consent == nil (no gate
+	// wired, e.g. legacy tests) we behave the pre-#64 way.
+	if d.consent != nil {
+		dec := d.consent.Allows(tool, action)
+		if !dec.Allowed {
+			elapsedMs := time.Since(startedAt).Milliseconds()
+			d.logger.Warn("worker tool dispatch FAIL (consent_required)",
+				"tool", tool,
+				"action", action,
+				"call_id", callId,
+				"reason", dec.Reason,
+				"elapsed_ms", elapsedMs,
+			)
+			return nil, &memqlv1.Failure{
+				ErrorCode:    "consent_required",
+				ErrorMessage: dec.Reason,
+			}
+		}
 	}
 
 	switch tool {

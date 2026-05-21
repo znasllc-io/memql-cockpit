@@ -13,6 +13,7 @@ import (
 
 	"github.com/znasllc-io/memql-cockpit/cli/config"
 	"github.com/znasllc-io/memql-cockpit/cli/crash"
+	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/internal/worker/consent"
 	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/internal/worker/tools"
 )
 
@@ -62,6 +63,8 @@ func dispatchHandleCommand(args []string) {
 		handleSetup(args[1:])
 	case "config":
 		handleConfig(args[1:])
+	case "consent":
+		handleConsentCmd(args[1:])
 	case "-h", "--help", "help":
 		printUsage()
 	default:
@@ -231,7 +234,22 @@ func handleRun(args []string) {
 		logger.Warn("policy load failed; using defaults", "error", err)
 		policy = tools.DefaultPolicy()
 	}
-	dispatcher := tools.NewDispatcher(logger, policy)
+
+	// Consent gate (memql-cockpit#64). Default-deny: every tool
+	// call is rejected until the operator runs `memql-cockpit
+	// worker consent grant --window=<duration>` from a different
+	// terminal. The socket goes up alongside the worker; teardown
+	// is wired to the same cancel() that handles SIGTERM below.
+	consentMgr := consent.NewManager()
+	consentSrv := consent.NewServer(consentMgr, consent.DefaultSocketPath(), logger)
+	consentCtx, consentCancel := context.WithCancel(context.Background())
+	if err := consentSrv.Listen(consentCtx); err != nil {
+		logger.Warn("consent socket failed to start; running with default-deny gate but no IPC control",
+			"error", err)
+	}
+	defer consentCancel()
+
+	dispatcher := tools.NewDispatcher(logger, policy, consentMgr)
 
 	var metrics *Metrics
 	if *metricsPort > 0 {
@@ -341,6 +359,7 @@ func printUsage() {
 	fmt.Println("                                     LaunchAgent / scripts).")
 	fmt.Println("  memql-cockpit worker setup         Re-run TCC permissions check (GUI builds only).")
 	fmt.Println("  memql-cockpit worker config        Print the effective config.")
+	fmt.Println("  memql-cockpit worker consent <op>  Manage the per-call consent gate (grant/revoke/status/watch).")
 	fmt.Println("")
 	fmt.Println("PAIR FLAGS")
 	fmt.Println("  --cluster <url>      Advanced: cluster URL (skip redeem; useful when the")
