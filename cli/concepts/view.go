@@ -312,9 +312,16 @@ func (v *View) renderConceptRow(screen *ui.Screen, bounds ui.Rect, idx int, sel 
 }
 
 // renderRowItem paints one 2-row entry in the middle pane. idx is
-// into rowMatches, which dereferences back to v.Rows. Primary line
-// is the display label (name/displayName/slug/title/id fallback);
-// subtitle is the row id + shortened createdAt.
+// into rowMatches, which dereferences back to v.Rows.
+//
+// When the selected concept's DSL declaration carries a
+// `@displayCard(...)` annotation (memql#160), the renderer uses
+// the per-concept hint set:
+//   - primary line: card.Primary's value from the row payload
+//   - subtitle: secondary · tertiary  ·  status  ·  relative-time
+// When no card is declared, falls back to the legacy
+// rowDisplayLabel + id + absolute timestamp shape so unannotated
+// concepts still render.
 func (v *View) renderRowItem(screen *ui.Screen, bounds ui.Rect, idx int, sel bool, theme ui.Theme) {
 	if idx < 0 || idx >= len(v.rowMatches) {
 		return
@@ -330,22 +337,174 @@ func (v *View) renderRowItem(screen *ui.Screen, bounds ui.Rect, idx int, sel boo
 	}
 	sub := primary.Foreground(theme.Subtle)
 
-	screen.DrawText(bounds.X+2, bounds.Y, bounds.Width-3, rowDisplayLabel(row), primary)
+	card := v.currentCardLocked()
+	primaryStr, subStr := rowCardFields(row, card)
 
-	rowId := getString(row, "id")
-	created := shortenTimestamp(getString(row, "createdAt"))
-	var subStr string
-	switch {
-	case rowId != "" && created != "":
-		subStr = rowId + "  ·  " + created
-	case rowId != "":
-		subStr = rowId
-	case created != "":
-		subStr = created
-	}
+	screen.DrawText(bounds.X+2, bounds.Y, bounds.Width-3, primaryStr, primary)
 	if subStr != "" {
 		screen.DrawText(bounds.X+2, bounds.Y+1, bounds.Width-3, subStr, sub)
 	}
+}
+
+// currentCardLocked returns the active concept's DisplayCard hint
+// set, or nil when no card is declared (or when no concept is
+// selected). Caller must hold the view's mutex.
+func (v *View) currentCardLocked() *client.DisplayCard {
+	idx := v.conceptList.Selected
+	if idx < 0 || idx >= len(v.Concepts) {
+		return nil
+	}
+	return v.Concepts[idx].DisplayCard
+}
+
+// rowCardFields composes the (primary, subtitle) pair the row list
+// renders for a single row. Centralised so the version-history pane
+// and any future row-card surface render with identical semantics.
+//
+// When card == nil the function returns the legacy shape:
+//
+//	primary  = rowDisplayLabel(row)
+//	subtitle = id · createdAt(absolute)
+//
+// When card != nil:
+//
+//	primary  = string-form of payload[card.Primary] (with sensible
+//	           fallbacks: row.id when the field is empty).
+//	subtitle = secondary · tertiary · status · createdAt(relative)
+//	           (slot omitted when its source field is empty).
+//
+// Time formatting is relative ("3m ago", "2h ago", "yesterday",
+// "Mar 14") -- absolute can be surfaced on hover via the detail
+// pane / version history; the row list optimizes for scan-ability.
+func rowCardFields(row map[string]any, card *client.DisplayCard) (string, string) {
+	if row == nil {
+		return "", ""
+	}
+	payload := getMap(row, "payload")
+	created := getString(row, "createdAt")
+
+	if card == nil {
+		primary := rowDisplayLabel(row)
+		rowId := getString(row, "id")
+		created := shortenTimestamp(created)
+		switch {
+		case rowId != "" && created != "":
+			return primary, rowId + "  ·  " + created
+		case rowId != "":
+			return primary, rowId
+		case created != "":
+			return primary, created
+		default:
+			return primary, ""
+		}
+	}
+
+	primary := payloadFieldString(payload, card.Primary)
+	if primary == "" {
+		// Fall back to the row id so the row never renders as
+		// completely blank (annotated concept whose primary field
+		// happens to be empty on this row).
+		primary = getString(row, "id")
+	}
+
+	var subParts []string
+	if s := payloadFieldString(payload, card.Secondary); s != "" {
+		subParts = append(subParts, s)
+	}
+	if s := payloadFieldString(payload, card.Tertiary); s != "" {
+		subParts = append(subParts, s)
+	}
+	if s := payloadFieldString(payload, card.Status); s != "" {
+		subParts = append(subParts, s)
+	}
+	if rel := relativeTime(created); rel != "" {
+		subParts = append(subParts, rel)
+	}
+	return primary, strings.Join(subParts, "  ·  ")
+}
+
+// payloadFieldString reads a payload field by name and converts the
+// value to a human-readable string. Handles the common JSON shapes:
+// string -> verbatim, bool -> "true"/"false", number -> fmt-decimal,
+// nil/missing/non-scalar -> "".
+//
+// Used by the displayCard slot projection -- the loader validates
+// that only displayable types land in the slots, so we don't have
+// to handle object / array values here.
+func payloadFieldString(payload map[string]any, field string) string {
+	if payload == nil || field == "" {
+		return ""
+	}
+	v, ok := payload[field]
+	if !ok || v == nil {
+		return ""
+	}
+	switch t := v.(type) {
+	case string:
+		return strings.TrimSpace(t)
+	case bool:
+		if t {
+			return "true"
+		}
+		return "false"
+	case float64:
+		// JSON numbers arrive as float64 even when authored as ints;
+		// strip the trailing .0 when integer-valued.
+		if t == float64(int64(t)) {
+			return fmt.Sprintf("%d", int64(t))
+		}
+		return fmt.Sprintf("%g", t)
+	case int:
+		return fmt.Sprintf("%d", t)
+	case int64:
+		return fmt.Sprintf("%d", t)
+	}
+	return ""
+}
+
+// relativeTime formats an RFC3339 timestamp as a short relative
+// string suitable for a row-list subtitle slot. Examples:
+//
+//	"3m ago"   (under an hour)
+//	"5h ago"   (under a day)
+//	"yesterday"
+//	"3d ago"   (under a week)
+//	"Mar 14"   (older than a week, same year)
+//	"Mar 14, 2025" (different year)
+//
+// Empty when the input doesn't parse as RFC3339.
+func relativeTime(ts string) string {
+	if ts == "" {
+		return ""
+	}
+	t, err := time.Parse(time.RFC3339, ts)
+	if err != nil {
+		return ""
+	}
+	now := time.Now().UTC()
+	delta := now.Sub(t.UTC())
+	if delta < 0 {
+		return t.Format("Jan 2")
+	}
+	if delta < time.Minute {
+		return "just now"
+	}
+	if delta < time.Hour {
+		return fmt.Sprintf("%dm ago", int(delta.Minutes()))
+	}
+	if delta < 24*time.Hour {
+		return fmt.Sprintf("%dh ago", int(delta.Hours()))
+	}
+	if delta < 48*time.Hour {
+		return "yesterday"
+	}
+	if delta < 7*24*time.Hour {
+		return fmt.Sprintf("%dd ago", int(delta.Hours()/24))
+	}
+	if t.Year() == now.Year() {
+		return t.Format("Jan 2")
+	}
+	return t.Format("Jan 2, 2006")
 }
 
 // renderVersionRow paints one 2-row version-history entry. Primary

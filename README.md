@@ -29,7 +29,7 @@ memQL Cockpit is the terminal-native IDE and operations console for [memQL](http
 
 ## Features
 
-- **Multi-tab TUI** — agents, auth, client, cluster, config, editor, explorer, settings — all in one terminal
+- **Multi-tab TUI** — clusters, chat, concepts, planner, settings — all in one terminal; the unified Concepts tab consumes `@displayCard` hints to render rows nicely per concept
 - **DSL editor + linter** — write `.memql` files with structured validation
 - **Worker modes** — `computer_use_headless` and `computer_use_embodied` bring computer use into the platform as per-user workers
 - **GUI variant** — opt-in CGO build with screenshot, mouse, and keyboard via RobotGo

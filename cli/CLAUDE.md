@@ -28,7 +28,10 @@ The original `memql-cockpit` invocation -- launches `cli.App`, mounts
 the Clusters / Concepts / Settings tabs, full F1..F3 navigation. This
 is what `app.go` orchestrates today; documented in the rest of this
 file. (Previous Explorer + Agents tabs were folded into the unified
-Concepts tab on 2026-05-16 -- the generic row browser supersedes both.)
+Concepts tab on 2026-05-16 / 2026-05-21 respectively -- the generic
+row browser supersedes both; the Agents-tab retirement landed when
+the Concepts surface started consuming @displayCard hints per
+memql-cockpit#126.)
 
 ### 2. Single-panel wizard
 
@@ -100,24 +103,23 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
    resolved. Without the `voice` tag the key surfaces a clear
    "voice support not compiled in" message. Gated on a connected,
    selected cluster.
-3. **Concepts (F3)** -- generic browser for every registered concept
+3. **Concepts (F3)** -- generic browser for every registered concept.
+   Renders rows + detail uniformly per concept by consuming the
+   `@displayCard(...)` hints memql core publishes on
+   `ConceptInfo.display_card` (memql#160). v1:agents:agent rows live
+   here too -- the dedicated Agents tab was retired in
+   memql-cockpit#126 once Concepts could render them well.
 4. **Planner (F4)** -- observe v1:planner:plan + child v1:planner:task
    rows. Read-only: goal submission moved to the Chat tab (the user
    talks to the assistant, which decides when to escalate to the
    planner). The one mutation that remains is R:Run on a queued
    plan -- flips it to running via mutationStartPlan. Gated on a
    connected, selected cluster.
-5. **Agents (F5)** -- read-only catalog of v1:agents:agent rows.
-   Left pane lists agents (name + role); right pane shows identity,
-   capabilities, knowledge domains, live knowledge, provider config,
-   and recent plan attribution for the highlighted agent. No
-   create/edit -- mutation surfaces live in CoPresent. Gated on a
-   connected, selected cluster.
-6. **Settings (F6)** -- credentials, theme, version
+5. **Settings (F5)** -- credentials, theme, version
 
-Concepts, Planner, Agents, and Chat are all gated on a connected,
-selected cluster -- they show a placeholder message until the user
-presses Enter on a cluster row in the Clusters tab.
+Concepts, Planner, and Chat are all gated on a connected, selected
+cluster -- they show a placeholder message until the user presses
+Enter on a cluster row in the Clusters tab.
 
 ### Concepts tab layout
 
@@ -249,23 +251,6 @@ via `Cancel()` does NOT trigger reconnect; only `Unexpected()` does.
 | Backspace   | Zoom out one level                                  |
 | Esc / X     | Return to live topology                             |
 
-### Agents tab (Agent list focus)
-| Key   | Action                                              |
-|-------|-----------------------------------------------------|
-| ↑/↓   | Move highlight                                      |
-| Enter | Focus the detail pane                               |
-| R     | Manual refresh (background polls every 10s)         |
-| Tab   | Cycle: List → Detail                                |
-
-### Agents tab (Detail pane focus)
-| Key       | Action                                          |
-|-----------|-------------------------------------------------|
-| ↑/↓       | Scroll detail by one line                       |
-| PgUp/PgDn | Scroll detail by ten lines                      |
-| Home      | Scroll to top                                   |
-| Esc       | Back to the agent list                          |
-| Tab       | Cycle: Detail → List                            |
-
 ---
 
 ## Files
@@ -284,7 +269,6 @@ via `Cancel()` does NOT trigger reconnect; only `Unexpected()` does.
 | `config/clusters.go`     | `~/.memql/clusters.yaml` load/save                            |
 | `concepts/`              | Concepts tab (concept picker + row list + generic renderer)   |
 | `planner/`               | Planner tab (read-only plan list + task list + detail; R:Run)  |
-| `agents/`                | Agents tab (agent list + read-only detail pane)               |
 | `chat/`                  | Chat tab (space list + utterance scroll + `v`:PTT via memql-sdk-go voice.PushToTalk) |
 | `editor/`                | Reusable text editor with Sense integration                   |
 | `settings/`              | Settings tab                                                  |
