@@ -24,9 +24,8 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 
-	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
-
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
+	"github.com/znasllc-io/memql/sdk/go/client"
 )
 
 // boundsForView is the rect a `concepts.View` paints into during the
@@ -56,7 +55,7 @@ func makeView(t *testing.T) (*View, *ui.Screen, tcell.SimulationScreen, ui.Rect)
 	screen := ui.NewScreenFromTcell(sim)
 
 	v := NewView(ui.DefaultTheme())
-	v.SetConcepts([]*memqlv1.ConceptInfo{
+	v.SetConcepts([]client.Concept{
 		{Id: "v1:platform:policyTrace"},
 		{Id: "v1:cognition:agent"},
 		{Id: "v1:hr:milestone"},

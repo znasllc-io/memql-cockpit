@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"github.com/gdamore/tcell/v2"
-	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
 	"github.com/znasllc-io/memql/sdk/go/client"
@@ -50,7 +49,7 @@ type View struct {
 
 	// Concept registry (left pane). Source slice owned by the view;
 	// conceptList consumes it via index callbacks.
-	Concepts []*memqlv1.ConceptInfo
+	Concepts []client.Concept
 
 	// Loaded rows for the selected concept (middle pane). rowMatches
 	// is the filtered index slice driven by rowFilter; rowList renders
@@ -118,18 +117,18 @@ func NewView(theme ui.Theme) *View {
 // from a background goroutine -- the write lock covers the slice
 // swap AND the chained refreshRowsFromCurrentLocked call so Draw
 // can't observe a torn intermediate.
-func (v *View) SetConcepts(concepts []*memqlv1.ConceptInfo) {
+func (v *View) SetConcepts(concepts []client.Concept) {
 	v.Mu.Lock()
 	defer v.Mu.Unlock()
-	v.Concepts = make([]*memqlv1.ConceptInfo, 0, len(concepts))
+	v.Concepts = make([]client.Concept, 0, len(concepts))
 	for _, c := range concepts {
-		if c == nil {
+		if c.Id == "" {
 			continue
 		}
 		v.Concepts = append(v.Concepts, c)
 	}
 	sort.Slice(v.Concepts, func(i, j int) bool {
-		return v.Concepts[i].GetId() < v.Concepts[j].GetId()
+		return v.Concepts[i].Id < v.Concepts[j].Id
 	})
 	v.conceptList.Count = len(v.Concepts)
 	if v.conceptList.Selected >= len(v.Concepts) {
@@ -229,7 +228,7 @@ func (v *View) drawRowList(screen *ui.Screen, bounds ui.Rect) {
 	}
 	conceptId := ""
 	if v.conceptList.Selected >= 0 && v.conceptList.Selected < len(v.Concepts) {
-		conceptId = v.Concepts[v.conceptList.Selected].GetId()
+		conceptId = v.Concepts[v.conceptList.Selected].Id
 	}
 	matches := v.rowMatches
 	title := " ROWS "
@@ -305,11 +304,11 @@ func (v *View) renderConceptRow(screen *ui.Screen, bounds ui.Rect, idx int, sel 
 	}
 	sub := primary.Foreground(theme.Subtle)
 
-	screen.DrawText(bounds.X+2, bounds.Y, bounds.Width-3, c.GetId(), primary)
+	screen.DrawText(bounds.X+2, bounds.Y, bounds.Width-3, c.Id, primary)
 
-	subStr := c.GetDescription()
+	subStr := c.Description
 	if subStr == "" {
-		subStr = c.GetType()
+		subStr = c.Type
 	}
 	if subStr != "" {
 		screen.DrawText(bounds.X+2, bounds.Y+1, bounds.Width-3, subStr, sub)
@@ -633,7 +632,7 @@ func (v *View) refreshRowsFromCurrentLocked() {
 		v.rowList.Count = 0
 		return
 	}
-	conceptId := v.Concepts[v.conceptList.Selected].GetId()
+	conceptId := v.Concepts[v.conceptList.Selected].Id
 	if conceptId == "" {
 		v.rowMatches = nil
 		v.rowList.Count = 0
@@ -700,7 +699,7 @@ func (v *View) openVersions() {
 	rowId := getString(row, "id")
 	conceptId := getString(row, "concept")
 	if conceptId == "" && v.conceptList.Selected >= 0 && v.conceptList.Selected < len(v.Concepts) {
-		conceptId = v.Concepts[v.conceptList.Selected].GetId()
+		conceptId = v.Concepts[v.conceptList.Selected].Id
 	}
 	if rowId == "" || conceptId == "" {
 		return

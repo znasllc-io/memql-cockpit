@@ -30,7 +30,6 @@ import (
 	genesiswizard "github.com/znasllc-io/memql-cockpit/cli/wizard/genesis"
 	"github.com/znasllc-io/memql-cockpit/cli/wizard/runlocal"
 	corgenesis "github.com/znasllc-io/memql/component/genesis"
-	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 	"github.com/znasllc-io/memql/component/node"
 	nodev1 "github.com/znasllc-io/memql/component/node/gen"
 	"github.com/znasllc-io/memql/sdk/go/client"
@@ -1293,14 +1292,14 @@ func (a *App) wireCluster() {
 	}
 }
 
-// parseClusterNodeEvent converts a gRPC EventNotification carrying a
+// parseClusterNodeEvent converts an SDK Event carrying a
 // v1:cluster:node CDC payload into a NodeInfo. Returns ok=false when the
 // payload is missing required fields (type + either ID).
-func parseClusterNodeEvent(ev *memqlv1.EventNotification) (cluster.NodeInfo, bool) {
-	if ev == nil || ev.GetPayload() == nil {
+func parseClusterNodeEvent(ev client.Event) (cluster.NodeInfo, bool) {
+	if ev.Payload == nil {
 		return cluster.NodeInfo{}, false
 	}
-	m := ev.GetPayload().AsMap()
+	m := ev.Payload
 
 	// Payload fields are flattened by the engine at emission; we still
 	// defensively check a nested "payload" in case of shape drift.

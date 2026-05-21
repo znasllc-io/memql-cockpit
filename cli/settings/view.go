@@ -8,7 +8,7 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
-	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
+	"github.com/znasllc-io/memql/sdk/go/client"
 )
 
 // View renders the Settings tab — version info, MY ACCESS, and keyboard shortcuts.
@@ -25,7 +25,7 @@ type View struct {
 	// access is the resolved My Access record for the currently
 	// selected cluster (nil when no cluster is connected or the
 	// fetch hasn't completed yet).
-	access        *memqlv1.MyAccessResult
+	access        *client.AccessSummary
 	accessCluster string // for the "For cluster X" header line
 }
 
@@ -40,7 +40,7 @@ func NewView(theme ui.Theme, cliVersion string) *View {
 // SetMyAccess attaches the caller's access record to the view. The
 // clusterName is shown alongside the data so the user knows which
 // cluster's access is being rendered.
-func (v *View) SetMyAccess(clusterName string, access *memqlv1.MyAccessResult) {
+func (v *View) SetMyAccess(clusterName string, access *client.AccessSummary) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.access = access
@@ -152,28 +152,31 @@ func (v *View) drawMyAccess(screen *ui.Screen, x, y, maxW int) int {
 	}
 	screen.DrawText(x+1, y, maxW-2, headerLabel, v.Theme.BaseStyle().Bold(true))
 	y++
-	drawField(screen, x+1, y, maxW-1, "User ID", v.access.GetUserId(), v.Theme.SubtleStyle(), v.Theme.BaseStyle())
+	drawField(screen, x+1, y, maxW-1, "User ID", v.access.UserId, v.Theme.SubtleStyle(), v.Theme.BaseStyle())
 	y++
-	drawField(screen, x+1, y, maxW-1, "Email", v.access.GetPrimaryEmail(), v.Theme.SubtleStyle(), v.Theme.BaseStyle())
+	drawField(screen, x+1, y, maxW-1, "Email", v.access.PrimaryEmail, v.Theme.SubtleStyle(), v.Theme.BaseStyle())
 	y++
-	drawField(screen, x+1, y, maxW-1, "Cluster role", roleLabel(v.access.GetClusterRole()), v.Theme.SubtleStyle(), v.Theme.BaseStyle())
+	drawField(screen, x+1, y, maxW-1, "Cluster role", roleLabel(v.access.ClusterRole), v.Theme.SubtleStyle(), v.Theme.BaseStyle())
 	y += 2
 	return y
 }
 
-// roleLabel returns the lowercase string form of a UserRole enum.
-func roleLabel(r memqlv1.UserRole) string {
+// roleLabel returns the lowercase string form of a Role. Mirrors the
+// previous proto-enum-driven switch; client.Role values already encode
+// the lowercase label, so the function is mostly a defensive guard for
+// the empty / unspecified case.
+func roleLabel(r client.Role) string {
 	switch r {
-	case memqlv1.UserRole_USER_ROLE_OWNER:
+	case client.RoleOwner:
 		return "owner"
-	case memqlv1.UserRole_USER_ROLE_ADMIN:
+	case client.RoleAdmin:
 		return "admin"
-	case memqlv1.UserRole_USER_ROLE_WRITER:
+	case client.RoleWriter:
 		return "writer"
-	case memqlv1.UserRole_USER_ROLE_READER:
+	case client.RoleReader:
 		return "reader"
 	default:
-		return strings.ToLower(r.String())
+		return strings.ToLower(string(r))
 	}
 }
 
