@@ -12,6 +12,12 @@
 // Single-chat model: there is one utterance stream per space,
 // visible to every participant. There is no per-user private
 // thread.
+//
+// Migrated to the cli/ui widget layer (epic #81). The spaces list
+// uses ui.ListPane; the utterance pane stays hand-rolled because
+// DetailPane can't express the per-row subtle/accent mix (humans
+// vs agent/si) without forcing bold on agent rows. A follow-up can
+// extend DetailPane for chat-style auto-pinned mixed-style logs.
 package chat
 
 import (
@@ -20,7 +26,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
@@ -41,14 +46,12 @@ const (
 )
 
 // maxUtterances bounds how many rows we keep in memory per refresh.
-// The pane scrolls within this window; older messages drop off.
 const maxUtterances = 200
 
 // View is the Chat tab. Mutated from both the event-loop goroutine
 // (HandleEvent) and the background refresher (refreshLoop).
 type View struct {
-	mu    sync.RWMutex
-	Theme ui.Theme
+	ui.BaseView // Mu / Theme / GatedMessage / OnStatus / OnRedraw
 
 	// QueryClient returns the client bound to the active cluster.
 	// Returns nil before a cluster is connected; Draw renders a
@@ -59,22 +62,6 @@ type View struct {
 	// used by the PTT flow to drive memql-sdk-go's voice.PushToTalk.
 	Dispatcher func() *client.Dispatcher
 
-	// OnRedraw is posted by the background refresher when new data
-	// has landed so the event loop redraws even if no key was pressed.
-	// Without this, the 3s tick mutates v.spaces / v.utterances but
-	// the screen waits for the next keystroke to repaint -- the user
-	// sees stale data until they interact.
-	OnRedraw func()
-
-	// OnStatus surfaces refresh / ensure errors to the cockpit's
-	// notification center (the header band, copy + dismiss). The
-	// chrome strip below the chat pane is reserved for action
-	// hints; pushing user-visible errors there hides them behind a
-	// half-line truncation and gives the user no way to copy or
-	// dismiss. The app's wireChat function points this at
-	// `a.notifications.Sync("chat", ui.SeverityError, msg)`.
-	OnStatus func(msg string)
-
 	// PTT state, surfaced in the chat-pane title strip.
 	pttActive    bool
 	pttPartial   string
@@ -83,9 +70,7 @@ type View struct {
 	pttCancel    context.CancelFunc
 	pttStopAudio func() error
 
-	spaces        []spaceRow
-	spaceSelected int
-	spaceScrollY  int
+	spaces []spaceRow
 	// userPickedSpace tracks whether the user has manually selected a
 	// space this session. While false, the refresher auto-snaps the
 	// highlight to today's daily on every refresh -- so a freshly
@@ -101,9 +86,12 @@ type View struct {
 
 	// ensureRan flips true after the first successful
 	// ensureDailySpaceForCaller call. Cheap idempotent capability,
-	// but no point hammering it -- once per session is enough; the
-	// midnight-rollover safety net is the server-side hourly cron.
+	// but no point hammering it.
 	ensureRan bool
+
+	// spaceList renders the left pane. Selected / ScrollY live in
+	// the widget; the view drives Count + Focused per render.
+	spaceList ui.ListPane
 }
 
 type spaceRow struct {
@@ -125,31 +113,22 @@ type utteranceRow struct {
 
 // NewView constructs the Chat view.
 func NewView(theme ui.Theme) *View {
-	return &View{Theme: theme}
+	v := &View{}
+	v.Theme = theme
+	v.spaceList.Render = v.renderSpaceRow
+	return v
 }
 
 // StartRefreshLoop runs a background ticker that re-pulls spaces +
-// utterances every interval.
+// utterances every interval. Wraps BaseView's context-based helper
+// so the legacy stop-channel API stays stable for app.go.
 func (v *View) StartRefreshLoop(stop <-chan struct{}, interval time.Duration) {
-	t := time.NewTicker(interval)
+	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		defer t.Stop()
-		v.refresh()
-		if v.OnRedraw != nil {
-			v.OnRedraw()
-		}
-		for {
-			select {
-			case <-stop:
-				return
-			case <-t.C:
-				v.refresh()
-				if v.OnRedraw != nil {
-					v.OnRedraw()
-				}
-			}
-		}
+		<-stop
+		cancel()
 	}()
+	v.BaseView.StartRefreshLoop(ctx, interval, v.refresh)
 }
 
 // Refresh is the explicit refresh entry point for callers.
@@ -163,21 +142,10 @@ func (v *View) refresh() {
 
 // ensureDailyOnce fires integration.dailyspace.ensureForCaller exactly
 // once per session, on the first refresh after a cluster connects.
-// The capability resolves the caller's user id from the request's
-// auth context (PAT subject in the cockpit's case) and provisions
-// today's `daily-{userShortId}-{dateKey}` space if it doesn't
-// already exist. The mutation is content-addressable on the id, so
-// repeat calls collapse server-side -- the ensureRan latch is just
-// a chattiness reducer, not a correctness gate.
-//
-// We do NOT wait for this call before painting the space list; the
-// 3s refresh loop will pick the row up on the next tick. That keeps
-// the chat tab snappy even when the engine has to do the
-// read-user + write-space dance.
 func (v *View) ensureDailyOnce() {
-	v.mu.RLock()
+	v.Mu.RLock()
 	already := v.ensureRan
-	v.mu.RUnlock()
+	v.Mu.RUnlock()
 	if already {
 		return
 	}
@@ -188,29 +156,23 @@ func (v *View) ensureDailyOnce() {
 	if qc == nil {
 		return
 	}
-	v.mu.Lock()
+	v.Mu.Lock()
 	v.ensureRan = true
-	v.mu.Unlock()
+	v.Mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	// Engine's top-level Execute dispatches the Logic wrapper, which
-	// runs the dailyspace.ensureForCaller integration capability;
-	// the capability resolves the JWT/PAT subject as the userId
-	// and runs the idempotent create.
 	if _, err := qc.LogicEnsureDailySpaceForCaller(ctx, client.LogicEnsureDailySpaceForCallerArgs{}); err != nil {
 		// Push the failure through the header notifications center
-		// (with copy + dismiss) instead of the chrome strip below
-		// the pane -- chrome rows are for action hints, not errors
-		// the user needs to read and act on. Clear the latch so the
-		// next 3s tick retries; a transient failure shouldn't
-		// strand the user without a daily.
+		// (with copy + dismiss) instead of the chrome strip. Clear
+		// the latch so the next 3s tick retries; a transient failure
+		// shouldn't strand the user without a daily.
 		if v.OnStatus != nil {
 			v.OnStatus("ensure daily space: " + err.Error())
 		}
-		v.mu.Lock()
+		v.Mu.Lock()
 		v.ensureRan = false
-		v.mu.Unlock()
+		v.Mu.Unlock()
 	}
 }
 
@@ -227,8 +189,7 @@ func (v *View) refreshSpaces() {
 
 	// Typed primitive -- the engine returns the user's active spaces
 	// already filtered by per-row authz, projected through the
-	// `spaceFull` shape. Fields land at the row top level (shape-
-	// wrapped queries flatten; see memql/sdk/go/CLAUDE.md).
+	// `spaceFull` shape. Fields land at the row top level.
 	res, err := qc.QueryActiveSpaces(ctx, client.QueryActiveSpacesArgs{})
 	if err != nil {
 		if v.OnStatus != nil {
@@ -252,12 +213,7 @@ func (v *View) refreshSpaces() {
 			Kind:        client.RowString(r, "kind"),
 		})
 	}
-	// Pin daily spaces at the top -- the user's "today" surface is
-	// the primary thing they came here to see. Within each group
-	// (daily vs regular) sort by id so the list is stable across
-	// refresh ticks. The list grouping mirrors what the CoPresent
-	// SpacesPanel does on the web -- daily first, ambient spaces
-	// underneath.
+	// Pin daily spaces at the top.
 	sort.SliceStable(out, func(i, j int) bool {
 		di, dj := out[i].Kind == "daily", out[j].Kind == "daily"
 		if di != dj {
@@ -266,35 +222,28 @@ func (v *View) refreshSpaces() {
 		return out[i].ID < out[j].ID
 	})
 
-	v.mu.Lock()
+	v.Mu.Lock()
 	v.spaces = out
-	if v.spaceSelected >= len(v.spaces) {
-		v.spaceSelected = 0
+	v.spaceList.Count = len(out)
+	if v.spaceList.Selected >= len(v.spaces) {
+		v.spaceList.Selected = 0
 	}
 	// Until the user has moved the highlight themselves, anchor the
-	// selection on today's daily. This makes a freshly provisioned
-	// daily land selected the tick it appears in the list even when
-	// the refresher beat ensureForCaller to first paint.
+	// selection on today's daily.
 	if !v.userPickedSpace && len(v.spaces) > 0 {
 		idx := indexOfDaily(v.spaces)
 		if idx < 0 {
 			idx = 0
 		}
-		if idx != v.spaceSelected {
-			// Adjust scroll so the row stays visible -- otherwise a
-			// list with several non-daily rows pushed the daily off
-			// the top of the viewport on first paint.
-			v.spaceSelected = idx
-			v.spaceScrollY = 0
+		if idx != v.spaceList.Selected {
+			v.spaceList.Selected = idx
+			v.spaceList.ScrollY = 0
 		}
 	}
-	v.mu.Unlock()
+	v.Mu.Unlock()
 }
 
 // indexOfDaily returns the index of the first daily-kind row, or -1.
-// Lives next to refreshSpaces because both paths assume the same
-// "daily rows are pinned to the top" sort order; if that contract
-// changes, both routines change together.
 func indexOfDaily(rows []spaceRow) int {
 	for i, r := range rows {
 		if r.Kind == "daily" {
@@ -312,25 +261,22 @@ func (v *View) refreshUtterances() {
 	if qc == nil {
 		return
 	}
-	v.mu.RLock()
+	v.Mu.RLock()
 	spaceID := ""
-	if v.spaceSelected < len(v.spaces) {
-		spaceID = v.spaces[v.spaceSelected].ID
+	if v.spaceList.Selected < len(v.spaces) {
+		spaceID = v.spaces[v.spaceList.Selected].ID
 	}
-	v.mu.RUnlock()
+	v.Mu.RUnlock()
 	if spaceID == "" {
-		v.mu.Lock()
+		v.Mu.Lock()
 		v.utterances = nil
-		v.mu.Unlock()
+		v.Mu.Unlock()
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Typed primitive -- querySpaceUtterances returns utterances for
-	// the given space already shape-projected to utteranceFull (flat
-	// row.X / payload.X paths land at the row top level).
 	res, err := qc.QuerySpaceUtterances(ctx, client.QuerySpaceUtterancesArgs{SpaceId: spaceID})
 	if err != nil {
 		if v.OnStatus != nil {
@@ -357,16 +303,16 @@ func (v *View) refreshUtterances() {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAtMillis < out[j].CreatedAtMillis })
 
-	v.mu.Lock()
+	v.Mu.Lock()
 	v.utterances = out
 	v.utteranceScrollY = 0
-	v.mu.Unlock()
+	v.Mu.Unlock()
 }
 
 // Draw renders the chat tab.
 func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
+	v.Mu.RLock()
+	defer v.Mu.RUnlock()
 
 	subtleStyle := tcell.StyleDefault.Foreground(v.Theme.Subtle)
 	accentStyle := tcell.StyleDefault.Foreground(v.Theme.Accent)
@@ -383,46 +329,39 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 	left := ui.Rect{X: bounds.X, Y: bounds.Y, Width: leftW, Height: bounds.Height}
 	right := ui.Rect{X: bounds.X + leftW, Y: bounds.Y, Width: bounds.Width - leftW, Height: bounds.Height}
 
+	// Left pane: spaces list inside a bordered box.
 	screen.DrawBox(left.X, left.Y, left.Width, left.Height, subtleStyle)
 	screen.DrawText(left.X+2, left.Y, left.Width-4, fmt.Sprintf(" SPACES (%d) ", len(v.spaces)), accentStyle)
-
-	listH := left.Height - 3
-	for i, s := range v.spaces[v.spaceScrollY:] {
-		row := v.spaceScrollY + i
-		if i >= listH {
-			break
-		}
-		marker := "  "
-		style := subtleStyle
-		if row == v.spaceSelected {
-			marker = "* "
-			style = accentStyle
-		}
-		label := s.Name
-		if label == "" {
-			label = s.ID
-		}
-		// Daily-kind rows get a "Today: " prefix so the user can
-		// distinguish "today's daily space" from any other space
-		// they've created with the same name; saves a Tab+arrow
-		// roundtrip to read the row id.
-		if s.Kind == "daily" {
-			label = "Today: " + label
-		}
-		screen.DrawText(left.X+1, left.Y+1+i, left.Width-2, marker+truncate(label, left.Width-4), style)
+	v.spaceList.Count = len(v.spaces)
+	v.spaceList.Focused = v.Focus == FocusSpaces
+	// ListPane bounds: inside the border, above the chrome row.
+	listInner := ui.Rect{
+		X:      left.X + 1,
+		Y:      left.Y + 1,
+		Width:  left.Width - 2,
+		Height: left.Height - 3, // border top + border bottom + chrome row
 	}
-	ui.DrawBottom(screen, left, subtleStyle, 1, "Up/Dn:Move  Tab:Right")
+	if listInner.Height < 1 {
+		listInner.Height = 1
+	}
+	v.spaceList.Draw(screen, listInner, v.Theme)
+	ui.DrawBottom(screen, left, subtleStyle, 1, hintsForSpaces())
 
+	// Right pane: utterance scroll inside a bordered box. Stays
+	// hand-rolled -- DetailPane can't express the per-row subtle
+	// (human) vs. accent (agent/si) mix without forcing bold on
+	// agent rows. A follow-up can extend DetailPane for chat-style
+	// auto-pinned mixed-style logs.
 	screen.DrawBox(right.X, right.Y, right.Width, right.Height, subtleStyle)
 	title := " UTTERANCES "
-	if v.spaceSelected < len(v.spaces) {
-		title = fmt.Sprintf(" CHAT: %s (%d) ", truncate(displayName(v.spaces[v.spaceSelected]), 40), len(v.utterances))
+	if v.spaceList.Selected < len(v.spaces) {
+		title = fmt.Sprintf(" CHAT: %s (%d) ", truncate(displayName(v.spaces[v.spaceList.Selected]), 40), len(v.utterances))
 	}
 	screen.DrawText(right.X+2, right.Y, right.Width-4, title, accentStyle)
 
 	contentH := right.Height - 3
-	// Reserve a row for the PTT status strip when a session is active
-	// or has just produced a final transcript / error to surface.
+	// Reserve a row for the PTT status strip when a session is
+	// active or has just produced a final transcript / error.
 	reservePTT := v.pttActive || v.pttStatus != ""
 	if reservePTT {
 		contentH--
@@ -454,16 +393,36 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 		screen.DrawText(right.X+1, pttRow, right.Width-2, pttText, accentStyle)
 	}
 
-	// Chrome strip is action hints only; refresh + ensure errors go
-	// through OnStatus to the header notifications center where the
-	// user can read them in full and copy / dismiss.
-	ui.DrawBottom(screen, right, subtleStyle, 1, "Up/Dn:Scroll  v:PTT  Tab:Left")
+	ui.DrawBottom(screen, right, subtleStyle, 1, hintsForUtterances())
 }
 
-// pttStatusLine renders the PTT state strip just above the chrome:
-// "[mic] listening: <partial>" while active, "[mic] transcribing..."
-// after release, "[mic] done: <final>" once the SDK resolves, or
-// the error string otherwise. Caller must hold the read lock.
+// renderSpaceRow paints a single space-list row using the marker-
+// prefix convention from the pre-migration code: "* label" for the
+// highlighted space, "  label" otherwise. Daily-kind spaces get a
+// "Today: " prefix on the label.
+func (v *View) renderSpaceRow(screen *ui.Screen, bounds ui.Rect, idx int, sel bool, theme ui.Theme) {
+	if idx < 0 || idx >= len(v.spaces) {
+		return
+	}
+	s := v.spaces[idx]
+	style := theme.SubtleStyle()
+	marker := "  "
+	if sel {
+		style = theme.AccentStyle()
+		marker = "* "
+	}
+	label := s.Name
+	if label == "" {
+		label = s.ID
+	}
+	if s.Kind == "daily" {
+		label = "Today: " + label
+	}
+	screen.DrawText(bounds.X, bounds.Y, bounds.Width, marker+truncate(label, bounds.Width-2), style)
+}
+
+// pttStatusLine renders the PTT state strip just above the chrome.
+// Caller must hold the read lock.
 func (v *View) pttStatusLine() string {
 	switch v.pttStatus {
 	case "listening":
@@ -484,6 +443,27 @@ func (v *View) pttStatusLine() string {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Hints
+// ---------------------------------------------------------------------------
+
+func hintsForSpaces() string {
+	bar := ui.HintBar{Chips: []ui.HintChip{
+		{Key: "↑/↓", Label: "Move"},
+		{Key: "Tab", Label: "Cycle"},
+	}}
+	return bar.String()
+}
+
+func hintsForUtterances() string {
+	bar := ui.HintBar{Chips: []ui.HintChip{
+		{Key: "↑/↓", Label: "Scroll"},
+		{Key: "v", Label: "PTT"},
+		{Key: "Tab", Label: "Cycle"},
+	}}
+	return bar.String()
+}
+
 // HandleEvent processes a key event. Returns true if consumed.
 func (v *View) HandleEvent(ev tcell.Event) bool {
 	kev, ok := ev.(*tcell.EventKey)
@@ -491,18 +471,16 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 		return false
 	}
 
-	// `v` toggles push-to-talk capture: first press starts the
-	// session, second press ends it cleanly so the SDK can finalize
-	// the transcript. Handled OUTSIDE the locked switch below because
-	// startPTT / stopPTT need to manage their own locking and spawn
-	// goroutines.
+	// `v` toggles push-to-talk capture. Handled OUTSIDE the locked
+	// switch below because startPTT / stopPTT manage their own
+	// locking and spawn goroutines.
 	if kev.Key() == tcell.KeyRune && (kev.Rune() == 'v' || kev.Rune() == 'V') {
 		v.togglePTT()
 		return true
 	}
 
-	v.mu.Lock()
-	defer v.mu.Unlock()
+	v.Mu.Lock()
+	defer v.Mu.Unlock()
 
 	switch kev.Key() {
 	case tcell.KeyTab:
@@ -514,8 +492,9 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 		return true
 	case tcell.KeyUp:
 		if v.Focus == FocusSpaces {
-			if v.spaceSelected > 0 {
-				v.spaceSelected--
+			v.spaceList.Focused = true
+			prev := v.spaceList.Selected
+			if v.spaceList.HandleEvent(kev) && v.spaceList.Selected != prev {
 				v.userPickedSpace = true
 				go v.refreshUtterances()
 			}
@@ -525,8 +504,9 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 		return true
 	case tcell.KeyDown:
 		if v.Focus == FocusSpaces {
-			if v.spaceSelected < len(v.spaces)-1 {
-				v.spaceSelected++
+			v.spaceList.Focused = true
+			prev := v.spaceList.Selected
+			if v.spaceList.HandleEvent(kev) && v.spaceList.Selected != prev {
 				v.userPickedSpace = true
 				go v.refreshUtterances()
 			}
@@ -541,30 +521,25 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 // togglePTT starts a PTT session if none is active, or signals the
 // active session to end. Audio capture + SDK transcription run in a
 // background goroutine; partials + final land on v.pttPartial /
-// v.pttFinal under v.mu, with OnRedraw posted so the title strip
+// v.pttFinal under v.Mu, with Redraw posted so the title strip
 // repaints in real time.
 func (v *View) togglePTT() {
-	v.mu.Lock()
+	v.Mu.Lock()
 	if v.pttActive {
-		// Second press: ask the audio reader to close, which lets
-		// PushToTalk see EOF on its read and send End{cancel:false}.
+		// Second press: ask the audio reader to close.
 		if v.pttStopAudio != nil {
 			_ = v.pttStopAudio()
 		}
 		v.pttStatus = "transcribing"
-		v.mu.Unlock()
-		if v.OnRedraw != nil {
-			v.OnRedraw()
-		}
+		v.Mu.Unlock()
+		v.Redraw()
 		return
 	}
 
 	if v.Dispatcher == nil || v.Dispatcher() == nil {
 		v.pttStatus = "error: no cluster connected"
-		v.mu.Unlock()
-		if v.OnRedraw != nil {
-			v.OnRedraw()
-		}
+		v.Mu.Unlock()
+		v.Redraw()
 		return
 	}
 	dispatcher := v.Dispatcher()
@@ -572,10 +547,8 @@ func (v *View) togglePTT() {
 	reader, stopAudio, err := audio.StartCapture(audio.DefaultFormat())
 	if err != nil {
 		v.pttStatus = "error: " + err.Error()
-		v.mu.Unlock()
-		if v.OnRedraw != nil {
-			v.OnRedraw()
-		}
+		v.Mu.Unlock()
+		v.Redraw()
 		return
 	}
 
@@ -586,22 +559,18 @@ func (v *View) togglePTT() {
 	v.pttStatus = "listening"
 	v.pttCancel = cancel
 	v.pttStopAudio = stopAudio
-	v.mu.Unlock()
-	if v.OnRedraw != nil {
-		v.OnRedraw()
-	}
+	v.Mu.Unlock()
+	v.Redraw()
 
 	go func() {
 		defer func() {
 			_ = stopAudio()
-			v.mu.Lock()
+			v.Mu.Lock()
 			v.pttActive = false
 			v.pttCancel = nil
 			v.pttStopAudio = nil
-			v.mu.Unlock()
-			if v.OnRedraw != nil {
-				v.OnRedraw()
-			}
+			v.Mu.Unlock()
+			v.Redraw()
 		}()
 
 		final, err := voice.PushToTalk(ctx, dispatcher, reader, voice.Options{
@@ -612,25 +581,21 @@ func (v *View) togglePTT() {
 			},
 			ChunkBytes: 3200, // 100ms of 16kHz mono PCM16
 			OnPartial: func(p voice.PartialTranscript) {
-				v.mu.Lock()
+				v.Mu.Lock()
 				v.pttPartial = p.Text
-				v.mu.Unlock()
-				if v.OnRedraw != nil {
-					v.OnRedraw()
-				}
+				v.Mu.Unlock()
+				v.Redraw()
 			},
 		})
-		v.mu.Lock()
+		v.Mu.Lock()
 		if err != nil {
 			v.pttStatus = "error: " + err.Error()
 		} else if final != nil {
 			v.pttFinal = final.Text
 			v.pttStatus = "done"
 		}
-		v.mu.Unlock()
-		if v.OnRedraw != nil {
-			v.OnRedraw()
-		}
+		v.Mu.Unlock()
+		v.Redraw()
 	}()
 }
 
