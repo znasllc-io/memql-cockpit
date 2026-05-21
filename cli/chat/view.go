@@ -345,9 +345,15 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 	left := ui.Rect{X: bounds.X, Y: bounds.Y, Width: leftW, Height: bounds.Height}
 	right := ui.Rect{X: bounds.X + leftW, Y: bounds.Y, Width: bounds.Width - leftW, Height: bounds.Height}
 
-	// Left pane: spaces list inside a bordered box.
+	// Left pane: spaces list inside a bordered box. Pass bounds
+	// shifted one column inward so PaneTitle's content lands AFTER
+	// the box's left ┌ corner instead of overdrawing it.
 	screen.DrawBox(left.X, left.Y, left.Width, left.Height, subtleStyle)
-	screen.DrawText(left.X+2, left.Y, left.Width-4, fmt.Sprintf(" SPACES (%d) ", len(v.spaces)), accentStyle)
+	ui.PaneTitle{
+		Title:   "SPACES",
+		Counter: ui.FormatCount(len(v.spaces)),
+		Focused: v.Focus == FocusSpaces,
+	}.Draw(screen, ui.Rect{X: left.X + 1, Y: left.Y, Width: left.Width - 2, Height: left.Height}, v.Theme)
 	v.spaceList.Count = len(v.spaces)
 	v.spaceList.Focused = v.Focus == FocusSpaces
 	// ListPane bounds: inside the border, above the chrome row.
@@ -369,11 +375,16 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 	// agent rows. A follow-up can extend DetailPane for chat-style
 	// auto-pinned mixed-style logs.
 	screen.DrawBox(right.X, right.Y, right.Width, right.Height, subtleStyle)
-	title := " UTTERANCES "
-	if v.spaceList.Selected < len(v.spaces) {
-		title = fmt.Sprintf(" CHAT: %s (%d) ", truncate(displayName(v.spaces[v.spaceList.Selected]), 40), len(v.utterances))
-	}
-	screen.DrawText(right.X+2, right.Y, right.Width-4, title, accentStyle)
+	// CHAT title is constant -- the embedded space name in the
+	// previous " CHAT: <spaceName> (N) " form was redundant with the
+	// highlighted row in the left pane (chrome contract: no
+	// embedded ids/names in titles). Counter is a bare utterance
+	// count for the selected space.
+	ui.PaneTitle{
+		Title:   "CHAT",
+		Counter: ui.FormatCount(len(v.utterances)),
+		Focused: v.Focus == FocusUtterances,
+	}.Draw(screen, ui.Rect{X: right.X + 1, Y: right.Y, Width: right.Width - 2, Height: right.Height}, v.Theme)
 
 	contentH := right.Height - 3
 	// Reserve a row for the PTT status strip when a session is
@@ -714,13 +725,6 @@ func parseMillis(v any) int64 {
 		}
 	}
 	return 0
-}
-
-func displayName(s spaceRow) string {
-	if s.Name != "" {
-		return s.Name
-	}
-	return s.ID
 }
 
 func truncate(s string, max int) string {

@@ -303,8 +303,7 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 // dslMissing latch.
 func (v *View) drawGated(screen *ui.Screen, bounds ui.Rect, msg string) {
 	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, v.Theme.BaseStyle())
-	title := " PLANNER "
-	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, v.Theme.SubtleStyle().Bold(true))
+	ui.PaneTitle{Title: "PLANNER"}.Draw(screen, bounds, v.Theme)
 	wrapped := ui.WrapText(msg, bounds.Width-4)
 	if len(wrapped) == 0 {
 		wrapped = []string{msg}
@@ -341,18 +340,11 @@ func paneChromeBounds(bounds ui.Rect) ui.Rect {
 func (v *View) drawPlanList(screen *ui.Screen, bounds ui.Rect) {
 	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, v.Theme.BaseStyle())
 
-	titleStyle := v.Theme.SubtleStyle().Bold(true)
-	if v.Focus == FocusPlans {
-		titleStyle = v.Theme.AccentStyle().Bold(true)
-	}
-	// Counts ride the title bar per the panel chrome contract --
-	// the bottom row is reserved for action hints, never a duplicate
-	// `n/m` strip.
-	title := " PLANS "
-	if n := len(v.plans); n > 0 {
-		title = fmt.Sprintf(" PLANS (%d/%d) ", v.planList.Selected+1, n)
-	}
-	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, titleStyle)
+	ui.PaneTitle{
+		Title:   "PLANS",
+		Counter: ui.FormatCursor(v.planList.Selected, len(v.plans)),
+		Focused: v.Focus == FocusPlans,
+	}.Draw(screen, bounds, v.Theme)
 
 	if len(v.plans) == 0 {
 		drawCentered(screen, v.Theme, bounds, "No plans yet -- submit a goal above.")
@@ -368,23 +360,26 @@ func (v *View) drawPlanList(screen *ui.Screen, bounds ui.Rect) {
 func (v *View) drawTaskList(screen *ui.Screen, bounds ui.Rect) {
 	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, v.Theme.BaseStyle())
 
-	titleStyle := v.Theme.SubtleStyle().Bold(true)
-	if v.Focus == FocusTasks {
-		titleStyle = v.Theme.AccentStyle().Bold(true)
-	}
-	// Position count rides the title bar per the chrome contract.
-	// Plan-level token rollup tags onto the title strip so the user
-	// sees the running total without leaving the Tasks pane.
-	title := " TASKS "
-	if n := len(v.tasks); n > 0 {
-		title = fmt.Sprintf(" TASKS (%d/%d) ", v.taskList.Selected+1, n)
-	}
+	// Counter carries the position plus the plan-level token rollup
+	// so the user sees the running total without leaving the Tasks
+	// pane. Token segment is appended to the counter rather than
+	// stacked into a second strip -- chrome contract: count lives in
+	// the title bar.
+	counter := ui.FormatCursor(v.taskList.Selected, len(v.tasks))
 	if v.planList.Selected >= 0 && v.planList.Selected < len(v.plans) {
 		if tok := planTokenSummary(v.plans[v.planList.Selected]); tok != "" {
-			title = strings.TrimRight(title, " ") + "  ·  " + tok + " "
+			if counter != "" {
+				counter = counter + "  ·  " + tok
+			} else {
+				counter = tok
+			}
 		}
 	}
-	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, titleStyle)
+	ui.PaneTitle{
+		Title:   "TASKS",
+		Counter: counter,
+		Focused: v.Focus == FocusTasks,
+	}.Draw(screen, bounds, v.Theme)
 
 	if len(v.tasks) == 0 {
 		msg := "No tasks for this plan."
@@ -501,12 +496,10 @@ func (v *View) renderTaskRow(screen *ui.Screen, bounds ui.Rect, idx int, sel boo
 func (v *View) drawTaskDetail(screen *ui.Screen, bounds ui.Rect) {
 	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, v.Theme.BaseStyle())
 
-	titleStyle := v.Theme.SubtleStyle().Bold(true)
-	if v.Focus == FocusTaskDetail {
-		titleStyle = v.Theme.AccentStyle().Bold(true)
-	}
-	title := " TASK DETAIL "
-	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, titleStyle)
+	ui.PaneTitle{
+		Title:   "TASK DETAIL",
+		Focused: v.Focus == FocusTaskDetail,
+	}.Draw(screen, bounds, v.Theme)
 
 	// Empty-state precedence: no plan selected -> no task -> nothing
 	// to show.

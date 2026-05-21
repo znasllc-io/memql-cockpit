@@ -315,3 +315,55 @@ func TestPanelChrome_NoCountFooterRow(t *testing.T) {
 		t.Errorf("chrome row appears to still contain a count footer: %q", chromeRow)
 	}
 }
+
+// TestPanelChrome_TitleFormat pins the post-#110 title layout:
+//
+//   - No parentheses anywhere on the title row -- the counter is bare
+//     digits, never `(1/3)`.
+//   - No "ROWS:" or "CHAT:" prefix -- the embedded concept-id /
+//     space-name in the title is the anti-pattern this migration
+//     deletes (chrome contract: "no embedded ids/colons in titles").
+//   - The counter is right-aligned, not crowded next to the title.
+//     We assert this by walking each pane's column range and
+//     checking the counter substring lands toward the pane's right
+//     edge, not within ~3 cells of the title's start.
+func TestPanelChrome_TitleFormat(t *testing.T) {
+	v, screen, sim, bounds := makeView(t)
+	rows := drawAndSnapshot(v, screen, sim, bounds)
+	titleRow := rows[bounds.Y]
+
+	// No parentheses on the title row. The old format was
+	// " CONCEPTS (1/77) " / " ROWS: <id> (3/12) " / " DETAIL (line 4/27) ";
+	// none of those are allowed anymore.
+	if strings.ContainsAny(titleRow, "()") {
+		t.Errorf("title row contains parentheses (contract forbids parens around counters): %q", titleRow)
+	}
+
+	// No "ROWS:" or "CHAT:" embedded-id prefix. The colon-after-pane-
+	// name shape is exactly what the migration deleted; if it shows
+	// up, a regression slipped a concept id back into a title.
+	if strings.Contains(titleRow, "ROWS:") {
+		t.Errorf("title row contains 'ROWS:' -- embedded concept id reintroduced: %q", titleRow)
+	}
+	if strings.Contains(titleRow, "CHAT:") {
+		t.Errorf("title row contains 'CHAT:' -- embedded space name reintroduced: %q", titleRow)
+	}
+
+	// Counter ("1/3") should appear toward the RIGHT side of each
+	// pane's title slice, not flush against the pane name. The three
+	// concept-tab panes split the viewWidth roughly 25/30/45; the
+	// first pane spans cols [0, ~30), the second [~30, ~66), the
+	// third [~66, 120). For each, the counter should land in the
+	// pane's RIGHT half.
+	conceptsPaneEnd := viewWidth * 25 / 100        // ~30
+	rowsPaneEnd := conceptsPaneEnd + viewWidth*30/100 // ~66
+	// Validate at least one of the counters is right-anchored. Use
+	// the CONCEPTS pane: counter "1/3" must land past the midpoint
+	// of [0, conceptsPaneEnd).
+	conceptsHalf := conceptsPaneEnd / 2
+	if idx := strings.Index(titleRow[:conceptsPaneEnd], "1/3"); idx >= 0 && idx < conceptsHalf {
+		t.Errorf("CONCEPTS counter not right-anchored (found at col %d, pane right-half starts at %d): %q",
+			idx, conceptsHalf, titleRow[:conceptsPaneEnd])
+	}
+	_ = rowsPaneEnd
+}

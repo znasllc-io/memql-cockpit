@@ -382,11 +382,10 @@ func (v *ClustersView) Draw(screen *ui.Screen, bounds ui.Rect) {
 	v.drawManagement(screen, leftBounds)
 
 	// Topology pane.
-	titleStyle := v.Theme.SubtleStyle().Bold(true)
-	if v.Focus == FocusTopology {
-		titleStyle = v.Theme.AccentStyle().Bold(true)
-	}
-	screen.DrawText(rightBounds.X+1, rightBounds.Y, rightBounds.Width-2, " TOPOLOGY ", titleStyle)
+	ui.PaneTitle{
+		Title:   "TOPOLOGY",
+		Focused: v.Focus == FocusTopology,
+	}.Draw(screen, rightBounds, v.Theme)
 	topoBounds := ui.Rect{X: rightBounds.X, Y: rightBounds.Y + 1, Width: rightBounds.Width, Height: rightBounds.Height - 1}
 	v.Topology.Draw(screen, topoBounds)
 }
@@ -397,23 +396,21 @@ func (v *ClustersView) drawManagement(screen *ui.Screen, bounds ui.Rect) {
 	x := bounds.X + 1
 	maxW := bounds.Width - 2
 
-	// Pane-level title (focus-aware blue/gray).
-	titleStyle := v.Theme.SubtleStyle().Bold(true)
-	if v.Focus == FocusManagement {
-		titleStyle = v.Theme.AccentStyle().Bold(true)
-	}
 	// Title reflects the pane's current mode. Entering add/edit
 	// mode rewrites the title instead of stacking a second one
 	// inside the form -- one status strip per pane, no duplicates.
-	title := " CLUSTERS "
+	title := "CLUSTERS"
 	if v.showAddForm {
 		if v.addForm.editMode {
-			title = " EDIT CLUSTER "
+			title = "EDIT CLUSTER"
 		} else {
-			title = " ADD CLUSTER "
+			title = "ADD CLUSTER"
 		}
 	}
-	screen.DrawText(x, y, maxW, title, titleStyle)
+	ui.PaneTitle{
+		Title:   title,
+		Focused: v.Focus == FocusManagement,
+	}.Draw(screen, bounds, v.Theme)
 	y++
 
 	if v.showAddForm {
