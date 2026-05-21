@@ -58,6 +58,7 @@ func TestDetailPane_RendersAllLineKinds(t *testing.T) {
 	d := DetailPane{
 		Lines: []DetailLine{
 			{Kind: LineHeader, Text: "PROVIDER"},
+			{Kind: LineSection, Text: "─ identity ─"},
 			{Kind: LinePlain, Text: "anthropic"},
 			{Kind: LineDim, Text: "----"},
 			{Kind: LineKV, Key: "Endpoint", Value: "localhost:9000"},
@@ -66,7 +67,7 @@ func TestDetailPane_RendersAllLineKinds(t *testing.T) {
 	d.Draw(screen, Rect{X: 0, Y: 0, Width: 40, Height: 10}, DefaultTheme())
 	sim.Sync()
 
-	wants := []string{"PROVIDER", "anthropic", "----", "Endpoint:", "localhost:9000"}
+	wants := []string{"PROVIDER", "─ identity ─", "anthropic", "----", "Endpoint:", "localhost:9000"}
 	for _, want := range wants {
 		found := false
 		for y := 0; y < 10; y++ {
@@ -79,6 +80,59 @@ func TestDetailPane_RendersAllLineKinds(t *testing.T) {
 			t.Errorf("missing %q somewhere in pane", want)
 		}
 	}
+}
+
+// TestDetailPane_LineSection_RendersSubtleBold pins the visual
+// contract for LineSection -- the kind introduced in cockpit#93 so
+// the planner / agents section markers don't pop in the accent
+// color the way LineHeader does. Asserts the row's style matches
+// theme.SubtleStyle().Bold(true) and is distinct from LineHeader's
+// accent-bold.
+func TestDetailPane_LineSection_RendersSubtleBold(t *testing.T) {
+	screen, sim := makeDetailSim(t, 40, 5)
+	defer sim.Fini()
+	theme := DefaultTheme()
+
+	d := DetailPane{Lines: []DetailLine{
+		{Kind: LineSection, Text: "─ identity ─"},
+		{Kind: LineHeader, Text: "─ accent ─"},
+	}}
+	d.Draw(screen, Rect{X: 0, Y: 0, Width: 40, Height: 5}, theme)
+	sim.Sync()
+
+	// Row 0 = LineSection. First non-space cell should carry the
+	// subtle + bold style.
+	sectionStyle := theme.SubtleStyle().Bold(true)
+	headerStyle := theme.AccentStyle().Bold(true)
+
+	gotRow0 := cellStyleAt(t, sim, 0, 0, 40)
+	if gotRow0 != sectionStyle {
+		t.Errorf("LineSection row style = %v, want SubtleStyle().Bold(true) %v", gotRow0, sectionStyle)
+	}
+	// Row 1 = LineHeader. Must differ from LineSection so the two
+	// kinds are visually distinguishable.
+	gotRow1 := cellStyleAt(t, sim, 1, 0, 40)
+	if gotRow1 != headerStyle {
+		t.Errorf("LineHeader row style = %v, want AccentStyle().Bold(true) %v", gotRow1, headerStyle)
+	}
+	if gotRow0 == gotRow1 {
+		t.Errorf("LineSection and LineHeader rendered with the same style (%v); they must visually differ", gotRow0)
+	}
+}
+
+// cellStyleAt returns the style of the first non-space cell in row
+// y, scanning from startX up to totalW. Helper for style
+// assertions; the cell's text content isn't inspected.
+func cellStyleAt(t *testing.T, sim tcell.SimulationScreen, y, startX, totalW int) tcell.Style {
+	t.Helper()
+	for x := startX; x < totalW; x++ {
+		ch, _, style, _ := sim.GetContent(x, y)
+		if ch != ' ' && ch != 0 {
+			return style
+		}
+	}
+	t.Fatalf("row %d has no non-space cells", y)
+	return tcell.Style{}
 }
 
 // TestDetailPane_WrapsLongLines: a single Plain line wider than the

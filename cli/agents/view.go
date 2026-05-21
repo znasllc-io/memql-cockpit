@@ -378,7 +378,10 @@ func (v *View) buildDetailLines(a map[string]any, innerWidth int) []ui.DetailLin
 	var lines []ui.DetailLine
 
 	plain := func(s string) ui.DetailLine { return ui.DetailLine{Kind: ui.LinePlain, Text: s} }
-	header := func(s string) ui.DetailLine { return ui.DetailLine{Kind: ui.LineHeader, Text: s} }
+	// Section markers ("─ name ─") use LineSection so they stay
+	// subtle + bold (band-style dividers), matching planner. See
+	// LineSection's doc comment in cli/ui/detailpane.go.
+	header := func(s string) ui.DetailLine { return ui.DetailLine{Kind: ui.LineSection, Text: s} }
 
 	addKV := func(label, value string) {
 		if value == "" {

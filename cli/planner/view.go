@@ -550,8 +550,10 @@ func (v *View) drawTaskDetail(screen *ui.Screen, bounds ui.Rect) {
 // to unit-test against fixture rows. innerWidth bounds each
 // JSON/string field's wrap so the detail pane never overflows.
 //
-// Section markers ("─ name ─") use LineHeader so they pop visually;
-// body content uses LinePlain.
+// Section markers ("─ name ─") use LineSection (subtle + bold) so
+// they recede into the chrome instead of popping in the accent
+// color -- every row sits under a section marker, so accent-bold
+// would make the whole pane look busy. Body content uses LinePlain.
 func (v *View) buildTaskDetailLines(task, plan map[string]any, innerWidth int) []ui.DetailLine {
 	if innerWidth < 16 {
 		innerWidth = 16
@@ -559,7 +561,7 @@ func (v *View) buildTaskDetailLines(task, plan map[string]any, innerWidth int) [
 	var lines []ui.DetailLine
 
 	plain := func(s string) ui.DetailLine { return ui.DetailLine{Kind: ui.LinePlain, Text: s} }
-	header := func(s string) ui.DetailLine { return ui.DetailLine{Kind: ui.LineHeader, Text: s} }
+	header := func(s string) ui.DetailLine { return ui.DetailLine{Kind: ui.LineSection, Text: s} }
 
 	addKV := func(label, value string) {
 		if value == "" {

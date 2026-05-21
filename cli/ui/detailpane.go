@@ -26,6 +26,15 @@ const (
 	// the chrome.
 	LineDim
 
+	// LineSection is a section marker in the subtle style + bold.
+	// Visually quieter than LineHeader -- recedes into the chrome
+	// instead of popping in the theme's accent color. Use for the
+	// repeating `─ name ─` band-style section dividers in the
+	// planner / agents detail panes, where every row sits under a
+	// section marker and accent-bold would make the whole pane look
+	// busy.
+	LineSection
+
 	// LineKV is a two-segment row: a dimmed `Key:` prefix followed
 	// by `Value` in base style on the same row. KV rows do NOT
 	// wrap -- if the value exceeds remaining width it's truncated.
@@ -228,6 +237,8 @@ func (d *DetailPane) flatten(innerW int, theme Theme) []renderedRow {
 		switch ln.Kind {
 		case LineHeader:
 			out = wrapInto(out, ln.Text, innerW, theme.AccentStyle().Bold(true))
+		case LineSection:
+			out = wrapInto(out, ln.Text, innerW, theme.SubtleStyle().Bold(true))
 		case LineDim:
 			out = wrapInto(out, ln.Text, innerW, theme.SubtleStyle())
 		case LineKV:
