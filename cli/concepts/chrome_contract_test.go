@@ -62,16 +62,17 @@ func makeView(t *testing.T) (*View, *ui.Screen, tcell.SimulationScreen, ui.Rect)
 		{Id: "v1:hr:milestone"},
 	})
 
-	v.mu.Lock()
+	v.Mu.Lock()
 	v.Rows = []map[string]any{
 		{"id": "row-alpha", "payload": map[string]any{"name": "alpha"}},
 		{"id": "row-beta", "payload": map[string]any{"name": "beta"}},
 		{"id": "row-gamma", "payload": map[string]any{"name": "gamma"}},
 	}
 	v.rowMatches = []int{0, 1, 2}
-	v.rowSelected = 0
+	v.rowList.Selected = 0
+	v.rowList.Count = len(v.rowMatches)
 	v.refreshDetailFromCurrentLocked()
-	v.mu.Unlock()
+	v.Mu.Unlock()
 
 	return v, screen, sim, ui.Rect{X: 0, Y: 0, Width: viewWidth, Height: viewHeight}
 }
@@ -149,18 +150,18 @@ func TestPanelChrome_ColonTriggersSearch_SlashDoesNot(t *testing.T) {
 
 	// `/` is reserved; today it must NOT trigger search.
 	v.HandleEvent(tcell.NewEventKey(tcell.KeyRune, '/', tcell.ModNone))
-	v.mu.RLock()
+	v.Mu.RLock()
 	wasOn := v.searchOn
-	v.mu.RUnlock()
+	v.Mu.RUnlock()
 	if wasOn {
 		t.Fatalf("pressing '/' activated search; the contract requires ':' as the trigger and reserves '/'")
 	}
 
 	// `:` is the canonical trigger.
 	v.HandleEvent(tcell.NewEventKey(tcell.KeyRune, ':', tcell.ModNone))
-	v.mu.RLock()
+	v.Mu.RLock()
 	wasOn = v.searchOn
-	v.mu.RUnlock()
+	v.Mu.RUnlock()
 	if !wasOn {
 		t.Fatalf("pressing ':' did not activate search; the chrome contract advertises ':Search' as the bottom-band hint")
 	}
@@ -194,8 +195,8 @@ var hintChip = regexp.MustCompile(`^\S*:\S+$`)
 func TestPanelChrome_HintFormat(t *testing.T) {
 	v, _, _, _ := makeView(t)
 
-	v.mu.RLock()
-	defer v.mu.RUnlock()
+	v.Mu.RLock()
+	defer v.Mu.RUnlock()
 
 	cases := []struct {
 		name string
@@ -250,8 +251,8 @@ func TestPanelChrome_ActiveSearchHintIsAccent(t *testing.T) {
 	v, _, _, _ := makeView(t)
 	v.HandleEvent(tcell.NewEventKey(tcell.KeyRune, ':', tcell.ModNone))
 
-	v.mu.RLock()
-	defer v.mu.RUnlock()
+	v.Mu.RLock()
+	defer v.Mu.RUnlock()
 	hint := hintsForRows(v)
 	if !hint.accent {
 		t.Fatalf("active search prompt must render in accent style; got subtle")
@@ -274,17 +275,17 @@ func TestPanelChrome_EscClearsFilter(t *testing.T) {
 	v.HandleEvent(tcell.NewEventKey(tcell.KeyRune, ':', tcell.ModNone))
 	v.HandleEvent(tcell.NewEventKey(tcell.KeyRune, 'a', tcell.ModNone))
 	v.HandleEvent(tcell.NewEventKey(tcell.KeyEsc, 0, tcell.ModNone)) // exit search input
-	v.mu.RLock()
+	v.Mu.RLock()
 	if v.rowFilter != "a" {
-		v.mu.RUnlock()
+		v.Mu.RUnlock()
 		t.Fatalf("expected filter 'a' after typing into search; got %q", v.rowFilter)
 	}
-	v.mu.RUnlock()
+	v.Mu.RUnlock()
 
 	// Esc on Rows pane with filter set must clear it. (`Esc:ClearSearch`.)
 	v.HandleEvent(tcell.NewEventKey(tcell.KeyEsc, 0, tcell.ModNone))
-	v.mu.RLock()
-	defer v.mu.RUnlock()
+	v.Mu.RLock()
+	defer v.Mu.RUnlock()
 	if v.rowFilter != "" {
 		t.Fatalf("Esc on Rows pane with active filter must clear it; rowFilter still %q", v.rowFilter)
 	}
