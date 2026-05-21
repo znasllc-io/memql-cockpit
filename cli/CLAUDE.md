@@ -511,11 +511,13 @@ push-to-talk, `sense/` for editor language intelligence, and
 
 What that means concretely:
 
-- **No direct `grpc.NewClient` dials** anywhere under `cli/**`. The
-  SDK owns transport (TLS, auth-token plumbing, request correlation).
-  The remaining worker dial in `cmd/memql-cockpit/internal/worker/`
-  is a known leak tracked in memql#117 -- it will move to
-  `sdk/go/worker/` and the cockpit will dial through that.
+- **No direct `grpc.NewClient` dials** anywhere under `cli/**` or
+  `cmd/memql-cockpit/internal/worker/`. The SDK owns transport
+  (TLS, auth-token plumbing, request correlation). Worker dials
+  go through `sdk/go/worker.Dial` (which carries the TLS config +
+  env-var knobs from memql#117); the cockpit's worker run-mode
+  keeps only the worker-protocol lifecycle (Register / Heartbeat /
+  ToolResult) on its side.
 - **No `memqlv1` imports** under `cli/**`. The previous leak set
   (`app.go`, `pool.go`, `settings/view.go`, `concepts/view.go`,
   `concepts/chrome_contract_test.go`, `settings/settings_race_test.go`)
