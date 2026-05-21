@@ -64,6 +64,36 @@ Cluster config lives at `~/.memql/clusters.yaml`; worker config at
 `~/.memql/worker.yaml`. The install scripts under `scripts/install/`
 register a LaunchAgent (macOS) or systemd user service (Linux).
 
+### Credential storage
+
+OAuth access + refresh tokens are stored via a pluggable
+`CredentialStore`. Backends:
+
+- **OS keyring (preferred)** -- Keychain on macOS, Secret Service
+  (gnome-keyring / KWallet via libsecret) on Linux, Credential
+  Manager on Windows. Selected automatically when the host exposes
+  a working keyring. Service name: `com.znasllc.memql-cockpit`.
+- **File (fallback)** -- `~/.memql/credentials/<cluster>.json` at
+  mode 0600. Used on CI runners, headless servers, and any host
+  where the OS keyring can't be reached. Always available.
+
+The cockpit logs the active backend at startup. Override with
+`MEMQL_COCKPIT_CRED_STORE=file` or `MEMQL_COCKPIT_CRED_STORE=keyring`
+(the latter errors out at startup when the keyring is unavailable
+rather than silently falling back to disk).
+
+To move existing on-disk tokens into the OS keyring:
+
+```bash
+memql-cockpit creds migrate-to-keyring   # idempotent; deletes source files on success
+memql-cockpit creds status               # show the active backend + cached clusters
+```
+
+The cluster registry itself (`~/.memql/clusters.yaml`) still lives
+on disk -- it carries the endpoint / OIDC issuer / optional PAT
+needed before any keyring access. The load-time mode validator
+(0600 enforced) catches drift on that file too.
+
 ## Module structure
 
 - `cmd/memql-cockpit/` -- binary entry point + per-subcommand internals
