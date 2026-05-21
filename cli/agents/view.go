@@ -223,8 +223,7 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 
 func (v *View) drawGated(screen *ui.Screen, bounds ui.Rect, msg string) {
 	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, v.Theme.BaseStyle())
-	title := " AGENTS "
-	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, v.Theme.SubtleStyle().Bold(true))
+	ui.PaneTitle{Title: "AGENTS"}.Draw(screen, bounds, v.Theme)
 	wrapped := ui.WrapText(msg, bounds.Width-4)
 	if len(wrapped) == 0 {
 		wrapped = []string{msg}
@@ -260,15 +259,11 @@ func paneChromeBounds(bounds ui.Rect) ui.Rect {
 func (v *View) drawList(screen *ui.Screen, bounds ui.Rect) {
 	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, v.Theme.BaseStyle())
 
-	titleStyle := v.Theme.SubtleStyle().Bold(true)
-	if v.Focus == FocusList {
-		titleStyle = v.Theme.AccentStyle().Bold(true)
-	}
-	title := " AGENTS "
-	if n := len(v.agents); n > 0 {
-		title = fmt.Sprintf(" AGENTS (%d/%d) ", v.agentList.Selected+1, n)
-	}
-	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, titleStyle)
+	ui.PaneTitle{
+		Title:   "AGENTS",
+		Counter: ui.FormatCursor(v.agentList.Selected, len(v.agents)),
+		Focused: v.Focus == FocusList,
+	}.Draw(screen, bounds, v.Theme)
 
 	if len(v.agents) == 0 {
 		drawCentered(screen, v.Theme, bounds,
@@ -337,11 +332,10 @@ func (v *View) renderAgentRow(screen *ui.Screen, bounds ui.Rect, idx int, sel bo
 func (v *View) drawDetail(screen *ui.Screen, bounds ui.Rect) {
 	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, v.Theme.BaseStyle())
 
-	titleStyle := v.Theme.SubtleStyle().Bold(true)
-	if v.Focus == FocusDetail {
-		titleStyle = v.Theme.AccentStyle().Bold(true)
-	}
-	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, " AGENT DETAIL ", titleStyle)
+	ui.PaneTitle{
+		Title:   "AGENT DETAIL",
+		Focused: v.Focus == FocusDetail,
+	}.Draw(screen, bounds, v.Theme)
 
 	if len(v.agents) == 0 || v.agentList.Selected < 0 || v.agentList.Selected >= len(v.agents) {
 		drawCentered(screen, v.Theme, bounds,

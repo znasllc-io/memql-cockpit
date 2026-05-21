@@ -63,10 +63,9 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 	defer v.mu.RUnlock()
 	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, v.Theme.BaseStyle())
 
-	// Top-level tab title. Matches the focus-accent blue used on other
-	// tabs so the user has a clear "you are here" cue. Settings has no
-	// focus switching between panes, so the title is always in accent.
-	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, " SETTINGS ", v.Theme.AccentStyle().Bold(true))
+	// Top-level tab title. Settings has no focus switching between
+	// panes, so the title is always rendered as if focused.
+	ui.PaneTitle{Title: "SETTINGS", Focused: true}.Draw(screen, bounds, v.Theme)
 
 	// Shift content down so the title has its own row.
 	contentBounds := ui.Rect{X: bounds.X, Y: bounds.Y + 1, Width: bounds.Width, Height: bounds.Height - 1}

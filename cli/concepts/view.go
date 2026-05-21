@@ -188,8 +188,7 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 
 func (v *View) drawGated(screen *ui.Screen, bounds ui.Rect) {
 	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, v.Theme.BaseStyle())
-	title := " CONCEPTS "
-	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, v.Theme.SubtleStyle().Bold(true))
+	ui.PaneTitle{Title: "CONCEPTS"}.Draw(screen, bounds, v.Theme)
 	midY := bounds.Y + bounds.Height/2
 	lineX := bounds.X + (bounds.Width-len(v.GatedMessage))/2
 	if lineX < bounds.X+1 {
@@ -215,15 +214,11 @@ func paneChromeBounds(bounds ui.Rect) ui.Rect {
 func (v *View) drawConceptList(screen *ui.Screen, bounds ui.Rect) {
 	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, v.Theme.BaseStyle())
 
-	titleStyle := v.Theme.SubtleStyle().Bold(true)
-	if v.Focus == FocusConcepts {
-		titleStyle = v.Theme.AccentStyle().Bold(true)
-	}
-	title := " CONCEPTS "
-	if c := len(v.Concepts); c > 0 {
-		title = fmt.Sprintf(" CONCEPTS (%d/%d) ", v.conceptList.Selected+1, c)
-	}
-	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, titleStyle)
+	ui.PaneTitle{
+		Title:   "CONCEPTS",
+		Counter: ui.FormatCursor(v.conceptList.Selected, len(v.Concepts)),
+		Focused: v.Focus == FocusConcepts,
+	}.Draw(screen, bounds, v.Theme)
 
 	v.conceptList.Count = len(v.Concepts)
 	v.conceptList.Focused = v.Focus == FocusConcepts
@@ -235,29 +230,17 @@ func (v *View) drawConceptList(screen *ui.Screen, bounds ui.Rect) {
 func (v *View) drawRowList(screen *ui.Screen, bounds ui.Rect) {
 	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, v.Theme.BaseStyle())
 
-	titleStyle := v.Theme.SubtleStyle().Bold(true)
-	if v.Focus == FocusRows {
-		titleStyle = v.Theme.AccentStyle().Bold(true)
-	}
-	conceptId := ""
-	if v.conceptList.Selected >= 0 && v.conceptList.Selected < len(v.Concepts) {
-		conceptId = v.Concepts[v.conceptList.Selected].Id
-	}
-	matches := v.rowMatches
-	title := " ROWS "
-	if conceptId != "" {
-		switch {
-		case len(matches) < len(v.Rows):
-			title = fmt.Sprintf(" ROWS: %s (%d/%d filtered from %d) ", conceptId, v.rowList.Selected+1, len(matches), len(v.Rows))
-		case len(matches) > 0:
-			title = fmt.Sprintf(" ROWS: %s (%d/%d) ", conceptId, v.rowList.Selected+1, len(matches))
-		default:
-			title = " ROWS: " + conceptId + " "
-		}
-	}
-	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, titleStyle)
+	// Counter formats: empty when no concept selected, filtered/cursor
+	// when there are rows. The concept id no longer appears in the
+	// title -- the left pane already shows which concept is selected
+	// (chrome contract: no embedded ids in titles).
+	ui.PaneTitle{
+		Title:   "ROWS",
+		Counter: ui.FormatFiltered(v.rowList.Selected, len(v.rowMatches), len(v.Rows)),
+		Focused: v.Focus == FocusRows,
+	}.Draw(screen, bounds, v.Theme)
 
-	v.rowList.Count = len(matches)
+	v.rowList.Count = len(v.rowMatches)
 	v.rowList.Focused = v.Focus == FocusRows && !v.searchOn
 	v.rowList.Draw(screen, paneChromeBounds(bounds), v.Theme)
 
@@ -267,17 +250,17 @@ func (v *View) drawRowList(screen *ui.Screen, bounds ui.Rect) {
 func (v *View) drawDetail(screen *ui.Screen, bounds ui.Rect) {
 	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, v.Theme.BaseStyle())
 
-	titleStyle := v.Theme.SubtleStyle().Bold(true)
-	if v.Focus == FocusDetail {
-		titleStyle = v.Theme.AccentStyle().Bold(true)
-	}
-	title := " DETAIL "
+	title := "DETAIL"
+	counter := ui.FormatLine(v.viewer.ScrollY, len(v.detailLines))
 	if v.versionsOpen {
-		title = fmt.Sprintf(" VERSIONS (%d/%d) ", v.versionList.Selected+1, len(v.versionRows))
-	} else if n := len(v.detailLines); n > 0 {
-		title = fmt.Sprintf(" DETAIL (line %d/%d) ", v.viewer.ScrollY+1, n)
+		title = "VERSIONS"
+		counter = ui.FormatCursor(v.versionList.Selected, len(v.versionRows))
 	}
-	screen.DrawText(bounds.X+1, bounds.Y, bounds.Width-2, title, titleStyle)
+	ui.PaneTitle{
+		Title:   title,
+		Counter: counter,
+		Focused: v.Focus == FocusDetail,
+	}.Draw(screen, bounds, v.Theme)
 
 	inner := paneChromeBounds(bounds)
 	// Reserve a two-cell left gutter so detail content doesn't crowd
