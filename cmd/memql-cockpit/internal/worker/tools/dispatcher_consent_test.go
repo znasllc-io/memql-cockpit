@@ -10,7 +10,7 @@ import (
 
 	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 
-	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/internal/worker/consent"
+	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/worker/consent"
 )
 
 // fakeGate is a ConsentGate stub the dispatcher tests plug in so we

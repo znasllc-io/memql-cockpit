@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/internal/worker/consent"
+	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/worker/consent"
 	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/internal/worker/tools"
 	"github.com/znasllc-io/memql/component/identity/workerpairing"
 )

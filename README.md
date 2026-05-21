@@ -89,6 +89,24 @@ The `--strict` flag on `grant` is honored on the wire (and recorded
 in events) but the per-action approval surface it implies ships as
 a follow-up under memql-cockpit#64.
 
+#### Workers tab (in-cockpit dashboard)
+
+The Workers tab (F5) is the in-cockpit surface for the same gate.
+It maintains a long-lived `watch` connection to `~/.memql/worker.sock`
+and renders:
+
+- The current consent state (granted / no consent / offline) plus
+  expiry, window length, and the strict flag.
+- A live tail of every worker dispatch (allowed + denied), newest
+  first, capped at 256 entries.
+- In-pane Grant / Revoke: `G` opens a duration picker
+  (5 min / 1 hour / 8 hours), `S` toggles strict before submitting,
+  `Enter` grants; `R` revokes immediately.
+
+A global kill switch — **`Ctrl+E` from any tab** — calls the same
+`revoke` op without making the user switch to the Workers tab
+first. The notification feed surfaces the outcome.
+
 Reference: memql-cockpit#64.
 
 ### Credential storage

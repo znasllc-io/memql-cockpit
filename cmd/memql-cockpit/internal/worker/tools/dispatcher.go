@@ -15,7 +15,7 @@ import (
 
 	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 
-	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/internal/worker/consent"
+	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/worker/consent"
 )
 
 // ConsentGate is the narrow interface the dispatcher uses to ask
