@@ -23,6 +23,7 @@ import (
 	"github.com/znasllc-io/memql-cockpit/cli/crash"
 	"github.com/znasllc-io/memql-cockpit/cli/discovery"
 	"github.com/znasllc-io/memql-cockpit/cli/planner"
+	"github.com/znasllc-io/memql-cockpit/cli/safety"
 	"github.com/znasllc-io/memql-cockpit/cli/settings"
 	"github.com/znasllc-io/memql-cockpit/cli/skills"
 	"github.com/znasllc-io/memql-cockpit/cli/splash"
@@ -92,6 +93,7 @@ type App struct {
 	skillsView   *skills.View
 	chatView     *chat.View
 	workersView  *workers.View
+	safetyView   *safety.View
 	settingsView *settings.View
 
 	// getQueries returns a QueryClient bound to the currently active
@@ -133,6 +135,7 @@ func NewApp(cfg AppConfig) *App {
 	skillsView := skills.NewView(theme)
 	chatView := chat.NewView(theme)
 	workersView := workers.NewView(theme)
+	safetyView := safety.NewView(theme)
 
 	// Clusters comes first -- it's the starting context for the session.
 	// Chat sits next (F2) because the daily-space conversation is the
@@ -153,6 +156,7 @@ func NewApp(cfg AppConfig) *App {
 		ui.Tab{Name: "Planner", Content: plannerView},
 		ui.Tab{Name: "Skills", Content: skillsView},
 		ui.Tab{Name: "Workers", Content: workersView},
+		ui.Tab{Name: "Safety", Content: safetyView},
 		ui.Tab{Name: "Settings", Content: settingsView},
 	)
 	tabBar.SetActive(0)
@@ -173,6 +177,7 @@ func NewApp(cfg AppConfig) *App {
 		skillsView:    skillsView,
 		chatView:      chatView,
 		workersView:   workersView,
+		safetyView:    safetyView,
 		settingsView:  settingsView,
 		helpOverlay:   ui.NewHelpOverlay(theme),
 		tabCrashes:    make(map[string]*crash.Report),
@@ -594,6 +599,7 @@ func (a *App) connect() {
 	a.wireSkills()
 	a.wireChat()
 	a.wireWorkers()
+	a.wireSafety()
 
 	for _, cfg := range configs {
 		a.openEntry(cfg)
@@ -1334,6 +1340,36 @@ func (a *App) wireSkills() {
 	a.skillsView.StartRefreshLoop(a.quitCh, 30*time.Second)
 }
 
+// wireSafety connects the Command Safety tab to the gRPC client.
+// The view polls queryAllSafetyClassifications every 5s -- rows
+// land per Gate.Evaluate call so they accumulate steadily under
+// shadow mode; a faster cadence than the skills catalog is
+// warranted while operators are watching the rollout.
+func (a *App) wireSafety() {
+	if a.safetyView == nil {
+		return
+	}
+	getQueries := func() *client.QueryClient {
+		d := a.activeDispatcher()
+		if d == nil {
+			return nil
+		}
+		return client.NewQueryClient(d)
+	}
+	a.safetyView.QueryClient = getQueries
+	a.safetyView.OnStatus = func(msg string) {
+		if a.notifications != nil {
+			a.notifications.Sync("safety", ui.SeverityWarning, msg)
+		}
+	}
+	a.safetyView.OnRedraw = func() {
+		if a.screen != nil {
+			a.screen.PostEvent(tcell.NewEventInterrupt(nil))
+		}
+	}
+	a.safetyView.StartRefreshLoop(a.quitCh, 5*time.Second)
+}
+
 // wireChat connects the Chat tab to the gRPC client. The chat view
 // polls v1:cognition:space + v1:cognition:utterance every 3s and
 // renders the single-chat-per-space stream. OnRedraw posts an
@@ -1968,6 +2004,9 @@ func (a *App) updateTabGating() {
 		}
 		if a.skillsView != nil {
 			a.skillsView.GatedMessage = msg
+		}
+		if a.safetyView != nil {
+			a.safetyView.GatedMessage = msg
 		}
 	}
 	name := a.selectedName()
