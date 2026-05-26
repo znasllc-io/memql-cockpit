@@ -251,8 +251,8 @@ func (v *View) RefreshTasksForSelected() {
 	}
 	v.Mu.RUnlock()
 	if agentId != "" {
-		eventsRes, err := qc.SkillChangeEventsForAgent(ctx,
-			client.SkillChangeEventsForAgentArgs{TargetAgentId: agentId})
+		eventsRes, err := qc.QuerySkillChangeEventsForAgent(ctx,
+			client.QuerySkillChangeEventsForAgentArgs{TargetAgentId: agentId})
 		if err == nil {
 			skillEvents = eventsRes.Rows()
 			sort.SliceStable(skillEvents, func(i, j int) bool {
