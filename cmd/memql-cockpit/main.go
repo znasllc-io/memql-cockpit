@@ -42,7 +42,10 @@ import (
 	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/internal/worker"
 )
 
-const version = "0.1.0"
+// version is the cockpit's semantic version. The git tag is the
+// source of truth (see VERSIONING.md); this constant tracks the
+// VERSION file and is bumped together with it on each release.
+const version = "0.9.0"
 
 func main() {
 	// Repo-root .env override sits above whatever genesis sealed in,

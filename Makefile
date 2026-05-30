@@ -12,10 +12,16 @@
 # ---------------------------------------------------------------------------
 
 GO          := go
-GOFLAGS     := -v
 CGO_ENABLED := 0
 BIN_DIR     := bin
-VERSION     := $(shell cat VERSION 2>/dev/null || echo "dev")
+# VERSION mirrors the plain semver in the VERSION file, which tracks
+# the git tag -- the tag is the source of truth (see VERSIONING.md).
+# Prefer the exact tag when building from a clean tagged checkout so
+# release artifacts stamp the real version; fall back to the VERSION
+# file otherwise.
+VERSION     := $(shell t=`git describe --tags --exact-match 2>/dev/null`; if [ -n "$$t" ]; then echo "$$t" | sed 's/^v//'; else cat VERSION 2>/dev/null || echo "dev"; fi)
+LDFLAGS     := -X main.version=$(VERSION)
+GOFLAGS     := -v -ldflags "$(LDFLAGS)"
 
 # ---------------------------------------------------------------------------
 # Build targets
@@ -141,26 +147,17 @@ generate:
 # Utility targets
 # ---------------------------------------------------------------------------
 
-.PHONY: clean version version-stamp help
+.PHONY: clean version help
 
 ## Remove build artifacts
 clean:
 	rm -rf $(BIN_DIR)/ coverage.out
 
-## Print the current version
+## Print the current version. Resolves to the exact git tag when the
+## checkout sits on one (the source of truth, see VERSIONING.md),
+## else the VERSION file.
 version:
 	@echo $(VERSION)
-
-## Refresh the epoch suffix in VERSION. Keeps the semver prefix,
-## stamps a fresh Unix timestamp. Run on each release / build to
-## keep VERSION current. Edit VERSION by hand to bump the semver
-## prefix; this target only touches the suffix.
-version-stamp:
-	@base="$$(cat VERSION 2>/dev/null | sed 's/-.*//' | head -1)"; \
-	if [ -z "$$base" ]; then base="0.1.0"; fi; \
-	new="$$base-$$(date +%s)"; \
-	echo "$$new" > VERSION; \
-	echo "VERSION -> $$new"
 
 ## Show all available targets
 help:
@@ -198,6 +195,5 @@ help:
 	@echo ""
 	@echo "UTILITY"
 	@echo "  make clean         Remove build artifacts"
-	@echo "  make version       Print current version"
-	@echo "  make version-stamp Refresh the epoch suffix in VERSION (keeps semver prefix)"
+	@echo "  make version       Print current version (git tag, else VERSION file)"
 	@echo "  make help          Show this help"
