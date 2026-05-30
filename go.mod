@@ -4,7 +4,7 @@ go 1.26.1
 
 require (
 	github.com/99designs/keyring v1.2.2
-	github.com/gdamore/tcell/v2 v2.13.9
+	github.com/gdamore/tcell/v2 v2.13.10
 	github.com/gen2brain/malgo v0.11.25
 	github.com/go-vgo/robotgo v1.0.2
 	github.com/znasllc-io/memql v0.0.0-20260521223032-3ce7947a1279
