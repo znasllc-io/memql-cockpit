@@ -12,7 +12,7 @@ body:
     attributes:
       label: Cockpit version / commit
       description: Output of `git log -1 --pretty=oneline` from the running checkout, or a release tag.
-      placeholder: "e.g. b8d9e9c or v0.1.0"
+      placeholder: "e.g. b8d9e9c or v0.9.0"
     validations:
       required: true
   - type: dropdown

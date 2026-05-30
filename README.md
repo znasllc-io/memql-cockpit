@@ -50,7 +50,11 @@ make cockpit-all-platforms       # cross-compile to darwin/linux x arm64/amd64
 make cockpit-gui-all-platforms   # GUI variant, all platforms
 ```
 
-Output lands under `bin/`.
+Output lands under `bin/`. Check the build's version with
+`./bin/memql-cockpit --version` (or `make version`). See
+[VERSIONING.md](VERSIONING.md) for the versioning scheme (semver,
+`0.9.0` baseline, git tag as source of truth) and the link to memQL's
+hub compatibility matrix.
 
 ## Run
 

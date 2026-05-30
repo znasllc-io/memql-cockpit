@@ -154,7 +154,7 @@ func (c *Connection) Close() {
 	c.conn.Close()
 }
 
-func cockpitVersion() string { return "0.1.0" }
+func cockpitVersion() string { return "0.9.0" }
 func cockpitBuildTag() string {
 	if buildTagOverride != "" {
 		return buildTagOverride

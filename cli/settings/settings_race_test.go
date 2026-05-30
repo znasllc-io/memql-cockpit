@@ -16,7 +16,7 @@ import (
 // the -race detector + corrupted MY ACCESS pane rendering in
 // practice.
 func TestSettingsView_NoRaceUnderConcurrentMutate(t *testing.T) {
-	v := NewView(ui.DefaultTheme(), "0.1.0")
+	v := NewView(ui.DefaultTheme(), "0.9.0")
 
 	const iters = 1000
 	var wg sync.WaitGroup
