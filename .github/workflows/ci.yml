@@ -27,6 +27,11 @@ jobs:
         with:
           repository: znasllc-io/memql
           path: memql
+          # Dependabot runs use a restricted token that can't read other private
+          # repos, so the sibling checkout fails there. MEMQL_SIBLING_TOKEN is a
+          # fine-grained PAT (contents:read on znasllc-io/memql) added as a
+          # Dependabot secret; it falls back to the default token on normal runs.
+          token: ${{ secrets.MEMQL_SIBLING_TOKEN || github.token }}
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version: '1.26'
@@ -49,6 +54,11 @@ jobs:
         with:
           repository: znasllc-io/memql
           path: memql
+          # Dependabot runs use a restricted token that can't read other private
+          # repos, so the sibling checkout fails there. MEMQL_SIBLING_TOKEN is a
+          # fine-grained PAT (contents:read on znasllc-io/memql) added as a
+          # Dependabot secret; it falls back to the default token on normal runs.
+          token: ${{ secrets.MEMQL_SIBLING_TOKEN || github.token }}
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version: '1.26'
@@ -71,6 +81,11 @@ jobs:
         with:
           repository: znasllc-io/memql
           path: memql
+          # Dependabot runs use a restricted token that can't read other private
+          # repos, so the sibling checkout fails there. MEMQL_SIBLING_TOKEN is a
+          # fine-grained PAT (contents:read on znasllc-io/memql) added as a
+          # Dependabot secret; it falls back to the default token on normal runs.
+          token: ${{ secrets.MEMQL_SIBLING_TOKEN || github.token }}
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version: '1.26'
