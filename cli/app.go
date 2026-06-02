@@ -1448,6 +1448,16 @@ func (a *App) wireCluster() {
 		return client.NewDeployControlClient(conn)
 	}
 
+	// #145 deploy-control modal hooks. OnRedraw lands an in-flight
+	// action's result line on screen the moment the SDK call returns
+	// (no waiting for the next poll tick); OnActionComplete kicks an
+	// immediate status refresh after a successful action so the
+	// Argo/Rollouts overlay reflects the new state right away.
+	a.clustersView.Topology.OnRedraw = a.postRedraw
+	a.clustersView.Topology.OnActionComplete = func() {
+		go a.refreshDeployStatus()
+	}
+
 	// Poll the deployment-v2 status on a periodic ticker. The loop
 	// self-gates on the connected caller's cluster role (owner/admin
 	// only) inside refreshDeployStatus.

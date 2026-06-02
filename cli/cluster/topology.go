@@ -117,6 +117,38 @@ type View struct {
 	// views use for their QueryClient. The poll loop calls this each tick
 	// so a cluster switch transparently retargets.
 	DeployClient func() *client.DeployControlClient
+
+	// OnRedraw, when set, requests a repaint of the topology pane.
+	// Wired to App.postRedraw in app.go so an async deploy action's
+	// result line lands on screen the moment the SDK call returns,
+	// without waiting for the next poll tick. nil is a no-op (tests
+	// that drive the modal state machine directly don't wire it).
+	OnRedraw func()
+
+	// OnActionComplete, when set, is called after a deploy-control
+	// action succeeds. Wired to App.refreshDeployStatus in app.go so
+	// the Argo/Rollouts overlay reflects the new state right away
+	// rather than on the next 10s poll tick. nil is a no-op.
+	OnActionComplete func()
+
+	// deployActor is the action executor the deploy-control modal fires
+	// against. In production it is left nil and the modal resolves it
+	// lazily from DeployClient() (so a cluster switch retargets); tests
+	// inject a fake to drive an action to SUCCESS / ERROR without a wire.
+	deployActor deployActions
+
+	// ctrl holds the transient deploy-control modal state. nil when the
+	// modal is closed. Guarded by v.mu like every other view field.
+	ctrl *deployControlState
+}
+
+// SetDeployActor overrides the deploy-control action executor. Used by
+// tests to inject a fake DeployControlClient; production leaves it nil
+// and the modal resolves the real client from DeployClient() per-fire.
+func (v *View) SetDeployActor(a deployActions) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.deployActor = a
 }
 
 // SetDisconnected toggles the "stream lost" rendering override. Does not
@@ -355,10 +387,21 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 	// (a healthy stream is the implicit default); only the "stale"
 	// warning surfaces, and only when we've actually lost the stream.
 	hints := "WASD:Pan  R:Reset View  X:Architecture"
+	// Deploy-control menu key is owner/admin-only; only advertise it
+	// when the caller can actually use it (chrome contract: hints that
+	// lie rot trust).
+	if v.canViewDeploymentsLocked() {
+		hints += "  D:Deploy"
+	}
 	if v.disconnected {
 		hints += "  stale"
 	}
 	screen.DrawText(bounds.X+bounds.Width-len(hints)-1, statusY, len(hints), hints, statusStyle)
+
+	// Deploy-control modal overlays everything else in the pane when open.
+	if v.ctrl != nil {
+		v.drawDeployModal(screen, bounds)
+	}
 }
 
 // drawTopology renders nodes as boxes with connection lines.
@@ -563,7 +606,23 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 	if v.Arch.Active() {
 		return v.Arch.HandleEvent(ev)
 	}
+	// Deploy-control modal takes key precedence whenever it's open
+	// (mirrors the workers grant/approval modal). handleDeployKey
+	// assumes v.mu is already held (we took the write lock above).
+	if v.ctrl != nil {
+		return v.handleDeployKeyLocked(keyEv)
+	}
 	if keyEv.Key() != tcell.KeyRune {
+		return false
+	}
+	// 'D' opens the deploy-control menu -- owner/admin only. Non-admins
+	// get a no-op (no controls, no hint). Checked before the pan keys so
+	// it isn't shadowed.
+	if r := keyEv.Rune(); r == 'D' {
+		if v.canViewDeploymentsLocked() {
+			v.openDeployModalLocked()
+			return true
+		}
 		return false
 	}
 	switch keyEv.Rune() {
