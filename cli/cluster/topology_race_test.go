@@ -6,6 +6,7 @@ import (
 
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
 	nodev1 "github.com/znasllc-io/memql/component/node/gen"
+	"github.com/znasllc-io/memql/sdk/go/client"
 )
 
 // TestTopology_NoRaceUnderConcurrentMutate exercises the race the
@@ -60,6 +61,14 @@ func TestTopology_NoRaceUnderConcurrentMutate(t *testing.T) {
 					v.SetNodeTypes([]NodeTypeInfo{
 						{Name: "bff"}, {Name: "voice"}, {Name: "cognition"},
 					})
+					// Deployment-v2 strip mutators share the same mu;
+					// churn them too so the race detector covers the
+					// read side (snapshotForRace touches deployStatus /
+					// clusterRole).
+					v.SetClusterRole(client.RoleAdmin)
+					v.SetDeploymentStatus("staging", client.DeploymentStatus{
+						Env: "staging", Version: "v1", Argocd: client.ArgoStatus{SyncStatus: "Synced"},
+					})
 				}
 			}
 		}(w)
@@ -104,6 +113,13 @@ func snapshotForRace(v *View) (nodes int, types int, edges int, disc bool) {
 	}
 	for _, nt := range v.NodeTypes {
 		_ = nt.Name
+	}
+	// Deployment-v2 state is read by drawDeployStrip under the same
+	// RLock; touch it here so the race detector flags any unlocked
+	// SetDeploymentStatus / SetClusterRole write.
+	_ = v.clusterRole
+	for _, st := range v.deployStatus {
+		_ = st.Version
 	}
 	return
 }
