@@ -38,6 +38,7 @@ import (
 	"github.com/znasllc-io/memql-cockpit/cli/auth"
 	"github.com/znasllc-io/memql-cockpit/cli/config"
 	"github.com/znasllc-io/memql-cockpit/cli/crash"
+	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/internal/harness"
 	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/internal/lint"
 	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/internal/worker"
 )
@@ -97,6 +98,8 @@ func main() {
 			os.Exit(1)
 		case "lint":
 			os.Exit(lint.HandleCommand(os.Args[2:]))
+		case "harness":
+			os.Exit(harness.HandleCommand(os.Args[2:]))
 		case "help":
 			printUsage()
 			return
@@ -410,6 +413,7 @@ func printUsage() {
 	fmt.Println("  memql-cockpit worker <subcommand>      Run as a memql worker (computer-use)")
 	fmt.Println("  memql-cockpit creds <subcommand>       Inspect / migrate the credential store")
 	fmt.Println("  memql-cockpit lint [path]              Validate a .memql file or DSL tree")
+	fmt.Println("  memql-cockpit harness trace <planId>   Print a harness plan's execution timeline")
 	fmt.Println("")
 	fmt.Println("FIRST-TIME SETUP")
 	fmt.Println("  Launching the TUI on a machine with no ~/.memql/genesis.znas runs")
