@@ -11,7 +11,13 @@ import (
 	"github.com/gdamore/tcell/v2"
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
 	nodev1 "github.com/znasllc-io/memql/component/node/gen"
+	"github.com/znasllc-io/memql/sdk/go/client"
 )
+
+// deployEnvs is the fixed set of environments the deployment-v2 status
+// strip renders, top-to-bottom. #144 is read-only across both; a future
+// story (#145) may add a selector / per-env controls.
+var deployEnvs = []string{"staging", "prod"}
 
 // NodeInfo describes a cluster node for rendering. The Health field is the
 // proto-defined enum from component/node/node.proto -- the source of truth
@@ -91,6 +97,26 @@ type View struct {
 	// instead of the live grid. The navigator owns its own keys
 	// (arrows, Enter, Backspace, Esc); HandleEvent routes accordingly.
 	Arch *ArchView
+
+	// deployStatus is the last-known deployment-v2 status keyed by env
+	// ("staging" / "prod"). Populated by SetDeploymentStatus from the
+	// per-env poll (see app.go refreshDeployStatus); read under RLock
+	// in Draw. A missing key renders as "no data yet" for that env.
+	deployStatus map[string]client.DeploymentStatus
+
+	// clusterRole is the connected caller's cluster-wide role, mirrored
+	// from refreshMyAccess via SetClusterRole. The deployment strip is
+	// only rendered for owner/admin -- the GetDeploymentStatus RPC is
+	// owner/admin-gated server-side, so a non-admin caller would just
+	// get PermissionDenied. Lower roles see a single muted line instead.
+	clusterRole client.Role
+
+	// DeployClient returns a DeployControlClient bound to the currently
+	// active cluster's connection, or nil when none is connected. Wired
+	// in app.go's wireCluster() using the same closure pattern the other
+	// views use for their QueryClient. The poll loop calls this each tick
+	// so a cluster switch transparently retargets.
+	DeployClient func() *client.DeployControlClient
 }
 
 // SetDisconnected toggles the "stream lost" rendering override. Does not
@@ -136,6 +162,54 @@ func (v *View) SetNodeTypes(types []NodeTypeInfo) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.NodeTypes = types
+}
+
+// SetDeploymentStatus stores the latest deployment-v2 status for env
+// ("staging" / "prod"). Called from the per-env poll goroutine (see
+// app.go refreshDeployStatus). Guarded by the same mu that serializes
+// Draw, so a render can never see a torn map.
+func (v *View) SetDeploymentStatus(env string, st client.DeploymentStatus) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.deployStatus == nil {
+		v.deployStatus = make(map[string]client.DeploymentStatus, len(deployEnvs))
+	}
+	v.deployStatus[env] = st
+}
+
+// SetClusterRole mirrors the connected caller's cluster-wide role into
+// the view. Wired from refreshMyAccess alongside the Settings update.
+// Drives whether the deployment strip renders (owner/admin) or shows
+// the "owner/admin only" muted line (everyone else).
+func (v *View) SetClusterRole(r client.Role) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.clusterRole = r
+}
+
+// canViewDeploymentsLocked reports whether the caller's role admits the
+// deployment-v2 surface. Caller MUST hold v.mu (read or write).
+func (v *View) canViewDeploymentsLocked() bool {
+	return v.clusterRole == client.RoleOwner || v.clusterRole == client.RoleAdmin
+}
+
+// CanViewDeployments reports whether the connected caller's role admits
+// the deployment-v2 surface (owner/admin). Used by the app's poll loop
+// to avoid issuing the owner/admin-gated GetDeploymentStatus RPC for a
+// caller that would just get PermissionDenied. Takes the read lock.
+func (v *View) CanViewDeployments() bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.canViewDeploymentsLocked()
+}
+
+// DeployEnvs returns the fixed set of environments the deployment-v2
+// status strip renders. Exposed so the app's poll loop iterates the
+// same list the renderer does.
+func DeployEnvs() []string {
+	out := make([]string, len(deployEnvs))
+	copy(out, deployEnvs)
+	return out
 }
 
 // ApplyNodeUpdate merges a single-node change into the topology model. If
@@ -240,6 +314,11 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 	if len(v.Nodes) > 0 {
 		v.drawTopology(screen, bounds)
 	}
+
+	// Deployment-v2 status strip. Painted in a fixed band anchored
+	// just above the status bar so it never overlaps the topology's
+	// own status row. Stays inside the RLock frame.
+	v.drawDeployStrip(screen, bounds)
 
 	// Status bar at bottom.
 	statusY := bounds.Y + bounds.Height - 1

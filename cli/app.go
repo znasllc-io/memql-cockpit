@@ -28,9 +28,9 @@ import (
 	"github.com/znasllc-io/memql-cockpit/cli/skills"
 	"github.com/znasllc-io/memql-cockpit/cli/splash"
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
-	"github.com/znasllc-io/memql-cockpit/cli/workers"
 	genesiswizard "github.com/znasllc-io/memql-cockpit/cli/wizard/genesis"
 	"github.com/znasllc-io/memql-cockpit/cli/wizard/runlocal"
+	"github.com/znasllc-io/memql-cockpit/cli/workers"
 	corgenesis "github.com/znasllc-io/memql/component/genesis"
 	"github.com/znasllc-io/memql/component/node"
 	nodev1 "github.com/znasllc-io/memql/component/node/gen"
@@ -1209,6 +1209,16 @@ func (a *App) refreshMyAccess(clusterName string, conn *client.Connection) {
 			return
 		}
 		a.settingsView.SetMyAccess(clusterName, access)
+		// Mirror the cluster role onto the Topology view so the
+		// deployment-v2 strip knows whether to render the panel
+		// (owner/admin) or the muted "owner/admin only" line. Same
+		// access record, two consumers. A fresh role also lets the
+		// next refreshDeployStatus tick start (or stop) polling the
+		// owner/admin-gated GetDeploymentStatus RPC.
+		if a.clustersView != nil && a.clustersView.Topology != nil && access != nil {
+			a.clustersView.Topology.SetClusterRole(access.ClusterRole)
+			go a.refreshDeployStatus()
+		}
 		a.postRedraw()
 	}()
 }
@@ -1413,6 +1423,95 @@ func (a *App) wireCluster() {
 		}
 		return entry.snapshotNodes()
 	}
+
+	// DeployClient resolves a DeployControlClient against whichever
+	// cluster is active right now, so a cluster switch transparently
+	// retargets -- same closure pattern as the other views' QueryClient.
+	// Returns nil when no cluster is connected; refreshDeployStatus
+	// no-ops on nil. Per #144 the deployment-v2 status surface is
+	// read-only.
+	a.clustersView.Topology.DeployClient = func() *client.DeployControlClient {
+		a.poolMu.RLock()
+		name := a.selected
+		entry := a.pool[name]
+		a.poolMu.RUnlock()
+		if entry == nil {
+			return nil
+		}
+		entry.mu.Lock()
+		conn := entry.Conn
+		state := entry.State
+		entry.mu.Unlock()
+		if conn == nil || state != stateConnected {
+			return nil
+		}
+		return client.NewDeployControlClient(conn)
+	}
+
+	// Poll the deployment-v2 status on a periodic ticker. The loop
+	// self-gates on the connected caller's cluster role (owner/admin
+	// only) inside refreshDeployStatus.
+	go a.deployStatusRefreshLoop()
+}
+
+// deployStatusRefreshLoop periodically refreshes the deployment-v2
+// status strip in the Topology pane. It runs for the life of the app;
+// each tick calls refreshDeployStatus, which is a no-op unless a cluster
+// is connected AND the caller's role is owner/admin. The cadence mirrors
+// the architecture-metrics refresh -- deploy state changes on human
+// timescales, so a slow tick is correct.
+func (a *App) deployStatusRefreshLoop() {
+	// One eager refresh so the strip populates on first connect without
+	// waiting a full tick, then periodic.
+	a.refreshDeployStatus()
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-a.quitCh:
+			return
+		case <-ticker.C:
+			a.refreshDeployStatus()
+		}
+	}
+}
+
+// refreshDeployStatus fetches GetDeploymentStatus for each env
+// (staging, prod) and stores the result on the Topology view. Role
+// gating: GetDeploymentStatus is owner/admin-gated server-side, so we
+// only call it when the connected caller's cluster role is owner/admin
+// (mirrored onto the view via SetClusterRole from refreshMyAccess). A
+// PermissionDenied or any other error stores nothing for that env and
+// is logged at debug level -- never crashes the poll loop.
+func (a *App) refreshDeployStatus() {
+	if a.clustersView == nil || a.clustersView.Topology == nil {
+		return
+	}
+	topo := a.clustersView.Topology
+	if !topo.CanViewDeployments() {
+		return
+	}
+	if topo.DeployClient == nil {
+		return
+	}
+	dc := topo.DeployClient()
+	if dc == nil {
+		return
+	}
+	for _, env := range cluster.DeployEnvs() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		st, err := dc.GetDeploymentStatus(ctx, env)
+		cancel()
+		if err != nil {
+			if a.logger != nil {
+				a.logger.Debug("deploy status fetch failed",
+					"env", env, "error", err)
+			}
+			continue
+		}
+		topo.SetDeploymentStatus(env, st)
+	}
+	a.postRedraw()
 }
 
 // parseClusterNodeEvent converts an SDK Event carrying a
