@@ -4,6 +4,7 @@ package tools
 
 import (
 	"fmt"
+	"math"
 	"os/exec"
 	"os/user"
 	"strconv"
@@ -23,6 +24,12 @@ func applyShellSysProcAttr(cmd *exec.Cmd, limits ShellLimits) error {
 		uid, gid, err := lookupUIDGID(limits.RunAsUser)
 		if err != nil {
 			return fmt.Errorf("run_as_user %q: %w", limits.RunAsUser, err)
+		}
+		// Bound-check before narrowing to uint32: a uid/gid outside the
+		// unsigned 32-bit range would wrap silently
+		// (CodeQL go/incorrect-integer-conversion).
+		if uid < 0 || uid > math.MaxUint32 || gid < 0 || gid > math.MaxUint32 {
+			return fmt.Errorf("run_as_user %q: uid/gid %d/%d out of uint32 range", limits.RunAsUser, uid, gid)
 		}
 		attr.Credential = &syscall.Credential{
 			Uid: uint32(uid),
