@@ -50,7 +50,7 @@ jobs:
           cache: true
           cache-dependency-path: memql-cockpit/go.sum
       - name: install cyclonedx-gomod
-        run: go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@latest
+        run: go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.10.0
       - name: generate SBOM
         working-directory: memql-cockpit
         run: |
