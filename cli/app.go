@@ -16,6 +16,7 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/znasllc-io/memql-cockpit/cli/auth"
+	"github.com/znasllc-io/memql-cockpit/cli/bundles"
 	"github.com/znasllc-io/memql-cockpit/cli/chat"
 	"github.com/znasllc-io/memql-cockpit/cli/cluster"
 	"github.com/znasllc-io/memql-cockpit/cli/concepts"
@@ -91,6 +92,7 @@ type App struct {
 	clustersView *cluster.ClustersView
 	plannerView  *planner.View
 	skillsView   *skills.View
+	bundlesView  *bundles.View
 	chatView     *chat.View
 	workersView  *workers.View
 	safetyView   *safety.View
@@ -133,6 +135,7 @@ func NewApp(cfg AppConfig) *App {
 	clustersView := cluster.NewClustersView(theme)
 	plannerView := planner.NewView(theme)
 	skillsView := skills.NewView(theme)
+	bundlesView := bundles.NewView(theme)
 	chatView := chat.NewView(theme)
 	workersView := workers.NewView(theme)
 	safetyView := safety.NewView(theme)
@@ -157,6 +160,7 @@ func NewApp(cfg AppConfig) *App {
 		ui.Tab{Name: "Skills", Content: skillsView},
 		ui.Tab{Name: "Workers", Content: workersView},
 		ui.Tab{Name: "Safety", Content: safetyView},
+		ui.Tab{Name: "Bundles", Content: bundlesView},
 		ui.Tab{Name: "Settings", Content: settingsView},
 	)
 	tabBar.SetActive(0)
@@ -175,6 +179,7 @@ func NewApp(cfg AppConfig) *App {
 		clustersView:  clustersView,
 		plannerView:   plannerView,
 		skillsView:    skillsView,
+		bundlesView:   bundlesView,
 		chatView:      chatView,
 		workersView:   workersView,
 		safetyView:    safetyView,
@@ -597,6 +602,7 @@ func (a *App) connect() {
 	a.wireCluster()
 	a.wirePlanner()
 	a.wireSkills()
+	a.wireBundles()
 	a.wireChat()
 	a.wireWorkers()
 	a.wireSafety()
@@ -1348,6 +1354,36 @@ func (a *App) wireSkills() {
 		}
 	}
 	a.skillsView.StartRefreshLoop(a.quitCh, 30*time.Second)
+}
+
+// wireBundles connects the Bundles tab to the gRPC client. The view
+// polls queryAuthoringBundlesForOwner every 15s -- authored bundles land
+// post-hoc as everyday tasks complete (memql#1161), so a steady cadence
+// surfaces a freshly-captured bundle shortly after its task finishes,
+// without the churn of the chat/planner loops.
+func (a *App) wireBundles() {
+	if a.bundlesView == nil {
+		return
+	}
+	getQueries := func() *client.QueryClient {
+		d := a.activeDispatcher()
+		if d == nil {
+			return nil
+		}
+		return client.NewQueryClient(d)
+	}
+	a.bundlesView.QueryClient = getQueries
+	a.bundlesView.OnStatus = func(msg string) {
+		if a.notifications != nil {
+			a.notifications.Sync("bundles", ui.SeverityWarning, msg)
+		}
+	}
+	a.bundlesView.OnRedraw = func() {
+		if a.screen != nil {
+			a.screen.PostEvent(tcell.NewEventInterrupt(nil))
+		}
+	}
+	a.bundlesView.StartRefreshLoop(a.quitCh, 15*time.Second)
 }
 
 // wireSafety connects the Command Safety tab to the gRPC client.
@@ -2102,9 +2138,9 @@ func (a *App) wireClustersCallbacks() {
 }
 
 // updateTabGating sets the GatedMessage on the cluster-dependent tabs
-// (Concepts, Planner, Skills) based on whether the user's selected
-// cluster has a live connection. Called from draw() so state changes
-// show up on the next repaint.
+// (Concepts, Planner, Skills, Safety, Bundles) based on whether the
+// user's selected cluster has a live connection. Called from draw() so
+// state changes show up on the next repaint.
 func (a *App) updateTabGating() {
 	setGated := func(msg string) {
 		a.conceptsView.GatedMessage = msg
@@ -2116,6 +2152,9 @@ func (a *App) updateTabGating() {
 		}
 		if a.safetyView != nil {
 			a.safetyView.GatedMessage = msg
+		}
+		if a.bundlesView != nil {
+			a.bundlesView.GatedMessage = msg
 		}
 	}
 	name := a.selectedName()

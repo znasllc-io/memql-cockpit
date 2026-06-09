@@ -158,9 +158,21 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
    FP/FN data instead of by gut feel. Polls
    `queryAllSafetyClassifications` every 5s. Per memql-cockpit#134.
    Gated on a connected, selected cluster.
-8. **Settings (F8)** -- credentials, theme, version
+8. **Bundles (F8)** -- read-only browser for the planner-authored
+   automation bundles (`v1:authoring:bundle` + `v1:authoring:construct`)
+   the authoring capture spine (memql#1160 / #1161) produces -- one
+   reproducible, inspectable bundle per completed everyday task. Left
+   pane lists the caller's bundles (newest first); the detail pane shows
+   the bundle's lifecycle metadata + the raw authored `.memql` source of
+   every member construct. `X` exports the selected bundle's source to
+   `~/.memql/bundles/<bundleId>/` (one `.memql` per construct + a
+   MANIFEST). Polls `queryAuthoringBundlesForOwner` every 15s; member
+   constructs load lazily per selected bundle via
+   `queryAuthoringConstructsForBundle`. Gated on a connected, selected
+   cluster. Per memql#1162.
+9. **Settings (F9)** -- credentials, theme, version
 
-Concepts, Planner, Skills, Chat, and Safety are all gated on a
+Concepts, Planner, Skills, Chat, Safety, and Bundles are all gated on a
 connected, selected cluster -- they show a placeholder message
 until the user presses Enter on a cluster row in the Clusters tab.
 Workers is NOT gated on a cluster -- it speaks to the local worker
@@ -318,6 +330,7 @@ via `Cancel()` does NOT trigger reconnect; only `Unexpected()` does.
 | `chat/`                  | Chat tab (space list + utterance scroll + `v`:PTT via memql-sdk-go voice.PushToTalk) |
 | `workers/`               | Workers tab (computer-use consent dashboard + live audit tail; subscribes to `~/.memql/worker.sock`). Hosts the global Ctrl+E kill switch path. |
 | `safety/`                | Safety tab (`v1:safety:classification` decision list + filters + drill-down; polls `queryAllSafetyClassifications`). |
+| `bundles/`               | Bundles tab (read-only `v1:authoring:bundle` list + per-construct authored `.memql` source viewer + `X`:export-to-files; polls `queryAuthoringBundlesForOwner`, lazy `queryAuthoringConstructsForBundle`). |
 | `editor/`                | Reusable text editor with Sense integration                   |
 | `settings/`              | Settings tab                                                  |
 | `ui/`                    | Theme, screen, tab bar, layout primitives                     |
