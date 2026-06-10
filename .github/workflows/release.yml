@@ -33,6 +33,10 @@ jobs:
         with:
           go-version-file: memql-cockpit/go.mod
 
+      - name: Tidy modules (sync go.mod/go.sum with the memql sibling)
+        working-directory: memql-cockpit
+        run: go mod tidy
+
       - name: Build all platforms (headless)
         working-directory: memql-cockpit
         run: make cockpit-all-platforms
