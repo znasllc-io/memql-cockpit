@@ -1,0 +1,44 @@
+name: Release binaries
+
+# Builds the cross-platform memql-cockpit binaries and attaches them to each
+# GitHub Release so memql.io/install.sh can download them. Names match the
+# Makefile's make cockpit-all-platforms outputs.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to attach binaries to"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build all platforms (headless)
+        run: make cockpit-all-platforms
+
+      - name: Upload binaries to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          gh release upload "$TAG" \
+            bin/memql-cockpit-darwin-arm64 \
+            bin/memql-cockpit-darwin-amd64 \
+            bin/memql-cockpit-linux-amd64 \
+            bin/memql-cockpit-linux-arm64 \
+            --clobber
