@@ -25,7 +25,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: znasllc-io/memql
-          ref: 3ce7947a12798454076032f5d2cbf3da9bf3de65
+          ref: main
           path: memql
 
       - name: Set up Go
