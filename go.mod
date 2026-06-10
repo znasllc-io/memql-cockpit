@@ -8,7 +8,7 @@ require (
 	github.com/gen2brain/malgo v0.11.25
 	github.com/go-vgo/robotgo v1.0.2
 	github.com/znasllc-io/memql v0.0.0-20260521223032-3ce7947a1279
-	golang.org/x/sys v0.45.0
+	golang.org/x/sys v0.46.0
 	golang.org/x/term v0.43.0
 	google.golang.org/grpc v1.81.1
 	google.golang.org/protobuf v1.36.11
