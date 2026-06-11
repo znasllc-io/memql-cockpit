@@ -22,11 +22,14 @@ import (
 // (capabilities_gui.go) derives its advertised action list from it,
 // so the two can never drift (memql-cockpit#162).
 //
-// window_list / window_focus are deliberately absent: they're
-// unsupported_on_platform stubs today (see dispatchComputer) and
-// must not be advertised until they ship for real. The
-// `capabilities` action is also absent -- it's build-agnostic and
+// The `capabilities` action is absent -- it's build-agnostic and
 // routed by the dispatcher before this table is consulted.
+//
+// window_list / window_focus (memql-cockpit#167) are real on macOS
+// (CGWindowList) and Linux/X11 (EWMH); on Wayland and other gui
+// platforms their handlers return a structured
+// unsupported_on_platform failure -- consumers should read the
+// descriptor's displayServer field alongside the action list.
 var computerActionHandlers = map[string]func(map[string]any) (*memqlv1.Success, *memqlv1.Failure){
 	"screenshot":      guiScreenshot,
 	"cursor_position": guiCursorPosition,
@@ -37,6 +40,8 @@ var computerActionHandlers = map[string]func(map[string]any) (*memqlv1.Success, 
 	"key_type":        guiKeyType,
 	"key_combo":       guiKeyCombo,
 	"display_info":    guiDisplayInfo,
+	"window_list":     guiWindowList,
+	"window_focus":    guiWindowFocus,
 }
 
 // dispatchComputer routes workerComputer.<action> to the matching
@@ -51,12 +56,6 @@ func (d *Dispatcher) dispatchComputer(ctx context.Context, action string, args m
 	_ = ctx
 	if handler, ok := computerActionHandlers[action]; ok {
 		return handler(args)
-	}
-	switch action {
-	case "window_list":
-		return guiWindowList(args)
-	case "window_focus":
-		return guiWindowFocus(args)
 	}
 	return nil, &memqlv1.Failure{
 		ErrorCode:    "unknown_action",
@@ -81,19 +80,10 @@ func (d *Dispatcher) dispatchComputer(ctx context.Context, action string, args m
 // emitted/captured ratio, logicalWidth/logicalHeight the RobotGo
 // input-space dims (the requested w/h for region captures).
 func guiScreenshot(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
-	// Per-call TCC preflight: confirm the Screen Recording grant is
-	// still in place. The setup wizard probes this once at first
-	// run; if the user later revokes the grant from System Settings
-	// -> Privacy -> Screen Recording, the next screenshot would
-	// otherwise return an empty / black image with no clear error.
-	// The hook is set by the darwin && gui build at init time; on
-	// every other platform it's nil and we skip.
-	if ScreenCapturePreflightHook != nil && !ScreenCapturePreflightHook() {
-		return nil, failure("permission_denied",
-			"Screen Recording permission is not granted for this binary. "+
-				"Open System Settings -> Privacy & Security -> Screen Recording, "+
-				"enable memql-cockpit-gui, then re-run.")
-	}
+	// The per-call Screen Recording TCC preflight runs in the
+	// dispatcher's preflightComputerAction (preflight.go) before this
+	// handler is reached, alongside the Accessibility + display-server
+	// gates (memql-cockpit#164).
 	format := strings.ToLower(strings.TrimSpace(argString(args, "format")))
 	if format == "" {
 		format = "png"
@@ -348,26 +338,9 @@ func guiDisplayInfo(_ map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	}, fmt.Sprintf("%dx%d", width, height), 0), nil
 }
 
-// guiWindowList and guiWindowFocus depend on robotgo's Window
-// helpers; coverage varies by platform (full on macOS via
-// applescript; partial on Linux). MVP returns "unsupported" on
-// platforms where the window API isn't reliable; the slot stays
-// here so future versions can wire in window enumeration without
-// touching the dispatcher.
-func guiWindowList(_ map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
-	return nil, &memqlv1.Failure{
-		ErrorCode:    "unsupported_on_platform",
-		ErrorMessage: "window_list not yet supported on this build; track via Phase 7+ window-API polish",
-	}
-}
-
-func guiWindowFocus(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
-	_ = args
-	return nil, &memqlv1.Failure{
-		ErrorCode:    "unsupported_on_platform",
-		ErrorMessage: "window_focus not yet supported on this build; track via Phase 7+ window-API polish",
-	}
-}
+// guiWindowList / guiWindowFocus live in window_gui.go with their
+// platform backends in window_gui_{darwin,linux,other}.go
+// (memql-cockpit#167).
 
 // successComputerJSON moved to capabilities.go (untagged) so the
 // build-agnostic capabilities handler can share it.

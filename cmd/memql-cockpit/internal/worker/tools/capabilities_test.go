@@ -166,9 +166,11 @@ func TestDispatcher_CapabilitiesGatedAsObserve(t *testing.T) {
 // TestDispatcher_OtherComputerActionsStillGuiUnavailable pins the
 // headless build's pre-existing behavior for every NON-capabilities
 // workerComputer action: gui_unavailable, not a silent success.
+// window_list / window_focus are real on the gui build since
+// memql-cockpit#167 but must stay gui_unavailable here.
 func TestDispatcher_OtherComputerActionsStillGuiUnavailable(t *testing.T) {
 	d := NewDispatcher(quietLogger(), DefaultPolicy(), nil)
-	for _, action := range []string{"screenshot", "mouse_click", "display_info"} {
+	for _, action := range []string{"screenshot", "mouse_click", "display_info", "window_list", "window_focus"} {
 		dispatch := &memqlv1.ToolDispatch{
 			Tool:     "workerComputer",
 			Action:   action,

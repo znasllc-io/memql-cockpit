@@ -170,8 +170,17 @@ func (d *Dispatcher) Dispatch(ctx context.Context, dispatch *memqlv1.ToolDispatc
 		// (guiAvailable=false, actions=[]) instead of rejecting
 		// with gui_unavailable. It is the one workerComputer action
 		// that must work on every build variant.
+		//
+		// Every other workerComputer action runs the per-call
+		// platform preflights first (memql-cockpit#164): macOS TCC
+		// (Accessibility for input, Screen Recording for screenshot)
+		// and the Linux display-server check. A failed preflight
+		// short-circuits with a structured remediation hint instead
+		// of letting RobotGo fail or panic downstream.
 		if action == computerCapabilitiesAction {
 			success, failure = runComputerCapabilities()
+		} else if fail := preflightComputerAction(action); fail != nil {
+			failure = fail
 		} else {
 			success, failure = d.dispatchComputer(ctx, action, args)
 		}

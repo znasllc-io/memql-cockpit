@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/go-vgo/robotgo"
+
+	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/internal/worker/tools"
 )
 
 // runSetupWizard is the macOS / Linux X11 permissions pre-flight.
@@ -103,6 +105,7 @@ func runSetupMacOS() error {
 	bundleHasAccess := tccCheck("Accessibility", binPath)
 	fmt.Printf("  per-binary grant: %s\n", bundleHasAccess)
 	if !accessOK {
+		fmt.Println("  Accessibility preflight: FAIL")
 		fmt.Println()
 		fmt.Println("  Accessibility is DENIED in this process tree.")
 		fmt.Println("  Open System Settings -> Privacy & Security -> Accessibility")
@@ -120,7 +123,7 @@ func runSetupMacOS() error {
 			return errors.New("Accessibility still denied after approval -- restart the binary or check System Settings")
 		}
 	}
-	fmt.Println("  Accessibility: OK")
+	fmt.Println("  Accessibility preflight: PASS")
 	fmt.Println()
 
 	fmt.Println("Step 2/3: Screen Recording")
@@ -130,6 +133,7 @@ func runSetupMacOS() error {
 	bundleHasSR := tccCheck("ScreenCapture", binPath)
 	fmt.Printf("  per-binary grant: %s\n", bundleHasSR)
 	if !srOK {
+		fmt.Println("  Screen Recording preflight: FAIL")
 		fmt.Println()
 		fmt.Println("  Screen Recording is DENIED in this process tree.")
 		fmt.Println("  Open System Settings -> Privacy & Security -> Screen Recording")
@@ -146,7 +150,7 @@ func runSetupMacOS() error {
 			return errors.New("Screen Recording still denied after approval -- macOS sometimes requires a binary restart; re-run setup")
 		}
 	}
-	fmt.Println("  Screen Recording: OK")
+	fmt.Println("  Screen Recording preflight: PASS")
 	fmt.Println()
 
 	fmt.Println("Step 3/3: Validate")
@@ -182,7 +186,20 @@ func runSetupMacOS() error {
 // with a clear message than freeze the wizard.
 //
 // Returns (granted, human-readable detail).
+//
+// On darwin the active probe is combined with the AXIsProcessTrusted
+// preflight (accessibility_preflight_darwin.go) -- the exact check
+// the dispatcher enforces before every input action -- so the
+// wizard's verdict can't disagree with runtime gating. On linux the
+// display-server detection runs first: on a Wayland or display-less
+// session the XTEST probe below would fail confusingly, so the
+// wizard answers from the same detection the dispatcher uses.
 func probeAccessibility() (bool, string) {
+	if runtime.GOOS == "linux" {
+		if server := tools.DetectDisplayServer(); server != "x11" {
+			return false, fmt.Sprintf("display server %q -- RobotGo requires an X11 session; input actions will return display_server_unsupported", server)
+		}
+	}
 	type result struct {
 		ok     bool
 		detail string
@@ -208,7 +225,17 @@ func probeAccessibility() (bool, string) {
 	}()
 	select {
 	case r := <-resCh:
-		return r.ok, r.detail
+		ok, detail := r.ok, r.detail
+		if runtime.GOOS == "darwin" {
+			// Per-call dispatch gating uses AXIsProcessTrusted, so
+			// the wizard verdict must factor it in: an active probe
+			// that succeeds via an inherited grant does not help if
+			// the AX preflight will deny every input dispatch.
+			trusted := preflightAccessibilityAccess()
+			detail = fmt.Sprintf("AXIsProcessTrusted=%t; %s", trusted, detail)
+			ok = ok && trusted
+		}
+		return ok, detail
 	case <-time.After(5 * time.Second):
 		return false, "probe timed out after 5s -- press R to re-probe after confirming Accessibility entry"
 	}
@@ -230,6 +257,11 @@ func probeAccessibility() (bool, string) {
 // preflight against; downstream capture failures surface as runtime
 // errors rather than pre-flight denials.
 func probeScreenRecording() (bool, string) {
+	if runtime.GOOS == "linux" {
+		if server := tools.DetectDisplayServer(); server != "x11" {
+			return false, fmt.Sprintf("display server %q -- RobotGo requires an X11 session; screenshot will return display_server_unsupported", server)
+		}
+	}
 	type result struct {
 		ok     bool
 		detail string
@@ -294,30 +326,45 @@ func firstLine(s string) string {
 }
 
 func runSetupLinux() error {
-	display := os.Getenv("DISPLAY")
-	wayland := os.Getenv("WAYLAND_DISPLAY")
-	if wayland != "" && display == "" {
-		fmt.Println("Wayland detected (WAYLAND_DISPLAY set, DISPLAY unset).")
-		fmt.Println("RobotGo's open-source build targets X11 only.")
+	// Step 1: the display-server preflight -- the exact detection the
+	// dispatcher enforces per call (tools.DetectDisplayServer, wired
+	// via display_preflight_linux.go), so the wizard's verdict can't
+	// disagree with runtime gating.
+	fmt.Println("Step 1/2: Display server")
+	fmt.Println(strings.Repeat("-", 60))
+	switch server := tools.DetectDisplayServer(); server {
+	case "x11":
+		fmt.Printf("  Display server preflight: PASS (x11, DISPLAY=%s)\n", os.Getenv("DISPLAY"))
+	case "wayland":
+		fmt.Println("  Display server preflight: FAIL (wayland session)")
 		fmt.Println()
-		fmt.Println("Action: register the worker as HEADLESS-only by leaving")
-		fmt.Println("the GUI capability out of ~/.memql/worker.yaml. The")
-		fmt.Println("install-linux.sh installer detects Wayland and does")
-		fmt.Println("this for you.")
+		fmt.Println("  RobotGo drives X11 only. On this session every")
+		fmt.Println("  workerComputer input + screenshot action will return")
+		fmt.Println("  display_server_unsupported.")
+		fmt.Println()
+		fmt.Println("  Action: log into an X11 (Xorg) session to enable GUI")
+		fmt.Println("  actions, or register the worker HEADLESS-only (the")
+		fmt.Println("  install-linux.sh installer detects Wayland and does")
+		fmt.Println("  this for you).")
 		return nil
+	default:
+		fmt.Printf("  Display server preflight: FAIL (%s)\n", server)
+		return errors.New("setup: no display server detected (DISPLAY unset); X11 unreachable")
 	}
-	if display == "" {
-		return errors.New("setup: DISPLAY env var is unset; X11 unreachable")
-	}
-	fmt.Printf("X11 DISPLAY=%s\n", display)
+	fmt.Println()
+
+	fmt.Println("Step 2/2: Input + screenshot probes")
+	fmt.Println(strings.Repeat("-", 60))
 	startX, startY := robotgo.Location()
 	robotgo.MoveRelative(2, 0)
 	robotgo.MilliSleep(40)
 	midX, midY := robotgo.Location()
 	robotgo.Move(startX, startY)
 	if midX == startX && midY == startY {
+		fmt.Println("  Input probe: FAIL")
 		return fmt.Errorf("X11: cursor MoveRelative did not move; check XTEST + DISPLAY auth (Xauth/cookie)")
 	}
+	fmt.Println("  Input probe: PASS (cursor moved + restored)")
 	tmp, err := os.CreateTemp("", "worker-setup-probe-*.png")
 	if err != nil {
 		return fmt.Errorf("temp file: %w", err)
@@ -326,14 +373,15 @@ func runSetupLinux() error {
 	_ = tmp.Close()
 	defer os.Remove(tmpPath)
 	if err := robotgo.SaveCapture(tmpPath, 0, 0, 16, 16); err != nil {
+		fmt.Println("  Screenshot probe: FAIL")
 		return fmt.Errorf("X11 screenshot probe: %w", err)
 	}
 	stat, err := os.Stat(tmpPath)
 	if err != nil || stat.Size() < 200 {
+		fmt.Println("  Screenshot probe: FAIL")
 		return fmt.Errorf("X11 screenshot suspiciously small (%d bytes)", stat.Size())
 	}
-	fmt.Printf("  cursor: moved + restored\n")
-	fmt.Printf("  screenshot: %d bytes\n", stat.Size())
+	fmt.Printf("  Screenshot probe: PASS (%d bytes)\n", stat.Size())
 	fmt.Println()
 	fmt.Println("SUCCESS: X11 permissions look good.")
 	return nil

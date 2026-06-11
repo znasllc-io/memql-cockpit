@@ -13,9 +13,11 @@ const buildHasGUI = true
 // uses (computer_gui.go) -- so the descriptor can never drift from
 // what the router actually serves. Sorted for a stable wire shape.
 //
-// window_list / window_focus are NOT handlers in that table today
-// (they're explicit unsupported_on_platform stubs), so they are
-// correctly absent here until they ship for real.
+// window_list / window_focus are advertised since memql-cockpit#167
+// shipped real implementations (macOS CGWindowList, Linux/X11 EWMH).
+// On a Wayland session they return a structured
+// unsupported_on_platform failure at call time -- the descriptor's
+// displayServer field is the up-front signal for that.
 func supportedComputerActions() []string {
 	out := make([]string, 0, len(computerActionHandlers))
 	for action := range computerActionHandlers {
