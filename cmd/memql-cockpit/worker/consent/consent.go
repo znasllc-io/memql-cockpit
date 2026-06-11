@@ -39,12 +39,13 @@ const DefaultApprovalTimeout = 30 * time.Second
 // TUI pane).
 //
 // ClassObserve is the read-side: fs_read / fs_list / fs_stat /
-// http_fetch / workerComputer.{screenshot,capabilities,window_list,
-// wait}.
+// http_fetch / workerComputer.{screenshot,cursor_position,
+// display_info,capabilities,window_list,wait}.
 //
 // ClassInteract is the write-side: exec / fs_write /
 // workerComputer.{mouse_click,mouse_down,mouse_up,mouse_move,
-// key_type,key_press,key_hold,window_focus}.
+// mouse_drag,mouse_scroll,key_type,key_press,key_hold,key_combo,
+// window_focus}.
 //
 // ClassUnknown is the safety net for unknown (tool, action) pairs;
 // they're treated as ClassInteract for gate purposes (deny-by-
@@ -493,7 +494,12 @@ func Classify(tool, action string) Class {
 		// metadata without touching anything -- observe-class.
 		// wait (memql-cockpit#166) is a bounded sleep: posts no
 		// input, reads nothing -- observe-class.
-		case "screenshot", "capabilities", "window_list", "wait":
+		// cursor_position / display_info read pointer + display
+		// metadata without touching anything -- observe-class
+		// (matches the memql-side scope.go classification,
+		// memql-cockpit#179).
+		case "screenshot", "capabilities", "window_list", "wait",
+			"cursor_position", "display_info":
 			return ClassObserve
 		// window_focus (memql-cockpit#167) re-orders the user's
 		// desktop (raises a window, steals focus) -- interact-class,
@@ -501,8 +507,13 @@ func Classify(tool, action string) Class {
 		// default.
 		// key_hold / mouse_down / mouse_up (memql-cockpit#166) post
 		// synthetic input -- interact-class.
+		// key_combo / mouse_drag / mouse_scroll also post synthetic
+		// input -- interact-class, made explicit rather than riding
+		// the unknown->interact default (memql-cockpit#179).
 		case "mouse_click", "mouse_down", "mouse_up", "mouse_move",
-			"key_type", "key_press", "key_hold", "window_focus":
+			"mouse_drag", "mouse_scroll",
+			"key_type", "key_press", "key_hold", "key_combo",
+			"window_focus":
 			return ClassInteract
 		}
 	}
