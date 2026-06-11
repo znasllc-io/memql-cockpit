@@ -31,8 +31,8 @@ memQL Cockpit is the terminal-native IDE and operations console for [memQL](http
 
 - **Multi-tab TUI** — clusters, chat, concepts, planner, settings — all in one terminal; the unified Concepts tab consumes `@displayCard` hints to render rows nicely per concept
 - **DSL editor + linter** — write `.memql` files with structured validation
-- **Worker modes** — `computer_use_headless` and `computer_use_embodied` bring computer use into the platform as per-user workers
-- **GUI variant** — opt-in CGO build with screenshot, mouse, and keyboard via RobotGo
+- **Worker modes** — per-user workers bring computer use into the platform: `HEADLESS` (shell / fs / http tools) on every build, `GUI` on the gui variant
+- **GUI variant** — opt-in CGO build with screenshot, mouse, keyboard, and window control via RobotGo; see [docs/computer-use.md](docs/computer-use.md)
 - **Service install** — register as a LaunchAgent (macOS) or systemd user service (Linux)
 - **gRPC client** — talks to memQL cluster nodes; no engine embedded
 
@@ -60,7 +60,7 @@ hub compatibility matrix.
 
 ```bash
 ./bin/memql-cockpit                # main IDE (multi-tab TUI)
-./bin/memql-cockpit worker run     # run as a per-user worker (computer_use_headless / computer_use_embodied)
+./bin/memql-cockpit worker run     # run as a per-user worker (HEADLESS; the gui build adds GUI)
 ./bin/memql-cockpit-gui worker setup  # one-time GUI worker setup wizard
 ```
 
@@ -68,101 +68,53 @@ Cluster config lives at `~/.memql/clusters.yaml`; worker config at
 `~/.memql/worker.yaml`. The install scripts under `scripts/install/`
 register a LaunchAgent (macOS) or systemd user service (Linux).
 
-### Worker platform requirements
+### Computer use
+
+The worker's computer-use surface (`workerComputer.*`: screenshot,
+mouse, keyboard, window control, displays, capabilities) is
+documented in **[docs/computer-use.md](docs/computer-use.md)** --
+architecture, the full 16-action vocabulary, the coordinate model,
+the capability descriptor, the platform support matrix, permission
+setup, and troubleshooting. The short version:
 
 - **macOS** -- the GUI worker needs two TCC grants for the
   `memql-cockpit-gui` binary under System Settings -> Privacy &
   Security: **Accessibility** (mouse + keyboard) and **Screen
-  Recording** (screenshots). `worker setup` probes both, and the
-  worker re-checks them on every dispatch, so a grant revoked
-  mid-session surfaces as a structured `permission_denied` with a
-  remediation hint instead of a raw RobotGo failure.
-- **Linux** -- RobotGo drives **X11 only**; an X11 (Xorg) session is
-  required. On a Wayland session (or with no display at all) the
-  worker returns `display_server_unsupported` for input + screenshot
-  actions; register it HEADLESS-only there (`install-linux.sh`
-  detects Wayland and does this automatically). Building the GUI
-  variant needs `gcc` plus `libxtst-dev`, `libxinerama-dev`,
-  `libxkbcommon-dev`, and `libpng-dev` (Debian/Ubuntu package names);
-  the matching runtime libraries must be present on the host.
+  Recording** (screenshots). `worker setup` probes both; the worker
+  re-checks them on every dispatch, so a mid-session revocation
+  surfaces as a structured `permission_denied` with a remediation
+  hint.
+- **Linux** -- RobotGo drives **X11 only**; on Wayland (or with no
+  display) input + screenshot actions return
+  `display_server_unsupported` -- register HEADLESS-only there
+  (`install-linux.sh` detects Wayland and does this automatically).
+  Building the GUI variant needs `gcc` plus the X11 dev packages
+  listed in [docs/computer-use.md](docs/computer-use.md).
 
 ### Computer-use consent gate
 
-Every `workerHost` / `workerComputer` tool call dispatched against a
-running worker passes through a **per-host consent gate**. Without
-an active operator-granted window, the worker rejects the call with
-`consent_required` -- the agent cannot drive shell / fs / mouse /
-keyboard on your machine until you say so.
-
-The worker starts a local control socket at
-`~/.memql/worker.sock` (mode 0600, owner-only). Use the
-`memql-cockpit worker consent ...` subcommand from a different
-terminal to manage windows:
+Every `workerHost` / `workerComputer` tool call passes through a
+**per-host consent gate**: without an active operator-granted window
+the worker rejects the call with `consent_required`. Manage windows
+over the local control socket (`~/.memql/worker.sock`, mode 0600):
 
 ```bash
-memql-cockpit worker consent grant --window=1h     # open a 1-hour window
-memql-cockpit worker consent grant --window=5m     # open a 5-minute window
-memql-cockpit worker consent revoke                # close immediately
-memql-cockpit worker consent status                # show current state
-memql-cockpit worker consent watch                 # live tail of grant/revoke/dispatch events
+memql-cockpit worker consent grant --window=1h [--strict]  # open a window
+memql-cockpit worker consent revoke                        # close immediately
+memql-cockpit worker consent status                        # show current state
+memql-cockpit worker consent watch                         # live event tail
 ```
 
-The `--strict` flag on `grant` enables **per-action approval** on
-the high-risk subset (`workerComputer.key_type` +
-`workerComputer.mouse_click`). When strict is on, those two actions
-block on a per-call approval -- the worker emits an
-`approval_requested` event over `watch`, the operator clicks Allow
-or Deny in the Workers tab, and the worker either admits or rejects
-the call. Approvals time out and default to deny after 30 seconds.
-Revoking the consent window also cancels every pending approval.
-
-Other ClassInteract actions (`exec`, `fs_write`, `mouse_move`,
-`key_press`) stay admitted by the standing window under strict
-mode -- typed text and mouse clicks are the calls the spec singles
-out as load-bearing for the second consent decision.
-
-**Region exemption.** A strict grant can carry an optional
-screen-coordinate region rect. A `mouse_click` whose cursor falls
-INSIDE the region is admitted without the per-action approval
-modal -- the operator pre-authorised that zone of the screen.
-Clicks outside the region still pop the Allow/Deny modal.
-`key_type` has no cursor coordinate, so the region exemption never
-applies to it -- typed text stays fully gated under strict mode.
-The region is set in the Workers-tab Grant flow (see below); the
-CLI `grant` path always uses plain strict mode (no region).
-
-#### Workers tab (in-cockpit dashboard)
-
-The Workers tab (F5) is the in-cockpit surface for the same gate.
-It maintains a long-lived `watch` connection to `~/.memql/worker.sock`
-and renders:
-
-- The current consent state (granted / no consent / offline) plus
-  expiry, window length, and the strict flag.
-- A live tail of every worker dispatch (allowed + denied), newest
-  first, capped at 256 entries.
-- In-pane Grant / Revoke: `G` opens a duration picker
-  (5 min / 1 hour / 8 hours), `S` toggles strict before submitting,
-  `Enter` grants; `R` revokes immediately.
-- **Region picker** (strict grants only): after toggling strict on,
-  `Enter` opens a region picker — a schematic of the screen with a
-  box you move with the arrow keys and resize with Shift+Arrows.
-  `Enter` grants with that region as the in-region exemption rect;
-  `N` skips the region (strict grant that gates every high-risk
-  call); `Esc` steps back to the duration picker.
-- **Strict-mode per-action approval**: when a strict window is open
-  and the agent calls `key_type`, or a `mouse_click` outside the
-  region, the worker blocks and the tab pops a modal naming the
-  tool + action. Press `A` to ALLOW once, `D` to DENY. Multiple
-  pending approvals queue FIFO; the modal cycles through them as
-  you respond.
-
-A global kill switch — **`Ctrl+E` from any tab** — calls the same
-`revoke` op without making the user switch to the Workers tab
-first. The notification feed surfaces the outcome. Revoke cancels
-every pending strict-mode approval too.
-
-Reference: memql-cockpit#64.
+`--strict` adds **per-action approval** on the high-risk subset
+(`key_type`, `key_hold`, `mouse_click`, `mouse_down`, `mouse_up`):
+those calls block until the operator clicks Allow or Deny in the
+Workers tab (F6), timing out to deny after 30 seconds. A strict grant
+made from the Workers tab can carry a screen-region rect that
+pre-authorises in-region `mouse_click`s. A global kill switch
+(`Ctrl+E` from any tab) revokes the window and cancels pending
+approvals. Details, including the Workers-tab dashboard and region
+picker: [docs/computer-use.md](docs/computer-use.md) and
+memql-cockpit#64.
 
 ### Credential storage
 

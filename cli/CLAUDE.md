@@ -128,7 +128,9 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
    dispatch (newest first, capped at 256). `G` opens the duration
    picker, `R` revokes immediately. **Strict-mode per-action
    approval** (64-B): when the granted window has `strict=true` and
-   the agent dispatches `workerComputer.key_type` or `.mouse_click`,
+   the agent dispatches a high-risk `workerComputer` action
+   (`key_type`, `key_hold`, `mouse_click`, `mouse_down`, `mouse_up`
+   -- see `worker/consent/consent.go` `isHighRiskAction`),
    the worker blocks awaiting an Allow/Deny in this tab. A modal
    overlay names the tool + action; `A` allows once, `D` denies.
    Pending approvals queue FIFO and the modal cycles as the operator
@@ -140,10 +142,12 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
    screen + an arrow-key-movable / Shift+Arrow-resizable box);
    `Enter` grants with the region, `N` skips it, `Esc` steps back.
    A `mouse_click` whose cursor is inside the region skips the
-   approval gate; out-of-region clicks + all `key_type` still gate.
-   The region is a static rect in a fixed 1920x1080 reference space
-   -- the worker has no window-bounds API yet (window_list /
-   window_focus are stubs). NOT gated on a cluster connection --
+   approval gate; out-of-region clicks + all other high-risk
+   actions still gate. The region is a static rect in a fixed
+   1920x1080 reference space; window-relative regions are future
+   work now that the window-bounds API exists (window_list /
+   window_focus, memql-cockpit#167 -- see docs/computer-use.md).
+   NOT gated on a cluster connection --
    the IPC is local-host between cockpit processes. Per
    memql-cockpit#64. A global `Ctrl+E` kill switch in
    `dispatchEvent` calls into `workersView.Revoke()` from any tab
