@@ -34,11 +34,11 @@ func TestComputeCapabilities_Headless(t *testing.T) {
 	if desc.DisplayServer != "none" {
 		t.Errorf("headless build must report displayServer=none regardless of env; got %q", desc.DisplayServer)
 	}
-	if desc.Actions == nil {
-		t.Error("actions must be an empty slice (marshals to []), not nil")
-	}
-	if len(desc.Actions) != 0 {
-		t.Errorf("headless build must advertise no actions; got %v", desc.Actions)
+	// Actions means "dispatchable actions" (memql-cockpit#166): the
+	// build-agnostic `wait` works headless, so it IS advertised even
+	// with guiAvailable=false. No GUI-backed action may appear.
+	if len(desc.Actions) != 1 || desc.Actions[0] != "wait" {
+		t.Errorf(`headless build must advertise exactly ["wait"]; got %v`, desc.Actions)
 	}
 	if desc.SchemaVersion != 1 {
 		t.Errorf("schemaVersion = %d, want 1", desc.SchemaVersion)
@@ -117,8 +117,8 @@ func TestDispatcher_CapabilitiesWorksHeadless(t *testing.T) {
 	if desc.GUIAvailable {
 		t.Error("headless dispatch must report guiAvailable=false")
 	}
-	if len(desc.Actions) != 0 {
-		t.Errorf("headless dispatch must report empty actions; got %v", desc.Actions)
+	if len(desc.Actions) != 1 || desc.Actions[0] != "wait" {
+		t.Errorf(`headless dispatch must report actions=["wait"]; got %v`, desc.Actions)
 	}
 	if desc.DisplayServer != "none" {
 		t.Errorf("headless dispatch must report displayServer=none; got %q", desc.DisplayServer)
@@ -130,14 +130,15 @@ func TestDispatcher_CapabilitiesWorksHeadless(t *testing.T) {
 		t.Errorf("platform = %q, want %q", desc.Platform, runtime.GOOS)
 	}
 
-	// The wire shape must carry "actions": [] (not null) so JSON
-	// consumers can iterate without a nil check.
+	// The wire shape must carry a JSON array (never null) so JSON
+	// consumers can iterate without a nil check. Headless advertises
+	// exactly the build-agnostic set: ["wait"] (memql-cockpit#166).
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(success.GetResultJson(), &raw); err != nil {
 		t.Fatalf("re-decode raw: %v", err)
 	}
-	if string(raw["actions"]) != "[]" {
-		t.Errorf(`"actions" must marshal to []; got %s`, raw["actions"])
+	if string(raw["actions"]) != `["wait"]` {
+		t.Errorf(`"actions" must marshal to ["wait"]; got %s`, raw["actions"])
 	}
 }
 
@@ -170,7 +171,7 @@ func TestDispatcher_CapabilitiesGatedAsObserve(t *testing.T) {
 // memql-cockpit#167 but must stay gui_unavailable here.
 func TestDispatcher_OtherComputerActionsStillGuiUnavailable(t *testing.T) {
 	d := NewDispatcher(quietLogger(), DefaultPolicy(), nil)
-	for _, action := range []string{"screenshot", "mouse_click", "display_info", "window_list", "window_focus"} {
+	for _, action := range []string{"screenshot", "mouse_click", "mouse_down", "mouse_up", "key_hold", "display_info", "window_list", "window_focus"} {
 		dispatch := &memqlv1.ToolDispatch{
 			Tool:     "workerComputer",
 			Action:   action,

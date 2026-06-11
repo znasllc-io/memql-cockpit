@@ -22,8 +22,9 @@ import (
 // (capabilities_gui.go) derives its advertised action list from it,
 // so the two can never drift (memql-cockpit#162).
 //
-// The `capabilities` action is absent -- it's build-agnostic and
-// routed by the dispatcher before this table is consulted.
+// The `capabilities` and `wait` actions are absent -- they are
+// build-agnostic and routed by the dispatcher before this table is
+// consulted (capabilities.go / wait.go).
 //
 // window_list / window_focus (memql-cockpit#167) are real on macOS
 // (CGWindowList) and Linux/X11 (EWMH); on Wayland and other gui
@@ -35,10 +36,13 @@ var computerActionHandlers = map[string]func(map[string]any) (*memqlv1.Success, 
 	"cursor_position": guiCursorPosition,
 	"mouse_move":      guiMouseMove,
 	"mouse_click":     guiMouseClick,
+	"mouse_down":      guiMouseDown,
+	"mouse_up":        guiMouseUp,
 	"mouse_drag":      guiMouseDrag,
 	"mouse_scroll":    guiMouseScroll,
 	"key_type":        guiKeyType,
 	"key_combo":       guiKeyCombo,
+	"key_hold":        guiKeyHold,
 	"display_info":    guiDisplayInfo,
 	"window_list":     guiWindowList,
 	"window_focus":    guiWindowFocus,
@@ -241,14 +245,81 @@ func guiMouseClick(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	if button == "" {
 		button = "left"
 	}
-	double := argBool(args, "double", false)
-	if argInt(args, "count", 1) >= 2 {
-		double = true
+	// count drives single / double / triple; the legacy `double` flag
+	// is honored as count=2 for back-compat. Clamped to [1, 3] --
+	// nothing in the UI vocabulary needs more than a triple-click.
+	count := clampInt(argInt(args, "count", 1), 1, 3)
+	if argBool(args, "double", false) && count < 2 {
+		count = 2
 	}
-	if err := robotgo.Click(button, double); err != nil {
+	var err error
+	switch count {
+	case 2:
+		err = robotgo.Click(button, true)
+	case 3:
+		// robotgo.Click only knows single/double. MultiClick(.., 3)
+		// posts a proper clickCount=3 event sequence on macOS
+		// (CGEventSetIntegerValueField under the hood) and three
+		// rapid clicks elsewhere, which X11 coalesces into a triple.
+		err = robotgo.MultiClick(button, 3)
+	default:
+		err = robotgo.Click(button, false)
+	}
+	if err != nil {
 		return nil, failure("mouse_click_failed", err.Error())
 	}
-	return successComputerJSON(map[string]any{"button": button, "double": double}, "clicked", 0), nil
+	return successComputerJSON(map[string]any{
+		"button": button,
+		"count":  count,
+		"double": count >= 2, // legacy field, kept for payload back-compat
+	}, "clicked", 0), nil
+}
+
+// guiMouseDown / guiMouseUp post a bare button-state transition
+// (memql-cockpit#166) for press-and-hold interactions the composite
+// mouse_click / mouse_drag can't express (e.g. hold-to-reveal menus,
+// custom drag handles needing intermediate moves). Deliberately
+// STATELESS: mouse_up succeeds even with no preceding mouse_down --
+// the OS treats a redundant button-up as a no-op, and tracking
+// pairing here would just desync from reality on any missed event.
+func guiMouseDown(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
+	button, fail := mouseButtonArg(args, "mouse_down")
+	if fail != nil {
+		return nil, fail
+	}
+	if err := robotgo.MouseDown(button); err != nil {
+		return nil, failure("mouse_down_failed", err.Error())
+	}
+	return successComputerJSON(map[string]any{"button": button}, "mouse down", 0), nil
+}
+
+func guiMouseUp(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
+	button, fail := mouseButtonArg(args, "mouse_up")
+	if fail != nil {
+		return nil, fail
+	}
+	if err := robotgo.MouseUp(button); err != nil {
+		return nil, failure("mouse_up_failed", err.Error())
+	}
+	return successComputerJSON(map[string]any{"button": button}, "mouse up", 0), nil
+}
+
+// mouseButtonArg validates the {button} argument for mouse_down /
+// mouse_up. Vocabulary is left / right / middle (defaulting to
+// left); "middle" maps to robotgo's "center" -- robotgo's CheckMouse
+// silently falls back to LEFT_BUTTON for unknown names, so an
+// unvalidated typo would click the wrong button instead of erroring.
+func mouseButtonArg(args map[string]any, action string) (string, *memqlv1.Failure) {
+	button := strings.ToLower(strings.TrimSpace(argString(args, "button")))
+	switch button {
+	case "", "left":
+		return "left", nil
+	case "right":
+		return "right", nil
+	case "middle", "center":
+		return "center", nil
+	}
+	return "", failure("bad_request", fmt.Sprintf("%s: button %q not supported (use left, right, or middle)", action, button))
 }
 
 func guiMouseDrag(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
@@ -328,6 +399,40 @@ func guiKeyCombo(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 		return nil, failure("key_combo_failed", err.Error())
 	}
 	return successComputerJSON(map[string]any{"keys": keys}, "key combo", 0), nil
+}
+
+// keyHoldMaxMs bounds workerComputer.key_hold so a single dispatch
+// can't pin a key (and the worker's call slot) indefinitely.
+const keyHoldMaxMs = 10000
+
+// guiKeyHold presses a key, holds it for durationMs, and releases it
+// (memql-cockpit#166) -- the press-and-hold primitive key_press /
+// key_combo can't express (games, OS-level hold gestures, key-repeat
+// driven UIs). durationMs clamps into [1, keyHoldMaxMs]; absent
+// clamps up from 0 to the 1ms floor (an instantaneous down/up).
+//
+// robotgo v1.0.2: KeyDown(key) == KeyToggle(key) (default direction
+// "down") and KeyUp(key) == KeyToggle(key, "up") -- both return the
+// underlying toggle error, so this is the dependable down/sleep/up
+// path. On a failed release we still report key_hold_failed and name
+// the release stage: a stuck key is operator-visible information.
+func guiKeyHold(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
+	key := strings.TrimSpace(argString(args, "key"))
+	if key == "" {
+		return nil, failure("bad_request", "key_hold: key required")
+	}
+	durationMs := clampInt(argInt(args, "durationMs", 0), 1, keyHoldMaxMs)
+	if err := robotgo.KeyDown(key); err != nil {
+		return nil, failure("key_hold_failed", "press: "+err.Error())
+	}
+	robotgo.MilliSleep(durationMs)
+	if err := robotgo.KeyUp(key); err != nil {
+		return nil, failure("key_hold_failed", "release (key may be stuck down): "+err.Error())
+	}
+	return successComputerJSON(map[string]any{
+		"key":        key,
+		"durationMs": durationMs,
+	}, fmt.Sprintf("held %q for %dms", key, durationMs), 0), nil
 }
 
 func guiDisplayInfo(_ map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
