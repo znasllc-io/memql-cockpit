@@ -101,12 +101,11 @@ the non-gui build.
 
 (1) The memql-side scope table is deny-by-default: an action absent
 from `workerComputerScope` is rejected at the memql dispatch gate with
-`unknown_action`. Classification of the v2 additions (`capabilities`,
-`wait`, `key_hold`, `mouse_down`, `mouse_up`) lands via memql#1333:
-`capabilities` + `wait` admit at observe against the `HEADLESS`
-capability (so a headless-only worker can serve them); the three input
-primitives require full against `GUI`. Until that merges, those five
-are dispatchable cockpit-side but denied server-side.
+`unknown_action`. The v2 additions (`capabilities`, `wait`,
+`key_hold`, `mouse_down`, `mouse_up`) are classified per memql#1333
+(merged): `capabilities` + `wait` admit at observe against the
+`HEADLESS` capability (so a headless-only worker can serve them); the
+three input primitives require full against `GUI`.
 
 (2) Strict-mode high-risk subset. Under a `--strict` consent grant
 these five actions (`key_type`, `key_hold`, `mouse_click`,
