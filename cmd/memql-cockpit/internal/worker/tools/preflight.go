@@ -34,10 +34,14 @@ var DisplayServerPreflightHook func() string
 // isComputerInputAction reports whether the workerComputer action
 // posts synthetic input events (the operations macOS gates behind
 // the Accessibility TCC entry). screenshot / cursor_position /
-// display_info are reads and are deliberately excluded.
+// display_info are reads and are deliberately excluded, as are the
+// build-agnostic `capabilities` and `wait` (memql-cockpit#166) --
+// a pure sleep posts no events and needs neither Accessibility nor
+// a display server.
 func isComputerInputAction(action string) bool {
 	switch action {
-	case "mouse_move", "mouse_click", "mouse_drag", "mouse_scroll", "key_type", "key_combo":
+	case "mouse_move", "mouse_click", "mouse_down", "mouse_up", "mouse_drag", "mouse_scroll",
+		"key_type", "key_combo", "key_hold":
 		return true
 	}
 	return false

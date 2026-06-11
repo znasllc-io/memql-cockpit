@@ -13,6 +13,8 @@ import (
 
 	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 	sdkworker "github.com/znasllc-io/memql/sdk/go/worker"
+
+	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/internal/worker/tools"
 )
 
 // Connection wraps the bidi gRPC stream the worker maintains against
@@ -62,8 +64,12 @@ func Connect(ctx context.Context, cfg Config, logger *slog.Logger) (*Connection,
 	return c, nil
 }
 
-// register sends the Register message and waits for the RegisterAck.
-func (c *Connection) register(ctx context.Context, cfg Config) error {
+// buildRegister assembles the worker-protocol Register handshake
+// message. Pulled out of register() so tests can assert the wire
+// shape -- in particular that capability_descriptor_json always
+// satisfies the server-side validation rules (memql#1331: raw size,
+// schemaVersion, action-name pattern) -- without a live stream.
+func buildRegister(cfg Config) *memqlv1.Register {
 	hostname, _ := os.Hostname()
 	register := &memqlv1.Register{
 		Name:         cfg.Name,
@@ -79,6 +85,21 @@ func (c *Connection) register(ctx context.Context, cfg Config) error {
 		Version:     cockpitVersion(),
 		BuildTag:    cockpitBuildTag(),
 	}
+	// Capability descriptor (memql-cockpit#166): the same JSON the
+	// workerComputer.capabilities action returns, sent up front so
+	// the server knows the action surface at registration time. The
+	// proto field is optional -- on the (never-expected) marshal
+	// failure we register without it rather than fail the handshake;
+	// the server treats omission as valid.
+	if descJSON, err := tools.CapabilityDescriptorJSON(); err == nil {
+		register.CapabilityDescriptorJson = descJSON
+	}
+	return register
+}
+
+// register sends the Register message and waits for the RegisterAck.
+func (c *Connection) register(ctx context.Context, cfg Config) error {
+	register := buildRegister(cfg)
 	if err := c.conn.Send(&memqlv1.WorkerClientMessage{
 		Payload: &memqlv1.WorkerClientMessage_Register{Register: register},
 	}); err != nil {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"sort"
 	"strings"
 
 	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
@@ -23,16 +24,34 @@ const capabilitySchemaVersion = 1
 // "what can this worker actually do?" must never itself fail.
 const computerCapabilitiesAction = "capabilities"
 
+// computerWaitAction is the build-agnostic pacing primitive
+// (memql-cockpit#166): a bounded sleep that needs no GUI backend.
+// Like `capabilities` it is routed by the dispatcher BEFORE the
+// per-build router so it works identically on headless and gui
+// builds -- see wait.go.
+const computerWaitAction = "wait"
+
+// buildAgnosticComputerActions lists workerComputer actions that are
+// dispatchable on EVERY build variant and therefore belong in the
+// descriptor's Actions list on both builds. Decision
+// (memql-cockpit#166): Actions means "dispatchable actions", so
+// `wait` is advertised even when guiAvailable=false -- a headless
+// worker really can serve it. The meta `capabilities` action stays
+// out of the list (it is the introspection channel itself and is
+// unconditionally available; advertising it would be circular).
+var buildAgnosticComputerActions = []string{computerWaitAction}
+
 // CapabilityDescriptor is the worker's computer-use capability
 // self-description (memql-cockpit#162). Computed from the build tag
 // (gui vs headless) plus the host environment at call time.
 //
-// Actions lists the GUI-backed workerComputer actions this build can
-// dispatch (derived from the same table the GUI action router uses,
-// so it can never drift from reality). The `capabilities` action
-// itself is deliberately NOT listed -- it is available on every
-// build unconditionally, including headless ones where Actions is
-// empty.
+// Actions lists the workerComputer actions this build can dispatch:
+// the GUI-backed set (derived from the same table the GUI action
+// router uses, so it can never drift from reality) plus the
+// build-agnostic set (`wait`, memql-cockpit#166) that works on every
+// variant -- so a headless build advertises ["wait"], not []. The
+// `capabilities` action itself is deliberately NOT listed -- it is
+// available on every build unconditionally.
 //
 // GUIAvailable reports whether the binary was built with the gui
 // tag. DisplayServer reports what the environment looks like at
@@ -58,7 +77,12 @@ func ComputeCapabilities() CapabilityDescriptor {
 // ComputeCapabilities so tests can table-drive the display-server
 // detection without mutating the process environment.
 func computeCapabilities(goos string, getenv func(string) string) CapabilityDescriptor {
-	actions := supportedComputerActions()
+	// Dispatchable actions = the per-build GUI router table plus the
+	// build-agnostic set (`wait`). Merged + sorted for a stable wire
+	// shape; the slices never overlap (the router table is GUI-only,
+	// the agnostic set is routed before the router).
+	actions := append(supportedComputerActions(), buildAgnosticComputerActions...)
+	sort.Strings(actions)
 	if actions == nil {
 		// Keep the JSON shape stable: "actions": [] -- never null.
 		actions = []string{}
@@ -106,6 +130,20 @@ func detectDisplayServer(goos string, getenv func(string) string) string {
 		return "none"
 	}
 	return "none"
+}
+
+// CapabilityDescriptorJSON marshals the live capability descriptor
+// for the registration handshake (memql-cockpit#166): the worker
+// copies it into Register.capability_descriptor_json so the server
+// learns the action surface up front, without a round-trip through
+// workerComputer.capabilities. Same source of truth as that action
+// (ComputeCapabilities), so the two can never disagree.
+func CapabilityDescriptorJSON() (string, error) {
+	body, err := json.Marshal(ComputeCapabilities())
+	if err != nil {
+		return "", fmt.Errorf("marshal capability descriptor: %w", err)
+	}
+	return string(body), nil
 }
 
 // runComputerCapabilities serves workerComputer.capabilities on
