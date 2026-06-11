@@ -164,7 +164,17 @@ func (d *Dispatcher) Dispatch(ctx context.Context, dispatch *memqlv1.ToolDispatc
 	case "workerHost":
 		success, failure = d.dispatchHost(ctx, action, args)
 	case "workerComputer":
-		success, failure = d.dispatchComputer(ctx, action, args)
+		// `capabilities` is build-agnostic introspection
+		// (memql-cockpit#162): route it BEFORE the per-build
+		// dispatchComputer so the headless build answers honestly
+		// (guiAvailable=false, actions=[]) instead of rejecting
+		// with gui_unavailable. It is the one workerComputer action
+		// that must work on every build variant.
+		if action == computerCapabilitiesAction {
+			success, failure = runComputerCapabilities()
+		} else {
+			success, failure = d.dispatchComputer(ctx, action, args)
+		}
 	default:
 		failure = &memqlv1.Failure{ErrorCode: "unknown_tool", ErrorMessage: fmt.Sprintf("unknown tool %q", tool)}
 	}
