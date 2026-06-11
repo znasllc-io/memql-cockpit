@@ -9,11 +9,11 @@ import (
 
 // TestComputeCapabilities_GUI pins the gui-build variant: the
 // descriptor advertises exactly the actions the router serves (the
-// computerActionHandlers table), guiAvailable=true, and the
-// window_* stubs + the meta `capabilities` action stay out of the
-// list. CI runs headless so this only executes on local gui-tagged
-// runs, but it keeps the variant honest for anyone building -tags
-// gui.
+// computerActionHandlers table) -- including window_list /
+// window_focus since memql-cockpit#167 -- guiAvailable=true, and
+// the meta `capabilities` action stays out of the list. CI runs
+// headless so this only executes on local gui-tagged runs, but it
+// keeps the variant honest for anyone building -tags gui.
 func TestComputeCapabilities_GUI(t *testing.T) {
 	desc := computeCapabilities("darwin", func(string) string { return "" })
 	if !desc.GUIAvailable {
@@ -33,11 +33,23 @@ func TestComputeCapabilities_GUI(t *testing.T) {
 			t.Errorf("advertised action %q is not in the router table", a)
 		}
 	}
-	for _, forbidden := range []string{"window_list", "window_focus", "capabilities"} {
+	for _, a := range desc.Actions {
+		if a == "capabilities" {
+			t.Error(`"capabilities" must not be advertised in actions (it is build-agnostic and always available)`)
+		}
+	}
+	// window_list / window_focus shipped for real in
+	// memql-cockpit#167 -- the gui build must advertise them.
+	for _, required := range []string{"window_list", "window_focus"} {
+		found := false
 		for _, a := range desc.Actions {
-			if a == forbidden {
-				t.Errorf("%q must not be advertised in actions", forbidden)
+			if a == required {
+				found = true
+				break
 			}
+		}
+		if !found {
+			t.Errorf("%q must be advertised in actions; got %v", required, desc.Actions)
 		}
 	}
 }

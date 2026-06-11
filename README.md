@@ -68,6 +68,24 @@ Cluster config lives at `~/.memql/clusters.yaml`; worker config at
 `~/.memql/worker.yaml`. The install scripts under `scripts/install/`
 register a LaunchAgent (macOS) or systemd user service (Linux).
 
+### Worker platform requirements
+
+- **macOS** -- the GUI worker needs two TCC grants for the
+  `memql-cockpit-gui` binary under System Settings -> Privacy &
+  Security: **Accessibility** (mouse + keyboard) and **Screen
+  Recording** (screenshots). `worker setup` probes both, and the
+  worker re-checks them on every dispatch, so a grant revoked
+  mid-session surfaces as a structured `permission_denied` with a
+  remediation hint instead of a raw RobotGo failure.
+- **Linux** -- RobotGo drives **X11 only**; an X11 (Xorg) session is
+  required. On a Wayland session (or with no display at all) the
+  worker returns `display_server_unsupported` for input + screenshot
+  actions; register it HEADLESS-only there (`install-linux.sh`
+  detects Wayland and does this automatically). Building the GUI
+  variant needs `gcc` plus `libxtst-dev`, `libxinerama-dev`,
+  `libxkbcommon-dev`, and `libpng-dev` (Debian/Ubuntu package names);
+  the matching runtime libraries must be present on the host.
+
 ### Computer-use consent gate
 
 Every `workerHost` / `workerComputer` tool call dispatched against a
