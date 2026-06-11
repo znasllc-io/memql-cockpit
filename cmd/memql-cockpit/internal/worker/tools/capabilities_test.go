@@ -46,6 +46,9 @@ func TestComputeCapabilities_Headless(t *testing.T) {
 	if desc.Platform != "linux" {
 		t.Errorf("platform = %q, want %q", desc.Platform, "linux")
 	}
+	if desc.Displays != 0 {
+		t.Errorf("headless build must report displays=0; got %d", desc.Displays)
+	}
 }
 
 func TestComputeCapabilities_PlatformFollowsRuntime(t *testing.T) {
@@ -139,6 +142,11 @@ func TestDispatcher_CapabilitiesWorksHeadless(t *testing.T) {
 	}
 	if string(raw["actions"]) != `["wait"]` {
 		t.Errorf(`"actions" must marshal to ["wait"]; got %s`, raw["actions"])
+	}
+	// displays is additive (memql-cockpit#165) and must be present --
+	// 0 on the headless build, never null/absent.
+	if string(raw["displays"]) != "0" {
+		t.Errorf(`"displays" must marshal to 0 on the headless build; got %s`, raw["displays"])
 	}
 }
 

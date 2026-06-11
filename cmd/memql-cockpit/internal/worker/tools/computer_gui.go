@@ -67,22 +67,25 @@ func (d *Dispatcher) dispatchComputer(ctx context.Context, action string, args m
 	}
 }
 
-// guiScreenshot captures the screen (or a region when supplied)
-// and returns base64-encoded image bytes plus dimensions.
+// guiScreenshot captures a display (or a region of it) and returns
+// base64-encoded image bytes plus dimensions.
 //
 // Args:
 //
 //	format: "png" (default) | "jpeg"
-//	region: { x, y, w, h } -- optional sub-rect (logical coords); full screen when absent
+//	display: int display id from display_info (default 0 = primary)
+//	region: { x, y, w, h } -- optional sub-rect (logical coords,
+//	  relative to the chosen display); full display when absent
 //	quality: int 1-100 (jpeg only; default 80)
 //	maxLongEdge: int, downscale ceiling for the emitted image's long
 //	  edge (default 1568, clamped to [512, 8000])
 //
 // Coordinate contract (see coords.go): the emitted image defines the
-// space the model speaks. width/height are the emitted dims,
-// sourceWidth/sourceHeight the captured physical dims, scale the
-// emitted/captured ratio, logicalWidth/logicalHeight the RobotGo
-// input-space dims (the requested w/h for region captures).
+// space the model speaks, scoped to the TARGET display. width/height
+// are the emitted dims, sourceWidth/sourceHeight the captured dims,
+// scale the emitted/captured ratio, logicalWidth/logicalHeight the
+// display's RobotGo input-space dims (the requested w/h for region
+// captures), display the targeted display id.
 func guiScreenshot(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	// The per-call Screen Recording TCC preflight runs in the
 	// dispatcher's preflightComputerAction (preflight.go) before this
@@ -96,50 +99,90 @@ func guiScreenshot(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 		return nil, failure("bad_request", fmt.Sprintf("screenshot format %q not supported (use png or jpeg)", format))
 	}
 	region := argMap(args, "region")
-	// Capture always lands as PNG; the requested output format is
-	// applied at re-encode time below.
-	tmp, err := os.CreateTemp("", "worker-screenshot-*.png")
-	if err != nil {
-		return nil, failure("screenshot_failed", err.Error())
-	}
-	tmpPath := tmp.Name()
-	_ = tmp.Close()
-	defer os.Remove(tmpPath)
+	displayID := argInt(args, "display", 0)
 
-	// Logical (input-space) dims for the payload: full screen uses
-	// the RobotGo screen size; a region capture is relative to the
-	// requested logical rect.
-	logicalW, logicalH := robotgo.GetScreenSize()
-	if region != nil {
-		x := argInt(region, "x", 0)
-		y := argInt(region, "y", 0)
-		w := argInt(region, "w", 0)
-		h := argInt(region, "h", 0)
-		if w <= 0 || h <= 0 {
-			return nil, failure("bad_request", "screenshot region requires positive w + h")
-		}
-		if err := robotgo.SaveCapture(tmpPath, x, y, w, h); err != nil {
+	var img image.Image
+	var logicalW, logicalH int
+	if displayID == 0 {
+		// Primary display: RobotGo's native capture path (physical
+		// pixels on Retina/HiDPI hosts), unchanged from the
+		// single-display behavior. Capture always lands as PNG; the
+		// requested output format is applied at re-encode time below.
+		tmp, err := os.CreateTemp("", "worker-screenshot-*.png")
+		if err != nil {
 			return nil, failure("screenshot_failed", err.Error())
 		}
-		logicalW, logicalH = w, h
+		tmpPath := tmp.Name()
+		_ = tmp.Close()
+		defer os.Remove(tmpPath)
+
+		// Logical (input-space) dims for the payload: full screen uses
+		// the RobotGo screen size; a region capture is relative to the
+		// requested logical rect.
+		logicalW, logicalH = robotgo.GetScreenSize()
+		if region != nil {
+			x := argInt(region, "x", 0)
+			y := argInt(region, "y", 0)
+			w := argInt(region, "w", 0)
+			h := argInt(region, "h", 0)
+			if w <= 0 || h <= 0 {
+				return nil, failure("bad_request", "screenshot region requires positive w + h")
+			}
+			if err := robotgo.SaveCapture(tmpPath, x, y, w, h); err != nil {
+				return nil, failure("screenshot_failed", err.Error())
+			}
+			logicalW, logicalH = w, h
+		} else {
+			if err := robotgo.SaveCapture(tmpPath); err != nil {
+				return nil, failure("screenshot_failed", err.Error())
+			}
+		}
+
+		rawCapture, err := os.ReadFile(tmpPath)
+		if err != nil {
+			return nil, failure("screenshot_failed", err.Error())
+		}
+
+		// Decode to learn the true captured (physical) dimensions -- on
+		// Retina/HiDPI hosts these exceed the logical size -- then apply
+		// the downscale policy so the emitted image stays vision-friendly.
+		decoded, _, err := image.Decode(bytes.NewReader(rawCapture))
+		if err != nil {
+			return nil, failure("screenshot_failed", "decode capture: "+err.Error())
+		}
+		img = decoded
 	} else {
-		if err := robotgo.SaveCapture(tmpPath); err != nil {
+		// Secondary display (memql-cockpit#165): captured through
+		// RobotGo's compositing path (robotgo.Capture) with the
+		// display's virtual-desktop rect. That path emits logical
+		// resolution -- captured == logical -- which mapperForDisplay
+		// mirrors so mouse targets derived from this screenshot map
+		// back correctly. A region is relative to the display and is
+		// offset by its origin before capture.
+		displays := enumerateDisplays()
+		d, ok := findDisplay(displays, displayID)
+		if !ok {
+			return nil, failure("bad_request", fmt.Sprintf(
+				"display %d unknown: display_info reports %d display(s)", displayID, len(displays)))
+		}
+		x, y, w, h := d.x, d.y, d.w, d.h
+		if region != nil {
+			rw := argInt(region, "w", 0)
+			rh := argInt(region, "h", 0)
+			if rw <= 0 || rh <= 0 {
+				return nil, failure("bad_request", "screenshot region requires positive w + h")
+			}
+			x, y = d.x+argInt(region, "x", 0), d.y+argInt(region, "y", 0)
+			w, h = rw, rh
+		}
+		captured, err := robotgo.Capture(x, y, w, h)
+		if err != nil {
 			return nil, failure("screenshot_failed", err.Error())
 		}
+		img = captured
+		logicalW, logicalH = w, h
 	}
 
-	rawCapture, err := os.ReadFile(tmpPath)
-	if err != nil {
-		return nil, failure("screenshot_failed", err.Error())
-	}
-
-	// Decode to learn the true captured (physical) dimensions -- on
-	// Retina/HiDPI hosts these exceed the logical size -- then apply
-	// the downscale policy so the emitted image stays vision-friendly.
-	img, _, err := image.Decode(bytes.NewReader(rawCapture))
-	if err != nil {
-		return nil, failure("screenshot_failed", "decode capture: "+err.Error())
-	}
 	capturedW, capturedH := img.Bounds().Dx(), img.Bounds().Dy()
 	maxLongEdge := clampLongEdge(argInt(args, "maxLongEdge", defaultMaxLongEdge))
 	emittedW, emittedH := FitWithin(capturedW, capturedH, maxLongEdge)
@@ -156,8 +199,12 @@ func guiScreenshot(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	encoded := base64.StdEncoding.EncodeToString(raw)
 	preview := fmt.Sprintf("[%s] %dx%d (source %dx%d, scale %.3f), %d bytes",
 		format, emittedW, emittedH, capturedW, capturedH, scale, len(raw))
+	if displayID != 0 {
+		preview += fmt.Sprintf(" display=%d", displayID)
+	}
 	payload := map[string]any{
 		"format":        format,
+		"display":       displayID,
 		"width":         emittedW,
 		"height":        emittedH,
 		"sourceWidth":   capturedW,
@@ -216,17 +263,128 @@ func liveMapper() CoordinateMapper {
 	return NewCoordinateMapper(logicalW, logicalH, capturedW, capturedH, emittedW, emittedH)
 }
 
+// displayGeometry describes one attached display in the
+// virtual-desktop logical coordinate space: the primary display's
+// top-left corner is (0,0), x grows right, y grows down, and
+// secondary displays can sit at negative origins (left of / above
+// the primary). scale is the pixel density a screenshot of this
+// display captures at: the primary uses RobotGo's native capture
+// (physical pixels, robotgo.ScaleF -- 2.0 on Retina macOS) while
+// secondary displays are captured through the compositing path at
+// logical resolution, so their capture scale is 1.0.
+type displayGeometry struct {
+	id      int
+	x, y    int
+	w, h    int
+	scale   float64
+	primary bool
+}
+
+// enumerateDisplays lists the attached displays via RobotGo
+// (CGGetActiveDisplayList on macOS, Xinerama on Linux/X11). Display
+// id 0 is always the primary (robotgo.GetDisplayBounds indexes the
+// main display first on both platforms). Defensive: when enumeration
+// fails or reports nothing usable -- e.g. Xinerama missing -- it
+// falls back to a single primary display from robotgo.GetScreenSize,
+// the exact pre-multi-display geometry, so callers never see an
+// empty list.
+func enumerateDisplays() []displayGeometry {
+	primaryScale := robotgo.ScaleF()
+	if primaryScale <= 0 {
+		primaryScale = 1
+	}
+	n := robotgo.DisplaysNum()
+	displays := make([]displayGeometry, 0, max(n, 1))
+	for i := 0; i < n; i++ {
+		x, y, w, h := robotgo.GetDisplayBounds(i)
+		if w <= 0 || h <= 0 {
+			// Enumeration glitch (display unplugged mid-call, Xinerama
+			// gap): skip the degenerate entry rather than advertise a
+			// rect no point can ever satisfy.
+			continue
+		}
+		scale := 1.0
+		if i == 0 {
+			scale = primaryScale
+		}
+		displays = append(displays, displayGeometry{
+			id: i, x: x, y: y, w: w, h: h, scale: scale, primary: i == 0,
+		})
+	}
+	if len(displays) == 0 {
+		w, h := robotgo.GetScreenSize()
+		displays = append(displays, displayGeometry{
+			id: 0, w: w, h: h, scale: primaryScale, primary: true,
+		})
+	}
+	return displays
+}
+
+// displayRectsOf projects enumerated displays onto the pure
+// DisplayRect form coords.go validates against.
+func displayRectsOf(displays []displayGeometry) []DisplayRect {
+	rects := make([]DisplayRect, 0, len(displays))
+	for _, d := range displays {
+		rects = append(rects, DisplayRect{ID: d.id, X: d.x, Y: d.y, W: d.w, H: d.h})
+	}
+	return rects
+}
+
+// findDisplay returns the enumerated display with the given id.
+func findDisplay(displays []displayGeometry, id int) (displayGeometry, bool) {
+	for _, d := range displays {
+		if d.id == id {
+			return d, true
+		}
+	}
+	return displayGeometry{}, false
+}
+
+// mapperForDisplay builds the coordinate mapper for the display a
+// mouse action targeted (the optional `display` arg; id 0 = primary,
+// the default). Display 0 uses liveMapper -- the exact single-display
+// geometry path -- so behavior without a display arg is unchanged.
+// Secondary displays are captured at logical resolution (see
+// displayGeometry.scale), so captured == logical there, and the
+// mapper offsets by the display's virtual-desktop origin: emitted
+// coords on display D map to D-local logical points plus D's origin.
+func mapperForDisplay(displays []displayGeometry, displayID int) (CoordinateMapper, *memqlv1.Failure) {
+	if displayID == 0 {
+		return liveMapper(), nil
+	}
+	d, ok := findDisplay(displays, displayID)
+	if !ok {
+		return CoordinateMapper{}, failure("bad_request", fmt.Sprintf(
+			"display %d unknown: display_info reports %d display(s)", displayID, len(displays)))
+	}
+	emittedW, emittedH := FitWithin(d.w, d.h, defaultMaxLongEdge)
+	return NewCoordinateMapper(d.w, d.h, d.w, d.h, emittedW, emittedH).WithOrigin(d.x, d.y), nil
+}
+
+// guiMouseMove moves the cursor to (x, y) in the emitted-screenshot
+// space of the targeted display (`display` arg, default 0 = primary
+// -- see the multi-display contract in coords.go). The mapped logical
+// point is re-validated against the union of display rects so a
+// stale geometry can never move the cursor into a dead zone.
 func guiMouseMove(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	x := argInt(args, "x", -1)
 	y := argInt(args, "y", -1)
 	if x < 0 || y < 0 {
 		return nil, failure("bad_request", "mouse_move: x and y are required and must be non-negative")
 	}
-	m := liveMapper()
+	displayID := argInt(args, "display", 0)
+	displays := enumerateDisplays()
+	m, fail := mapperForDisplay(displays, displayID)
+	if fail != nil {
+		return nil, fail
+	}
 	if fail := validatePointInRect("mouse_move", x, y, m.EmittedW, m.EmittedH); fail != nil {
 		return nil, fail
 	}
 	lx, ly := m.ToLogical(x, y)
+	if fail := validatePointInDisplays("mouse_move", lx, ly, displayRectsOf(displays)); fail != nil {
+		return nil, fail
+	}
 	smooth := argBool(args, "smooth", false)
 	if smooth {
 		robotgo.MoveSmooth(lx, ly)
@@ -235,6 +393,7 @@ func guiMouseMove(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	}
 	return successComputerJSON(map[string]any{
 		"x": x, "y": y,
+		"display":  displayID,
 		"logicalX": lx, "logicalY": ly,
 		"smooth": smooth,
 	}, "moved", 0), nil
@@ -322,6 +481,12 @@ func mouseButtonArg(args map[string]any, action string) (string, *memqlv1.Failur
 	return "", failure("bad_request", fmt.Sprintf("%s: button %q not supported (use left, right, or middle)", action, button))
 }
 
+// guiMouseDrag drags from/to points in the emitted-screenshot space
+// of the targeted display (`display` arg, default 0 = primary -- see
+// the multi-display contract in coords.go). Both endpoints live on
+// the SAME display: cross-display drags are not expressible and that
+// is deliberate -- the drag path RobotGo takes across mismatched
+// scale factors is undefined.
 func guiMouseDrag(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	fromX := argInt(args, "fromX", -1)
 	fromY := argInt(args, "fromY", -1)
@@ -330,7 +495,12 @@ func guiMouseDrag(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	if fromX < 0 || fromY < 0 || toX < 0 || toY < 0 {
 		return nil, failure("bad_request", "mouse_drag: fromX, fromY, toX, toY all required")
 	}
-	m := liveMapper()
+	displayID := argInt(args, "display", 0)
+	displays := enumerateDisplays()
+	m, fail := mapperForDisplay(displays, displayID)
+	if fail != nil {
+		return nil, fail
+	}
 	if fail := validatePointInRect("mouse_drag from", fromX, fromY, m.EmittedW, m.EmittedH); fail != nil {
 		return nil, fail
 	}
@@ -339,12 +509,20 @@ func guiMouseDrag(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	}
 	lFromX, lFromY := m.ToLogical(fromX, fromY)
 	lToX, lToY := m.ToLogical(toX, toY)
+	rects := displayRectsOf(displays)
+	if fail := validatePointInDisplays("mouse_drag from", lFromX, lFromY, rects); fail != nil {
+		return nil, fail
+	}
+	if fail := validatePointInDisplays("mouse_drag to", lToX, lToY, rects); fail != nil {
+		return nil, fail
+	}
 	robotgo.Move(lFromX, lFromY)
 	robotgo.MilliSleep(50)
 	robotgo.DragSmooth(lToX, lToY)
 	return successComputerJSON(map[string]any{
 		"fromX": fromX, "fromY": fromY,
 		"toX": toX, "toY": toY,
+		"display":      displayID,
 		"logicalFromX": lFromX, "logicalFromY": lFromY,
 		"logicalToX": lToX, "logicalToY": lToY,
 	}, "dragged", 0), nil
@@ -435,12 +613,37 @@ func guiKeyHold(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	}, fmt.Sprintf("held %q for %dms", key, durationMs), 0), nil
 }
 
+// guiDisplayInfo reports every attached display in the
+// virtual-desktop logical coordinate space (memql-cockpit#165):
+// {displays: [{id, x, y, width, height, scale, primary}], primary:
+// <id>}. The top-level width/height remain the primary display's
+// logical size for continuity with callers that predate the
+// multi-display shape.
 func guiDisplayInfo(_ map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	width, height := robotgo.GetScreenSize()
+	displays := enumerateDisplays()
+	primaryID := 0
+	list := make([]map[string]any, 0, len(displays))
+	for _, d := range displays {
+		if d.primary {
+			primaryID = d.id
+		}
+		list = append(list, map[string]any{
+			"id":      d.id,
+			"x":       d.x,
+			"y":       d.y,
+			"width":   d.w,
+			"height":  d.h,
+			"scale":   d.scale,
+			"primary": d.primary,
+		})
+	}
 	return successComputerJSON(map[string]any{
-		"width":  width,
-		"height": height,
-	}, fmt.Sprintf("%dx%d", width, height), 0), nil
+		"width":    width,
+		"height":   height,
+		"displays": list,
+		"primary":  primaryID,
+	}, fmt.Sprintf("%dx%d, %d display(s)", width, height, len(displays)), 0), nil
 }
 
 // guiWindowList / guiWindowFocus live in window_gui.go with their

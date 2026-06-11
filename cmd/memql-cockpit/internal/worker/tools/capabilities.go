@@ -57,11 +57,17 @@ var buildAgnosticComputerActions = []string{computerWaitAction}
 // tag. DisplayServer reports what the environment looks like at
 // call time ("none" when no display is reachable); consumers that
 // want "can I actually screenshot right now" should check both.
+//
+// Displays is the number of attached displays at call time
+// (memql-cockpit#165): 0 on headless builds and when no display
+// server is reachable, at least 1 otherwise. An additive field --
+// schemaVersion stays 1.
 type CapabilityDescriptor struct {
 	Platform      string   `json:"platform"`
 	DisplayServer string   `json:"displayServer"`
 	GUIAvailable  bool     `json:"guiAvailable"`
 	Actions       []string `json:"actions"`
+	Displays      int      `json:"displays"`
 	SchemaVersion int      `json:"schemaVersion"`
 }
 
@@ -91,11 +97,20 @@ func computeCapabilities(goos string, getenv func(string) string) CapabilityDesc
 	if buildHasGUI {
 		displayServer = detectDisplayServer(goos, getenv)
 	}
+	// Probe the display count only when a RobotGo-drivable display
+	// server is actually reachable: the probe touches the display
+	// server, and capabilities must never fail -- not even on a gui
+	// build running headless or under Wayland.
+	displays := 0
+	if displayServer == "quartz" || displayServer == "x11" {
+		displays = displayCount()
+	}
 	return CapabilityDescriptor{
 		Platform:      goos,
 		DisplayServer: displayServer,
 		GUIAvailable:  buildHasGUI,
 		Actions:       actions,
+		Displays:      displays,
 		SchemaVersion: capabilitySchemaVersion,
 	}
 }
@@ -152,13 +167,14 @@ func CapabilityDescriptorJSON() (string, error) {
 // rejecting with gui_unavailable.
 func runComputerCapabilities() (*memqlv1.Success, *memqlv1.Failure) {
 	desc := ComputeCapabilities()
-	preview := fmt.Sprintf("platform=%s displayServer=%s guiAvailable=%t actions=%d",
-		desc.Platform, desc.DisplayServer, desc.GUIAvailable, len(desc.Actions))
+	preview := fmt.Sprintf("platform=%s displayServer=%s guiAvailable=%t actions=%d displays=%d",
+		desc.Platform, desc.DisplayServer, desc.GUIAvailable, len(desc.Actions), desc.Displays)
 	return successComputerJSON(map[string]any{
 		"platform":      desc.Platform,
 		"displayServer": desc.DisplayServer,
 		"guiAvailable":  desc.GUIAvailable,
 		"actions":       desc.Actions,
+		"displays":      desc.Displays,
 		"schemaVersion": desc.SchemaVersion,
 	}, preview, 0), nil
 }
