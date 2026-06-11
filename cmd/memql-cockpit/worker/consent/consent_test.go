@@ -15,9 +15,9 @@ type fakeClock struct {
 	now time.Time
 }
 
-func newFakeClock(t time.Time) *fakeClock                { return &fakeClock{now: t} }
-func (c *fakeClock) Now() time.Time                      { c.mu.Lock(); defer c.mu.Unlock(); return c.now }
-func (c *fakeClock) advance(d time.Duration)             { c.mu.Lock(); c.now = c.now.Add(d); c.mu.Unlock() }
+func newFakeClock(t time.Time) *fakeClock    { return &fakeClock{now: t} }
+func (c *fakeClock) Now() time.Time          { c.mu.Lock(); defer c.mu.Unlock(); return c.now }
+func (c *fakeClock) advance(d time.Duration) { c.mu.Lock(); c.now = c.now.Add(d); c.mu.Unlock() }
 
 func TestManager_AllowsRejectsWithoutGrant(t *testing.T) {
 	m := NewManager()
@@ -173,6 +173,7 @@ func TestClassify(t *testing.T) {
 		{"workerHost", "exec", ClassInteract},
 		{"workerHost", "fs_write", ClassInteract},
 		{"workerComputer", "screenshot", ClassObserve},
+		{"workerComputer", "capabilities", ClassObserve},
 		{"workerComputer", "mouse_click", ClassInteract},
 		{"workerComputer", "mouse_move", ClassInteract},
 		{"workerComputer", "key_type", ClassInteract},
