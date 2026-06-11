@@ -34,8 +34,8 @@ type Format struct {
 }
 
 // DefaultFormat is the recommended capture format: 16kHz mono PCM16,
-// matched against Deepgram Nova-3 and OpenAI Realtime's expected
-// inputs. Caller can override.
+// matched against OpenAI Realtime's expected input. Caller can
+// override.
 func DefaultFormat() Format {
 	return Format{Encoding: "pcm16", SampleRate: 16000, Channels: 1}
 }
