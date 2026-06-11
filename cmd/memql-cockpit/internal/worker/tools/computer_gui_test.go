@@ -3,6 +3,7 @@
 package tools
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -88,5 +89,144 @@ func TestGuiMouseDownUp_RejectBadButton(t *testing.T) {
 				t.Errorf("%s with an unknown button must be bad_request; got %q", tc.name, code)
 			}
 		})
+	}
+}
+
+// Live multi-display tests (memql-cockpit#165). These exercise the
+// RobotGo-backed enumeration so they only run on gui-tagged builds
+// with a reachable display; the geometry/bounds logic itself is
+// covered headlessly in coords_test.go.
+
+// TestEnumerateDisplays pins the enumeration invariants: never
+// empty, display 0 present and primary, every rect non-degenerate,
+// ids unique, and a positive scale everywhere.
+func TestEnumerateDisplays(t *testing.T) {
+	displays := enumerateDisplays()
+	if len(displays) == 0 {
+		t.Fatal("enumerateDisplays must never return an empty list")
+	}
+	seen := map[int]bool{}
+	primaries := 0
+	for _, d := range displays {
+		if seen[d.id] {
+			t.Errorf("display id %d enumerated twice", d.id)
+		}
+		seen[d.id] = true
+		if d.w <= 0 || d.h <= 0 {
+			t.Errorf("display %d has degenerate size %dx%d", d.id, d.w, d.h)
+		}
+		if d.scale <= 0 {
+			t.Errorf("display %d has non-positive scale %f", d.id, d.scale)
+		}
+		if d.primary {
+			primaries++
+			if d.id != 0 {
+				t.Errorf("primary display must be id 0; got %d", d.id)
+			}
+			if d.x != 0 || d.y != 0 {
+				t.Errorf("primary display must sit at the virtual-desktop origin; got (%d,%d)", d.x, d.y)
+			}
+		}
+	}
+	if primaries != 1 {
+		t.Errorf("exactly one display must be primary; got %d", primaries)
+	}
+}
+
+// TestMapperForDisplay pins the routing: display 0 is the exact
+// liveMapper geometry (zero origin -- single-display behavior
+// unchanged), unknown ids are a structured bad_request, and any
+// enumerated secondary gets an origin-offset logical==captured
+// mapper.
+func TestMapperForDisplay(t *testing.T) {
+	displays := enumerateDisplays()
+
+	m, fail := mapperForDisplay(displays, 0)
+	if fail != nil {
+		t.Fatalf("display 0 must always resolve; got %s: %s", fail.GetErrorCode(), fail.GetErrorMessage())
+	}
+	if m != liveMapper() {
+		t.Errorf("display 0 mapper must equal liveMapper(); got %+v vs %+v", m, liveMapper())
+	}
+	if m.OriginX != 0 || m.OriginY != 0 {
+		t.Errorf("display 0 mapper must have a zero origin; got (%d,%d)", m.OriginX, m.OriginY)
+	}
+
+	if _, fail := mapperForDisplay(displays, 9999); fail == nil {
+		t.Error("unknown display id must fail")
+	} else if fail.GetErrorCode() != "bad_request" {
+		t.Errorf("unknown display id error code = %q, want bad_request", fail.GetErrorCode())
+	}
+
+	for _, d := range displays {
+		if d.id == 0 {
+			continue
+		}
+		m, fail := mapperForDisplay(displays, d.id)
+		if fail != nil {
+			t.Fatalf("enumerated display %d must resolve; got %s", d.id, fail.GetErrorMessage())
+		}
+		if m.OriginX != d.x || m.OriginY != d.y {
+			t.Errorf("display %d mapper origin = (%d,%d), want (%d,%d)", d.id, m.OriginX, m.OriginY, d.x, d.y)
+		}
+		if m.LogicalW != d.w || m.LogicalH != d.h {
+			t.Errorf("display %d mapper logical = %dx%d, want %dx%d", d.id, m.LogicalW, m.LogicalH, d.w, d.h)
+		}
+		if m.CapturedW != d.w || m.CapturedH != d.h {
+			t.Errorf("display %d capture path is logical resolution; captured = %dx%d, want %dx%d",
+				d.id, m.CapturedW, m.CapturedH, d.w, d.h)
+		}
+	}
+}
+
+// TestGuiDisplayInfoWireShape pins the display_info payload
+// (memql-cockpit#165): the legacy top-level width/height stay, plus
+// a displays array of {id, x, y, width, height, scale, primary} and
+// a top-level primary id that names a display marked primary.
+func TestGuiDisplayInfoWireShape(t *testing.T) {
+	success, fail := guiDisplayInfo(nil)
+	if fail != nil {
+		t.Fatalf("display_info failed: %s: %s", fail.GetErrorCode(), fail.GetErrorMessage())
+	}
+	var payload struct {
+		Width    int `json:"width"`
+		Height   int `json:"height"`
+		Primary  int `json:"primary"`
+		Displays []struct {
+			ID      int     `json:"id"`
+			X       int     `json:"x"`
+			Y       int     `json:"y"`
+			Width   int     `json:"width"`
+			Height  int     `json:"height"`
+			Scale   float64 `json:"scale"`
+			Primary bool    `json:"primary"`
+		} `json:"displays"`
+	}
+	if err := json.Unmarshal(success.GetResultJson(), &payload); err != nil {
+		t.Fatalf("display_info payload is not the expected shape: %v (raw: %s)", err, success.GetResultJson())
+	}
+	if payload.Width <= 0 || payload.Height <= 0 {
+		t.Errorf("legacy top-level width/height must stay positive; got %dx%d", payload.Width, payload.Height)
+	}
+	if len(payload.Displays) == 0 {
+		t.Fatal("displays array must never be empty")
+	}
+	foundPrimary := false
+	for _, d := range payload.Displays {
+		if d.Width <= 0 || d.Height <= 0 {
+			t.Errorf("display %d has degenerate size %dx%d", d.ID, d.Width, d.Height)
+		}
+		if d.Scale <= 0 {
+			t.Errorf("display %d has non-positive scale %f", d.ID, d.Scale)
+		}
+		if d.ID == payload.Primary {
+			foundPrimary = true
+			if !d.Primary {
+				t.Errorf("top-level primary %d must point at a display marked primary", payload.Primary)
+			}
+		}
+	}
+	if !foundPrimary {
+		t.Errorf("top-level primary %d is not in the displays array", payload.Primary)
 	}
 }
