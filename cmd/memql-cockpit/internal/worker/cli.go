@@ -13,8 +13,8 @@ import (
 
 	"github.com/znasllc-io/memql-cockpit/cli/config"
 	"github.com/znasllc-io/memql-cockpit/cli/crash"
-	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/worker/consent"
 	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/internal/worker/tools"
+	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/worker/consent"
 )
 
 // HandleCommand dispatches `memql-cockpit worker <subcommand>`.

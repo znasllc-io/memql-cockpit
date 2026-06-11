@@ -172,7 +172,12 @@ func TestClassify(t *testing.T) {
 		{"workerHost", "http_fetch", ClassObserve},
 		{"workerHost", "exec", ClassInteract},
 		{"workerHost", "fs_write", ClassInteract},
+		// The full workerComputer action vocabulary, pinned
+		// explicitly so a new action can't silently ride the
+		// unknown->interact default (memql-cockpit#179).
 		{"workerComputer", "screenshot", ClassObserve},
+		{"workerComputer", "cursor_position", ClassObserve},
+		{"workerComputer", "display_info", ClassObserve},
 		{"workerComputer", "capabilities", ClassObserve},
 		{"workerComputer", "window_list", ClassObserve},
 		{"workerComputer", "wait", ClassObserve},
@@ -180,9 +185,12 @@ func TestClassify(t *testing.T) {
 		{"workerComputer", "mouse_down", ClassInteract},
 		{"workerComputer", "mouse_up", ClassInteract},
 		{"workerComputer", "mouse_move", ClassInteract},
+		{"workerComputer", "mouse_drag", ClassInteract},
+		{"workerComputer", "mouse_scroll", ClassInteract},
 		{"workerComputer", "key_type", ClassInteract},
 		{"workerComputer", "key_press", ClassInteract},
 		{"workerComputer", "key_hold", ClassInteract},
+		{"workerComputer", "key_combo", ClassInteract},
 		{"workerComputer", "window_focus", ClassInteract},
 		{"workerHost", "experimental_new_action", ClassUnknown},
 		{"workerOther", "foo", ClassUnknown},
