@@ -39,11 +39,12 @@ const DefaultApprovalTimeout = 30 * time.Second
 // TUI pane).
 //
 // ClassObserve is the read-side: fs_read / fs_list / fs_stat /
-// http_fetch / workerComputer.{screenshot,capabilities,window_list}.
+// http_fetch / workerComputer.{screenshot,capabilities,window_list,
+// wait}.
 //
 // ClassInteract is the write-side: exec / fs_write /
-// workerComputer.{mouse_click,mouse_move,key_type,key_press,
-// window_focus}.
+// workerComputer.{mouse_click,mouse_down,mouse_up,mouse_move,
+// key_type,key_press,key_hold,window_focus}.
 //
 // ClassUnknown is the safety net for unknown (tool, action) pairs;
 // they're treated as ClassInteract for gate purposes (deny-by-
@@ -490,13 +491,18 @@ func Classify(tool, action string) Class {
 		// sensitive, touches nothing -- observe-class.
 		// window_list (memql-cockpit#167) enumerates window
 		// metadata without touching anything -- observe-class.
-		case "screenshot", "capabilities", "window_list":
+		// wait (memql-cockpit#166) is a bounded sleep: posts no
+		// input, reads nothing -- observe-class.
+		case "screenshot", "capabilities", "window_list", "wait":
 			return ClassObserve
 		// window_focus (memql-cockpit#167) re-orders the user's
 		// desktop (raises a window, steals focus) -- interact-class,
 		// made explicit rather than riding the unknown->interact
 		// default.
-		case "mouse_click", "mouse_move", "key_type", "key_press", "window_focus":
+		// key_hold / mouse_down / mouse_up (memql-cockpit#166) post
+		// synthetic input -- interact-class.
+		case "mouse_click", "mouse_down", "mouse_up", "mouse_move",
+			"key_type", "key_press", "key_hold", "window_focus":
 			return ClassInteract
 		}
 	}
@@ -504,12 +510,17 @@ func Classify(tool, action string) Class {
 }
 
 // isHighRiskAction names the strict-mode per-action approval subset.
-// Per the #64 spec these are the two actions where a granted-window
+// Per the #64 spec these are the actions where a granted-window
 // admission isn't tight enough -- typed text exfiltrates the most
 // data in the shortest time, and a non-region-confined mouse click
-// can fire arbitrary UI affordances. Other ClassInteract actions
-// (exec / fs_write / mouse_move / key_press) stay admitted by the
-// window's standing grant.
+// can fire arbitrary UI affordances. key_hold / mouse_down /
+// mouse_up (memql-cockpit#166) join the set because they compose
+// into exactly those primitives (a held modifier turns any
+// subsequent click into a chord; a bare button-down/up pair IS a
+// click) -- leaving them out would let strict mode be bypassed by
+// decomposition. Other ClassInteract actions (exec / fs_write /
+// mouse_move / key_press) stay admitted by the window's standing
+// grant.
 //
 // Region-confined exemption from the spec is deferred -- the
 // codebase has no notion of designated regions today; revisit when
@@ -519,7 +530,7 @@ func isHighRiskAction(tool, action string) bool {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(action)) {
-	case "key_type", "mouse_click":
+	case "key_type", "key_hold", "mouse_click", "mouse_down", "mouse_up":
 		return true
 	}
 	return false
