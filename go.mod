@@ -8,6 +8,7 @@ require (
 	github.com/gen2brain/malgo v0.11.25
 	github.com/go-vgo/robotgo v1.0.2
 	github.com/znasllc-io/memql v0.0.0-20260521223032-3ce7947a1279
+	golang.org/x/image v0.41.0
 	golang.org/x/sys v0.46.0
 	golang.org/x/term v0.44.0
 	google.golang.org/grpc v1.81.1
@@ -80,7 +81,6 @@ require (
 	go.yaml.in/yaml/v4 v4.0.0-rc.2 // indirect
 	golang.org/x/crypto v0.53.0 // indirect
 	golang.org/x/exp v0.0.0-20260312153236-7ab1446f8b90 // indirect
-	golang.org/x/image v0.41.0 // indirect
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/text v0.38.0 // indirect

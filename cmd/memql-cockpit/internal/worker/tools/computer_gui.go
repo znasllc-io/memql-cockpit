@@ -8,8 +8,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"image"
-	"image/jpeg"
-	"image/png"
+	_ "image/png" // register the PNG decoder for image.Decode (SaveCapture writes PNG)
 	"os"
 	"strings"
 
@@ -71,8 +70,16 @@ func (d *Dispatcher) dispatchComputer(ctx context.Context, action string, args m
 // Args:
 //
 //	format: "png" (default) | "jpeg"
-//	region: { x, y, w, h } -- optional sub-rect; full screen when absent
+//	region: { x, y, w, h } -- optional sub-rect (logical coords); full screen when absent
 //	quality: int 1-100 (jpeg only; default 80)
+//	maxLongEdge: int, downscale ceiling for the emitted image's long
+//	  edge (default 1568, clamped to [512, 8000])
+//
+// Coordinate contract (see coords.go): the emitted image defines the
+// space the model speaks. width/height are the emitted dims,
+// sourceWidth/sourceHeight the captured physical dims, scale the
+// emitted/captured ratio, logicalWidth/logicalHeight the RobotGo
+// input-space dims (the requested w/h for region captures).
 func guiScreenshot(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	// Per-call TCC preflight: confirm the Screen Recording grant is
 	// still in place. The setup wizard probes this once at first
@@ -91,8 +98,13 @@ func guiScreenshot(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	if format == "" {
 		format = "png"
 	}
+	if format != "png" && format != "jpeg" && format != "jpg" {
+		return nil, failure("bad_request", fmt.Sprintf("screenshot format %q not supported (use png or jpeg)", format))
+	}
 	region := argMap(args, "region")
-	tmp, err := os.CreateTemp("", "worker-screenshot-*."+format)
+	// Capture always lands as PNG; the requested output format is
+	// applied at re-encode time below.
+	tmp, err := os.CreateTemp("", "worker-screenshot-*.png")
 	if err != nil {
 		return nil, failure("screenshot_failed", err.Error())
 	}
@@ -100,6 +112,10 @@ func guiScreenshot(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	_ = tmp.Close()
 	defer os.Remove(tmpPath)
 
+	// Logical (input-space) dims for the payload: full screen uses
+	// the RobotGo screen size; a region capture is relative to the
+	// requested logical rect.
+	logicalW, logicalH := robotgo.GetScreenSize()
 	if region != nil {
 		x := argInt(region, "x", 0)
 		y := argInt(region, "y", 0)
@@ -111,44 +127,62 @@ func guiScreenshot(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 		if err := robotgo.SaveCapture(tmpPath, x, y, w, h); err != nil {
 			return nil, failure("screenshot_failed", err.Error())
 		}
+		logicalW, logicalH = w, h
 	} else {
 		if err := robotgo.SaveCapture(tmpPath); err != nil {
 			return nil, failure("screenshot_failed", err.Error())
 		}
 	}
 
-	raw, err := os.ReadFile(tmpPath)
+	rawCapture, err := os.ReadFile(tmpPath)
 	if err != nil {
 		return nil, failure("screenshot_failed", err.Error())
 	}
 
-	// SaveCapture writes PNG by default; transcode to JPEG when
-	// requested for smaller payloads on big screens.
-	if format == "jpeg" || format == "jpg" {
-		quality := argInt(args, "quality", 80)
-		if quality < 1 {
-			quality = 1
-		} else if quality > 100 {
-			quality = 100
-		}
-		raw, err = transcodeToJPEG(raw, quality)
-		if err != nil {
-			return nil, failure("screenshot_failed", "jpeg encode: "+err.Error())
-		}
+	// Decode to learn the true captured (physical) dimensions -- on
+	// Retina/HiDPI hosts these exceed the logical size -- then apply
+	// the downscale policy so the emitted image stays vision-friendly.
+	img, _, err := image.Decode(bytes.NewReader(rawCapture))
+	if err != nil {
+		return nil, failure("screenshot_failed", "decode capture: "+err.Error())
+	}
+	capturedW, capturedH := img.Bounds().Dx(), img.Bounds().Dy()
+	maxLongEdge := clampLongEdge(argInt(args, "maxLongEdge", defaultMaxLongEdge))
+	emittedW, emittedH := FitWithin(capturedW, capturedH, maxLongEdge)
+	if emittedW != capturedW || emittedH != capturedH {
+		img = downscaleImage(img, emittedW, emittedH)
 	}
 
-	width, height := robotgo.GetScreenSize()
+	raw, err := encodeImage(img, format, argInt(args, "quality", 80))
+	if err != nil {
+		return nil, failure("screenshot_failed", "encode: "+err.Error())
+	}
+
+	scale := float64(emittedW) / float64(capturedW)
 	encoded := base64.StdEncoding.EncodeToString(raw)
-	preview := fmt.Sprintf("[%s] %dx%d, %d bytes", format, width, height, len(raw))
-	return successComputerJSON(map[string]any{
-		"format":       format,
-		"width":        width,
-		"height":       height,
-		"sourceWidth":  width,
-		"sourceHeight": height,
-		"bytesBase64":  encoded,
-		"sizeBytes":    len(raw),
-	}, preview, len(raw)), nil
+	preview := fmt.Sprintf("[%s] %dx%d (source %dx%d, scale %.3f), %d bytes",
+		format, emittedW, emittedH, capturedW, capturedH, scale, len(raw))
+	payload := map[string]any{
+		"format":        format,
+		"width":         emittedW,
+		"height":        emittedH,
+		"sourceWidth":   capturedW,
+		"sourceHeight":  capturedH,
+		"scale":         scale,
+		"logicalWidth":  logicalW,
+		"logicalHeight": logicalH,
+		"bytesBase64":   encoded,
+		"sizeBytes":     len(raw),
+	}
+	if region != nil {
+		payload["region"] = map[string]any{
+			"x": argInt(region, "x", 0),
+			"y": argInt(region, "y", 0),
+			"w": argInt(region, "w", 0),
+			"h": argInt(region, "h", 0),
+		}
+	}
+	return successComputerJSON(payload, preview, len(raw)), nil
 }
 
 func guiCursorPosition(_ map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
@@ -166,19 +200,50 @@ func cursorLocation() (x, y int, known bool) {
 	return x, y, true
 }
 
+// liveMapper builds the coordinate mapper for the main display from
+// live geometry plus the fixed downscale policy (defaultMaxLongEdge),
+// per the contract in coords.go: model coords are in the emitted
+// screenshot space, and the mapping to logical input coords is
+// recomputed statelessly on every mouse action.
+//
+// Physical dims derive from robotgo.ScaleF() (2.0 on Retina macOS).
+// Defensive: a non-positive scale is treated as 1, so on displays
+// where capture dims equal logical dims the mapper is an identity
+// (modulo the downscale policy).
+func liveMapper() CoordinateMapper {
+	logicalW, logicalH := robotgo.GetScreenSize()
+	scale := robotgo.ScaleF()
+	if scale <= 0 {
+		scale = 1
+	}
+	capturedW := roundHalfAway(float64(logicalW) * scale)
+	capturedH := roundHalfAway(float64(logicalH) * scale)
+	emittedW, emittedH := FitWithin(capturedW, capturedH, defaultMaxLongEdge)
+	return NewCoordinateMapper(logicalW, logicalH, capturedW, capturedH, emittedW, emittedH)
+}
+
 func guiMouseMove(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	x := argInt(args, "x", -1)
 	y := argInt(args, "y", -1)
 	if x < 0 || y < 0 {
 		return nil, failure("bad_request", "mouse_move: x and y are required and must be non-negative")
 	}
+	m := liveMapper()
+	if fail := validatePointInRect("mouse_move", x, y, m.EmittedW, m.EmittedH); fail != nil {
+		return nil, fail
+	}
+	lx, ly := m.ToLogical(x, y)
 	smooth := argBool(args, "smooth", false)
 	if smooth {
-		robotgo.MoveSmooth(x, y)
+		robotgo.MoveSmooth(lx, ly)
 	} else {
-		robotgo.Move(x, y)
+		robotgo.Move(lx, ly)
 	}
-	return successComputerJSON(map[string]any{"x": x, "y": y, "smooth": smooth}, "moved", 0), nil
+	return successComputerJSON(map[string]any{
+		"x": x, "y": y,
+		"logicalX": lx, "logicalY": ly,
+		"smooth": smooth,
+	}, "moved", 0), nil
 }
 
 func guiMouseClick(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
@@ -204,15 +269,29 @@ func guiMouseDrag(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	if fromX < 0 || fromY < 0 || toX < 0 || toY < 0 {
 		return nil, failure("bad_request", "mouse_drag: fromX, fromY, toX, toY all required")
 	}
-	robotgo.Move(fromX, fromY)
+	m := liveMapper()
+	if fail := validatePointInRect("mouse_drag from", fromX, fromY, m.EmittedW, m.EmittedH); fail != nil {
+		return nil, fail
+	}
+	if fail := validatePointInRect("mouse_drag to", toX, toY, m.EmittedW, m.EmittedH); fail != nil {
+		return nil, fail
+	}
+	lFromX, lFromY := m.ToLogical(fromX, fromY)
+	lToX, lToY := m.ToLogical(toX, toY)
+	robotgo.Move(lFromX, lFromY)
 	robotgo.MilliSleep(50)
-	robotgo.DragSmooth(toX, toY)
+	robotgo.DragSmooth(lToX, lToY)
 	return successComputerJSON(map[string]any{
 		"fromX": fromX, "fromY": fromY,
 		"toX": toX, "toY": toY,
+		"logicalFromX": lFromX, "logicalFromY": lFromY,
+		"logicalToX": lToX, "logicalToY": lToY,
 	}, "dragged", 0), nil
 }
 
+// guiMouseScroll takes wheel-tick deltas (dx/dy), not screen
+// coordinates, so the screenshot-space -> logical mapping that
+// applies to mouse_move / mouse_drag targets does not apply here.
 func guiMouseScroll(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	dx := argInt(args, "dx", 0)
 	dy := argInt(args, "dy", 0)
@@ -292,23 +371,6 @@ func guiWindowFocus(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 
 // successComputerJSON moved to capabilities.go (untagged) so the
 // build-agnostic capabilities handler can share it.
-
-func transcodeToJPEG(in []byte, quality int) ([]byte, error) {
-	img, _, err := image.Decode(bytes.NewReader(in))
-	if err != nil {
-		// SaveCapture default is PNG, so try png first if the
-		// generic decoder doesn't recognize the magic bytes.
-		img, err = png.Decode(bytes.NewReader(in))
-		if err != nil {
-			return nil, err
-		}
-	}
-	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: quality}); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
 
 // argBool extracts a boolean argument with a default. The args map
 // may carry the value as a real bool (parsed JSON) or a string
