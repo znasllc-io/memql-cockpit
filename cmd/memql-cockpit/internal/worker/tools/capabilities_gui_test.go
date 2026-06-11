@@ -59,4 +59,9 @@ func TestComputeCapabilities_GUI(t *testing.T) {
 			t.Errorf("%q must be advertised in actions; got %v", required, desc.Actions)
 		}
 	}
+	// displayServer is quartz here, so the descriptor must carry a
+	// live display count of at least one (memql-cockpit#165).
+	if desc.Displays < 1 {
+		t.Errorf("gui build with a reachable display server must report displays >= 1; got %d", desc.Displays)
+	}
 }
