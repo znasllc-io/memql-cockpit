@@ -169,13 +169,20 @@ func getTestWindow(t *testing.T) time.Duration {
 	return time.Hour
 }
 
-// TestDispatcher_MouseClickRoutesThroughAllowsAt confirms a
-// workerComputer.mouse_click goes through the cursor-aware
-// AllowsAt path (memql-cockpit#131) rather than plain Allows --
-// that's what lets the strict-mode region exemption fire. On this
-// non-gui test build cursorLocation() reports Known=false, which
-// is the correct headless behaviour.
-func TestDispatcher_MouseClickRoutesThroughAllowsAt(t *testing.T) {
+// mouseClickAllowsAtCursor drives a workerComputer.mouse_click
+// through a DENYING fakeGate and returns the cursor the dispatcher
+// handed to AllowsAt. It confirms mouse_click goes through the
+// cursor-aware AllowsAt path (memql-cockpit#131) rather than plain
+// Allows -- that's what lets the strict-mode region exemption fire.
+//
+// Shared scaffolding for the per-build-tag variants
+// (memql-cockpit#171): the headless build asserts Known=false (its
+// cursorLocation stub), the gui build asserts the live-cursor path
+// (Known=true). The gate denies, so the per-action handler never
+// runs and no real input is ever driven; on the gui build
+// cursorLocation() only reads robotgo.Location().
+func mouseClickAllowsAtCursor(t *testing.T) consent.CursorPoint {
+	t.Helper()
 	gate := &fakeGate{decision: consent.Decision{Allowed: false, Reason: "gated"}}
 	d := NewDispatcher(quietLogger(), DefaultPolicy(), gate)
 
@@ -192,11 +199,8 @@ func TestDispatcher_MouseClickRoutesThroughAllowsAt(t *testing.T) {
 	if gate.calls != 1 {
 		t.Errorf("gate should be consulted once; got %d", gate.calls)
 	}
-	// AllowsAt sets lastCursor. The headless build's cursorLocation
-	// stub reports Known=false -- assert the dispatcher took the
-	// AllowsAt path (lastCursor was written) and carried the
-	// headless sentinel.
-	if gate.lastCursor.Known {
-		t.Errorf("headless build must report Known=false cursor; got %+v", gate.lastCursor)
-	}
+	// AllowsAt sets lastCursor; returning it proves the dispatcher
+	// took the AllowsAt path. Each build-tag variant asserts the
+	// Known flag appropriate for its cursorLocation backing.
+	return gate.lastCursor
 }

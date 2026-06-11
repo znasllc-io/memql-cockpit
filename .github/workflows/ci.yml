@@ -94,3 +94,46 @@ jobs:
       - name: go vet
         working-directory: memql-cockpit
         run: go vet ./...
+
+  # Compiles + vets the gui-tagged code (RobotGo etc.) on both supported
+  # platforms. Build + vet ONLY: `go test -tags gui` is deliberately omitted —
+  # CI runners are headless and the gui tests drive a real cursor/display
+  # (see #171). Keep the job name short; it appears in branch protection.
+  build-gui:
+    name: build-gui
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout memql-cockpit
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          path: memql-cockpit
+      - name: Checkout memql (sibling for replace directive)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: znasllc-io/memql
+          path: memql
+          # Dependabot runs use a restricted token that can't read other private
+          # repos, so the sibling checkout fails there. MEMQL_SIBLING_TOKEN is a
+          # fine-grained PAT (contents:read on znasllc-io/memql) added as a
+          # Dependabot secret; it falls back to the default token on normal runs.
+          token: ${{ secrets.MEMQL_SIBLING_TOKEN || github.token }}
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: '1.26'
+          cache: true
+          cache-dependency-path: memql-cockpit/go.sum
+      - name: Install X11 dev headers (RobotGo CGO deps)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxtst-dev libxinerama-dev libxkbcommon-dev libxkbcommon-x11-dev libpng-dev libx11-dev libxi-dev
+      - name: go build (gui)
+        working-directory: memql-cockpit
+        run: CGO_ENABLED=1 go build -tags gui ./...
+      - name: go vet (gui)
+        working-directory: memql-cockpit
+        run: CGO_ENABLED=1 go vet -tags gui ./...
