@@ -175,10 +175,14 @@ func TestClassify(t *testing.T) {
 		{"workerComputer", "screenshot", ClassObserve},
 		{"workerComputer", "capabilities", ClassObserve},
 		{"workerComputer", "window_list", ClassObserve},
+		{"workerComputer", "wait", ClassObserve},
 		{"workerComputer", "mouse_click", ClassInteract},
+		{"workerComputer", "mouse_down", ClassInteract},
+		{"workerComputer", "mouse_up", ClassInteract},
 		{"workerComputer", "mouse_move", ClassInteract},
 		{"workerComputer", "key_type", ClassInteract},
 		{"workerComputer", "key_press", ClassInteract},
+		{"workerComputer", "key_hold", ClassInteract},
 		{"workerComputer", "window_focus", ClassInteract},
 		{"workerHost", "experimental_new_action", ClassUnknown},
 		{"workerOther", "foo", ClassUnknown},
@@ -377,11 +381,15 @@ func TestStrictMode_HighRiskSubset(t *testing.T) {
 	}{
 		{"workerComputer", "key_type", true},
 		{"workerComputer", "mouse_click", true},
+		{"workerComputer", "key_hold", true},   // composes into chords (memql-cockpit#166)
+		{"workerComputer", "mouse_down", true}, // down/up pair IS a click
+		{"workerComputer", "mouse_up", true},
 		{"workerComputer", "key_press", false}, // ClassInteract but NOT high-risk
 		{"workerComputer", "mouse_move", false},
 		{"workerHost", "exec", false}, // ClassInteract but workerHost, not workerComputer
 		{"workerHost", "fs_write", false},
 		{"workerComputer", "screenshot", false}, // ClassObserve
+		{"workerComputer", "wait", false},       // ClassObserve (memql-cockpit#166)
 	} {
 		t.Run(tc.tool+"."+tc.action, func(t *testing.T) {
 			dec := m.Allows(tc.tool, tc.action)
@@ -488,11 +496,16 @@ func TestIsHighRiskAction(t *testing.T) {
 	}{
 		{"workerComputer", "key_type", true},
 		{"workerComputer", "mouse_click", true},
+		{"workerComputer", "key_hold", true},
+		{"workerComputer", "mouse_down", true},
+		{"workerComputer", "mouse_up", true},
 		{"workerComputer", "KEY_TYPE", true}, // case + whitespace tolerant
 		{" workerComputer ", " mouse_click ", true},
+		{" workerComputer ", " MOUSE_DOWN ", true},
 		{"workerComputer", "mouse_move", false},
 		{"workerComputer", "key_press", false},
 		{"workerComputer", "screenshot", false},
+		{"workerComputer", "wait", false},
 		{"workerHost", "exec", false},
 		{"workerHost", "fs_write", false},
 		{"", "", false},

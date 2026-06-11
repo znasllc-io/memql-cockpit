@@ -177,8 +177,14 @@ func (d *Dispatcher) Dispatch(ctx context.Context, dispatch *memqlv1.ToolDispatc
 		// and the Linux display-server check. A failed preflight
 		// short-circuits with a structured remediation hint instead
 		// of letting RobotGo fail or panic downstream.
+		// `wait` (memql-cockpit#166) is the second build-agnostic
+		// action: a bounded sleep that needs no GUI backend and no
+		// platform permission, so it routes alongside `capabilities`,
+		// before the per-build router AND before the preflights.
 		if action == computerCapabilitiesAction {
 			success, failure = runComputerCapabilities()
+		} else if action == computerWaitAction {
+			success, failure = runComputerWait(ctx, args)
 		} else if fail := preflightComputerAction(action); fail != nil {
 			failure = fail
 		} else {
