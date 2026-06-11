@@ -602,7 +602,7 @@ func (w *wizard) bodyText() []string {
 	switch w.step {
 	case stepAccessibility:
 		if runtime.GOOS != "darwin" {
-			return []string{"On Linux X11 the wizard probes XTEST mouse movement; on Wayland the worker registers HEADLESS only and this step is informational."}
+			return []string{"On Linux the wizard checks the display server first -- RobotGo requires X11, so a Wayland or display-less session FAILS here and input actions return display_server_unsupported at dispatch time. On X11 it then probes XTEST mouse movement."}
 		}
 		return []string{
 			"macOS grants Accessibility per BINARY. Running this wizard from Terminal probes whether the underlying CGEvent post succeeds, which can be true because Terminal already has the grant and the cockpit-gui inherits.",
@@ -611,7 +611,7 @@ func (w *wizard) bodyText() []string {
 		}
 	case stepScreenRecording:
 		if runtime.GOOS != "darwin" {
-			return []string{"On Linux the screen-grab uses the X11 SHM extension; success is reported by file size of the test capture."}
+			return []string{"On Linux the screen-grab requires an X11 session (Wayland FAILS with display_server_unsupported); on X11 the grab uses the X11 SHM extension."}
 		}
 		return []string{
 			"Screen Recording is a separate macOS TCC entry from Accessibility. Same inheritance rules apply -- a probe that succeeds via Terminal does NOT mean cockpit-gui itself is approved.",
