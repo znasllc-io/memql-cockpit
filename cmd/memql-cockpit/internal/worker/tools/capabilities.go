@@ -76,6 +76,16 @@ func computeCapabilities(goos string, getenv func(string) string) CapabilityDesc
 	}
 }
 
+// DetectDisplayServer reports the display server the live host
+// session exposes ("quartz" / "wayland" / "x11" / "none"). Exported
+// so the worker package can wire it as the Linux display-server
+// preflight hook (memql-cockpit#164) and the setup wizard can print
+// the same verdict the dispatcher will enforce -- one detection, no
+// drift.
+func DetectDisplayServer() string {
+	return detectDisplayServer(runtime.GOOS, os.Getenv)
+}
+
 // detectDisplayServer names the display server the host environment
 // exposes: "quartz" on macOS (always present), and on Linux
 // "wayland" / "x11" / "none" from the session env vars. Everything

@@ -174,10 +174,12 @@ func TestClassify(t *testing.T) {
 		{"workerHost", "fs_write", ClassInteract},
 		{"workerComputer", "screenshot", ClassObserve},
 		{"workerComputer", "capabilities", ClassObserve},
+		{"workerComputer", "window_list", ClassObserve},
 		{"workerComputer", "mouse_click", ClassInteract},
 		{"workerComputer", "mouse_move", ClassInteract},
 		{"workerComputer", "key_type", ClassInteract},
 		{"workerComputer", "key_press", ClassInteract},
+		{"workerComputer", "window_focus", ClassInteract},
 		{"workerHost", "experimental_new_action", ClassUnknown},
 		{"workerOther", "foo", ClassUnknown},
 		{"  WORKERHOST  ", "  FS_READ  ", ClassObserve}, // case + whitespace
