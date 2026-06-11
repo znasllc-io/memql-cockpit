@@ -2,7 +2,11 @@
 
 package tools
 
-import "sort"
+import (
+	"sort"
+
+	"github.com/go-vgo/robotgo"
+)
 
 // buildHasGUI reports whether this binary was built with the gui
 // tag. True here: the gui-tagged build carries the RobotGo backend.
@@ -25,4 +29,19 @@ func supportedComputerActions() []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// displayCount probes the number of attached displays for the
+// capability descriptor (memql-cockpit#165). Only called once
+// computeCapabilities has confirmed a reachable display server
+// (quartz / x11), so a non-positive probe result -- e.g. Xinerama
+// missing on a single-headed X server -- is floored at 1: a display
+// server implies at least one display. Mirrors the
+// enumerateDisplays fallback in computer_gui.go.
+func displayCount() int {
+	n := robotgo.DisplaysNum()
+	if n < 1 {
+		n = 1
+	}
+	return n
 }

@@ -16,3 +16,11 @@ const buildHasGUI = false
 func supportedComputerActions() []string {
 	return []string{}
 }
+
+// displayCount on the headless build is 0: there is no RobotGo
+// backend to probe displays with, and the descriptor's displayServer
+// is always "none" here so computeCapabilities never reaches this --
+// it exists so both build variants satisfy the same contract.
+func displayCount() int {
+	return 0
+}
