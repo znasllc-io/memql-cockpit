@@ -1,9 +1,5 @@
 name: Release binaries
 
-# Builds the cross-platform memql-cockpit binaries and attaches them to each
-# GitHub Release so memql.io/install.sh can download them. Names match the
-# Makefile's make cockpit-all-platforms outputs.
-
 on:
   release:
     types: [published]
@@ -20,18 +16,33 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout cockpit
         uses: actions/checkout@v4
+        with:
+          path: memql-cockpit
+
+      - name: Checkout memql (sibling — satisfies the ../memql replace in go.mod)
+        uses: actions/checkout@v4
+        with:
+          repository: znasllc-io/memql
+          ref: main
+          path: memql
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version-file: memql-cockpit/go.mod
+
+      - name: Tidy modules (sync go.mod/go.sum with the memql sibling)
+        working-directory: memql-cockpit
+        run: go mod tidy
 
       - name: Build all platforms (headless)
+        working-directory: memql-cockpit
         run: make cockpit-all-platforms
 
       - name: Upload binaries to the release
+        working-directory: memql-cockpit
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
