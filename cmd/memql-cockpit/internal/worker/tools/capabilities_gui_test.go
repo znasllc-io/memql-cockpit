@@ -25,12 +25,18 @@ func TestComputeCapabilities_GUI(t *testing.T) {
 	if !sort.StringsAreSorted(desc.Actions) {
 		t.Errorf("actions must be sorted for a stable wire shape; got %v", desc.Actions)
 	}
-	if len(desc.Actions) != len(computerActionHandlers) {
-		t.Errorf("actions length %d must match the router table %d", len(desc.Actions), len(computerActionHandlers))
+	// The advertised list = the GUI router table + the build-agnostic
+	// set (`wait`, memql-cockpit#166).
+	if want := len(computerActionHandlers) + len(buildAgnosticComputerActions); len(desc.Actions) != want {
+		t.Errorf("actions length %d must match router table + build-agnostic set (%d)", len(desc.Actions), want)
+	}
+	agnostic := make(map[string]bool, len(buildAgnosticComputerActions))
+	for _, a := range buildAgnosticComputerActions {
+		agnostic[a] = true
 	}
 	for _, a := range desc.Actions {
-		if _, ok := computerActionHandlers[a]; !ok {
-			t.Errorf("advertised action %q is not in the router table", a)
+		if _, ok := computerActionHandlers[a]; !ok && !agnostic[a] {
+			t.Errorf("advertised action %q is neither in the router table nor build-agnostic", a)
 		}
 	}
 	for _, a := range desc.Actions {
@@ -39,8 +45,9 @@ func TestComputeCapabilities_GUI(t *testing.T) {
 		}
 	}
 	// window_list / window_focus shipped for real in
-	// memql-cockpit#167 -- the gui build must advertise them.
-	for _, required := range []string{"window_list", "window_focus"} {
+	// memql-cockpit#167; wait / key_hold / mouse_down / mouse_up in
+	// memql-cockpit#166 -- the gui build must advertise them all.
+	for _, required := range []string{"window_list", "window_focus", "wait", "key_hold", "mouse_down", "mouse_up"} {
 		found := false
 		for _, a := range desc.Actions {
 			if a == required {

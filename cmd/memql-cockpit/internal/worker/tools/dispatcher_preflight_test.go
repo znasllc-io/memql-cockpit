@@ -45,7 +45,8 @@ func dispatchComputerAction(t *testing.T, d *Dispatcher, action string) (*memqlv
 // without a matching preflight classification shows up as a
 // conscious decision here.
 var computerInputActions = []string{
-	"mouse_move", "mouse_click", "mouse_drag", "mouse_scroll", "key_type", "key_combo",
+	"mouse_move", "mouse_click", "mouse_down", "mouse_up", "mouse_drag", "mouse_scroll",
+	"key_type", "key_combo", "key_hold",
 }
 
 // TestDispatcher_AccessibilityPreflightDeniesInputActions: when the
@@ -203,9 +204,38 @@ func TestIsComputerInputAction(t *testing.T) {
 			t.Errorf("isComputerInputAction(%q) = false, want true", action)
 		}
 	}
-	for _, action := range []string{"screenshot", "cursor_position", "display_info", "capabilities", "window_list", "window_focus", ""} {
+	// wait is deliberately exempt (memql-cockpit#166): a pure sleep
+	// posts no input events, so it must never trip the Accessibility
+	// or display-server preflights.
+	for _, action := range []string{"screenshot", "cursor_position", "display_info", "capabilities", "wait", "window_list", "window_focus", ""} {
 		if isComputerInputAction(action) {
 			t.Errorf("isComputerInputAction(%q) = true, want false", action)
 		}
+	}
+}
+
+// TestDispatcher_WaitBypassesPreflight: like capabilities, wait is
+// build-agnostic and permission-free -- it must succeed even when
+// every preflight hook would deny (memql-cockpit#166). Runs on both
+// build variants: a sleep drives no real input.
+func TestDispatcher_WaitBypassesPreflight(t *testing.T) {
+	setPreflightHooks(t,
+		func() bool { return false },
+		func() bool { return false },
+		func() string { return "wayland" },
+	)
+	d := NewDispatcher(quietLogger(), DefaultPolicy(), nil)
+
+	success, failure := d.Dispatch(context.Background(), &memqlv1.ToolDispatch{
+		Tool:     "workerComputer",
+		Action:   "wait",
+		ArgsJson: []byte(`{"ms": 1}`),
+		CallId:   "preflight-wait",
+	})
+	if failure != nil {
+		t.Fatalf("wait must never be preflight-gated; got %s: %s", failure.GetErrorCode(), failure.GetErrorMessage())
+	}
+	if success == nil {
+		t.Fatal("expected a success payload from wait")
 	}
 }
