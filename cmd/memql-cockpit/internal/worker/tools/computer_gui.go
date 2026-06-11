@@ -81,19 +81,10 @@ func (d *Dispatcher) dispatchComputer(ctx context.Context, action string, args m
 // emitted/captured ratio, logicalWidth/logicalHeight the RobotGo
 // input-space dims (the requested w/h for region captures).
 func guiScreenshot(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
-	// Per-call TCC preflight: confirm the Screen Recording grant is
-	// still in place. The setup wizard probes this once at first
-	// run; if the user later revokes the grant from System Settings
-	// -> Privacy -> Screen Recording, the next screenshot would
-	// otherwise return an empty / black image with no clear error.
-	// The hook is set by the darwin && gui build at init time; on
-	// every other platform it's nil and we skip.
-	if ScreenCapturePreflightHook != nil && !ScreenCapturePreflightHook() {
-		return nil, failure("permission_denied",
-			"Screen Recording permission is not granted for this binary. "+
-				"Open System Settings -> Privacy & Security -> Screen Recording, "+
-				"enable memql-cockpit-gui, then re-run.")
-	}
+	// The per-call Screen Recording TCC preflight runs in the
+	// dispatcher's preflightComputerAction (preflight.go) before this
+	// handler is reached, alongside the Accessibility + display-server
+	// gates (memql-cockpit#164).
 	format := strings.ToLower(strings.TrimSpace(argString(args, "format")))
 	if format == "" {
 		format = "png"
