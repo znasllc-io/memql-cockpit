@@ -189,6 +189,179 @@ func TestClampLongEdge(t *testing.T) {
 	}
 }
 
+// Multi-display geometry tests (memql-cockpit#165). Pure: no
+// display, no build tag.
+
+// TestCoordinateMapperWithOrigin pins the per-display mapping
+// contract: emitted coords on display D map to D-local logical
+// points clamped into D's rect, then offset by D's virtual-desktop
+// origin (negative for displays left of / above the primary).
+func TestCoordinateMapperWithOrigin(t *testing.T) {
+	// Secondary 1920x1080 at logical capture (captured == logical),
+	// downscaled to 1568x882.
+	right := NewCoordinateMapper(1920, 1080, 1920, 1080, 1568, 882).WithOrigin(1728, 0)
+	left := NewCoordinateMapper(1920, 1080, 1920, 1080, 1568, 882).WithOrigin(-1920, 0)
+	above := NewCoordinateMapper(1920, 1080, 1920, 1080, 1568, 882).WithOrigin(0, -1080)
+	// Secondary small enough to skip the downscale policy entirely.
+	rightRaw := NewCoordinateMapper(1280, 720, 1280, 720, 1280, 720).WithOrigin(2560, 200)
+
+	cases := []struct {
+		name         string
+		m            CoordinateMapper
+		x, y         int
+		wantX, wantY int
+	}{
+		{name: "right monitor origin maps to its corner", m: right, x: 0, y: 0, wantX: 1728, wantY: 0},
+		{name: "right monitor far corner stays inside", m: right, x: 1567, y: 881, wantX: 1728 + 1919, wantY: 1079},
+		{name: "right monitor mid point", m: right, x: 784, y: 441, wantX: 1728 + 960, wantY: 540},
+		{name: "left monitor origin is negative", m: left, x: 0, y: 0, wantX: -1920, wantY: 0},
+		{name: "left monitor mid point", m: left, x: 784, y: 441, wantX: -960, wantY: 540},
+		{name: "left monitor far corner stays left of primary", m: left, x: 1567, y: 881, wantX: -1, wantY: 1079},
+		{name: "above monitor maps to negative y", m: above, x: 0, y: 0, wantX: 0, wantY: -1080},
+		{name: "no-downscale identity plus offset", m: rightRaw, x: 100, y: 50, wantX: 2660, wantY: 250},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotX, gotY := tc.m.ToLogical(tc.x, tc.y)
+			if gotX != tc.wantX || gotY != tc.wantY {
+				t.Fatalf("ToLogical(%d,%d) = (%d,%d), want (%d,%d)",
+					tc.x, tc.y, gotX, gotY, tc.wantX, tc.wantY)
+			}
+		})
+	}
+}
+
+// TestCoordinateMapperWithOriginZeroIsIdentity pins that a zero
+// origin -- the default for every mapper built before multi-display
+// support -- changes nothing, so the single-display behavior is
+// byte-identical.
+func TestCoordinateMapperWithOriginZeroIsIdentity(t *testing.T) {
+	base := NewCoordinateMapper(1728, 1117, 3456, 2234, 1568, 1014)
+	offset := base.WithOrigin(0, 0)
+	points := [][2]int{{0, 0}, {784, 507}, {1567, 1013}}
+	for _, p := range points {
+		bx, by := base.ToLogical(p[0], p[1])
+		ox, oy := offset.ToLogical(p[0], p[1])
+		if bx != ox || by != oy {
+			t.Fatalf("WithOrigin(0,0) diverged at (%d,%d): base (%d,%d) vs origin (%d,%d)",
+				p[0], p[1], bx, by, ox, oy)
+		}
+	}
+}
+
+// TestCoordinateMapperWithOriginRoundTrip pins emitted -> logical ->
+// emitted within one pixel for offset displays, including negative
+// origins, so repeated mapping cannot drift across displays.
+func TestCoordinateMapperWithOriginRoundTrip(t *testing.T) {
+	mappers := map[string]CoordinateMapper{
+		"right":     NewCoordinateMapper(1920, 1080, 1920, 1080, 1568, 882).WithOrigin(1728, 0),
+		"left":      NewCoordinateMapper(1920, 1080, 1920, 1080, 1568, 882).WithOrigin(-1920, 0),
+		"above":     NewCoordinateMapper(2560, 1440, 2560, 1440, 1568, 882).WithOrigin(0, -1440),
+		"identity+": NewCoordinateMapper(1280, 720, 1280, 720, 1280, 720).WithOrigin(2560, 200),
+	}
+	for name, m := range mappers {
+		t.Run(name, func(t *testing.T) {
+			points := [][2]int{
+				{0, 0},
+				{1, 1},
+				{m.EmittedW / 2, m.EmittedH / 2},
+				{m.EmittedW - 1, m.EmittedH - 1},
+			}
+			for _, p := range points {
+				lx, ly := m.ToLogical(p[0], p[1])
+				if lx < m.OriginX || ly < m.OriginY ||
+					lx >= m.OriginX+m.LogicalW || ly >= m.OriginY+m.LogicalH {
+					t.Fatalf("ToLogical(%d,%d) = (%d,%d) escaped display rect origin (%d,%d) size %dx%d",
+						p[0], p[1], lx, ly, m.OriginX, m.OriginY, m.LogicalW, m.LogicalH)
+				}
+				ex, ey := m.ToEmitted(lx, ly)
+				if abs(ex-p[0]) > 1 || abs(ey-p[1]) > 1 {
+					t.Fatalf("round trip (%d,%d) -> (%d,%d) -> (%d,%d) drifted more than 1px",
+						p[0], p[1], lx, ly, ex, ey)
+				}
+			}
+		})
+	}
+}
+
+func TestValidatePointInDisplays(t *testing.T) {
+	sideBySide := []DisplayRect{
+		{ID: 0, X: 0, Y: 0, W: 1920, H: 1080},
+		{ID: 1, X: 1920, Y: 0, W: 1920, H: 1080},
+	}
+	// L-shaped: a wide primary with a smaller display below-left. The
+	// bounding box would cover (1920..2559, 1440..2519) but no
+	// display does -- that dead zone must reject.
+	lShape := []DisplayRect{
+		{ID: 0, X: 0, Y: 0, W: 2560, H: 1440},
+		{ID: 1, X: 0, Y: 1440, W: 1920, H: 1080},
+	}
+	leftMonitor := []DisplayRect{
+		{ID: 0, X: 0, Y: 0, W: 1728, H: 1117},
+		{ID: 1, X: -1920, Y: 0, W: 1920, H: 1080},
+	}
+	gapped := []DisplayRect{
+		{ID: 0, X: 0, Y: 0, W: 1000, H: 1000},
+		{ID: 1, X: 1100, Y: 0, W: 1000, H: 1000},
+	}
+	withDegenerate := []DisplayRect{
+		{ID: 0, X: 0, Y: 0, W: 0, H: 0},
+		{ID: 1, X: 10, Y: 10, W: 100, H: 100},
+	}
+
+	cases := []struct {
+		name     string
+		displays []DisplayRect
+		x, y     int
+		wantOK   bool
+	}{
+		{name: "primary origin", displays: sideBySide, x: 0, y: 0, wantOK: true},
+		{name: "primary far corner", displays: sideBySide, x: 1919, y: 1079, wantOK: true},
+		{name: "secondary first column", displays: sideBySide, x: 1920, y: 0, wantOK: true},
+		{name: "secondary far corner", displays: sideBySide, x: 3839, y: 1079, wantOK: true},
+		{name: "past the union right edge", displays: sideBySide, x: 3840, y: 0, wantOK: false},
+		{name: "below both displays", displays: sideBySide, x: 0, y: 1080, wantOK: false},
+		{name: "negative x with no left display", displays: sideBySide, x: -1, y: 0, wantOK: false},
+		{name: "L-shape inside lower display", displays: lShape, x: 1900, y: 1500, wantOK: true},
+		{name: "L-shape dead zone rejects", displays: lShape, x: 2000, y: 1500, wantOK: false},
+		{name: "L-shape primary far corner", displays: lShape, x: 2559, y: 1439, wantOK: true},
+		{name: "L-shape right of primary", displays: lShape, x: 2560, y: 0, wantOK: false},
+		{name: "left monitor negative coords valid", displays: leftMonitor, x: -1, y: 0, wantOK: true},
+		{name: "left monitor far origin valid", displays: leftMonitor, x: -1920, y: 0, wantOK: true},
+		{name: "past the left monitor", displays: leftMonitor, x: -1921, y: 0, wantOK: false},
+		{name: "below left monitor but left of primary", displays: leftMonitor, x: -1, y: 1085, wantOK: false},
+		{name: "gap between monitors rejects", displays: gapped, x: 1050, y: 500, wantOK: false},
+		{name: "right edge of gap is valid", displays: gapped, x: 1100, y: 500, wantOK: true},
+		{name: "no displays rejects", displays: nil, x: 0, y: 0, wantOK: false},
+		{name: "degenerate rect contains nothing", displays: withDegenerate, x: 5, y: 5, wantOK: false},
+		{name: "degenerate rect does not mask real ones", displays: withDegenerate, x: 10, y: 10, wantOK: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fail := validatePointInDisplays("mouse_move", tc.x, tc.y, tc.displays)
+			if tc.wantOK {
+				if fail != nil {
+					t.Fatalf("expected (%d,%d) inside the display union, got failure: %s",
+						tc.x, tc.y, fail.GetErrorMessage())
+				}
+				return
+			}
+			if fail == nil {
+				t.Fatalf("expected (%d,%d) outside the display union to fail, got nil", tc.x, tc.y)
+			}
+			if fail.GetErrorCode() != "out_of_bounds" {
+				t.Fatalf("error code = %q, want out_of_bounds", fail.GetErrorCode())
+			}
+			if !strings.Contains(fail.GetErrorMessage(), "mouse_move") {
+				t.Fatalf("message should carry the action label, got: %s", fail.GetErrorMessage())
+			}
+			if len(tc.displays) > 0 && !strings.Contains(fail.GetErrorMessage(), "display 0") {
+				t.Fatalf("message should name the display rects, got: %s", fail.GetErrorMessage())
+			}
+		})
+	}
+}
+
 func abs(v int) int {
 	if v < 0 {
 		return -v
