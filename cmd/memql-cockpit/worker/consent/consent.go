@@ -39,10 +39,11 @@ const DefaultApprovalTimeout = 30 * time.Second
 // TUI pane).
 //
 // ClassObserve is the read-side: fs_read / fs_list / fs_stat /
-// http_fetch / workerComputer.{screenshot,capabilities}.
+// http_fetch / workerComputer.{screenshot,capabilities,window_list}.
 //
 // ClassInteract is the write-side: exec / fs_write /
-// workerComputer.{mouse_click,mouse_move,key_type,key_press}.
+// workerComputer.{mouse_click,mouse_move,key_type,key_press,
+// window_focus}.
 //
 // ClassUnknown is the safety net for unknown (tool, action) pairs;
 // they're treated as ClassInteract for gate purposes (deny-by-
@@ -70,10 +71,10 @@ type Decision struct {
 // -- the operator pre-authorised that zone of the screen. Clicks
 // outside the rect still route through the Allow/Deny modal.
 //
-// The region is a static screen rect because the worker has no
-// window-bounds API today (window_list / window_focus are stubs).
-// A window-relative or per-app region is future work once that API
-// lands. key_type carries no spatial coordinate, so the region
+// The region is a static screen rect. A window-relative or per-app
+// region is future work now that the window-bounds API exists
+// (window_list / window_focus, memql-cockpit#167).
+// key_type carries no spatial coordinate, so the region
 // exemption never applies to it -- typed text stays fully gated
 // under strict mode.
 type Region struct {
@@ -487,9 +488,15 @@ func Classify(tool, action string) Class {
 		// capabilities is pure self-introspection (build tag +
 		// display-server env, memql-cockpit#162): reads nothing
 		// sensitive, touches nothing -- observe-class.
-		case "screenshot", "capabilities":
+		// window_list (memql-cockpit#167) enumerates window
+		// metadata without touching anything -- observe-class.
+		case "screenshot", "capabilities", "window_list":
 			return ClassObserve
-		case "mouse_click", "mouse_move", "key_type", "key_press":
+		// window_focus (memql-cockpit#167) re-orders the user's
+		// desktop (raises a window, steals focus) -- interact-class,
+		// made explicit rather than riding the unknown->interact
+		// default.
+		case "mouse_click", "mouse_move", "key_type", "key_press", "window_focus":
 			return ClassInteract
 		}
 	}
