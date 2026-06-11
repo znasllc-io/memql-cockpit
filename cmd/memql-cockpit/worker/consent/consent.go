@@ -39,7 +39,7 @@ const DefaultApprovalTimeout = 30 * time.Second
 // TUI pane).
 //
 // ClassObserve is the read-side: fs_read / fs_list / fs_stat /
-// http_fetch / workerComputer.screenshot.
+// http_fetch / workerComputer.{screenshot,capabilities}.
 //
 // ClassInteract is the write-side: exec / fs_write /
 // workerComputer.{mouse_click,mouse_move,key_type,key_press}.
@@ -484,7 +484,10 @@ func Classify(tool, action string) Class {
 		}
 	case "workercomputer":
 		switch strings.ToLower(strings.TrimSpace(action)) {
-		case "screenshot":
+		// capabilities is pure self-introspection (build tag +
+		// display-server env, memql-cockpit#162): reads nothing
+		// sensitive, touches nothing -- observe-class.
+		case "screenshot", "capabilities":
 			return ClassObserve
 		case "mouse_click", "mouse_move", "key_type", "key_press":
 			return ClassInteract

@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"image"
 	"image/jpeg"
@@ -18,6 +17,29 @@ import (
 	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 )
 
+// computerActionHandlers is the single source of truth for the
+// GUI-backed workerComputer actions this build supports. The
+// dispatcher routes through it AND the capability descriptor
+// (capabilities_gui.go) derives its advertised action list from it,
+// so the two can never drift (memql-cockpit#162).
+//
+// window_list / window_focus are deliberately absent: they're
+// unsupported_on_platform stubs today (see dispatchComputer) and
+// must not be advertised until they ship for real. The
+// `capabilities` action is also absent -- it's build-agnostic and
+// routed by the dispatcher before this table is consulted.
+var computerActionHandlers = map[string]func(map[string]any) (*memqlv1.Success, *memqlv1.Failure){
+	"screenshot":      guiScreenshot,
+	"cursor_position": guiCursorPosition,
+	"mouse_move":      guiMouseMove,
+	"mouse_click":     guiMouseClick,
+	"mouse_drag":      guiMouseDrag,
+	"mouse_scroll":    guiMouseScroll,
+	"key_type":        guiKeyType,
+	"key_combo":       guiKeyCombo,
+	"display_info":    guiDisplayInfo,
+}
+
 // dispatchComputer routes workerComputer.<action> to the matching
 // RobotGo-backed implementation. The default-build sibling
 // (computer.go, //go:build !gui) returns Unimplemented.
@@ -28,25 +50,10 @@ import (
 // and `memql-cockpit-gui worker setup` for the operator wizard.
 func (d *Dispatcher) dispatchComputer(ctx context.Context, action string, args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	_ = ctx
+	if handler, ok := computerActionHandlers[action]; ok {
+		return handler(args)
+	}
 	switch action {
-	case "screenshot":
-		return guiScreenshot(args)
-	case "cursor_position":
-		return guiCursorPosition(args)
-	case "mouse_move":
-		return guiMouseMove(args)
-	case "mouse_click":
-		return guiMouseClick(args)
-	case "mouse_drag":
-		return guiMouseDrag(args)
-	case "mouse_scroll":
-		return guiMouseScroll(args)
-	case "key_type":
-		return guiKeyType(args)
-	case "key_combo":
-		return guiKeyCombo(args)
-	case "display_info":
-		return guiDisplayInfo(args)
 	case "window_list":
 		return guiWindowList(args)
 	case "window_focus":
@@ -283,16 +290,8 @@ func guiWindowFocus(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	}
 }
 
-// successComputerJSON is a small helper kept here for the GUI
-// handlers above.
-func successComputerJSON(payload map[string]any, preview string, bytesOut int) *memqlv1.Success {
-	body, _ := json.Marshal(payload)
-	return &memqlv1.Success{
-		ResultJson:    body,
-		BytesOut:      uint64(bytesOut),
-		OutputPreview: clampPreview(preview),
-	}
-}
+// successComputerJSON moved to capabilities.go (untagged) so the
+// build-agnostic capabilities handler can share it.
 
 func transcodeToJPEG(in []byte, quality int) ([]byte, error) {
 	img, _, err := image.Decode(bytes.NewReader(in))

@@ -1,0 +1,129 @@
+package tools
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"runtime"
+	"strings"
+
+	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
+)
+
+// capabilitySchemaVersion is the wire-shape version of the
+// capability descriptor. Bump when the JSON shape changes in a way
+// consumers must branch on; additive fields don't need a bump.
+const capabilitySchemaVersion = 1
+
+// computerCapabilitiesAction is the one workerComputer action that
+// works on EVERY build variant. The dispatcher routes it before the
+// per-build dispatchComputer so a headless binary answers honestly
+// (guiAvailable=false, actions=[]) instead of returning
+// gui_unavailable. It's the agent runtime's introspection path:
+// "what can this worker actually do?" must never itself fail.
+const computerCapabilitiesAction = "capabilities"
+
+// CapabilityDescriptor is the worker's computer-use capability
+// self-description (memql-cockpit#162). Computed from the build tag
+// (gui vs headless) plus the host environment at call time.
+//
+// Actions lists the GUI-backed workerComputer actions this build can
+// dispatch (derived from the same table the GUI action router uses,
+// so it can never drift from reality). The `capabilities` action
+// itself is deliberately NOT listed -- it is available on every
+// build unconditionally, including headless ones where Actions is
+// empty.
+//
+// GUIAvailable reports whether the binary was built with the gui
+// tag. DisplayServer reports what the environment looks like at
+// call time ("none" when no display is reachable); consumers that
+// want "can I actually screenshot right now" should check both.
+type CapabilityDescriptor struct {
+	Platform      string   `json:"platform"`
+	DisplayServer string   `json:"displayServer"`
+	GUIAvailable  bool     `json:"guiAvailable"`
+	Actions       []string `json:"actions"`
+	SchemaVersion int      `json:"schemaVersion"`
+}
+
+// ComputeCapabilities builds the descriptor for the running binary
+// and host. The build-variant bits (buildHasGUI +
+// supportedComputerActions) come from capabilities_headless.go /
+// capabilities_gui.go.
+func ComputeCapabilities() CapabilityDescriptor {
+	return computeCapabilities(runtime.GOOS, os.Getenv)
+}
+
+// computeCapabilities is the env-injectable core of
+// ComputeCapabilities so tests can table-drive the display-server
+// detection without mutating the process environment.
+func computeCapabilities(goos string, getenv func(string) string) CapabilityDescriptor {
+	actions := supportedComputerActions()
+	if actions == nil {
+		// Keep the JSON shape stable: "actions": [] -- never null.
+		actions = []string{}
+	}
+	displayServer := "none"
+	if buildHasGUI {
+		displayServer = detectDisplayServer(goos, getenv)
+	}
+	return CapabilityDescriptor{
+		Platform:      goos,
+		DisplayServer: displayServer,
+		GUIAvailable:  buildHasGUI,
+		Actions:       actions,
+		SchemaVersion: capabilitySchemaVersion,
+	}
+}
+
+// detectDisplayServer names the display server the host environment
+// exposes: "quartz" on macOS (always present), and on Linux
+// "wayland" / "x11" / "none" from the session env vars. Everything
+// else (windows, BSDs without the env vars) reports "none" until a
+// dedicated probe lands.
+func detectDisplayServer(goos string, getenv func(string) string) string {
+	switch goos {
+	case "darwin":
+		return "quartz"
+	case "linux":
+		if getenv("WAYLAND_DISPLAY") != "" ||
+			strings.EqualFold(strings.TrimSpace(getenv("XDG_SESSION_TYPE")), "wayland") {
+			return "wayland"
+		}
+		if getenv("DISPLAY") != "" {
+			return "x11"
+		}
+		return "none"
+	}
+	return "none"
+}
+
+// runComputerCapabilities serves workerComputer.capabilities on
+// every build variant. Routed by the dispatcher BEFORE the per-build
+// dispatchComputer so the headless build answers instead of
+// rejecting with gui_unavailable.
+func runComputerCapabilities() (*memqlv1.Success, *memqlv1.Failure) {
+	desc := ComputeCapabilities()
+	preview := fmt.Sprintf("platform=%s displayServer=%s guiAvailable=%t actions=%d",
+		desc.Platform, desc.DisplayServer, desc.GUIAvailable, len(desc.Actions))
+	return successComputerJSON(map[string]any{
+		"platform":      desc.Platform,
+		"displayServer": desc.DisplayServer,
+		"guiAvailable":  desc.GUIAvailable,
+		"actions":       desc.Actions,
+		"schemaVersion": desc.SchemaVersion,
+	}, preview, 0), nil
+}
+
+// successComputerJSON is the structured-success helper for
+// workerComputer handlers. Lives here (untagged) because both build
+// variants need it: the GUI handlers in computer_gui.go and the
+// build-agnostic capabilities handler above.
+func successComputerJSON(payload map[string]any, preview string, bytesOut int) *memqlv1.Success {
+	body, _ := json.Marshal(payload)
+	return &memqlv1.Success{
+		ResultJson:    body,
+		BytesOut:      uint64(bytesOut),
+		OutputPreview: clampPreview(preview),
+	}
+}
