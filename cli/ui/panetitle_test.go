@@ -18,12 +18,12 @@ func TestPaneTitle_FormatHelpers(t *testing.T) {
 			total    int
 			want     string
 		}{
-			{0, 0, ""},        // empty list -> bare title
-			{0, 1, "1/1"},     // 0-indexed cursor displays as 1-indexed
+			{0, 0, ""},    // empty list -> bare title
+			{0, 1, "1/1"}, // 0-indexed cursor displays as 1-indexed
 			{2, 5, "3/5"},
-			{-1, 5, "1/5"},    // clamp under
-			{99, 5, "5/5"},    // clamp over
-			{0, -3, ""},       // defensive: negative total -> empty
+			{-1, 5, "1/5"}, // clamp under
+			{99, 5, "5/5"}, // clamp over
+			{0, -3, ""},    // defensive: negative total -> empty
 		}
 		for _, tc := range cases {
 			if got := FormatCursor(tc.selected, tc.total); got != tc.want {
@@ -37,11 +37,11 @@ func TestPaneTitle_FormatHelpers(t *testing.T) {
 			selected, matches, total int
 			want                     string
 		}{
-			{0, 0, 0, ""},                             // empty everything
-			{0, 5, 5, "1/5"},                          // no filter active
-			{2, 3, 12, "3/3 filtered from 12"},        // filter narrows
-			{0, 0, 12, "0/0 filtered from 12"},        // filter matched nothing
-			{99, 3, 12, "3/3 filtered from 12"},      // selected clamps under matches
+			{0, 0, 0, ""},                       // empty everything
+			{0, 5, 5, "1/5"},                    // no filter active
+			{2, 3, 12, "3/3 filtered from 12"},  // filter narrows
+			{0, 0, 12, "0/0 filtered from 12"},  // filter matched nothing
+			{99, 3, 12, "3/3 filtered from 12"}, // selected clamps under matches
 		}
 		for _, tc := range cases {
 			if got := FormatFiltered(tc.selected, tc.matches, tc.total); got != tc.want {

@@ -17,12 +17,12 @@
 //
 // Layout follows the cli/CLAUDE.md panel chrome contract:
 //
-//   LEFT (DECISIONS)                            RIGHT (DETAIL)
-//   title + filtered counter                    title + line counter
-//   row list, 2-row items                       generic field list
-//   aggregate strip (totals + breakdowns)       (scrolls independently)
-//   filter chip strip
-//   action hints
+//	LEFT (DECISIONS)                            RIGHT (DETAIL)
+//	title + filtered counter                    title + line counter
+//	row list, 2-row items                       generic field list
+//	aggregate strip (totals + breakdowns)       (scrolls independently)
+//	filter chip strip
+//	action hints
 //
 // Both panes embed cli/ui widgets (ListPane / DetailPane) so
 // scroll, scrollbar, page keys, and key-routing behave the same as

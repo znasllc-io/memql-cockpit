@@ -319,6 +319,7 @@ func (v *View) renderConceptRow(screen *ui.Screen, bounds ui.Rect, idx int, sel 
 // the per-concept hint set:
 //   - primary line: card.Primary's value from the row payload
 //   - subtitle: secondary · tertiary  ·  status  ·  relative-time
+//
 // When no card is declared, falls back to the legacy
 // rowDisplayLabel + id + absolute timestamp shape so unannotated
 // concepts still render.
