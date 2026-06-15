@@ -51,6 +51,56 @@ func TestMouseButtonArg(t *testing.T) {
 	}
 }
 
+// TestMouseClickModifiers covers the pure (pre-RobotGo) validation of
+// the mouse_click `modifiers` arg (memql-cockpit#184): the schema
+// vocabulary + aliases canonicalize to RobotGo key names, order is
+// preserved, duplicates collapse, and an unknown modifier is a
+// structured bad_request rather than a silent no-op.
+func TestMouseClickModifiers(t *testing.T) {
+	cases := []struct {
+		name    string
+		args    map[string]any
+		want    []string
+		wantErr bool
+	}{
+		{"absent yields none", map[string]any{}, nil, false},
+		{"empty list yields none", map[string]any{"modifiers": []any{}}, nil, false},
+		{"single cmd", map[string]any{"modifiers": []any{"cmd"}}, []string{"cmd"}, false},
+		{"schema vocabulary", map[string]any{"modifiers": []any{"cmd", "shift", "alt", "ctrl"}},
+			[]string{"cmd", "shift", "alt", "ctrl"}, false},
+		{"aliases canonicalize", map[string]any{"modifiers": []any{"command", "option", "control"}},
+			[]string{"cmd", "alt", "ctrl"}, false},
+		{"case + whitespace tolerant", map[string]any{"modifiers": []any{" Cmd ", "SHIFT"}},
+			[]string{"cmd", "shift"}, false},
+		{"duplicates collapse, order preserved", map[string]any{"modifiers": []any{"shift", "cmd", "shift"}},
+			[]string{"shift", "cmd"}, false},
+		{"unknown rejected", map[string]any{"modifiers": []any{"hyper"}}, nil, true},
+		{"one bad among good rejected", map[string]any{"modifiers": []any{"cmd", "fn"}}, nil, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, fail := mouseClickModifiers(tc.args)
+			if tc.wantErr {
+				if fail == nil || fail.GetErrorCode() != "bad_request" {
+					t.Fatalf("expected bad_request; got mods=%v fail=%+v", got, fail)
+				}
+				return
+			}
+			if fail != nil {
+				t.Fatalf("unexpected failure: %+v", fail)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("modifiers = %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("modifiers[%d] = %q, want %q (full %v)", i, got[i], tc.want[i], got)
+				}
+			}
+		})
+	}
+}
+
 func TestGuiKeyHold_RequiresKey(t *testing.T) {
 	success, fail := guiKeyHold(map[string]any{"durationMs": float64(10)})
 	if success != nil {

@@ -399,6 +399,63 @@ func guiMouseMove(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	}, "moved", 0), nil
 }
 
+// modifierKeyAliases maps the bff tool schema's modifier vocabulary
+// (modifiers: [cmd|shift|alt|ctrl]) onto RobotGo key names, plus the
+// common cross-platform aliases a model is likely to emit. Every value
+// is a name RobotGo's KeyDown/KeyUp accept directly (see robotgo
+// key.go: cmd == META, the "win" key on Windows; alt == Option on
+// macOS; ctrl == control). Resolving to the OS-correct physical key is
+// RobotGo's job -- holding "cmd" presses Command on macOS and the
+// Super/Win key elsewhere, matching how the existing key_combo /
+// key_hold handlers pass these names straight through.
+var modifierKeyAliases = map[string]string{
+	"cmd":     "cmd",
+	"command": "cmd",
+	"meta":    "cmd",
+	"super":   "cmd",
+	"win":     "cmd",
+	"windows": "cmd",
+	"shift":   "shift",
+	"alt":     "alt",
+	"option":  "alt",
+	"opt":     "alt",
+	"ctrl":    "ctrl",
+	"control": "ctrl",
+}
+
+// mouseClickModifiers validates and canonicalizes the optional
+// mouse_click `modifiers` arg into the RobotGo key names to hold around
+// the click. The arg is a string array (e.g. ["cmd"], ["shift","alt"]);
+// absent / empty yields no modifiers. An unknown name is a structured
+// bad_request rather than a silent no-op -- the whole point of #184 is
+// that a requested modifier must take effect or fail loudly. Order is
+// preserved and duplicates are dropped so a press has exactly one
+// matching release.
+//
+// This is the pure (pre-RobotGo) half so it can be unit-tested on any
+// build; guiMouseClick performs the actual KeyDown/KeyUp.
+func mouseClickModifiers(args map[string]any) ([]string, *memqlv1.Failure) {
+	raw := argStringList(args, "modifiers")
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	out := make([]string, 0, len(raw))
+	seen := map[string]bool{}
+	for _, m := range raw {
+		key, ok := modifierKeyAliases[strings.ToLower(strings.TrimSpace(m))]
+		if !ok {
+			return nil, failure("bad_request", fmt.Sprintf(
+				"mouse_click: modifier %q not supported (use cmd, shift, alt, or ctrl)", m))
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, key)
+	}
+	return out, nil
+}
+
 func guiMouseClick(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	button := strings.ToLower(strings.TrimSpace(argString(args, "button")))
 	if button == "" {
@@ -411,6 +468,41 @@ func guiMouseClick(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	if argBool(args, "double", false) && count < 2 {
 		count = 2
 	}
+	// modifiers (cmd/shift/alt/ctrl) are held DOWN around the click so a
+	// model-requested cmd-click / shift-click composes into a real chord
+	// instead of degrading to a plain click (memql-cockpit#184). The
+	// bff tool schema has always advertised this arg; it was a silent
+	// no-op until now. Strict-mode classification is unchanged: this is
+	// still mouse_click, already in the high-risk subset (consent.go
+	// isHighRiskAction), and the held-modifier-becomes-a-chord risk is
+	// exactly why that subset exists.
+	modifiers, fail := mouseClickModifiers(args)
+	if fail != nil {
+		return nil, fail
+	}
+
+	// Press modifiers in order, then ALWAYS release (LIFO) -- even if a
+	// press or the click itself fails -- so a partial failure can never
+	// leave a key stuck down and silently chord every later action.
+	var pressed []string
+	releaseModifiers := func() *memqlv1.Failure {
+		var relFail *memqlv1.Failure
+		for i := len(pressed) - 1; i >= 0; i-- {
+			if err := robotgo.KeyUp(pressed[i]); err != nil && relFail == nil {
+				relFail = failure("mouse_click_failed",
+					fmt.Sprintf("release modifier %q (key may be stuck down): %v", pressed[i], err))
+			}
+		}
+		return relFail
+	}
+	for _, mod := range modifiers {
+		if err := robotgo.KeyDown(mod); err != nil {
+			releaseModifiers()
+			return nil, failure("mouse_click_failed", fmt.Sprintf("press modifier %q: %v", mod, err))
+		}
+		pressed = append(pressed, mod)
+	}
+
 	var err error
 	switch count {
 	case 2:
@@ -424,14 +516,22 @@ func guiMouseClick(args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	default:
 		err = robotgo.Click(button, false)
 	}
+	releaseFail := releaseModifiers()
 	if err != nil {
 		return nil, failure("mouse_click_failed", err.Error())
 	}
-	return successComputerJSON(map[string]any{
+	if releaseFail != nil {
+		return nil, releaseFail
+	}
+	payload := map[string]any{
 		"button": button,
 		"count":  count,
 		"double": count >= 2, // legacy field, kept for payload back-compat
-	}, "clicked", 0), nil
+	}
+	if len(modifiers) > 0 {
+		payload["modifiers"] = modifiers
+	}
+	return successComputerJSON(payload, "clicked", 0), nil
 }
 
 // guiMouseDown / guiMouseUp post a bare button-state transition
