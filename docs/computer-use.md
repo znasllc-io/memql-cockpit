@@ -155,8 +155,12 @@ the target display), `display` (default 0), `smooth` (bool). Result
 
 **`mouse_click`** -- `button` (`left` default | `right` | `middle`),
 `count` (1-3, clamped; 3 posts a real triple-click), legacy `double`
-bool honored as `count=2`. Clicks at the CURRENT cursor position --
-position with `mouse_move` first. Result `{button, count, double}`.
+bool honored as `count=2`, `modifiers` (optional string array of
+`cmd` | `shift` | `alt` | `ctrl`, held DOWN around the click so a
+cmd-click / shift-click composes into a real chord; an unknown
+modifier is a `bad_request`, never a silent plain click). Clicks at
+the CURRENT cursor position -- position with `mouse_move` first.
+Result `{button, count, double, modifiers?}`.
 
 **`mouse_down` / `mouse_up`** -- `button` (`left` default | `right` |
 `middle`). Deliberately stateless: a `mouse_up` with no preceding
