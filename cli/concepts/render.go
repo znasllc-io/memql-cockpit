@@ -15,10 +15,10 @@ import (
 // "no block" (e.g. header / separator rows); intrinsics / payload /
 // provenance each get their own id so consecutive rows form a band.
 const (
-	blockNone        = 0
-	blockIntrinsics  = 1
-	blockPayload     = 2
-	blockProvenance  = 3
+	blockNone       = 0
+	blockIntrinsics = 1
+	blockPayload    = 2
+	blockProvenance = 3
 )
 
 // serializedRow is the intermediate representation produced by

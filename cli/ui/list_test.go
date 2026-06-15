@@ -175,13 +175,13 @@ func TestListPane_HandleEvent_NotFocusedReturnsFalse(t *testing.T) {
 // shift Selected and consume the event.
 func TestListPane_HandleEvent_FocusedArrowKeysMove(t *testing.T) {
 	cases := []struct {
-		name      string
-		key       tcell.Key
-		startSel  int
-		wantSel   int
-		startVPC  int
-		count     int
-		ru        rune
+		name     string
+		key      tcell.Key
+		startSel int
+		wantSel  int
+		startVPC int
+		count    int
+		ru       rune
 	}{
 		{name: "Up", key: tcell.KeyUp, startSel: 3, wantSel: 2, count: 10},
 		{name: "Down", key: tcell.KeyDown, startSel: 3, wantSel: 4, count: 10},
@@ -250,9 +250,9 @@ func TestListPane_HandleEvent_EmptyListReturnsFalse(t *testing.T) {
 // doesn't.
 func TestListPane_ScrollbarVisibleOnlyWhenOverflow(t *testing.T) {
 	cases := []struct {
-		name        string
-		count       int
-		boundsH     int
+		name          string
+		count         int
+		boundsH       int
 		wantScrollbar bool
 	}{
 		{"fits exactly", 5, 5, false},

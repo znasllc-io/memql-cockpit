@@ -355,7 +355,7 @@ func TestPanelChrome_TitleFormat(t *testing.T) {
 	// first pane spans cols [0, ~30), the second [~30, ~66), the
 	// third [~66, 120). For each, the counter should land in the
 	// pane's RIGHT half.
-	conceptsPaneEnd := viewWidth * 25 / 100        // ~30
+	conceptsPaneEnd := viewWidth * 25 / 100           // ~30
 	rowsPaneEnd := conceptsPaneEnd + viewWidth*30/100 // ~66
 	// Validate at least one of the counters is right-anchored. Use
 	// the CONCEPTS pane: counter "1/3" must land past the midpoint
