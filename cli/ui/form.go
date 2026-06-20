@@ -211,13 +211,8 @@ func (f *Form) drawField(screen *Screen, theme Theme, idx, x, y, maxW int) {
 			placeStyle := tcell.StyleDefault.Foreground(theme.Subtle).Background(bg)
 			screen.DrawText(fieldX+1, y, fieldW-2, field.Placeholder, placeStyle)
 		} else {
-			screen.DrawText(fieldX+1, y, fieldW-2, text, boxStyle)
-			if focused {
-				cursorX := fieldX + 1 + len(text)
-				if cursorX < fieldX+fieldW-1 {
-					screen.SetCell(cursorX, y, ' ', tcell.StyleDefault.Background(theme.FG))
-				}
-			}
+			caretStyle := tcell.StyleDefault.Background(theme.FG)
+			DrawInputValue(screen, fieldX, y, fieldW, text, focused, boxStyle, caretStyle)
 		}
 	}
 }
@@ -466,4 +461,56 @@ func runeLen(s string) int {
 		n++
 	}
 	return n
+}
+
+// DrawInputValue renders the value of a single-line text input inside a
+// box, with horizontal scrolling so the END of the value -- and the
+// caret -- stay visible when the value is wider than the box.
+//
+// The caret is modeled at the END of value: the cockpit's text fields
+// are append/backspace-only (no mid-string caret movement), so the
+// insertion point is always the last rune. Without windowing, a value
+// longer than the box rendered from its start, hiding both the tail the
+// user just typed/pasted and the caret -- you couldn't see what you were
+// editing (memql-cockpit#193). This is the one place that logic lives so
+// every form field scrolls identically.
+//
+// Geometry: boxX/boxW describe the filled input box; the text is inset
+// one cell on each side (inner = boxW-2 visible cells). When focused a
+// cell is reserved at the right for the block caret so it never falls
+// off the edge, and the view windows to the tail. When not focused there
+// is no caret and the value renders from its start (the readable default
+// for a field you're not editing). textStyle paints the value; caretStyle
+// paints the block caret.
+func DrawInputValue(screen *Screen, boxX, y, boxW int, value string, focused bool, textStyle, caretStyle tcell.Style) {
+	if screen == nil {
+		return
+	}
+	inner := boxW - 2
+	if inner < 1 {
+		return
+	}
+	if !focused {
+		// Not editing: show the head, clipped -- recognizable for a
+		// field the user isn't currently in.
+		screen.DrawText(boxX+1, y, inner, value, textStyle)
+		return
+	}
+
+	// Reserve the right-most inner cell for the caret so it is always on
+	// screen, then window the value to its tail.
+	glyphCells := inner - 1
+	runes := []rune(value)
+	if glyphCells < 1 {
+		// Degenerate box (boxW == 3): just show the caret.
+		screen.SetCell(boxX+1, y, ' ', caretStyle)
+		return
+	}
+	start := 0
+	if len(runes) > glyphCells {
+		start = len(runes) - glyphCells
+	}
+	screen.DrawText(boxX+1, y, glyphCells, string(runes[start:]), textStyle)
+	caretX := boxX + 1 + (len(runes) - start)
+	screen.SetCell(caretX, y, ' ', caretStyle)
 }

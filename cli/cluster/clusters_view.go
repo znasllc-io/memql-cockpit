@@ -711,13 +711,11 @@ func (v *ClustersView) drawAddForm(screen *ui.Screen, x, y, maxW int, bounds ui.
 		if text == "" && i != v.addForm.cursor {
 			screen.DrawText(fieldX+1, y, fieldW-2, placeholders[i], fieldStyle.Foreground(v.Theme.Subtle))
 		} else {
-			screen.DrawText(fieldX+1, y, fieldW-2, text, fieldStyle)
-			if i == v.addForm.cursor {
-				cursorX := fieldX + 1 + len(text)
-				if cursorX < fieldX+fieldW-1 {
-					screen.SetCell(cursorX, y, ' ', tcell.StyleDefault.Background(v.Theme.FG))
-				}
-			}
+			// Horizontal scroll so a long pasted value keeps its end +
+			// caret on screen (memql-cockpit#193). Encapsulated in
+			// ui.DrawInputValue so every form field scrolls the same way.
+			caretStyle := tcell.StyleDefault.Background(v.Theme.FG)
+			ui.DrawInputValue(screen, fieldX, y, fieldW, text, i == v.addForm.cursor, fieldStyle, caretStyle)
 		}
 		y += 2
 	}
