@@ -2060,80 +2060,99 @@ func (a *App) wireClustersCallbacks() {
 		}
 	}
 
-	// Delete a cluster (local cannot be deleted). Deleting the cluster
-	// the user was viewing OR working against re-homes both the viewed
-	// and selected pointers onto the row the cluster-list now
-	// highlights -- local in practice, since it's always at index 0.
-	// Without this rehoming the topology pane would stay frozen on
-	// the deleted cluster's title/state until the user manually
-	// arrowed back.
-	a.clustersView.OnDelete = func(clusterName string) {
-		if clusterName == "local" {
-			return
-		}
-		clusters, err := config.LoadClusters()
-		if err != nil {
-			return
-		}
-		var remaining []config.ClusterConfig
-		for _, c := range clusters.Clusters {
-			if c.Name != clusterName {
-				remaining = append(remaining, c)
-			}
-		}
-		clusters.Clusters = remaining
-		_ = config.SaveClusters(clusters)
-		_ = config.DeleteToken(clusterName)
+	// Delete a cluster (see deleteCluster -- local cannot be deleted;
+	// teardown is forked off the event loop).
+	a.clustersView.OnDelete = a.deleteCluster
+}
 
-		// Close the pool entry and drop any references to the deleted
-		// cluster before the list refresh -- so refreshClusterList sees
-		// a clean pool when it stamps row statuses.
-		a.poolMu.Lock()
-		entry, ok := a.pool[clusterName]
-		if ok {
-			delete(a.pool, clusterName)
+// deleteCluster removes a user-added cluster from the registry and the
+// UI. "local" is never deletable.
+//
+// CRITICAL: this runs on the tcell event-loop goroutine (it's the
+// OnDelete keypress callback). Everything here MUST be fast, non-
+// blocking, local work -- the loop processes one event at a time, so a
+// blocking call freezes the entire TUI. The actual teardown
+// (gRPC stream close + OS-keyring token delete) is BLOCKING I/O and is
+// forked to a background goroutine below. On macOS in particular the
+// keyring delete can pop a system permission dialog that's invisible
+// behind the full-screen TUI, hanging the loop indefinitely if run
+// inline (memql-cockpit#191). This mirrors the clipboard-copy (Ctrl+Y)
+// and kill-switch (Ctrl+E) goroutine-fork pattern.
+func (a *App) deleteCluster(clusterName string) {
+	if clusterName == "local" {
+		return
+	}
+	clusters, err := config.LoadClusters()
+	if err != nil {
+		return
+	}
+	var remaining []config.ClusterConfig
+	for _, c := range clusters.Clusters {
+		if c.Name != clusterName {
+			remaining = append(remaining, c)
 		}
-		selectedDeleted := a.selected == clusterName
-		viewedDeleted := a.viewed == clusterName
-		if selectedDeleted {
-			a.selected = ""
-		}
-		if viewedDeleted {
-			a.viewed = ""
-		}
-		a.poolMu.Unlock()
+	}
+	clusters.Clusters = remaining
+	_ = config.SaveClusters(clusters)
+
+	// Drop the pool entry + any references to the deleted cluster before
+	// the list refresh -- so refreshClusterList sees a clean pool when it
+	// stamps row statuses. The entry's blocking Close() is forked below.
+	a.poolMu.Lock()
+	entry, ok := a.pool[clusterName]
+	if ok {
+		delete(a.pool, clusterName)
+	}
+	selectedDeleted := a.selected == clusterName
+	viewedDeleted := a.viewed == clusterName
+	if selectedDeleted {
+		a.selected = ""
+	}
+	if viewedDeleted {
+		a.viewed = ""
+	}
+	a.poolMu.Unlock()
+
+	// Blocking teardown off the event loop: the gRPC stream/conn close
+	// and the OS-keyring token delete (the indefinite-hang culprit on
+	// macOS). The cluster is already gone from config + the pool, so the
+	// row disappears on this frame regardless of how long teardown takes.
+	go func() {
 		if entry != nil {
 			entry.Close()
 		}
-		a.clustersView.SetConnected(clusterName, false, "", "")
-		a.refreshClusterList()
+		_ = config.DeleteToken(clusterName)
+		a.postRedraw()
+	}()
 
-		// Pick the row the list is now highlighting (clamped to the
-		// shrunk list; "local" at index 0 is guaranteed to exist).
-		if v := a.clustersView; v != nil {
-			if v.Selected >= len(v.Clusters) && v.Selected > 0 {
-				v.Selected = len(v.Clusters) - 1
-			}
-			if len(v.Clusters) == 0 {
-				// Shouldn't happen -- local is always present -- but
-				// bail gracefully rather than panic.
-				v.SelectedCluster = ""
-				return
-			}
-			newName := v.Clusters[v.Selected].Config.Name
-			// Rehome the viewed pointer (and its topology side-effect)
-			// whenever the viewed cluster went away.
-			if viewedDeleted {
-				a.setViewed(newName)
-			}
-			// Rehome the working-cluster pointer too if THAT one was
-			// deleted. Independent of viewed -- user may have deleted
-			// a cluster that was selected but not highlighted.
-			if selectedDeleted {
-				a.setSelected(newName)
-			}
-			v.SelectedCluster = a.selectedName()
+	a.clustersView.SetConnected(clusterName, false, "", "")
+	a.refreshClusterList()
+
+	// Pick the row the list is now highlighting (clamped to the
+	// shrunk list; "local" at index 0 is guaranteed to exist).
+	if v := a.clustersView; v != nil {
+		if v.Selected >= len(v.Clusters) && v.Selected > 0 {
+			v.Selected = len(v.Clusters) - 1
 		}
+		if len(v.Clusters) == 0 {
+			// Shouldn't happen -- local is always present -- but
+			// bail gracefully rather than panic.
+			v.SelectedCluster = ""
+			return
+		}
+		newName := v.Clusters[v.Selected].Config.Name
+		// Rehome the viewed pointer (and its topology side-effect)
+		// whenever the viewed cluster went away.
+		if viewedDeleted {
+			a.setViewed(newName)
+		}
+		// Rehome the working-cluster pointer too if THAT one was
+		// deleted. Independent of viewed -- user may have deleted
+		// a cluster that was selected but not highlighted.
+		if selectedDeleted {
+			a.setSelected(newName)
+		}
+		v.SelectedCluster = a.selectedName()
 	}
 }
 
