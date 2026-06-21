@@ -42,6 +42,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net"
 	"net/http"
@@ -95,17 +96,17 @@ func Login(ctx context.Context, issuer, clientId string) (*LoginResult, error) {
 				msg = errParam + ": " + desc
 			}
 			codeCh <- callbackResult{err: errors.New(msg)}
-			fmt.Fprintf(w, "Authentication failed: %s. You can close this tab.", msg)
+			writeCallbackPage(w, false, "Sign-in failed", msg)
 			return
 		}
 		code := r.URL.Query().Get("code")
 		if code == "" {
 			codeCh <- callbackResult{err: errors.New("no code in callback")}
-			http.Error(w, "missing code", http.StatusBadRequest)
+			writeCallbackPage(w, false, "Sign-in failed", "The identity service didn't return an authorization code.")
 			return
 		}
 		codeCh <- callbackResult{code: code}
-		fmt.Fprint(w, "Authentication successful. You can close this tab and return to the terminal.")
+		writeCallbackPage(w, true, "You're signed in", "memQL Cockpit has been authorized to connect on your behalf.")
 	})
 
 	server := &http.Server{Handler: mux}
@@ -356,3 +357,69 @@ func openBrowser(target string) error {
 		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
 	}
 }
+
+// writeCallbackPage renders the browser landing page shown after the
+// loopback OAuth callback fires -- a small, self-contained (no external
+// assets) memQL Cockpit-branded card. ok picks the success vs error
+// treatment; title + message are the headline + body. message is
+// HTML-escaped since it can carry an upstream error string.
+func writeCallbackPage(w http.ResponseWriter, ok bool, title, message string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if !ok {
+		w.WriteHeader(http.StatusBadRequest)
+	}
+	badgeClass, icon := "ok", "&#10003;" // check mark
+	if !ok {
+		badgeClass, icon = "err", "&#10005;" // multiplication x
+	}
+	fmt.Fprintf(w, callbackPageHTML,
+		html.EscapeString(title), badgeClass, icon,
+		html.EscapeString(title), html.EscapeString(message))
+}
+
+// callbackPageHTML is the landing-page template. Order of %s:
+// <title>, badge class, icon, headline, body. Inline CSS only; dark
+// theme tuned to read well in any browser without external fonts.
+const callbackPageHTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>%s &middot; memQL Cockpit</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%%; margin: 0; }
+  body {
+    display: grid; place-items: center;
+    font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: radial-gradient(1100px 560px at 50%% -8%%, #1b2330, #0b0e14);
+    color: #e6edf3; padding: 24px;
+  }
+  .card {
+    width: min(92vw, 430px); padding: 40px 36px; text-align: center;
+    background: #11161f; border: 1px solid #232b38; border-radius: 16px;
+    box-shadow: 0 24px 64px rgba(0,0,0,.5);
+  }
+  .badge {
+    width: 64px; height: 64px; margin: 0 auto 22px; border-radius: 50%%;
+    display: grid; place-items: center; font-size: 30px; line-height: 1;
+  }
+  .badge.ok  { background: rgba(63,185,80,.14); color: #3fb950; }
+  .badge.err { background: rgba(248,81,73,.14); color: #f85149; }
+  .brand { font-size: 12px; letter-spacing: .16em; text-transform: uppercase; color: #8b949e; margin-bottom: 8px; }
+  h1 { font-size: 20px; margin: 0 0 10px; font-weight: 600; }
+  p  { font-size: 14px; line-height: 1.55; color: #aab2bd; margin: 0; }
+  .hint { margin-top: 24px; font-size: 12px; color: #6e7681; }
+</style>
+</head>
+<body>
+  <main class="card">
+    <div class="badge %s">%s</div>
+    <div class="brand">memQL Cockpit</div>
+    <h1>%s</h1>
+    <p>%s</p>
+    <div class="hint">You can close this tab and return to your terminal.</div>
+  </main>
+</body>
+</html>`

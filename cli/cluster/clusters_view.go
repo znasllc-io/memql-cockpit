@@ -628,7 +628,7 @@ func (v *ClustersView) drawAddForm(screen *ui.Screen, x, y, maxW int, bounds ui.
 	screen.FillRect(fieldX, y, fieldW, 1, fieldStyle)
 	caretStyle := tcell.StyleDefault.Background(v.Theme.FG)
 	if v.addForm.domain == "" {
-		screen.DrawText(fieldX+1, y, fieldW-2, "staging.copresent.ai", fieldStyle.Foreground(v.Theme.Subtle))
+		screen.DrawText(fieldX+1, y, fieldW-2, "example.copresent.ai", fieldStyle.Foreground(v.Theme.Subtle))
 		screen.SetCell(fieldX+1, y, ' ', caretStyle)
 	} else {
 		// Horizontal scroll so a long domain keeps its end + caret on
@@ -636,18 +636,6 @@ func (v *ClustersView) drawAddForm(screen *ui.Screen, x, y, maxW int, bounds ui.
 		ui.DrawInputValue(screen, fieldX, y, fieldW, v.addForm.domain, true, fieldStyle, caretStyle)
 	}
 	y += 2
-
-	// Live preview of the URLs the domain composes into, so the
-	// convention is visible before saving.
-	if d := strings.TrimSpace(v.addForm.domain); d != "" {
-		preview := v.Theme.SubtleStyle()
-		screen.DrawText(x+1, y, maxW-1, "bff."+d, preview)
-		y++
-		screen.DrawText(x+1, y, maxW-1, "identity."+d, preview)
-		y += 2
-	} else {
-		y++
-	}
 
 	// Inline validation error (if any). Wrapped via ui.WrapText so a
 	// long message doesn't truncate in the narrow left column.

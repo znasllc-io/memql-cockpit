@@ -85,6 +85,12 @@ type App struct {
 	// startup (typically "local").
 	viewed   string
 	selected string
+	// pendingSelect is a cluster name to promote to "selected" (working
+	// cluster) the moment it first reaches stateConnected. Set when the
+	// user adds a cluster: after the sign-in flow completes and the
+	// entry dials successfully, onEntryConnected auto-selects it so the
+	// new cluster ends up selected + online without a manual Enter.
+	pendingSelect string
 
 	// Tab views
 	conceptsView *concepts.View
@@ -1884,9 +1890,9 @@ func (a *App) wireClustersCallbacks() {
 		a.notifications.Clear("cluster:add")
 		a.refreshClusterList()
 
-		// Open a pool entry for it -- the 3-attempt lifecycle starts
-		// automatically. User can press Enter (once it connects) to
-		// make it their selected cluster.
+		// Open a pool entry for it. A freshly-added cluster has an
+		// Issuer + ClientId but no token yet, so openEntry parks it in
+		// stateNeedsToken -- it won't dial on its own.
 		a.openEntry(c)
 
 		// Highlight the new row + move the "viewed" pointer so the
@@ -1901,6 +1907,21 @@ func (a *App) wireClustersCallbacks() {
 			}
 		}
 		a.setViewed(c.Name)
+
+		// Arm auto-select: when this cluster first connects (after the
+		// sign-in below), onEntryConnected promotes it to the working
+		// cluster so the user lands on it selected + online.
+		a.setPendingSelect(c.Name)
+
+		// Route straight to sign-in. Adding a cluster IS the intent to
+		// use it, so open the browser flow now instead of parking the
+		// row in needs-login behind a separate L keypress. A PAT or an
+		// already-cached token skips the browser (the lifecycle dials
+		// directly); everything else opens the OAuth flow, which caches
+		// the token and restarts the entry so it dials + connects.
+		if c.PAT == "" && !hasValidCachedToken(c.Name) {
+			go a.runLoginFlow(c.Name)
+		}
 	}
 
 	// Save an edit to an existing cluster. Works for "local" too -- the
