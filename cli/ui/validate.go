@@ -87,6 +87,40 @@ func IsNameChar(r rune) bool {
 	}
 }
 
+// ValidateDomain checks a cluster domain (e.g. "staging.copresent.ai").
+// Required, fully-qualified (must contain a dot), hostname-shaped, and
+// within MaxHostLen. Returns the normalized (trimmed, lower-cased)
+// domain. The Add/Edit form composes bff.<domain> / identity.<domain>
+// from it, so the shape rules here mirror ValidateHost.
+func ValidateDomain(s string) (string, error) {
+	d := NormalizeName(s)
+	if d == "" {
+		return "", fmt.Errorf("domain is required")
+	}
+	if len(d) > MaxHostLen {
+		return "", fmt.Errorf("domain is too long (max %d chars)", MaxHostLen)
+	}
+	if !strings.Contains(d, ".") {
+		return "", fmt.Errorf("domain must be fully-qualified (e.g. staging.copresent.ai)")
+	}
+	if !hostRE.MatchString(d) {
+		return "", fmt.Errorf("domain must be a hostname like staging.copresent.ai")
+	}
+	return d, nil
+}
+
+// DomainToName derives the clusters.yaml key from a domain: lower-case,
+// dots become dashes, clipped to MaxNameLen, with surrounding dashes
+// trimmed so the result satisfies the DNS-label name rule
+// (dnsLabelRE). "staging.copresent.ai" -> "staging-copresent-ai".
+func DomainToName(domain string) string {
+	s := strings.ReplaceAll(NormalizeName(domain), ".", "-")
+	if len(s) > MaxNameLen {
+		s = s[:MaxNameLen]
+	}
+	return strings.Trim(s, "-")
+}
+
 // ValidateHost checks that the host looks like a reachable network
 // address. Empty is NOT allowed -- a cluster without a host is a
 // save-time error, which the form surfaces inline.
