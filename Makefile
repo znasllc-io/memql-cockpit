@@ -89,7 +89,7 @@ cockpit-gui-all-platforms: cockpit-gui-darwin-arm64 cockpit-gui-darwin-amd64 coc
 # Run targets
 # ---------------------------------------------------------------------------
 
-.PHONY: run-cockpit cockpit-gui-run
+.PHONY: run-cockpit cockpit-gui-run cockpit-gui-run-dev
 
 ## Build and run memQL Cockpit. Reads ~/.memql/clusters.yaml for the
 ## active cluster + credential (PAT or cached OIDC token). Run
@@ -104,6 +104,14 @@ run-cockpit: cockpit
 ## bin/memql-cockpit. See `make cockpit-gui` for build prerequisites.
 cockpit-gui-run: cockpit-gui
 	./$(BIN_DIR)/memql-cockpit-gui
+
+## Build + run the GUI variant in DEV mode: forces the file credential
+## store (MEMQL_COCKPIT_CRED_STORE=file) so the macOS Keychain never
+## prompts for saved cluster tokens. Tokens live in ~/.memql/ (mode 0600)
+## instead of the Keychain. Dev-only convenience -- the unsuffixed
+## targets keep the secure Keychain backend (the default on macOS).
+cockpit-gui-run-dev: cockpit-gui
+	MEMQL_COCKPIT_CRED_STORE=file ./$(BIN_DIR)/memql-cockpit-gui
 
 # ---------------------------------------------------------------------------
 # Test targets
@@ -186,8 +194,9 @@ help:
 	@echo "  make cockpit-gui-all-platforms      GUI cross-build for all platforms"
 	@echo ""
 	@echo "RUN"
-	@echo "  make run-cockpit      Build and run memQL Cockpit (uses ~/.memql/clusters.yaml)"
-	@echo "  make cockpit-gui-run  Build and run the GUI variant (computer-use worker)"
+	@echo "  make run-cockpit          Build and run memQL Cockpit (uses ~/.memql/clusters.yaml)"
+	@echo "  make cockpit-gui-run      Build and run the GUI variant (computer-use worker)"
+	@echo "  make cockpit-gui-run-dev  Same, but file cred store (no macOS Keychain prompts)"
 	@echo ""
 	@echo "TEST"
 	@echo "  make test         Run all tests"
