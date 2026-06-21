@@ -905,6 +905,29 @@ func (a *App) isSelectedCluster(name string) bool {
 	return a.selected == name
 }
 
+// setPendingSelect arms an auto-select for the named cluster: the next
+// time it reaches stateConnected, onEntryConnected promotes it to the
+// working cluster. Used by the Add flow so a just-added, just-signed-in
+// cluster ends up selected without a manual Enter.
+func (a *App) setPendingSelect(name string) {
+	a.poolMu.Lock()
+	a.pendingSelect = name
+	a.poolMu.Unlock()
+}
+
+// takePendingSelect reports whether name is the armed pending-select
+// cluster, clearing the arming if so (one-shot). Must be called WITHOUT
+// poolMu held -- it takes the lock itself.
+func (a *App) takePendingSelect(name string) bool {
+	a.poolMu.Lock()
+	defer a.poolMu.Unlock()
+	if a.pendingSelect == name {
+		a.pendingSelect = ""
+		return true
+	}
+	return false
+}
+
 // onEntryConnected is called by an entry's lifecycle when it reaches
 // stateConnected. Updates the list row and -- if this entry is the
 // VIEWED one (arrow-key highlighted) -- paints its topology pane.
@@ -933,6 +956,13 @@ func (a *App) onEntryConnected(e *connEntry) {
 	// concepts the moment we ask.
 	if a.isSelectedCluster(e.Config.Name) {
 		go a.refreshConcepts(context.Background())
+	}
+
+	// Auto-select a just-added cluster on its first successful connect
+	// (armed by the Add flow). setSelected promotes it to the working
+	// cluster + refreshes the cluster-dependent tabs.
+	if a.takePendingSelect(e.Config.Name) {
+		a.setSelected(e.Config.Name)
 	}
 }
 
