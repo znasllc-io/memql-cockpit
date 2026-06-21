@@ -89,29 +89,36 @@ cockpit-gui-all-platforms: cockpit-gui-darwin-arm64 cockpit-gui-darwin-amd64 coc
 # Run targets
 # ---------------------------------------------------------------------------
 
-.PHONY: run-cockpit cockpit-gui-run cockpit-gui-run-dev
+.PHONY: run-cockpit cockpit-gui-run
+
+# Credential store for the make-launched `*-run` targets. A cockpit
+# started via `make` is ALWAYS a local dev run -- the shipped binary is
+# run directly, not through make -- and locally-built binaries aren't
+# stably code-signed, so the macOS Keychain re-prompts for every saved
+# cluster token on each rebuild. Default these dev launches to the file
+# backend (tokens in ~/.memql/, mode 0600) so there are no prompts.
+# Override to exercise the Keychain path:
+#   make cockpit-gui-run CRED_STORE=keyring
+# The shipped binary's own default is unchanged (auto-probe -> Keychain
+# on macOS); this only affects make-launched runs.
+CRED_STORE ?= file
 
 ## Build and run memQL Cockpit. Reads ~/.memql/clusters.yaml for the
 ## active cluster + credential (PAT or cached OIDC token). Run
 ## `memql-cockpit authorize <url>` once to authorize against an
-## identity service if you haven't already.
+## identity service if you haven't already. Uses the file credential
+## store by default (CRED_STORE=keyring to use the macOS Keychain).
 run-cockpit: cockpit
-	./$(BIN_DIR)/memql-cockpit
+	MEMQL_COCKPIT_CRED_STORE=$(CRED_STORE) ./$(BIN_DIR)/memql-cockpit
 
 ## Build and run the GUI variant (CGO + RobotGo). Same TUI as
 ## `run-cockpit` plus the workerComputer.* capability for
 ## `memql-cockpit worker run`; runs bin/memql-cockpit-gui, NOT
 ## bin/memql-cockpit. See `make cockpit-gui` for build prerequisites.
+## Uses the file credential store by default (CRED_STORE=keyring for
+## the macOS Keychain).
 cockpit-gui-run: cockpit-gui
-	./$(BIN_DIR)/memql-cockpit-gui
-
-## Build + run the GUI variant in DEV mode: forces the file credential
-## store (MEMQL_COCKPIT_CRED_STORE=file) so the macOS Keychain never
-## prompts for saved cluster tokens. Tokens live in ~/.memql/ (mode 0600)
-## instead of the Keychain. Dev-only convenience -- the unsuffixed
-## targets keep the secure Keychain backend (the default on macOS).
-cockpit-gui-run-dev: cockpit-gui
-	MEMQL_COCKPIT_CRED_STORE=file ./$(BIN_DIR)/memql-cockpit-gui
+	MEMQL_COCKPIT_CRED_STORE=$(CRED_STORE) ./$(BIN_DIR)/memql-cockpit-gui
 
 # ---------------------------------------------------------------------------
 # Test targets
@@ -194,9 +201,9 @@ help:
 	@echo "  make cockpit-gui-all-platforms      GUI cross-build for all platforms"
 	@echo ""
 	@echo "RUN"
-	@echo "  make run-cockpit          Build and run memQL Cockpit (uses ~/.memql/clusters.yaml)"
-	@echo "  make cockpit-gui-run      Build and run the GUI variant (computer-use worker)"
-	@echo "  make cockpit-gui-run-dev  Same, but file cred store (no macOS Keychain prompts)"
+	@echo "  make run-cockpit      Build and run memQL Cockpit (file cred store; no Keychain prompts)"
+	@echo "  make cockpit-gui-run  Build and run the GUI variant (computer-use worker)"
+	@echo "                        (both: CRED_STORE=keyring to use the macOS Keychain)"
 	@echo ""
 	@echo "TEST"
 	@echo "  make test         Run all tests"
