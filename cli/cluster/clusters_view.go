@@ -673,6 +673,20 @@ func (v *ClustersView) FormOpen() bool {
 // so a concurrent pool-lifecycle SetX call can't race row-level
 // state. The Topology sub-view owns its own lock and is dispatched
 // without this lock held -- the routing fan-out is state-free.
+// fireUnlocked invokes an app-layer callback WITHOUT v.Mu held, then
+// re-acquires the lock. HandleEvent holds v.Mu for its whole body, but
+// the OnAdd / OnSave / OnDelete callbacks re-enter the view via
+// SetClusters / SetConnected (which take v.Mu). Go's mutex is not
+// reentrant, so calling them under the lock self-deadlocks the event
+// loop (memql-cockpit#201). Releasing around the call-out, then
+// re-locking, keeps HandleEvent's deferred Unlock balanced. MUST be
+// called only while v.Mu is held (i.e. from within HandleEvent).
+func (v *ClustersView) fireUnlocked(cb func()) {
+	v.Mu.Unlock()
+	cb()
+	v.Mu.Lock()
+}
+
 func (v *ClustersView) HandleEvent(ev tcell.Event) bool {
 	v.Mu.Lock()
 	defer v.Mu.Unlock()
@@ -827,12 +841,20 @@ func (v *ClustersView) handleDeleteConfirm(ev *tcell.EventKey) bool {
 		v.confirmDelete = false
 		return true
 	case ev.Key() == tcell.KeyRune && (ev.Rune() == 'y' || ev.Rune() == 'Y'):
+		var fire func()
 		if v.Selected >= 0 && v.Selected < len(v.Clusters) && v.OnDelete != nil {
-			v.OnDelete(v.Clusters[v.Selected].Config.Name)
+			name := v.Clusters[v.Selected].Config.Name
+			cb := v.OnDelete
+			fire = func() { cb(name) }
 		}
 		v.confirmDelete = false
 		if v.Selected >= len(v.Clusters) && v.Selected > 0 {
 			v.Selected--
+		}
+		// OnDelete re-enters the view (SetClusters/SetConnected); run it
+		// without v.Mu held to avoid the re-entrant deadlock (#201).
+		if fire != nil {
+			v.fireUnlocked(fire)
 		}
 		return true
 	default:
@@ -857,18 +879,26 @@ func (v *ClustersView) handleAddFormEvent(ev *tcell.EventKey) bool {
 			return true
 		}
 		c := composeFromDomain(domain)
+		var fire func()
 		if v.addForm.editMode {
 			// Keep the original config key immutable so a saved token /
 			// active-cluster lookup isn't orphaned; only the composed
 			// URLs + display follow the (possibly new) domain.
 			c.Name = v.addForm.editName
 			if v.OnSave != nil {
-				v.OnSave(c)
+				cb := v.OnSave
+				fire = func() { cb(c) }
 			}
 		} else if v.OnAdd != nil {
-			v.OnAdd(c)
+			cb := v.OnAdd
+			fire = func() { cb(c) }
 		}
 		v.showAddForm = false
+		// OnAdd/OnSave re-enter the view (refreshClusterList ->
+		// SetClusters); run without v.Mu held to avoid deadlock (#201).
+		if fire != nil {
+			v.fireUnlocked(fire)
+		}
 		return true
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
 		v.addForm.formError = ""
