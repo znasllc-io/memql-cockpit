@@ -89,7 +89,7 @@ cockpit-gui-all-platforms: cockpit-gui-darwin-arm64 cockpit-gui-darwin-amd64 coc
 # Run targets
 # ---------------------------------------------------------------------------
 
-.PHONY: run-cockpit
+.PHONY: run-cockpit cockpit-gui-run
 
 ## Build and run memQL Cockpit. Reads ~/.memql/clusters.yaml for the
 ## active cluster + credential (PAT or cached OIDC token). Run
@@ -97,6 +97,13 @@ cockpit-gui-all-platforms: cockpit-gui-darwin-arm64 cockpit-gui-darwin-amd64 coc
 ## identity service if you haven't already.
 run-cockpit: cockpit
 	./$(BIN_DIR)/memql-cockpit
+
+## Build and run the GUI variant (CGO + RobotGo). Same TUI as
+## `run-cockpit` plus the workerComputer.* capability for
+## `memql-cockpit worker run`; runs bin/memql-cockpit-gui, NOT
+## bin/memql-cockpit. See `make cockpit-gui` for build prerequisites.
+cockpit-gui-run: cockpit-gui
+	./$(BIN_DIR)/memql-cockpit-gui
 
 # ---------------------------------------------------------------------------
 # Test targets
@@ -179,7 +186,8 @@ help:
 	@echo "  make cockpit-gui-all-platforms      GUI cross-build for all platforms"
 	@echo ""
 	@echo "RUN"
-	@echo "  make run-cockpit  Build and run memQL Cockpit (uses ~/.memql/clusters.yaml)"
+	@echo "  make run-cockpit      Build and run memQL Cockpit (uses ~/.memql/clusters.yaml)"
+	@echo "  make cockpit-gui-run  Build and run the GUI variant (computer-use worker)"
 	@echo ""
 	@echo "TEST"
 	@echo "  make test         Run all tests"
