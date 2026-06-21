@@ -22,7 +22,6 @@ import (
 	"github.com/znasllc-io/memql-cockpit/cli/concepts"
 	"github.com/znasllc-io/memql-cockpit/cli/config"
 	"github.com/znasllc-io/memql-cockpit/cli/crash"
-	"github.com/znasllc-io/memql-cockpit/cli/discovery"
 	"github.com/znasllc-io/memql-cockpit/cli/planner"
 	"github.com/znasllc-io/memql-cockpit/cli/safety"
 	"github.com/znasllc-io/memql-cockpit/cli/settings"
@@ -634,116 +633,6 @@ func (a *App) persistSelected(name string) {
 	if err := config.SaveClusters(clusters); err != nil && a.logger != nil {
 		a.logger.Warn("failed to persist selected cluster", "error", err)
 	}
-}
-
-// runAuthorizeFlow is the OnAuthorize goroutine body. Reports
-// progress + outcome through the notifications center so the UI
-// thread sees status updates without blocking. The notification id
-// is keyed on the cluster being authorized so successive runs
-// against the same cluster replace each other instead of stacking.
-//
-// existingName is the row currently being edited (empty for Add).
-// Used to resolve "what is the row name now?" when the discovery
-// doc disagrees: edit mode keeps the existing name (the user is
-// updating credentials for THIS slot, not renaming), Add mode
-// trusts the discovery doc.
-func (a *App) runAuthorizeFlow(discoveryURL, existingName string) {
-	notifId := "cluster:authorize"
-	if existingName != "" {
-		notifId = "cluster:authorize:" + existingName
-	}
-	a.notifications.SyncMeta(notifId, ui.SeverityInfo,
-		fmt.Sprintf("Fetching discovery from %s ...", discoveryURL))
-	a.postRedraw()
-
-	doc, err := discovery.Fetch(discoveryURL)
-	if err != nil {
-		a.notifications.SyncMeta(notifId, ui.SeverityError,
-			fmt.Sprintf("Discovery failed: %v", err))
-		a.postRedraw()
-		return
-	}
-
-	name := strings.TrimSpace(existingName)
-	if name == "" {
-		name = strings.TrimSpace(doc.ClusterName)
-	}
-	if name == "" {
-		name = discovery.HostFromURL(discoveryURL)
-	}
-	if name == "" {
-		a.notifications.SyncMeta(notifId, ui.SeverityError,
-			"Discovery response did not include a cluster name -- cannot continue.")
-		a.postRedraw()
-		return
-	}
-
-	cfg := config.ClusterConfig{
-		Name:     name,
-		Endpoint: strings.TrimSpace(doc.GRPCEndpoint),
-		Issuer:   strings.TrimSpace(doc.IdentityURL),
-		ClientId: strings.TrimSpace(doc.ClientId),
-	}
-
-	// Persist (replace-in-place for existing rows, append for new ones).
-	clusters, err := config.LoadClusters()
-	if err != nil {
-		a.notifications.SyncMeta(notifId, ui.SeverityError,
-			fmt.Sprintf("Load clusters config: %v", err))
-		a.postRedraw()
-		return
-	}
-	replaced := false
-	for i := range clusters.Clusters {
-		if clusters.Clusters[i].Name == cfg.Name {
-			// Preserve user-set PAT when overwriting the auth-relevant
-			// fields.
-			cfg.PAT = clusters.Clusters[i].PAT
-			clusters.Clusters[i] = cfg
-			replaced = true
-			break
-		}
-	}
-	if !replaced {
-		clusters.Clusters = append(clusters.Clusters, cfg)
-	}
-	if err := config.SaveClusters(clusters); err != nil {
-		a.notifications.SyncMeta(notifId, ui.SeverityError,
-			fmt.Sprintf("Save clusters config: %v", err))
-		a.postRedraw()
-		return
-	}
-
-	// Refresh the cluster list view so the user sees the new Endpoint
-	// / Issuer / ClientId values immediately. The pool entry is left
-	// in stateNeedsConfig (its config is still the pre-authorize one)
-	// until after the token is minted -- otherwise the lifecycle
-	// would race the browser flow, exhaust its 3 dials with "no
-	// authorization header" before the user even sees the magic
-	// link, and the cluster would surface as unreachable while the
-	// user is still typing their email.
-	a.refreshClusterList()
-
-	a.notifications.SyncMeta(notifId, ui.SeverityInfo,
-		fmt.Sprintf("Opening browser to authenticate with %q ...", cfg.Name))
-	a.postRedraw()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	if _, err := auth.EnsureValidToken(ctx, cfg); err != nil {
-		a.notifications.SyncMeta(notifId, ui.SeverityError,
-			fmt.Sprintf("Authorization failed for %q: %v", cfg.Name, err))
-		a.postRedraw()
-		return
-	}
-
-	a.notifications.SyncMeta(notifId, ui.SeverityInfo,
-		fmt.Sprintf("Authorized %q -- connecting...", cfg.Name))
-	a.postRedraw()
-
-	// Token is cached; recreate the pool entry with the new config
-	// so a fresh dial cycle starts with the bearer in place.
-	a.replaceEntry(cfg)
 }
 
 // runLoginFlow runs the OAuth / magic-link browser flow against an
@@ -1953,17 +1842,6 @@ func (a *App) wireClustersCallbacks() {
 			nextStr = fmt.Sprintf("%ds", int(wait.Seconds()+0.5))
 		}
 		return state.String(), attempt, nextStr, true
-	}
-
-	// OnAuthorize fires when the user submits the Add/Edit form with
-	// the Discovery URL field filled. The whole pipeline runs off the
-	// UI thread so the screen stays responsive while the browser flow
-	// is open: discover the well-known doc, persist the resolved
-	// cluster row, mint a token via OAuth (browser), cache the token,
-	// and finally restart the pool entry so the new credentials get
-	// picked up by a fresh dial cycle.
-	a.clustersView.OnAuthorize = func(discoveryURL, existingName string) {
-		go a.runAuthorizeFlow(discoveryURL, existingName)
 	}
 
 	// OnLogin fires when L is pressed on a fully-configured row

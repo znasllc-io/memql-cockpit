@@ -93,12 +93,6 @@ type ClustersView struct {
 	OnHighlight func(clusterName string)     // Arrow keys moved highlight -- topology view should follow
 	OnCancel    func(clusterName string)     // Esc on a row -- cancel its retry cycle if any
 	OnRetry     func(clusterName string)     // R on a row -- manually retry after the 3-attempt cycle failed
-	// OnAuthorize is invoked when the user presses Enter on the Add /
-	// Edit form with the Discovery URL field filled. The app layer
-	// runs the well-known fetch + OAuth + save sequence in a
-	// goroutine and reports progress via notifications. existingName
-	// is the row being edited (empty when this is a fresh Add).
-	OnAuthorize func(discoveryURL, existingName string)
 	// OnLogin runs the OAuth / magic-link browser flow against a
 	// fully-configured cluster (one that already has Issuer +
 	// ClientId, or a PAT). Used when the user presses L on a row
@@ -110,29 +104,15 @@ type ClustersView struct {
 	OnEntryState func(clusterName string) (state string, attempt int, nextTryAt string, ok bool)
 }
 
-// formFieldCount is the number of editable rows in the add/edit form.
-const formFieldCount = 6
-
-// Field indices for the add/edit form. Keep this consistent with the
-// `labels` / `placeholders` arrays in drawAddForm.
-//
-// Discovery sits at the top so a paste-the-URL flow naturally lands
-// the cursor there first. Filling it is optional -- empty Discovery
-// + manually-filled Host/Port/Issuer/ClientId is also a valid path.
-const (
-	formFieldDiscovery = iota
-	formFieldName
-	formFieldHost
-	formFieldPort
-	formFieldIssuer
-	formFieldClientId
-)
-
+// addFormState backs the single-field Add/Edit cluster form. The user
+// types one Domain (e.g. "staging.copresent.ai"); Endpoint / Issuer /
+// ClientId are composed from it by convention on save (see
+// composeFromDomain). Deployments that don't follow the bff./identity.
+// convention are edited directly in ~/.memql/clusters.yaml.
 type addFormState struct {
-	fields   [formFieldCount]string
-	cursor   int
+	domain   string
 	editMode bool   // true when re-opening the form for an existing cluster
-	editName string // original cluster name when editMode is true
+	editName string // original (immutable) cluster name when editMode is true
 	// formError is set by Enter-handling when validation fails. Cleared
 	// on the next keystroke so the hint disappears once the user
 	// acknowledges it and continues editing.
@@ -156,79 +136,46 @@ func LocalClusterConfig() config.ClusterConfig {
 	return defaultLocalClusterConfig
 }
 
-// splitEndpoint parses an endpoint string into its host + port parts
-// for the Add/Edit form. Accepts three shapes:
-//
-//	"host:port"               -> ("host", "port")    -- bare gRPC, plaintext
-//	"scheme://host[:port]"    -> ("scheme://host", "port_or_empty")
-//	""                        -> ("", "")
-//
-// When the user pastes a full URL (https://bff.local.znas.io), the
-// scheme stays on the Host field so joinEndpoint round-trips it back
-// to a working endpoint that ParseClusterEndpoint in cli/client can
-// resolve. Empty port is allowed; validated on save.
-func splitEndpoint(endpoint string) (host, port string) {
-	endpoint = strings.TrimSpace(endpoint)
-	if endpoint == "" {
-		return "", ""
+// composeFromDomain builds a full ClusterConfig from a single domain by
+// the bff./identity. convention the local stack ships with (and that
+// autoSeedLocalFromGenesis uses): Endpoint=https://bff.<domain>,
+// Issuer=https://identity.<domain>, ClientId="cockpit". The caller has
+// already validated + normalized the domain.
+func composeFromDomain(domain string) config.ClusterConfig {
+	return config.ClusterConfig{
+		Name:        ui.DomainToName(domain),
+		DisplayName: domain,
+		Domain:      domain,
+		Endpoint:    "https://bff." + domain,
+		Issuer:      "https://identity." + domain,
+		ClientId:    "cockpit",
 	}
-	if i := strings.Index(endpoint, "://"); i >= 0 {
-		schemePrefix := endpoint[:i+3]
-		rest := endpoint[i+3:]
-		hostPart, portPart := splitHostPort(rest)
-		return schemePrefix + hostPart, portPart
-	}
-	return splitHostPort(endpoint)
 }
 
-func splitHostPort(s string) (host, port string) {
-	idx := strings.LastIndex(s, ":")
-	if idx < 0 {
-		return s, ""
+// domainFromConfig recovers the domain for the Edit form: the stored
+// Domain when present, else derived from a conventional
+// https://bff.<domain> endpoint, else blank (hand-edited rows that
+// don't follow the convention just start empty -- retype the domain or
+// keep editing clusters.yaml by hand).
+func domainFromConfig(c config.ClusterConfig) string {
+	if d := strings.TrimSpace(c.Domain); d != "" {
+		return d
 	}
-	return s[:idx], s[idx+1:]
-}
-
-// joinEndpoint combines host + port back into the single string stored
-// on ClusterConfig.Endpoint. Preserves a scheme prefix on host: a
-// user editing "https://bff.local.znas.io" with empty port saves the
-// URL as-is; a user editing "localhost" + "50050" saves
-// "localhost:50050". The connection layer's ParseClusterEndpoint
-// handles both.
-func joinEndpoint(host, port string) string {
-	host = strings.TrimSpace(host)
-	port = strings.TrimSpace(port)
-	if host == "" && port == "" {
-		return ""
+	ep := strings.TrimSpace(c.Endpoint)
+	ep = strings.TrimPrefix(ep, "https://")
+	ep = strings.TrimPrefix(ep, "http://")
+	ep = strings.TrimPrefix(ep, "bff.")
+	if i := strings.LastIndex(ep, ":"); i >= 0 {
+		ep = ep[:i]
 	}
-	if port == "" {
-		return host
-	}
-	return host + ":" + port
+	return ep
 }
 
 // formStateFromConfig builds an addFormState pre-populated from an
-// existing ClusterConfig. Used when opening the form in edit mode.
-// Discovery URL is always blank when re-entering -- it's an input
-// channel (paste a URL, fetch metadata), not a stored field.
+// existing ClusterConfig, for opening the form in edit mode.
 func formStateFromConfig(c config.ClusterConfig) addFormState {
-	host, port := splitEndpoint(c.Endpoint)
-	cursor := formFieldHost // jump straight to the most-edited field
-	if c.NeedsAuth() {
-		// Row was opened from the L:Authorize affordance -- the
-		// natural next action is to type a discovery URL.
-		cursor = formFieldDiscovery
-	}
 	return addFormState{
-		fields: [formFieldCount]string{
-			formFieldDiscovery: "",
-			formFieldName:      c.Name,
-			formFieldHost:      host,
-			formFieldPort:      port,
-			formFieldIssuer:    c.Issuer,
-			formFieldClientId:  c.ClientId,
-		},
-		cursor:   cursor,
+		domain:   domainFromConfig(c),
 		editMode: true,
 		editName: c.Name,
 	}
@@ -657,73 +604,53 @@ func (v *ClustersView) hintsForManagement() string {
 
 func (v *ClustersView) drawAddForm(screen *ui.Screen, x, y, maxW int, bounds ui.Rect) {
 	// Pane title already reads 'ADD CLUSTER' / 'EDIT CLUSTER' in
-	// drawManagement, so no inline title here -- avoid stacking two
-	// copies of the same label. One blank line of breathing room
-	// before the first field label.
-	_ = bounds // retained for future width-dependent layout decisions
+	// drawManagement, so no inline title here. One blank line of
+	// breathing room before the field.
+	_ = bounds
 	y++
 
-	// Keep these arrays indexed by formField* constants so a reorder in
-	// one place stays consistent. Host + Port are split for clarity --
-	// the connection layer sees them joined on save.
-	labels := [formFieldCount]string{
-		formFieldDiscovery: "Discovery",
-		formFieldName:      "Name",
-		formFieldHost:      "Host",
-		formFieldPort:      "Port",
-		formFieldIssuer:    "Issuer",
-		formFieldClientId:  "Client ID",
-	}
-	placeholders := [formFieldCount]string{
-		formFieldDiscovery: "https://identity.<domain> (optional)",
-		formFieldName:      "my-cluster",
-		formFieldHost:      "https://bff.<domain>",
-		formFieldPort:      "(blank for URLs)",
-		formFieldIssuer:    "(optional)",
-		formFieldClientId:  "(optional)",
-	}
-
-	for i := 0; i < formFieldCount; i++ {
-		// Name is immutable in edit mode -- changing it would orphan any
-		// saved token and break the active-cluster lookup.
-		if v.addForm.editMode && i == formFieldName {
-			screen.DrawText(x+1, y, 10, labels[i], v.Theme.SubtleStyle())
-			screen.DrawText(x+12, y, maxW-13, v.addForm.fields[i], v.Theme.SubtleStyle())
-			y += 2
-			continue
-		}
-		labelStyle := v.Theme.BaseStyle()
-		if i == v.addForm.cursor {
-			labelStyle = v.Theme.AccentStyle()
-		}
-		screen.DrawText(x+1, y, 10, labels[i], labelStyle)
-
-		fieldX := x + 12
-		fieldW := min(maxW-13, 25)
-		fieldBG := tcell.NewRGBColor(35, 38, 45)
-		if i == v.addForm.cursor {
-			fieldBG = tcell.NewRGBColor(50, 55, 65)
-		}
-		fieldStyle := tcell.StyleDefault.Foreground(v.Theme.FG).Background(fieldBG)
-		screen.FillRect(fieldX, y, fieldW, 1, fieldStyle)
-
-		text := v.addForm.fields[i]
-		if text == "" && i != v.addForm.cursor {
-			screen.DrawText(fieldX+1, y, fieldW-2, placeholders[i], fieldStyle.Foreground(v.Theme.Subtle))
-		} else {
-			// Horizontal scroll so a long pasted value keeps its end +
-			// caret on screen (memql-cockpit#193). Encapsulated in
-			// ui.DrawInputValue so every form field scrolls the same way.
-			caretStyle := tcell.StyleDefault.Background(v.Theme.FG)
-			ui.DrawInputValue(screen, fieldX, y, fieldW, text, i == v.addForm.cursor, fieldStyle, caretStyle)
-		}
+	// In edit mode show the immutable config key for context -- changing
+	// the domain recomposes the URLs but keeps the key.
+	if v.addForm.editMode {
+		screen.DrawText(x+1, y, maxW-1, "Cluster  "+v.addForm.editName, v.Theme.SubtleStyle())
 		y += 2
 	}
 
-	// Inline validation error (if any). Shown just above the hint
-	// block so the user sees which field failed without hunting.
-	// Wrapped via ui.WrapText so a long message doesn't truncate in
-	// the narrow left column.
+	// The single field: Domain. Endpoint / Issuer / ClientId are
+	// composed from it on save (see composeFromDomain).
+	screen.DrawText(x+1, y, 10, "Domain", v.Theme.AccentStyle())
+	fieldX := x + 12
+	fieldW := min(maxW-13, 28)
+	if fieldW < 3 {
+		return
+	}
+	fieldStyle := tcell.StyleDefault.Foreground(v.Theme.FG).Background(tcell.NewRGBColor(50, 55, 65))
+	screen.FillRect(fieldX, y, fieldW, 1, fieldStyle)
+	caretStyle := tcell.StyleDefault.Background(v.Theme.FG)
+	if v.addForm.domain == "" {
+		screen.DrawText(fieldX+1, y, fieldW-2, "staging.copresent.ai", fieldStyle.Foreground(v.Theme.Subtle))
+		screen.SetCell(fieldX+1, y, ' ', caretStyle)
+	} else {
+		// Horizontal scroll so a long domain keeps its end + caret on
+		// screen (memql-cockpit#193).
+		ui.DrawInputValue(screen, fieldX, y, fieldW, v.addForm.domain, true, fieldStyle, caretStyle)
+	}
+	y += 2
+
+	// Live preview of the URLs the domain composes into, so the
+	// convention is visible before saving.
+	if d := strings.TrimSpace(v.addForm.domain); d != "" {
+		preview := v.Theme.SubtleStyle()
+		screen.DrawText(x+1, y, maxW-1, "bff."+d, preview)
+		y++
+		screen.DrawText(x+1, y, maxW-1, "identity."+d, preview)
+		y += 2
+	} else {
+		y++
+	}
+
+	// Inline validation error (if any). Wrapped via ui.WrapText so a
+	// long message doesn't truncate in the narrow left column.
 	if v.addForm.formError != "" {
 		errStyle := tcell.StyleDefault.Foreground(v.Theme.Error).Background(v.Theme.BG)
 		for _, ln := range ui.WrapText(v.addForm.formError, maxW) {
@@ -733,12 +660,7 @@ func (v *ClustersView) drawAddForm(screen *ui.Screen, x, y, maxW int, bounds ui.
 		y++
 	}
 
-	// Hints split across two rows so the narrow left-pane width
-	// doesn't truncate "Esc:Cancel". Primary editing keys on top,
-	// save/exit on the bottom.
 	subtle := v.Theme.SubtleStyle()
-	screen.DrawText(x, y, maxW, "↑/↓:Next Field", subtle)
-	y++
 	screen.DrawText(x, y, maxW, "Enter:Save       Esc:Cancel", subtle)
 }
 
@@ -895,9 +817,11 @@ func (v *ClustersView) HandleEvent(ev tcell.Event) bool {
 				}
 			}
 			if rowState == "needs-auth" {
+				// Row is missing issuer/clientId (hand-edited or pre-seed
+				// local). Open the domain form so typing the domain
+				// composes the URLs + client id.
 				v.showAddForm = true
 				v.addForm = formStateFromConfig(v.Clusters[v.Selected].Config)
-				v.addForm.cursor = formFieldDiscovery
 				return true
 			}
 			if v.OnLogin != nil {
@@ -934,140 +858,54 @@ func (v *ClustersView) handleAddFormEvent(ev *tcell.EventKey) bool {
 	case tcell.KeyEscape:
 		v.showAddForm = false
 		return true
-	// Tab is reserved globally for pane navigation; explicitly
-	// swallow it here so it doesn't accidentally drive anything while
-	// a form is open. Forms move between fields with ↑/↓ only.
-	case tcell.KeyTab:
-		return true
-	case tcell.KeyDown:
-		v.addForm.formError = ""
-		v.addForm.cursor = v.nextFormCursor(v.addForm.cursor, +1)
-		return true
-	case tcell.KeyUp:
-		v.addForm.formError = ""
-		v.addForm.cursor = v.nextFormCursor(v.addForm.cursor, -1)
+	// Single-field form: Tab/↑/↓ have nothing to navigate to. Swallow
+	// them so they don't leak to pane navigation while the form is open.
+	case tcell.KeyTab, tcell.KeyUp, tcell.KeyDown:
 		return true
 	case tcell.KeyEnter:
-		// Discovery URL takes priority: when filled, the app layer
-		// fetches the well-known doc + runs OAuth in the background
-		// and the rest of the form (Host/Port/Issuer/ClientId) is
-		// ignored. This is the "paste one URL, done" path.
-		discovery := strings.TrimSpace(v.addForm.fields[formFieldDiscovery])
-		if discovery != "" && v.OnAuthorize != nil {
-			v.OnAuthorize(discovery, v.addForm.editName)
-			v.showAddForm = false
-			return true
-		}
-		// Manual path: validate every field (name shape/length, host,
-		// port range, issuer URL, client id). The first failure is
-		// surfaced inline below the form fields; the next keystroke
-		// clears it so the user can retry without an explicit
-		// dismiss.
-		normName, err := ui.ValidateName(v.addForm.fields[formFieldName])
+		domain, err := ui.ValidateDomain(v.addForm.domain)
 		if err != nil {
-			v.addForm.formError = "Name: " + err.Error()
+			v.addForm.formError = err.Error()
 			return true
 		}
-		if err := ui.ValidateHost(v.addForm.fields[formFieldHost]); err != nil {
-			v.addForm.formError = "Host: " + err.Error()
-			return true
-		}
-		if err := ui.ValidatePort(v.addForm.fields[formFieldPort]); err != nil {
-			v.addForm.formError = "Port: " + err.Error()
-			return true
-		}
-		if err := ui.ValidateOptionalURL(v.addForm.fields[formFieldIssuer]); err != nil {
-			v.addForm.formError = "Issuer: " + err.Error()
-			return true
-		}
-		if err := ui.ValidateOptionalClientId(v.addForm.fields[formFieldClientId]); err != nil {
-			v.addForm.formError = "Client ID: " + err.Error()
-			return true
-		}
-		c := config.ClusterConfig{
-			Name:     normName,
-			Endpoint: joinEndpoint(strings.TrimSpace(v.addForm.fields[formFieldHost]), strings.TrimSpace(v.addForm.fields[formFieldPort])),
-			Issuer:   strings.TrimSpace(v.addForm.fields[formFieldIssuer]),
-			ClientId: strings.TrimSpace(v.addForm.fields[formFieldClientId]),
-		}
-		switch {
-		case v.addForm.editMode && v.OnSave != nil:
-			v.OnSave(c)
-		case !v.addForm.editMode && v.OnAdd != nil:
+		c := composeFromDomain(domain)
+		if v.addForm.editMode {
+			// Keep the original config key immutable so a saved token /
+			// active-cluster lookup isn't orphaned; only the composed
+			// URLs + display follow the (possibly new) domain.
+			c.Name = v.addForm.editName
+			if v.OnSave != nil {
+				v.OnSave(c)
+			}
+		} else if v.OnAdd != nil {
 			v.OnAdd(c)
 		}
 		v.showAddForm = false
 		return true
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
 		v.addForm.formError = ""
-		i := v.addForm.cursor
-		if len(v.addForm.fields[i]) > 0 {
-			v.addForm.fields[i] = v.addForm.fields[i][:len(v.addForm.fields[i])-1]
+		if r := []rune(v.addForm.domain); len(r) > 0 {
+			v.addForm.domain = string(r[:len(r)-1])
 		}
 		return true
 	case tcell.KeyRune:
 		v.addForm.formError = ""
-		// Per-field keystroke filter + length cap. Silently drop
-		// characters the validator would later reject -- the input
-		// stream stays clean and we never have to unwind a bad char.
-		i := v.addForm.cursor
 		r := ev.Rune()
-		var allowed bool
-		var cap int
-		switch i {
-		case formFieldDiscovery:
-			// Discovery is a URL paste target -- any printable char.
-			allowed = r >= 0x20 && r != 0x7f
-			cap = ui.MaxURLLen
-		case formFieldName:
-			allowed = ui.IsNameChar(r)
-			cap = ui.MaxNameLen
-			// Auto-lowercase so the stored form matches the server's
-			// normalized id (and what the user sees in the list after save).
-			if allowed && r >= 'A' && r <= 'Z' {
-				r = r + ('a' - 'A')
-			}
-		case formFieldHost:
-			allowed = ui.IsHostChar(r)
-			cap = ui.MaxHostLen
-		case formFieldPort:
-			allowed = ui.IsPortChar(r)
-			cap = ui.MaxPortLen
-		case formFieldIssuer:
-			// Let anything printable through and clip by length --
-			// URLs carry a lot of characters legitimately.
-			allowed = r >= 0x20 && r != 0x7f
-			cap = ui.MaxURLLen
-		case formFieldClientId:
-			allowed = r >= 0x20 && r != 0x7f
-			cap = ui.MaxClientIdLen
-		default:
-			allowed = true
-			cap = ui.MaxURLLen
+		// Domains are a subset of the host charset; lower-case on the way
+		// in so the stored value matches the server's normalized form.
+		if r >= 'A' && r <= 'Z' {
+			r += 'a' - 'A'
 		}
-		if !allowed {
+		if !ui.IsHostChar(r) {
 			return true
 		}
-		if len(v.addForm.fields[i]) >= cap {
+		if len([]rune(v.addForm.domain)) >= ui.MaxHostLen {
 			return true
 		}
-		v.addForm.fields[i] += string(r)
+		v.addForm.domain += string(r)
 		return true
 	}
 	return false
-}
-
-// nextFormCursor advances the form cursor by delta (+1 or -1), skipping
-// the Name field in edit mode (which is rendered as read-only).
-func (v *ClustersView) nextFormCursor(cur, delta int) int {
-	for i := 0; i < formFieldCount; i++ {
-		cur = (cur + delta + formFieldCount) % formFieldCount
-		if v.addForm.editMode && cur == formFieldName {
-			continue
-		}
-		return cur
-	}
-	return cur
 }
 
 func clusterStatusIcon(status string, theme ui.Theme) (rune, tcell.Color) {

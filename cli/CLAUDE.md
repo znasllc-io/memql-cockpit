@@ -290,13 +290,41 @@ via `Cancel()` does NOT trigger reconnect; only `Unexpected()` does.
 | R     | Manual retry after Failed                           |
 | Tab   | Cycle: Cluster Manager → Topology                   |
 
-### Add/Edit forms
+### Add/Edit cluster form (single Domain field)
+
+The cluster Add/Edit form collects ONE value: a **Domain** (e.g.
+`staging.copresent.ai`). Endpoint / Issuer / ClientId are composed
+from it by convention on save (`composeFromDomain` in
+`cluster/clusters_view.go`), the same convention
+`autoSeedLocalFromGenesis` uses for the local row:
+
+```
+Endpoint = https://bff.<domain>
+Issuer   = https://identity.<domain>
+ClientId = cockpit
+Name     = slug(<domain>)   (dots -> dashes; the clusters.yaml key)
+```
+
+The form previews `bff.<domain>` / `identity.<domain>` live as you
+type. `Name` is the immutable config key (preserved across edits so a
+cached token isn't orphaned); the Domain is stored on
+`ClusterConfig.Domain` so Edit round-trips it. Authorization is NOT
+part of the form -- after save the row is `needs-login`, and
+`L:Authorize`/`L:Login` runs OAuth against the composed Issuer +
+ClientId.
+
+Deployments that DON'T follow the `bff.`/`identity.` convention
+(local plaintext `host:port`, custom hostnames, a PAT, a different
+client id) are edited directly in `~/.memql/clusters.yaml` -- the form
+is intentionally convention-only. (The previous multi-field form +
+its discovery-URL / well-known fetch path were removed; see
+memql-cockpit#197.)
+
 | Key       | Action                              |
 |-----------|-------------------------------------|
-| Tab       | Next field                          |
-| Enter     | Save                                |
+| (type)    | Edit the Domain value               |
+| Enter     | Compose + Save                      |
 | Esc       | Cancel                              |
-| Ctrl+N    | Toggle "No Auth" (cluster form)     |
 
 ### Clusters tab (Topology pane focus)
 | Key         | Action                                              |
