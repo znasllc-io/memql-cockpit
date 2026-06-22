@@ -58,6 +58,16 @@ type View struct {
 	rowFilter  string
 	rowMatches []int
 
+	// Keyset paging for the rows pane (memql#2008). BrowseConcept now
+	// declares sort + paginate, so a large concept registry no longer
+	// silently truncates at the engine's 50-row unmarked-list backstop:
+	// the first fetch loads one keyset page and stashes the continuation
+	// cursor; M:More (LoadMoreRows) appends the next page until
+	// rowsHasMore clears. rowsCursor is the opaque cursor for the page
+	// AFTER the rows currently loaded.
+	rowsCursor  string
+	rowsHasMore bool
+
 	// Detail (right pane) -- pseudo-MemQL render of the highlighted
 	// row, syntax-highlighted via Sense and laid out by the reusable
 	// ui.Viewer widget (line numbers, hard-wrap, block tinting).
@@ -583,6 +593,9 @@ func hintsForRows(v *View) paneHint {
 		{Key: "Enter", Label: "Detail"},
 		{Key: "", Label: "Search"},
 		{Key: "V", Label: "Versions"},
+		// M:More only when a continuation cursor remains (memql#2008) -- a
+		// disabled chip signals the concept is fully loaded.
+		{Key: "M", Label: "More", Disabled: !v.rowsHasMore},
 		{Key: "Tab", Label: "Cycle"},
 		{Key: "Esc", Label: "ClearSearch", Disabled: v.rowFilter == ""},
 	}}
@@ -695,6 +708,16 @@ func (v *View) handleRowListKeyLocked(ev *tcell.EventKey) bool {
 		v.refreshDetailFromCurrentLocked()
 		v.Focus = FocusDetail
 		return true
+	case tcell.KeyRune:
+		// M:More -- append the next keyset page when the concept has more
+		// rows than the loaded window (memql#2008). No-op when exhausted.
+		if ev.Rune() == 'm' || ev.Rune() == 'M' {
+			if v.rowsHasMore {
+				v.loadMoreRowsLocked()
+			}
+			return true
+		}
+		return false
 	case tcell.KeyEsc:
 		// Esc clears an active filter so the user can get back to the
 		// full row list without re-typing through the search box.
@@ -769,6 +792,8 @@ func (v *View) refreshRowsFromCurrentLocked() {
 	v.Rows = nil
 	v.detailLines = nil
 	v.detailCacheRowId = ""
+	v.rowsCursor = ""
+	v.rowsHasMore = false
 	v.rowList.Selected = 0
 	v.rowList.ScrollY = 0
 	v.viewer.ScrollY = 0
@@ -799,9 +824,21 @@ func (v *View) refreshRowsFromCurrentLocked() {
 	defer cancel()
 	// Admin-surface escape hatch: the Concepts tab is a concept-
 	// agnostic row browser, so there's no compile-time named primitive
-	// to call. The SDK's BrowseConcept method exists precisely for
+	// to call. The SDK's BrowseConceptPage method exists precisely for
 	// this case; see sdk/go/CLAUDE.md for the rule.
-	res, err := qc.BrowseConcept(ctx, conceptId)
+	//
+	// Keyset-paginated (memql#2008): BrowseConceptPage declares sort +
+	// paginate, so a concept with more rows than the engine's implicit
+	// 50-row unmarked-list backstop no longer silently truncates. The
+	// first page lands here; the operator walks the rest via M:More
+	// (LoadMoreRows), which continues from the stashed cursor.
+	//
+	// PageResult.Rows preserves the full nested wire shape (`payload`,
+	// `metadata`, `provenance`, and the `type` / `schema` / `createdBy`
+	// intrinsics) for the bundle path -- identical to the old
+	// Result.RawNodes() the detail viewer + row search filter + display
+	// label all expect. See memql/sdk/go/client/keyset_pagination.go.
+	page, err := qc.BrowseConceptPage(ctx, conceptId, "", 0)
 	if err != nil {
 		if v.OnStatus != nil {
 			v.OnStatus(fmt.Sprintf("rows load failed: %v", err))
@@ -809,16 +846,56 @@ func (v *View) refreshRowsFromCurrentLocked() {
 		v.recomputeRowMatchesLocked()
 		return
 	}
-	// RawNodes (NOT Rows) preserves the full nested wire shape --
-	// `payload`, `metadata`, `provenance`, and the `type` / `schema`
-	// / `createdBy` intrinsics survive. Rows() flattens the bundle
-	// and drops all of those, which is right for typed named
-	// primitives but wrong for an inspector tool. The detail
-	// viewer + row search filter + display label all expect the
-	// nested form. See memql/sdk/go/client/support.go.
-	v.Rows = res.RawNodes()
+	v.Rows = page.Rows
+	v.rowsCursor = page.NextCursor
+	v.rowsHasMore = page.NextCursor != ""
 	v.recomputeRowMatchesLocked()
 	v.refreshDetailFromCurrentLocked()
+}
+
+// LoadMoreRows appends the next keyset page of rows for the currently-
+// selected concept, continuing from the cursor stashed by the last
+// fetch. No-op when the set is already exhausted (rowsHasMore false).
+// Bound to M:More in the Rows pane (memql#2008) so an operator can walk
+// a large concept registry past the bounded first page instead of
+// silently seeing only the first window of rows.
+func (v *View) LoadMoreRows() {
+	v.Mu.Lock()
+	defer v.Mu.Unlock()
+	v.loadMoreRowsLocked()
+}
+
+func (v *View) loadMoreRowsLocked() {
+	if v.QueryClient == nil || !v.rowsHasMore || v.rowsCursor == "" {
+		return
+	}
+	if v.conceptList.Selected < 0 || v.conceptList.Selected >= len(v.Concepts) {
+		return
+	}
+	qc := v.QueryClient()
+	if qc == nil {
+		return
+	}
+	conceptId := v.Concepts[v.conceptList.Selected].Id
+	if conceptId == "" {
+		return
+	}
+	cursor := v.rowsCursor
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	page, err := qc.BrowseConceptPage(ctx, conceptId, cursor, 0)
+	if err != nil {
+		if v.OnStatus != nil {
+			v.OnStatus(fmt.Sprintf("load more rows failed: %v", err))
+		}
+		return
+	}
+	// Append in keyset order (createdAt-asc continues past the rows in
+	// hand); the engine guarantees no dup / no gap across the cursor.
+	v.Rows = append(v.Rows, page.Rows...)
+	v.rowsCursor = page.NextCursor
+	v.rowsHasMore = page.NextCursor != ""
+	v.recomputeRowMatchesLocked()
 }
 
 func (v *View) refreshDetailFromCurrent() {
