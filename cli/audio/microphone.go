@@ -26,7 +26,7 @@ import (
 
 // Format describes the PCM format StartCapture configures the device
 // to capture in. Matches the shape memql-sdk-go's voice package
-// accepts for SITranscribeStreamStart.
+// accepts for AiTranscribeStreamStart.
 type Format struct {
 	Encoding   string // always "pcm16" for now
 	SampleRate uint32
