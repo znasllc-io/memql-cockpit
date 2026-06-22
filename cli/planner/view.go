@@ -61,6 +61,18 @@ type View struct {
 	plans []map[string]any
 	tasks []map[string]any
 
+	// Keyset pagination over queryAllPlans (memql#1997 / epic #1964).
+	// queryAllPlans is `sort` + `paginate 50`, so RefreshPlans pulls a
+	// bounded first page and stashes the continuation cursor; M:More
+	// (LoadMorePlans) appends the next page until plansHasMore clears.
+	// plansCursor is the opaque cursor to fetch the page AFTER the rows
+	// currently loaded. plansPages tracks how many pages the operator has
+	// loaded (>=1) so the 3s poll re-fetches the SAME depth instead of
+	// snapping back to the first page and wiping their M:More progress.
+	plansCursor  string
+	plansHasMore bool
+	plansPages   int
+
 	// agentSkillEvents indexes the v1:agents:skillChangeEvent rows
 	// fetched for the currently-selected plan's ownerAgentId,
 	// newest first. cockpit#125 surfaces these in the Task Detail
@@ -156,7 +168,19 @@ func (v *View) RefreshPlans() {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 
-	res, err := qc.QueryAllPlans(ctx, client.QueryAllPlansArgs{})
+	// Re-fetch the SAME page depth the operator has loaded (memql#1997).
+	// queryAllPlans is `sort` + `paginate 50` and sorts createdAt-desc, so
+	// the first keyset page is already the newest plans; re-draining N
+	// pages keeps M:More progress across the 3s poll instead of snapping
+	// back to page 1.
+	v.Mu.RLock()
+	pages := v.plansPages
+	v.Mu.RUnlock()
+	if pages < 1 {
+		pages = 1
+	}
+
+	rows, nextCursor, err := drainPlanPages(ctx, qc, pages)
 	if err != nil {
 		if isPlannerDSLMissing(err) {
 			v.markDSLMissing()
@@ -168,7 +192,6 @@ func (v *View) RefreshPlans() {
 		return
 	}
 
-	rows := res.Rows()
 	sort.Slice(rows, func(i, j int) bool {
 		return getString(rows[i], "createdAt") > getString(rows[j], "createdAt")
 	})
@@ -176,11 +199,88 @@ func (v *View) RefreshPlans() {
 	v.Mu.Lock()
 	defer v.Mu.Unlock()
 	v.plans = rows
+	v.plansCursor = nextCursor
+	v.plansHasMore = nextCursor != ""
+	v.plansPages = pages
 	v.planList.Count = len(v.plans)
 	if v.planList.Selected >= len(v.plans) {
 		v.planList.Selected = 0
 		v.planList.ScrollY = 0
 	}
+}
+
+// drainPlanPages walks up to `pages` keyset pages of queryAllPlans,
+// returning the accumulated rows + the cursor for the page AFTER the
+// last one fetched (empty when the set is exhausted before `pages` is
+// reached). Used by RefreshPlans to re-fetch the operator's current
+// load-more depth in one place.
+func drainPlanPages(ctx context.Context, qc *client.QueryClient, pages int) ([]map[string]any, string, error) {
+	rows := []map[string]any{}
+	cursor := ""
+	for i := 0; i < pages; i++ {
+		page, err := qc.QueryAllPlansPage(ctx, client.QueryAllPlansArgs{}, cursor)
+		if err != nil {
+			return nil, "", err
+		}
+		rows = append(rows, page.Rows...)
+		cursor = page.NextCursor
+		if cursor == "" {
+			break
+		}
+	}
+	return rows, cursor, nil
+}
+
+// LoadMorePlans appends the next keyset page of plans to the list,
+// continuing from the cursor stashed by the last fetch. No-op when the
+// set is already exhausted (plansHasMore false) or a fetch is in flight.
+// Bound to M:More in the Plans pane (memql#1997 / epic #1964) so an
+// operator can walk past the bounded first page instead of silently
+// seeing only the newest 50 plans.
+func (v *View) LoadMorePlans() {
+	if v.QueryClient == nil {
+		return
+	}
+	qc := v.QueryClient()
+	if qc == nil {
+		return
+	}
+
+	v.Mu.Lock()
+	if v.fetching || !v.plansHasMore || v.plansCursor == "" {
+		v.Mu.Unlock()
+		return
+	}
+	cursor := v.plansCursor
+	v.fetching = true
+	v.Mu.Unlock()
+
+	defer func() {
+		v.Mu.Lock()
+		v.fetching = false
+		v.Mu.Unlock()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+
+	page, err := qc.QueryAllPlansPage(ctx, client.QueryAllPlansArgs{}, cursor)
+	if err != nil {
+		if v.OnStatus != nil {
+			v.OnStatus(fmt.Sprintf("planner: load more failed: %v", err))
+		}
+		return
+	}
+
+	v.Mu.Lock()
+	defer v.Mu.Unlock()
+	// Append in keyset order (createdAt-desc continues past the rows in
+	// hand); the engine guarantees no dup / no gap across the cursor.
+	v.plans = append(v.plans, page.Rows...)
+	v.plansCursor = page.NextCursor
+	v.plansHasMore = page.NextCursor != ""
+	v.plansPages++
+	v.planList.Count = len(v.plans)
 }
 
 // RefreshTasksForSelected re-pulls tasks for whichever plan is
@@ -874,12 +974,18 @@ func hintsForPlans(v *View) string {
 	}
 	canRun := v.planList.Selected >= 0 && v.planList.Selected < len(v.plans) &&
 		getString(v.plans[v.planList.Selected], "status") == "queued"
-	bar := ui.HintBar{Chips: []ui.HintChip{
+	chips := []ui.HintChip{
 		{Key: "↑/↓", Label: "Move"},
 		{Key: "Enter", Label: "Tasks"},
 		{Key: "R", Label: "Run", Disabled: !canRun},
-		{Key: "Tab", Label: "Cycle"},
-	}}
+	}
+	// M:More only when a continuation cursor remains (memql#1997) -- a
+	// hint that lies rots trust (per the panel chrome contract).
+	if v.plansHasMore {
+		chips = append(chips, ui.HintChip{Key: "M", Label: "More"})
+	}
+	chips = append(chips, ui.HintChip{Key: "Tab", Label: "Cycle"})
+	bar := ui.HintBar{Chips: chips}
 	return bar.String()
 }
 
@@ -942,6 +1048,18 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 		if v.highlightedPlanIsQueued() {
 			go v.runSelectedPlan()
 		}
+		return true
+	}
+
+	// M means "load more": fetch + append the next keyset page of plans
+	// (memql#1997). No-op once the set is exhausted; the hint chip only
+	// advertises M:More while plansHasMore is set.
+	if v.Focus == FocusPlans && keyEv.Key() == tcell.KeyRune &&
+		(keyEv.Rune() == 'm' || keyEv.Rune() == 'M') {
+		go func() {
+			v.LoadMorePlans()
+			v.Redraw()
+		}()
 		return true
 	}
 
