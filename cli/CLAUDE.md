@@ -113,8 +113,12 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
    rows. Read-only: goal submission moved to the Chat tab (the user
    talks to the assistant, which decides when to escalate to the
    planner). The one mutation that remains is R:Run on a queued
-   plan -- flips it to running via mutationStartPlan. Gated on a
-   connected, selected cluster.
+   plan -- flips it to running via mutationStartPlan. The plan list is
+   keyset-paginated (`queryAllPlans` is `sort` + `paginate 50`,
+   memql#1997): the 3s poll re-fetches the operator's current page
+   depth and `M:More` appends the next page until the cursor is
+   exhausted, so the list isn't silently capped at the newest 50 plans.
+   Gated on a connected, selected cluster.
 5. **Skills (F5)** -- read-only catalog browser for `v1:agents:skill`
    rows, grouped by category + tier. Agents themselves live under the
    Concepts tab (post the memql-cockpit#126 retire); Skills earns its
@@ -170,7 +174,10 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
    the bundle's lifecycle metadata + the raw authored `.memql` source of
    every member construct. `X` exports the selected bundle's source to
    `~/.memql/bundles/<bundleId>/` (one `.memql` per construct + a
-   MANIFEST). Polls `queryAuthoringBundlesForOwner` every 15s; member
+   MANIFEST). Polls `queryAuthoringBundlesForOwner` every 15s (which is
+   `sort` + `paginate 50`, memql#1997 -- the poll re-fetches the
+   operator's current page depth and `M:More` appends the next keyset
+   page so the bundle list isn't silently capped at 50); member
    constructs load lazily per selected bundle via
    `queryAuthoringConstructsForBundle`. Gated on a connected, selected
    cluster. Per memql#1162.

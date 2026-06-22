@@ -54,6 +54,14 @@ type View struct {
 	ui.BaseView
 
 	bundles []map[string]any
+	// Keyset pagination over queryAuthoringBundlesForOwner (memql#1997 /
+	// epic #1964). The query is `sort` + `paginate 50`; Refresh re-fetches
+	// the operator's current page depth (bundlesPages, >=1) so the 15s
+	// poll preserves M:More progress, and bundlesCursor is the cursor for
+	// the page AFTER the rows currently loaded.
+	bundlesCursor  string
+	bundlesHasMore bool
+	bundlesPages   int
 	// constructs caches the member-construct rows per bundle id, fetched
 	// lazily when a bundle is first selected. constructFetching guards a
 	// per-bundle in-flight fetch so selection churn can't fan out.
@@ -121,14 +129,22 @@ func (v *View) Refresh() {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 
-	res, err := qc.QueryAuthoringBundlesForOwner(ctx, client.QueryAuthoringBundlesForOwnerArgs{})
+	// Re-fetch the SAME page depth the operator has loaded (memql#1997)
+	// so the 15s poll doesn't snap M:More progress back to page 1.
+	v.Mu.RLock()
+	pages := v.bundlesPages
+	v.Mu.RUnlock()
+	if pages < 1 {
+		pages = 1
+	}
+
+	rows, nextCursor, err := drainBundlePages(ctx, qc, pages)
 	if err != nil {
 		if v.OnStatus != nil {
 			v.OnStatus(fmt.Sprintf("bundles: queryAuthoringBundlesForOwner failed: %v", err))
 		}
 		return
 	}
-	rows := res.Rows()
 
 	// Newest first: a captured bundle is most interesting right after the
 	// task that produced it ran. Stable so re-renders don't shuffle rows
@@ -139,6 +155,9 @@ func (v *View) Refresh() {
 
 	v.Mu.Lock()
 	v.bundles = rows
+	v.bundlesCursor = nextCursor
+	v.bundlesHasMore = nextCursor != ""
+	v.bundlesPages = pages
 	v.bundleList.Count = len(v.bundles)
 	if v.bundleList.Selected >= len(v.bundles) {
 		v.bundleList.Selected = 0
@@ -149,6 +168,76 @@ func (v *View) Refresh() {
 	v.Mu.Unlock()
 
 	v.ensureConstructs(selID)
+}
+
+// drainBundlePages walks up to `pages` keyset pages of
+// queryAuthoringBundlesForOwner, returning the accumulated rows + the
+// cursor for the page AFTER the last one fetched (empty when the set is
+// exhausted first). Shared by Refresh (re-drain current depth) so the
+// page-walk lives in one place.
+func drainBundlePages(ctx context.Context, qc *client.QueryClient, pages int) ([]map[string]any, string, error) {
+	rows := []map[string]any{}
+	cursor := ""
+	for i := 0; i < pages; i++ {
+		page, err := qc.QueryAuthoringBundlesForOwnerPage(ctx, client.QueryAuthoringBundlesForOwnerArgs{}, cursor)
+		if err != nil {
+			return nil, "", err
+		}
+		rows = append(rows, page.Rows...)
+		cursor = page.NextCursor
+		if cursor == "" {
+			break
+		}
+	}
+	return rows, cursor, nil
+}
+
+// LoadMoreBundles appends the next keyset page of bundles to the list,
+// continuing from the cursor stashed by the last fetch. No-op when the
+// set is exhausted or a fetch is in flight. Bound to M:More in the list
+// pane (memql#1997 / epic #1964).
+func (v *View) LoadMoreBundles() {
+	if v.QueryClient == nil {
+		return
+	}
+	qc := v.QueryClient()
+	if qc == nil {
+		return
+	}
+
+	v.Mu.Lock()
+	if v.fetching || !v.bundlesHasMore || v.bundlesCursor == "" {
+		v.Mu.Unlock()
+		return
+	}
+	cursor := v.bundlesCursor
+	v.fetching = true
+	v.Mu.Unlock()
+
+	defer func() {
+		v.Mu.Lock()
+		v.fetching = false
+		v.Mu.Unlock()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+
+	page, err := qc.QueryAuthoringBundlesForOwnerPage(ctx, client.QueryAuthoringBundlesForOwnerArgs{}, cursor)
+	if err != nil {
+		if v.OnStatus != nil {
+			v.OnStatus(fmt.Sprintf("bundles: load more failed: %v", err))
+		}
+		return
+	}
+
+	v.Mu.Lock()
+	defer v.Mu.Unlock()
+	v.bundles = append(v.bundles, page.Rows...)
+	v.bundlesCursor = page.NextCursor
+	v.bundlesHasMore = page.NextCursor != ""
+	v.bundlesPages++
+	v.bundleList.Count = len(v.bundles)
 }
 
 // ensureConstructs lazily fetches + caches a bundle's member constructs.
@@ -278,7 +367,7 @@ func (v *View) drawList(screen *ui.Screen, bounds ui.Rect) {
 	v.bundleList.Focused = v.Focus == FocusList
 	v.bundleList.Draw(screen, paneChromeBounds(bounds), v.Theme)
 
-	ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1, hintsForList())
+	ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1, hintsForList(v))
 }
 
 // renderBundleRow paints a 2-row bundle entry. Primary: status marker +
@@ -514,6 +603,18 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 		return true
 	}
 
+	// M:More -- fetch + append the next keyset page of bundles
+	// (memql#1997). No-op once the set is exhausted; the chip only shows
+	// while bundlesHasMore is set.
+	if v.Focus == FocusList && keyEv.Key() == tcell.KeyRune &&
+		(keyEv.Rune() == 'm' || keyEv.Rune() == 'M') {
+		go func() {
+			v.LoadMoreBundles()
+			v.Redraw()
+		}()
+		return true
+	}
+
 	switch v.Focus {
 	case FocusList:
 		return v.handleListKey(keyEv)
@@ -569,16 +670,22 @@ func (v *View) handleDetailKey(ev *tcell.EventKey) bool {
 // Hints
 // ---------------------------------------------------------------------------
 
-func hintsForList() string {
+func hintsForList(v *View) string {
 	// Tab-cycling is advertised in the header chrome (cli/CLAUDE.md: "No
 	// Tab:Switch panes duplication"), so the narrow list pane spends its
 	// width on the pane-local actions instead.
-	bar := ui.HintBar{Chips: []ui.HintChip{
+	chips := []ui.HintChip{
 		{Key: "↑/↓", Label: "Move"},
 		{Key: "Enter", Label: "Open"},
 		{Key: "X", Label: "Export"},
 		{Key: "R", Label: "Refresh"},
-	}}
+	}
+	// M:More only while a continuation cursor remains (memql#1997) -- a
+	// hint that lies rots trust (per the panel chrome contract).
+	if v.bundlesHasMore {
+		chips = append(chips, ui.HintChip{Key: "M", Label: "More"})
+	}
+	bar := ui.HintBar{Chips: chips}
 	return bar.String()
 }
 
