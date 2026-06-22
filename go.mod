@@ -10,7 +10,7 @@ require (
 	github.com/jezek/xgb v1.3.0
 	github.com/jezek/xgbutil v0.0.0-20260124183602-9fd151d6a51a
 	github.com/znasllc-io/memql v0.0.0-20260622012555-89e148c79338
-	golang.org/x/image v0.41.0
+	golang.org/x/image v0.43.0
 	golang.org/x/sys v0.46.0
 	golang.org/x/term v0.44.0
 	google.golang.org/grpc v1.81.1
