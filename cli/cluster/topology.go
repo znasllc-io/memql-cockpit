@@ -38,6 +38,21 @@ type NodeInfo struct {
 	Version string
 	Health  nodev1.NodeHealthStatus
 	Labels  map[string]string
+
+	// DeploymentId is the stable id of the v1:cluster:deployment that
+	// created this node (FK to v1:cluster:deployment.deploymentId). Empty
+	// for nodes registered before deployment tracking, or hand-started
+	// nodes. Used by the Deployments section to filter a deployment's
+	// topology and to flag orphans (a node whose deploymentId is not the
+	// expected/current one). Per memql-cockpit#207.
+	DeploymentId string
+
+	// ParentId is the node id this node discovered the mesh through (the
+	// peer it registered from). Drives the parent/child edges the
+	// topology renders so the diagram reflects the real discovery graph
+	// rather than only the static service-relationship map. Empty for the
+	// seed node. Per memql-cockpit#207.
+	ParentId string
 }
 
 // NodeTypeInfo is a row from the v1:cluster:nodeType concept. The CLI
@@ -140,6 +155,45 @@ type View struct {
 	// ctrl holds the transient deploy-control modal state. nil when the
 	// modal is closed. Guarded by v.mu like every other view field.
 	ctrl *deployControlState
+
+	// --- Deployments section (memql-cockpit#207) ---
+	//
+	// showDeployments toggles the right pane between the live topology
+	// and the concept-driven Deployments section (history + per-
+	// deployment topology + cut/deploy/rollback controls). Toggled with
+	// 'P'. All fields below are guarded by v.mu.
+	showDeployments bool
+	deployments     []DeploymentInfo // v1:cluster:deployment history, newest-first
+	deploySelected  int              // cursor into deployments
+	deployNodes     []NodeInfo       // nodes for the selected deployment (QueryNodesForDeployment)
+	deployOrphans   []NodeInfo       // nodes NOT in the selected deployment (QueryNodesNotInDeployment)
+	deployLoadedFor string           // deploymentId the node/orphan cache was loaded for
+
+	// dctrl holds the transient cut/deploy/rollback modal state for the
+	// Deployments section. nil when closed. Distinct from ctrl (the
+	// deployment-v2 overlay modal). Guarded by v.mu.
+	dctrl *deployConceptState
+
+	// deployConceptActor overrides the deployment-concept action executor.
+	// Production leaves it nil and the modal resolves the real client
+	// from DeployClient() per-fire; tests inject a fake.
+	deployConceptActor deployConceptActions
+
+	// OnDeploymentsShown is called (off-thread) when the Deployments
+	// section is opened, so the app can fetch the deployment history via
+	// QueryDeploymentsForCluster and push it back through SetDeployments.
+	OnDeploymentsShown func()
+
+	// OnSelectDeployment is called (off-thread) with the selected
+	// deploymentId when the operator drills into a deployment, so the app
+	// can load its nodes (QueryNodesForDeployment) + orphans
+	// (QueryNodesNotInDeployment) and push them back via SetDeploymentNodes.
+	OnSelectDeployment func(deploymentID string)
+
+	// OnDeploymentsChanged is called after a cut/deploy/rollback action
+	// succeeds, so the app refreshes the history right away rather than on
+	// the next poll tick. nil is a no-op.
+	OnDeploymentsChanged func()
 }
 
 // SetDeployActor overrides the deploy-control action executor. Used by
@@ -285,6 +339,12 @@ func (v *View) ApplyNodeUpdate(incoming NodeInfo) {
 	if incoming.Labels != nil {
 		existing.Labels = incoming.Labels
 	}
+	if incoming.DeploymentId != "" {
+		existing.DeploymentId = incoming.DeploymentId
+	}
+	if incoming.ParentId != "" {
+		existing.ParentId = incoming.ParentId
+	}
 	v.buildEdgesLocked()
 }
 
@@ -343,6 +403,23 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 		return
 	}
 
+	// Deployments section claims the whole pane below the cluster-name
+	// title when toggled on ('P'). It renders its own status bar + hint
+	// chips and overlays the cut/deploy/rollback modal when open.
+	if v.showDeployments {
+		v.drawDeployments(screen, bounds)
+		statusY := bounds.Y + bounds.Height - 1
+		statusStyle := tcell.StyleDefault.Foreground(v.Theme.Subtle).Background(v.Theme.BG)
+		screen.FillRect(bounds.X, statusY, bounds.Width, 1, statusStyle)
+		left := fmt.Sprintf(" Deployments: %d", len(v.deployments))
+		screen.DrawText(bounds.X, statusY, bounds.Width/2, left, statusStyle)
+		drawRightHints(screen, bounds, statusY, v.hintsForDeployments(), statusStyle)
+		if v.dctrl != nil {
+			v.drawDeployConceptModal(screen, bounds)
+		}
+		return
+	}
+
 	if len(v.Nodes) > 0 {
 		v.drawTopology(screen, bounds)
 	}
@@ -380,13 +457,20 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 		if offline > 0 {
 			statusText += fmt.Sprintf("  Offline:%d", offline)
 		}
+		// Count vs expected (memql-cockpit#207): flag any node type running
+		// fewer healthy replicas than expectedNodesPerType so an
+		// understaffed tier is visible without opening the Deployments
+		// section.
+		if short := v.shortTypesLocked(); len(short) > 0 {
+			statusText += "  short: " + strings.Join(short, ",")
+		}
 	}
 	screen.DrawText(bounds.X, statusY, bounds.Width/2, statusText, statusStyle)
 
 	// Right-align: pan/reset hints. The "live" indicator was redundant
 	// (a healthy stream is the implicit default); only the "stale"
 	// warning surfaces, and only when we've actually lost the stream.
-	hints := "WASD:Pan  R:Reset View  X:Architecture"
+	hints := "WASD:Pan  R:Reset  X:Architecture  P:Deployments"
 	// Deploy-control menu key is owner/admin-only; only advertise it
 	// when the caller can actually use it (chrome contract: hints that
 	// lie rot trust).
@@ -396,7 +480,7 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 	if v.disconnected {
 		hints += "  stale"
 	}
-	screen.DrawText(bounds.X+bounds.Width-len(hints)-1, statusY, len(hints), hints, statusStyle)
+	drawRightHints(screen, bounds, statusY, hints, statusStyle)
 
 	// Deploy-control modal overlays everything else in the pane when open.
 	if v.ctrl != nil {
@@ -412,7 +496,10 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 // guarantees we never bleed into the clusters pane on the left.
 func (v *View) drawTopology(screen *ui.Screen, bounds ui.Rect) {
 	const boxW = 16
-	const boxH = 4
+	// boxH is 5 so each box carries three content rows: type, health, and
+	// a version + short-deploymentId line (the topology-truthfulness data
+	// from memql-cockpit#207). Border rows top + bottom make 5.
+	const boxH = 5
 
 	// Group by type for hierarchical layout. Row order comes from the
 	// seeded nodeType list (v.NodeTypes, fetched via
@@ -519,11 +606,32 @@ func (v *View) drawTopology(screen *ui.Screen, bounds ui.Rect) {
 		}
 	}
 
-	// Draw node boxes.
+	// Draw node boxes. Orphan/stale nodes (stopped, or carrying a
+	// non-current deploymentId) render with the warning border + an
+	// [orphan] tag so a half-finished rollout or leftover node is obvious.
+	current := v.currentDeploymentIdLocked()
 	for i, node := range v.Nodes {
 		pos := positions[i]
-		v.drawNodeBox(screen, pos.x, pos.y, boxW, boxH, area, node)
+		v.drawNodeBox(screen, pos.x, pos.y, boxW, boxH, area, node, v.isOrphanLocked(node, current))
 	}
+}
+
+// drawRightHints renders a hint string right-aligned within bounds on
+// row y, clamped so it never bleeds left of bounds.X. On the Clusters
+// tab the topology pane sits to the right of a `│` divider; an
+// over-long, naively right-aligned hint would start at a negative
+// offset and paint over the divider + the management pane (breaking the
+// panel-chrome contract, memql-cockpit#207). Clamping the start to
+// bounds.X and the width to the pane keeps long hints clipping on the
+// right inside the pane instead.
+func drawRightHints(screen *ui.Screen, bounds ui.Rect, y int, hints string, style tcell.Style) {
+	x := bounds.X + bounds.Width - len(hints) - 1
+	width := len(hints)
+	if x < bounds.X {
+		x = bounds.X
+		width = bounds.Width
+	}
+	screen.DrawText(x, y, width, hints, style)
 }
 
 // plotCell writes a cell in world coordinates, applying the pan offset
@@ -554,12 +662,18 @@ func (v *View) plotText(screen *ui.Screen, worldX, worldY int, area ui.Rect, tex
 // Coordinates are in world space -- plotCell/plotText apply pan + clip.
 // When the view is disconnected, every box is forced to the OFFLINE
 // visual treatment regardless of the node's last-known Health.
-func (v *View) drawNodeBox(screen *ui.Screen, x, y, w, h int, area ui.Rect, node NodeInfo) {
+func (v *View) drawNodeBox(screen *ui.Screen, x, y, w, h int, area ui.Rect, node NodeInfo, orphan bool) {
 	effectiveHealth := node.Health
 	if v.disconnected {
 		effectiveHealth = nodev1.NodeHealthStatus_NODE_HEALTH_OFFLINE
 	}
 	healthColor := nodeHealthColor(effectiveHealth)
+	// An orphan/stale node overrides the health-derived border with the
+	// warning color so it reads as "running but not part of the current
+	// deployment" regardless of its own health.
+	if orphan && !v.disconnected {
+		healthColor = v.Theme.Warning
+	}
 	borderStyle := tcell.StyleDefault.Foreground(healthColor).Background(v.Theme.BG)
 	typeStyle := tcell.StyleDefault.Foreground(v.Theme.FG).Background(v.Theme.BG).Bold(true)
 
@@ -584,6 +698,31 @@ func (v *View) drawNodeBox(screen *ui.Screen, x, y, w, h int, area ui.Rect, node
 	// Line 2: health status (colored).
 	status := healthLabel(effectiveHealth)
 	v.plotText(screen, x+1, y+2, area, clipText(status, w-2), tcell.StyleDefault.Foreground(healthColor).Background(v.Theme.BG))
+
+	// Line 3: topology-truthfulness data (memql-cockpit#207). Orphans show
+	// an [orphan] tag in the warning color; otherwise show the running
+	// version + a short deploymentId so version/deployment drift is
+	// visible per-node at a glance.
+	subStyle := tcell.StyleDefault.Foreground(v.Theme.Subtle).Background(v.Theme.BG)
+	var line3 string
+	if orphan {
+		line3 = "[orphan]"
+		subStyle = tcell.StyleDefault.Foreground(v.Theme.Warning).Background(v.Theme.BG)
+	} else {
+		ver := strings.TrimSpace(node.Version)
+		dep := shortID(node.DeploymentId)
+		switch {
+		case ver != "" && dep != "":
+			line3 = ver + " " + dep
+		case ver != "":
+			line3 = ver
+		case dep != "":
+			line3 = dep
+		}
+	}
+	if line3 != "" {
+		v.plotText(screen, x+1, y+3, area, clipText(line3, w-2), subStyle)
+	}
 }
 
 // HandleEvent processes keyboard input. The topology view is driven by
@@ -606,14 +745,30 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 	if v.Arch.Active() {
 		return v.Arch.HandleEvent(ev)
 	}
+	// Deployment-concept modal (cut/deploy/rollback) takes precedence
+	// whenever it's open. handleDeployConceptKeyLocked assumes v.mu held.
+	if v.dctrl != nil {
+		return v.handleDeployConceptKeyLocked(keyEv)
+	}
 	// Deploy-control modal takes key precedence whenever it's open
 	// (mirrors the workers grant/approval modal). handleDeployKey
 	// assumes v.mu is already held (we took the write lock above).
 	if v.ctrl != nil {
 		return v.handleDeployKeyLocked(keyEv)
 	}
+	// Deployments section owns navigation + control keys (Up/Down/Enter/
+	// Esc plus C/G/B and P) while it's active. Routed before the KeyRune
+	// guard so the arrow/Enter/Esc keys reach it.
+	if v.showDeployments {
+		return v.handleDeploymentsKeyLocked(keyEv)
+	}
 	if keyEv.Key() != tcell.KeyRune {
 		return false
+	}
+	// 'P' toggles the Deployments section (any connected role may view).
+	if r := keyEv.Rune(); r == 'p' || r == 'P' {
+		v.toggleDeploymentsLocked()
+		return true
 	}
 	// 'D' opens the deploy-control menu -- owner/admin only. Non-admins
 	// get a no-op (no controls, no hint). Checked before the pan keys so
@@ -699,14 +854,114 @@ func (v *View) buildEdgesLocked() {
 		}
 	}
 
+	seen := make(map[[2]int]bool)
 	for _, rel := range edgeRelations {
 		parentIdx, hasParent := firstByType[rel[0]]
 		childIdx, hasChild := firstByType[rel[1]]
 		if !hasParent || !hasChild {
 			continue // drop the edge if one side is missing
 		}
-		v.Edges = append(v.Edges, [2]int{parentIdx, childIdx})
+		e := [2]int{parentIdx, childIdx}
+		if !seen[e] {
+			seen[e] = true
+			v.Edges = append(v.Edges, e)
+		}
 	}
+
+	// Real discovery edges from parentId (memql-cockpit#207): a node that
+	// discovered the mesh through a peer carries that peer's id in
+	// ParentId. Render those actual parent/child links on top of the
+	// static service-relationship map so the diagram reflects the live
+	// discovery graph. Indexed by node id; self-edges and dangling
+	// parents (peer not in the current node set) are skipped.
+	idToIdx := make(map[string]int, len(v.Nodes))
+	for i, n := range v.Nodes {
+		if n.ID != "" {
+			idToIdx[n.ID] = i
+		}
+	}
+	for childIdx, n := range v.Nodes {
+		if n.ParentId == "" {
+			continue
+		}
+		parentIdx, ok := idToIdx[n.ParentId]
+		if !ok || parentIdx == childIdx {
+			continue
+		}
+		e := [2]int{parentIdx, childIdx}
+		if !seen[e] {
+			seen[e] = true
+			v.Edges = append(v.Edges, e)
+		}
+	}
+}
+
+// currentDeploymentIdLocked returns the deploymentId treated as the live
+// "current" deployment for orphan detection. It prefers the newest
+// succeeded / in-progress deployment from the history (newest-first), and
+// falls back to the most common non-empty deploymentId across the live
+// nodes. Returns "" when unknown -- in which case nothing is flagged as an
+// orphan, so a cluster with no deployment metadata never shows false
+// positives. Caller MUST hold v.mu.
+func (v *View) currentDeploymentIdLocked() string {
+	for _, d := range v.deployments {
+		switch strings.ToLower(strings.TrimSpace(d.Status)) {
+		case "succeeded", "in_progress":
+			if d.ID != "" {
+				return d.ID
+			}
+		}
+	}
+	counts := map[string]int{}
+	best, bestN := "", 0
+	for _, n := range v.Nodes {
+		if n.DeploymentId == "" {
+			continue
+		}
+		counts[n.DeploymentId]++
+		if counts[n.DeploymentId] > bestN {
+			best, bestN = n.DeploymentId, counts[n.DeploymentId]
+		}
+	}
+	return best
+}
+
+// isOrphanLocked reports whether a node is orphaned/stale: it has stopped,
+// or it carries a deploymentId that isn't the current one (when current is
+// known). These are the nodes the topology highlights so a half-finished
+// rollout or a leftover node from a superseded deployment is obvious.
+// Caller MUST hold v.mu.
+func (v *View) isOrphanLocked(n NodeInfo, current string) bool {
+	if n.Health == nodev1.NodeHealthStatus_NODE_HEALTH_STOPPED {
+		return true
+	}
+	if current != "" && n.DeploymentId != "" && n.DeploymentId != current {
+		return true
+	}
+	return false
+}
+
+// shortTypesLocked returns, in topology row order, the node types whose
+// healthy-node count is below expectedNodesPerType, formatted as
+// "type(got/exp)". Drives the "count vs expected" truthfulness summary in
+// the status bar. Caller MUST hold v.mu.
+func (v *View) shortTypesLocked() []string {
+	healthyByType := map[string]int{}
+	groups := map[string][]int{}
+	for i, n := range v.Nodes {
+		groups[n.Type] = append(groups[n.Type], i)
+		if n.Health == nodev1.NodeHealthStatus_NODE_HEALTH_HEALTHY {
+			healthyByType[n.Type]++
+		}
+	}
+	var short []string
+	for _, t := range v.buildTypeOrder(groups) {
+		got := healthyByType[t]
+		if got < expectedNodesPerType {
+			short = append(short, fmt.Sprintf("%s(%d/%d)", nodeTypeShort(t), got, expectedNodesPerType))
+		}
+	}
+	return short
 }
 
 func (v *View) healthCounts() (healthy, degraded, offline int) {

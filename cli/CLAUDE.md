@@ -215,7 +215,49 @@ chrome-contract) below. Tab cycles focus between the three panes.
 - **Left pane**: cluster manager (list + detail + add/edit form).
 - **Right pane**: topology diagram (current cluster's nodes +
   health), or the architecture-model drill-down navigator when
-  toggled with `X`.
+  toggled with `X`, or the Deployments section when toggled with `P`.
+
+### Deployments section (the `P` toggle, memql-cockpit#207)
+
+The right pane's third mode (alongside live topology and the `X`
+architecture navigator) is the concept-driven **Deployments
+section**. Toggle in/out with `P`. It is the integrative deliverable
+of the Deployment & Topology Overhaul (epic memql#1871) and reads the
+`v1:cluster:deployment` concept rows landed in that epic.
+
+- **History list** -- `QueryDeploymentsForCluster` (clusterId resolved
+  via `QueryExistingCluster`), rendered newest-first by createdAt with
+  a status token (succeeded / in-progress / pending / failed /
+  superseded / rolled-back) + version + env + provider.
+- **Select -> topology** -- `Enter` on a row loads that deployment's
+  nodes (`QueryNodesForDeployment`) and the orphans
+  (`QueryNodesNotInDeployment`), rendered as a count-vs-expected
+  summary + per-node health/version, with orphans flagged in the
+  warning color.
+- **Controls** (SDK `DeployControlClient` wrappers): `C` cut-version
+  (env -> bump picker, previews `SuggestNextVersion`, then
+  `CutVersion`), `G` deploy the selected pending deployment
+  (`Deploy`), `B` roll back to the selected succeeded deployment
+  (`RollbackDeployment`, type-to-confirm). Role matrix (locked,
+  epic #1871): view = any role; cut/deploy = developer + admin +
+  owner (`client.RoleDeveloper`/`RoleAdmin`/`RoleOwner`); rollback =
+  owner only. Disallowed controls are hidden/disabled in the hint
+  bar and the keys are no-ops.
+
+The **live topology** also got truthfulness upgrades from the same
+issue: each node box carries a third line (running version + short
+deploymentId, or an `[orphan]` tag), orphaned/stale nodes (stopped,
+or carrying a non-current deploymentId) render with the warning
+border, the status tally flags any node type below the expected
+replica count (`expectedNodesPerType`), and `parentId` discovery
+links are drawn as edges on top of the static service-relationship
+map.
+
+Files: `cluster/deployments.go` (section view + history + per-
+deployment topology), `cluster/deployments_controls.go` (cut/deploy/
+rollback modal). The app wires the SDK closures in `wireCluster`
+(`OnDeploymentsShown` / `OnSelectDeployment` / `OnDeploymentsChanged`)
+and parses rows in `app.go` (`parseDeployments` / `parseDeploymentNodes`).
 
 ### Architecture navigator (the `X` toggle)
 
@@ -332,6 +374,17 @@ memql-cockpit#197.)
 | WASD        | Pan the live-topology grid                          |
 | R           | Reset pan to origin                                 |
 | X           | Toggle Architecture navigator (drill-down)          |
+| P           | Toggle the Deployments section (history + controls) |
+
+### Clusters tab (Deployments section, P-toggled)
+| Key         | Action                                                  |
+|-------------|---------------------------------------------------------|
+| ↑/↓         | Move the history cursor                                 |
+| Enter       | Load the selected deployment's topology (nodes/orphans) |
+| C           | Cut a new version (developer/admin/owner)               |
+| G           | Deploy the selected pending deployment (developer+)     |
+| B           | Roll back to the selected succeeded deployment (owner)  |
+| Esc / P     | Return to the live topology                             |
 
 ### Architecture navigator (X-toggled)
 | Key         | Action                                              |

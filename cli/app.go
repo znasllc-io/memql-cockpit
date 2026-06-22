@@ -1389,6 +1389,21 @@ func (a *App) wireCluster() {
 		go a.refreshDeployStatus()
 	}
 
+	// #207 Deployments section hooks. OnDeploymentsShown loads the
+	// deployment history (QueryExistingCluster -> QueryDeploymentsForCluster);
+	// OnSelectDeployment loads the selected deployment's nodes + orphans;
+	// OnDeploymentsChanged re-loads the history after a cut/deploy/rollback
+	// action so the list reflects the new state right away.
+	a.clustersView.Topology.OnDeploymentsShown = func() {
+		go a.refreshDeployments()
+	}
+	a.clustersView.Topology.OnSelectDeployment = func(deploymentID string) {
+		go a.loadDeploymentNodes(deploymentID)
+	}
+	a.clustersView.Topology.OnDeploymentsChanged = func() {
+		go a.refreshDeployments()
+	}
+
 	// Poll the deployment-v2 status on a periodic ticker. The loop
 	// self-gates on the connected caller's cluster role (owner/admin
 	// only) inside refreshDeployStatus.
@@ -1455,6 +1470,169 @@ func (a *App) refreshDeployStatus() {
 	a.postRedraw()
 }
 
+// activeQueryClient resolves a QueryClient bound to the currently active
+// cluster's connection, or nil when none is connected. Mirrors the
+// DeployClient closure's pool lookup so a cluster switch retargets.
+func (a *App) activeQueryClient() *client.QueryClient {
+	a.poolMu.RLock()
+	name := a.selected
+	entry := a.pool[name]
+	a.poolMu.RUnlock()
+	if entry == nil {
+		return nil
+	}
+	entry.mu.Lock()
+	conn := entry.Conn
+	state := entry.State
+	entry.mu.Unlock()
+	if conn == nil || state != stateConnected {
+		return nil
+	}
+	return client.NewQueryClient(conn.Dispatcher())
+}
+
+// refreshDeployments loads the deployment history for the active cluster
+// and pushes it onto the Topology view's Deployments section. Resolves
+// the clusterId via QueryExistingCluster first (single-cluster staging),
+// then QueryDeploymentsForCluster. Errors leave the existing list intact
+// and log at debug. Per memql-cockpit#207.
+func (a *App) refreshDeployments() {
+	if a.clustersView == nil || a.clustersView.Topology == nil {
+		return
+	}
+	qc := a.activeQueryClient()
+	if qc == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	clusterId := a.resolveClusterId(ctx, qc)
+	if clusterId == "" {
+		return
+	}
+	res, err := qc.QueryDeploymentsForCluster(ctx, client.QueryDeploymentsForClusterArgs{ClusterId: clusterId})
+	if err != nil {
+		if a.logger != nil {
+			a.logger.Debug("queryDeploymentsForCluster failed", "cluster", clusterId, "error", err)
+		}
+		return
+	}
+	a.clustersView.Topology.SetDeployments(parseDeployments(res))
+	a.postRedraw()
+}
+
+// resolveClusterId returns the active connection's cluster id via
+// QueryExistingCluster, or "" when unknown. Single-cluster staging
+// returns one row; the first non-empty id wins.
+func (a *App) resolveClusterId(ctx context.Context, qc *client.QueryClient) string {
+	res, err := qc.QueryExistingCluster(ctx, client.QueryExistingClusterArgs{})
+	if err != nil {
+		if a.logger != nil {
+			a.logger.Debug("queryExistingCluster failed", "error", err)
+		}
+		return ""
+	}
+	for _, r := range res.Rows() {
+		if id := client.RowString(r, "id"); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
+// loadDeploymentNodes loads the selected deployment's node set
+// (QueryNodesForDeployment) + orphans (QueryNodesNotInDeployment) and
+// pushes them onto the view. Called off-thread from OnSelectDeployment.
+func (a *App) loadDeploymentNodes(deploymentID string) {
+	if deploymentID == "" || a.clustersView == nil || a.clustersView.Topology == nil {
+		return
+	}
+	qc := a.activeQueryClient()
+	if qc == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var nodes, orphans []cluster.NodeInfo
+	if res, err := qc.QueryNodesForDeployment(ctx, client.QueryNodesForDeploymentArgs{DeploymentId: deploymentID}); err == nil {
+		nodes = parseDeploymentNodes(res)
+	} else if a.logger != nil {
+		a.logger.Debug("queryNodesForDeployment failed", "deployment", deploymentID, "error", err)
+	}
+	if res, err := qc.QueryNodesNotInDeployment(ctx, client.QueryNodesNotInDeploymentArgs{DeploymentId: deploymentID}); err == nil {
+		orphans = parseDeploymentNodes(res)
+	} else if a.logger != nil {
+		a.logger.Debug("queryNodesNotInDeployment failed", "deployment", deploymentID, "error", err)
+	}
+	a.clustersView.Topology.SetDeploymentNodes(deploymentID, nodes, orphans)
+	a.postRedraw()
+}
+
+// parseDeployments converts a queryDeploymentsForCluster result into the
+// view's DeploymentInfo slice, sorted newest-first by createdAt.
+func parseDeployments(res *client.Result) []cluster.DeploymentInfo {
+	if res == nil {
+		return nil
+	}
+	rows := res.Rows()
+	out := make([]cluster.DeploymentInfo, 0, len(rows))
+	for _, r := range rows {
+		id := firstNonEmpty(client.RowString(r, "deploymentId"), client.RowString(r, "id"))
+		if id == "" {
+			continue
+		}
+		out = append(out, cluster.DeploymentInfo{
+			ID:                   id,
+			Version:              client.RowString(r, "version"),
+			ImageDigest:          client.RowString(r, "imageDigest"),
+			Provider:             client.RowString(r, "provider"),
+			Environment:          client.RowString(r, "environment"),
+			Region:               client.RowString(r, "region"),
+			Status:               client.RowString(r, "status"),
+			TriggeredBy:          client.RowString(r, "triggeredBy"),
+			CreatedAt:            firstNonEmpty(client.RowString(r, "createdAt"), client.RowString(r, "created_at")),
+			UpdatedAt:            client.RowString(r, "updatedAt"),
+			PreviousDeploymentId: client.RowString(r, "previousDeploymentId"),
+			Notes:                client.RowString(r, "notes"),
+		})
+	}
+	// Newest-first by createdAt (RFC3339 sorts lexicographically). Stable
+	// so equal timestamps keep source order.
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].CreatedAt > out[j].CreatedAt
+	})
+	return out
+}
+
+// parseDeploymentNodes converts a node query result (for-deployment or
+// not-in-deployment) into NodeInfo, carrying the deploymentId/parentId
+// the Deployments section + orphan highlight rely on.
+func parseDeploymentNodes(res *client.Result) []cluster.NodeInfo {
+	if res == nil {
+		return nil
+	}
+	rows := res.Rows()
+	out := make([]cluster.NodeInfo, 0, len(rows))
+	for _, r := range rows {
+		nodeType := firstNonEmpty(client.RowString(r, "nodeType"), client.RowString(r, "type"))
+		id := client.RowString(r, "id")
+		if nodeType == "" && id == "" {
+			continue
+		}
+		out = append(out, cluster.NodeInfo{
+			ID:           id,
+			Name:         firstNonEmpty(client.RowString(r, "name"), nodeType),
+			Type:         nodeType,
+			Address:      client.RowString(r, "address"),
+			Version:      client.RowString(r, "version"),
+			Health:       node.ParseHealthLabel(firstNonEmpty(client.RowString(r, "health"), "healthy")),
+			DeploymentId: client.RowString(r, "deploymentId"),
+			ParentId:     client.RowString(r, "parentId"),
+		})
+	}
+	return out
+}
+
 // parseClusterNodeEvent converts an SDK Event carrying a
 // v1:cluster:node CDC payload into a NodeInfo. Returns ok=false when the
 // payload is missing required fields (type + either ID).
@@ -1483,12 +1661,14 @@ func parseClusterNodeEvent(ev client.Event) (cluster.NodeInfo, bool) {
 	healthStr := firstNonEmpty(getString(payload, "health"), getString(m, "health"))
 
 	return cluster.NodeInfo{
-		ID:      nodeId,
-		Name:    firstNonEmpty(getString(payload, "name"), nodeType),
-		Type:    nodeType,
-		Address: firstNonEmpty(getString(payload, "address"), getString(m, "address")),
-		Version: firstNonEmpty(getString(payload, "version"), getString(m, "version")),
-		Health:  node.ParseHealthLabel(healthStr),
+		ID:           nodeId,
+		Name:         firstNonEmpty(getString(payload, "name"), nodeType),
+		Type:         nodeType,
+		Address:      firstNonEmpty(getString(payload, "address"), getString(m, "address")),
+		Version:      firstNonEmpty(getString(payload, "version"), getString(m, "version")),
+		Health:       node.ParseHealthLabel(healthStr),
+		DeploymentId: firstNonEmpty(getString(payload, "deploymentId"), getString(m, "deploymentId")),
+		ParentId:     firstNonEmpty(getString(payload, "parentId"), getString(m, "parentId")),
 	}, true
 }
 
@@ -1646,12 +1826,14 @@ func parseClusterNodes(result any) []cluster.NodeInfo {
 		)
 
 		n := cluster.NodeInfo{
-			ID:      id,
-			Name:    firstNonEmpty(getString(payload, "name"), getString(m, "name"), nodeType),
-			Type:    nodeType,
-			Address: firstNonEmpty(getString(payload, "address"), getString(m, "address")),
-			Version: firstNonEmpty(getString(payload, "version"), getString(m, "version")),
-			Health:  node.ParseHealthLabel(healthStr),
+			ID:           id,
+			Name:         firstNonEmpty(getString(payload, "name"), getString(m, "name"), nodeType),
+			Type:         nodeType,
+			Address:      firstNonEmpty(getString(payload, "address"), getString(m, "address")),
+			Version:      firstNonEmpty(getString(payload, "version"), getString(m, "version")),
+			Health:       node.ParseHealthLabel(healthStr),
+			DeploymentId: firstNonEmpty(getString(payload, "deploymentId"), getString(m, "deploymentId")),
+			ParentId:     firstNonEmpty(getString(payload, "parentId"), getString(m, "parentId")),
 		}
 
 		// Group by id so every historical version of the same node
