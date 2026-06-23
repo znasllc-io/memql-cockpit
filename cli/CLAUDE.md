@@ -86,7 +86,9 @@ focused subcommand surface that imports the TUI primitives.
 The tab bar lives at the top of the screen. Tabs are ordered so that
 "connect to a cluster" is the first thing the user sees:
 
-1. **Clusters (F1)** -- cluster manager + topology
+1. **DevOps (F1)** -- cluster manager + live topology + deployments
+   (renamed from "Clusters" in memql-cockpit#233; the left sub-pane is
+   still the cluster list, titled CLUSTERS)
 2. **Concepts (F2)** -- generic browser for every registered concept.
    Renders rows + detail uniformly per concept by consuming the
    `@displayCard(...)` hints memql core publishes on
@@ -122,7 +124,10 @@ chrome-contract) below. Tab cycles focus between the three panes.
 
 ---
 
-## Clusters Tab Layout
+## DevOps Tab Layout
+
+(Tab labelled **DevOps** since memql-cockpit#233; the left sub-pane that
+lists/manages clusters keeps the title CLUSTERS.)
 
 ```
 ┌──────────────────────────┬───────────────────────────────────┐
@@ -169,10 +174,30 @@ rows, bottom-anchored, with a 1-row `─` divider above it and the
 topology grid filling the rest. `drawTopology` is handed only the top
 sub-`Rect`, which is what stops the grid from bleeding into the
 deployments band (the overlap bug #221/#220 fixed). There is **no
-toggle** -- both regions are always present. (A graphical topology
-preview of the *selected* deployment is a follow-up; for now the
-selected deployment's node composition is shown textually in the
-deployments detail block -- see the `TODO(#221)` in `View.Draw`.)
+toggle** -- both regions are always present.
+
+**Deployment preview + drill-down (memql-cockpit#225, delivered in #234).**
+`drawTopology` is parameterized -- it takes an explicit node set + edges +
+an orphan predicate (the pure `computeEdges(nodes)` derives the graph), so
+the same renderer paints the live grid AND a deployment preview. Pressing
+`Enter` on a deployment row renders THAT deployment's composition
+graphically in the top region (its nodes + flagged orphans) under a
+`preview: deployment <id>` header; `Enter` again expands to a fullscreen
+drill-down; `F` toggles fullscreen directly; `Esc` steps back out
+(fullscreen -> preview -> live). While previewing, `Up/Dn` switches which
+deployment is previewed. The desired per-tier spec (Epic 2
+`deploymentNodeSpec`: version/replicas, via `NodeSpecsForDeployment`) is
+surfaced in the composition view.
+
+**Topology builder (memql-cockpit#237, phase 1).** `N` enters an
+interactive topology-as-canvas builder. Phase 1 is LIST-based: an
+editable per-node-type composition (type x replicas, + version) seeded
+from the selected deployment's `deploymentNodeSpec` set or the cluster's
+known node types + live counts. `Up/Dn` move, `+`/`-` adjust replicas,
+`A` adds the next known type, `D` removes a row, `N`/`Esc` close. The
+model (`composeBuilder`, `cluster/builder.go`) is pure; `toSpecs()` is the
+hand-off point the clickable-node canvas (phase 2, backed by `cli/canvas`)
+will consume.
 
 ### Deployments section (memql-cockpit#207)
 
@@ -184,21 +209,26 @@ landed in that epic.
 - **History list** -- `DeploymentsForCluster` (clusterId resolved
   via `ExistingCluster`), rendered newest-first by createdAt with
   a status token (succeeded / in-progress / pending / failed /
-  superseded / rolled-back) + version + env + provider.
+  superseded / rolled-back) + version + env + provider. The CURRENT
+  (live) deployment is flagged green with a `●` marker + green
+  version and a `(current)` tag in the detail header (#235). The
+  detail band height is adaptive so the list keeps several rows.
 - **Select -> topology** -- `Enter` on a row loads that deployment's
   nodes (`NodesForDeployment`) and the orphans
   (`NodesNotInDeployment`), rendered as a count-vs-expected
   summary + per-node health/version, with orphans flagged in the
   warning color.
 - **Controls** (SDK `DeployControlClient` wrappers): `C` cut-version
-  (env -> bump picker, previews `SuggestNextVersion`, then
-  `CutVersion`), `G` deploy the selected pending deployment
-  (`Deploy`), `B` roll back to the selected succeeded deployment
-  (`RollbackDeployment`, type-to-confirm). Role matrix (locked,
-  epic #1871): view = any role; cut/deploy = developer + admin +
-  owner (`client.RoleDeveloper`/`RoleAdmin`/`RoleOwner`); rollback =
-  owner only. Disallowed controls are hidden/disabled in the hint
-  bar and the keys are no-ops.
+  (opens straight on the bump picker -- the env is the cluster's own,
+  resolved from `ExistingCluster` rather than picked, #226/#236 --
+  previews `SuggestNextVersion`, then `CutVersion`), `G` deploy the
+  selected pending deployment (`Deploy`), `B` roll back to the selected
+  succeeded deployment (`RollbackDeployment`, type-to-confirm). Role
+  matrix (locked, epic #1871): view = any role; cut/deploy = developer +
+  admin + owner (`client.RoleDeveloper`/`RoleAdmin`/`RoleOwner`);
+  rollback = **owner only** (matches the backend `authorizeOwner` gate,
+  memql#1876 -- not even admin). Disallowed controls are hidden/disabled
+  in the hint bar and the keys are no-ops.
 
 The **live topology** (top region) also got truthfulness upgrades from
 the same issue: each node box carries a third line (running version +
@@ -406,11 +436,23 @@ pans the grid). There is no toggle.
 | WASD        | Pan the live-topology grid (top region)                 |
 | R           | Reset pan to origin                                     |
 | X           | Toggle Architecture navigator (drill-down, top region)  |
+| N           | Toggle the Topology builder (list-based, phase 1, #237) |
 | ↑/↓         | Move the Deployments history cursor (bottom region)     |
-| Enter       | Load the selected deployment's topology (nodes/orphans) |
-| C           | Cut a new version (developer/admin/owner)               |
+| Enter       | Preview the selected deployment graphically; again = fullscreen (#225) |
+| F           | Toggle fullscreen deployment drill-down                 |
+| Esc         | Step back out of preview / fullscreen to the live grid  |
+| C           | Cut a new version (developer/admin/owner; env auto-resolved) |
 | G           | Deploy the selected pending deployment (developer+)     |
 | B           | Roll back to the selected succeeded deployment (owner)  |
+
+### Topology builder (N-toggled, phase 1)
+| Key         | Action                                              |
+|-------------|-----------------------------------------------------|
+| ↑/↓         | Move the row cursor                                 |
+| +/-         | Adjust the selected node type's replica count       |
+| A           | Add the next known node type not yet in the list    |
+| D           | Remove the selected node type                       |
+| N / Esc     | Close the builder                                   |
 
 ### Architecture navigator (X-toggled)
 | Key         | Action                                              |
@@ -429,8 +471,9 @@ pans the grid). There is no toggle.
 | `app.go`                 | Top-level App: tab bar, screen loop, callback wiring          |
 | `pool.go`                | Per-cluster `connEntry` + lifecycle state machine             |
 | `cluster/clusters_view.go` | Clusters tab layout, focus, cluster manager                |
-| `cluster/topology.go`    | Right-pane persistent split: live topology grid (top) + Architecture toggle + `View.Draw` split layout |
-| `cluster/deployments.go` | Deployments section (bottom band): history list + per-deployment detail/topology |
+| `cluster/topology.go`    | Right-pane persistent split: live topology grid (top) + parameterized `drawTopology`/`computeEdges` + deployment preview/drill-down + Architecture + builder toggles + `View.Draw` split layout |
+| `cluster/builder.go`     | Interactive topology-as-canvas phase 1: pure `composeBuilder` list model + the `N`-toggled builder mode |
+| `cluster/deployments.go` | Deployments section (bottom band): history list (current=green) + per-deployment detail/topology + nodeSpec composition |
 | `cluster/deployments_controls.go` | Cut/deploy/rollback concept modal for the Deployments section |
 | `cluster/deploy_shared.go` | Shared deploy helpers (async-fire outcome, gRPC PermissionDenied mapping, colored-token / wrapped-text writers) reused by the Deployments section |
 | `cluster/architecture.go`| `ArchView`: drill-down navigator over `topology.model.json`   |

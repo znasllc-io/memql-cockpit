@@ -108,6 +108,13 @@ type View struct {
 	// (arrows, Enter, Backspace, Esc); HandleEvent routes accordingly.
 	Arch *ArchView
 
+	// builder is the interactive topology-as-canvas, PHASE 1: a list-based
+	// composition builder (memql-cockpit#237). nil when inactive; toggled
+	// with 'N'. While active it owns the topology region + all keys (like
+	// Arch). Seeded from the selected deployment's deploymentNodeSpec set or
+	// the cluster's known node types. See builder.go.
+	builder *composeBuilder
+
 	// clusterRole is the connected caller's cluster-wide role, mirrored
 	// from refreshMyAccess via SetClusterRole. Drives the role gating on
 	// the Deployments section's cut/deploy/rollback controls (view = any
@@ -359,6 +366,19 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 		return
 	}
 
+	// Topology builder (memql-cockpit#237, phase 1): when active it owns
+	// the pane below the cluster-name title with its own hint bar.
+	if v.builder != nil {
+		region := ui.Rect{X: bounds.X, Y: bounds.Y, Width: bounds.Width, Height: bounds.Height - 1}
+		v.drawBuilder(screen, region)
+		hintStyle := tcell.StyleDefault.Foreground(v.Theme.Subtle).Background(v.Theme.BG)
+		hintY := bounds.Y + bounds.Height - 1
+		screen.FillRect(bounds.X, hintY, bounds.Width, 1, hintStyle)
+		screen.DrawText(bounds.X, hintY, bounds.Width/2, " Topology builder", hintStyle)
+		drawRightHints(screen, bounds, hintY, "Up/Dn:Move  +/-:Replicas  A:Add  D:Del  N/Esc:Close", hintStyle)
+		return
+	}
+
 	// Fullscreen deployment drill-down (memql-cockpit#225): the selected
 	// deployment's composition owns the whole pane below the cluster-name
 	// title; the live grid + deployments band are hidden until Esc / F
@@ -501,8 +521,8 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 		screen.FillRect(bounds.X, tallyY, bounds.Width, 1, statusStyle)
 		screen.DrawText(bounds.X, tallyY, bounds.Width/2, statusText, statusStyle)
 
-		// Right-align the pan/reset/arch hints on the same row.
-		hints := "WASD:Pan  R:Reset  X:Architecture"
+		// Right-align the pan/reset/arch/build hints on the same row.
+		hints := "WASD:Pan  R:Reset  X:Arch  N:Build"
 		if v.disconnected {
 			hints += "  stale"
 		}
@@ -804,6 +824,10 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 	if v.Arch.Active() {
 		return v.Arch.HandleEvent(ev)
 	}
+	// Topology builder (memql-cockpit#237) owns all keys while active.
+	if v.builder != nil {
+		return v.handleBuilderKeyLocked(keyEv)
+	}
 	// Cut/deploy/rollback concept modal takes precedence whenever it's
 	// open. handleDeployConceptKeyLocked assumes v.mu held.
 	if v.dctrl != nil {
@@ -840,6 +864,10 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 		return true
 	case 'x', 'X':
 		v.Arch.Toggle()
+		return true
+	case 'n', 'N':
+		// Enter the interactive topology builder (phase 1, #237).
+		v.openBuilderLocked()
 		return true
 	case 'f', 'F':
 		// Fullscreen deployment drill-down toggle (memql-cockpit#225).
