@@ -240,6 +240,9 @@ func (a *App) Run() error {
 	// countdown while any entry is in backoff.
 	go a.connect()
 	go a.backoffRedrawLoop()
+	// Liveness probe for non-selected clusters (up/down dot only;
+	// the selected cluster has a real connection). Epic #239 / CM3.
+	go a.livenessProbeLoop()
 
 	// Event loop. Each iteration body runs under a panic catcher
 	// (crash.Catch) so a panic ANYWHERE outside the per-tab Draw /
@@ -2125,6 +2128,113 @@ func (a *App) backoffRedrawLoop() {
 	}
 }
 
+// probeInterval is the cadence of the non-selected-cluster liveness
+// probe sweep. Slow on purpose -- it's an at-a-glance up/down dot, not
+// a live feed; the selected cluster has a real connection for that.
+const probeInterval = 25 * time.Second
+
+// probeConcurrency bounds how many liveness probes run at once so a
+// user with many configured clusters doesn't fire a dial storm every
+// sweep (the very thing epic #239 set out to kill at boot).
+const probeConcurrency = 3
+
+// probeTimeout caps a single connect-and-close probe.
+const probeTimeout = 5 * time.Second
+
+// livenessProbeLoop periodically probes every NON-selected,
+// registered-idle cluster for reachability (up/down only) so the
+// cluster list shows a status dot without holding a full connection
+// (epic #239 / CM3 #242). The selected cluster is skipped (it has a
+// live connection); needs-auth / needs-login rows are skipped (nothing
+// to probe -- they aren't stateIdle). One shared ticker drives the
+// sweep; a bounded worker pool inside each sweep prevents probe storms.
+func (a *App) livenessProbeLoop() {
+	ticker := time.NewTicker(probeInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-a.quitCh:
+			return
+		case <-ticker.C:
+		}
+		a.probeSweep()
+	}
+}
+
+// probeSweep probes all eligible (non-selected, registered-idle)
+// clusters once, with bounded concurrency, and updates each row's
+// status only when its reachability changes (so a steady-state sweep
+// produces zero redraws -- no flicker).
+func (a *App) probeSweep() {
+	a.poolMu.RLock()
+	selected := a.selected
+	type probeTarget struct {
+		entry *connEntry
+		cfg   config.ClusterConfig
+	}
+	var targets []probeTarget
+	for name, entry := range a.pool {
+		if name == selected || entry == nil {
+			continue
+		}
+		if entry.probeReachableEligible() {
+			targets = append(targets, probeTarget{entry: entry, cfg: entry.Config})
+		}
+	}
+	a.poolMu.RUnlock()
+	if len(targets) == 0 {
+		return
+	}
+
+	sem := make(chan struct{}, probeConcurrency)
+	var wg sync.WaitGroup
+	for _, t := range targets {
+		select {
+		case <-a.quitCh:
+			wg.Wait()
+			return
+		case sem <- struct{}{}:
+		}
+		wg.Add(1)
+		go func(pt probeTarget) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+			defer cancel()
+			result := probeReachability(ctx, pt.cfg)
+			// Re-check eligibility: the cluster may have been selected
+			// (and thus fully connected) while the probe was in flight;
+			// don't clobber a live-connection row status with a probe
+			// result.
+			if !pt.entry.probeReachableEligible() || a.isSelectedCluster(pt.cfg.Name) {
+				return
+			}
+			if pt.entry.setProbe(result) {
+				a.syncProbeRowStatus(pt.cfg.Name, result)
+			}
+		}(t)
+	}
+	wg.Wait()
+}
+
+// syncProbeRowStatus maps a probe result onto the cluster-row status
+// string. Reuses the existing "available" (hollow green dot) and
+// "unreachable" (red dot) row statuses so the icon set stays unchanged
+// -- "available" = reachable but not the live working connection.
+func (a *App) syncProbeRowStatus(name string, s probeStatus) {
+	var status string
+	switch s {
+	case probeReachable:
+		status = "available"
+	case probeUnreachable:
+		status = "unreachable"
+	default:
+		status = "unknown"
+	}
+	a.clustersView.SetRowStatus(name, status)
+	a.postRedraw()
+}
+
 // refreshClusterList reloads clusters from the config file and decorates
 // each row's status from the pool: if a cluster has a live pool entry,
 // it shows "connected"; if the entry is mid-reconnect, "unreachable";
@@ -2160,6 +2270,17 @@ func (a *App) refreshClusterList() {
 				status = "connecting"
 			case stateFailed:
 				status = "unreachable"
+			case stateIdle:
+				// Registered-idle (non-selected) cluster: carry the
+				// liveness-probe dot forward so an add/delete refresh
+				// doesn't blank it back to "unknown" until the next
+				// probe sweep (epic #239 / CM3 #242).
+				switch entry.probe {
+				case probeReachable:
+					status = "available"
+				case probeUnreachable:
+					status = "unreachable"
+				}
 			}
 			entry.mu.Unlock()
 		}

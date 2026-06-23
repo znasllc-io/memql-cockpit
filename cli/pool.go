@@ -125,8 +125,27 @@ type connEntry struct {
 	// Close must not block waiting on lifecycleExited for them.
 	lifecycleStarted bool
 
+	// probe is the last liveness-probe result for a registered-idle
+	// (non-selected, non-dialed) cluster. It is DISTINCT from State:
+	// the selected cluster's reachability is its live-connection
+	// State, while every other configured cluster gets a lightweight
+	// up/down probe instead of a full connection (epic #239, CM3
+	// #242). Only meaningful while lifecycleStarted is false.
+	probe probeStatus
+
 	closed bool
 }
+
+// probeStatus is the reachability of a non-selected cluster as seen by
+// the lightweight liveness probe -- separate from the full-connection
+// entryState machine.
+type probeStatus int
+
+const (
+	probeNone        probeStatus = iota // not probed yet
+	probeReachable                      // server answered (or refused creds -- still up)
+	probeUnreachable                    // dial/TLS/timeout failure -- down
+)
 
 // markLifecycleStarted records that runLifecycle was launched for
 // this entry, so Close knows to wait for lifecycleExited. Entries
@@ -136,6 +155,60 @@ func (e *connEntry) markLifecycleStarted() {
 	e.mu.Lock()
 	e.lifecycleStarted = true
 	e.mu.Unlock()
+}
+
+// probeReachableEligible reports whether this entry should be liveness-
+// probed: it must be a registered-idle entry (no running lifecycle,
+// stateIdle) -- the selected cluster has a real connection, and
+// needs-config / needs-login rows have nothing to probe (state is not
+// idle for those). Caller additionally excludes the selected cluster.
+func (e *connEntry) probeReachableEligible() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return !e.lifecycleStarted && !e.closed && e.State == stateIdle
+}
+
+// setProbe records the probe result under lock and reports whether it
+// changed (so the caller only redraws on a real transition -- no
+// flicker from steady-state re-probes).
+func (e *connEntry) setProbe(s probeStatus) (changed bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.probe == s {
+		return false
+	}
+	e.probe = s
+	return true
+}
+
+// probeStatusSnapshot returns the entry's last probe result under lock.
+func (e *connEntry) probeStatusSnapshot() probeStatus {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.probe
+}
+
+// probeReachability performs ONE lightweight liveness probe: a short-
+// timeout connect-and-close with no token, no subscribe, no initial
+// loads, no refresher. The handshake completes without credentials,
+// and an auth rejection still proves the server is reachable -- so
+// only a transport-level failure (dial refused, TLS, timeout) counts
+// as down. Returns probeReachable / probeUnreachable.
+func probeReachability(ctx context.Context, cfg config.ClusterConfig) probeStatus {
+	// Logger intentionally nil: this fires every probe interval per
+	// cluster, so it must not spew "cockpit dialing cluster" lines.
+	conn, err := client.Connect(ctx, client.ConnectConfig{Endpoint: cfg.Endpoint})
+	if err == nil {
+		conn.Close()
+		return probeReachable
+	}
+	// A credentials rejection means the server answered -- it's up, we
+	// just didn't present a token (we deliberately don't, to keep the
+	// probe free of the auth machinery).
+	if looksLikeAuthRejection(err) {
+		return probeReachable
+	}
+	return probeUnreachable
 }
 
 // newConnEntry builds the entry metadata. Start the lifecycle
