@@ -20,6 +20,7 @@ import (
 	"github.com/znasllc-io/memql-cockpit/cli/concepts"
 	"github.com/znasllc-io/memql-cockpit/cli/config"
 	"github.com/znasllc-io/memql-cockpit/cli/crash"
+	"github.com/znasllc-io/memql-cockpit/cli/dsledit"
 	"github.com/znasllc-io/memql-cockpit/cli/settings"
 	"github.com/znasllc-io/memql-cockpit/cli/splash"
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
@@ -30,6 +31,7 @@ import (
 	"github.com/znasllc-io/memql/component/node"
 	nodev1 "github.com/znasllc-io/memql/component/node/gen"
 	"github.com/znasllc-io/memql/sdk/go/client"
+	"github.com/znasllc-io/memql/sdk/go/pack"
 	"github.com/znasllc-io/memql/sdk/go/sense"
 )
 
@@ -91,6 +93,7 @@ type App struct {
 	conceptsView *concepts.View
 	clustersView *cluster.ClustersView
 	settingsView *settings.View
+	dsleditView  *dsledit.View
 
 	// getQueries returns a QueryClient bound to the currently active
 	// cluster's dispatcher, or nil if none is connected. Cached by
@@ -127,16 +130,19 @@ func NewApp(cfg AppConfig) *App {
 
 	conceptsView := concepts.NewView(theme)
 	clustersView := cluster.NewClustersView(theme)
+	dsleditView := dsledit.NewView(theme)
 
 	// DevOps comes first -- it's the starting context for the session
 	// (cluster management + live topology + deployments). Concepts
-	// follows as the operations-console read surface. Settings stays
+	// follows as the operations-console read surface, then the Editor
+	// (read-only DSL pack browser, memql-cockpit#228). Settings stays
 	// last. (Planner / Skills / Workers / Safety / Bundles panels were
 	// removed in memql-cockpit#216 -- the cockpit is scoped to DevOps
-	// + concept browsing + settings for now.)
+	// + concept browsing + DSL editing + settings.)
 	tabBar := ui.NewTabBar(theme,
 		ui.Tab{Name: "DevOps", Content: clustersView},
 		ui.Tab{Name: "Concepts", Content: conceptsView},
+		ui.Tab{Name: "Editor", Content: dsleditView},
 		ui.Tab{Name: "Settings", Content: settingsView},
 	)
 	tabBar.SetActive(0)
@@ -154,6 +160,7 @@ func NewApp(cfg AppConfig) *App {
 		conceptsView:  conceptsView,
 		clustersView:  clustersView,
 		settingsView:  settingsView,
+		dsleditView:   dsleditView,
 		helpOverlay:   ui.NewHelpOverlay(theme),
 		tabCrashes:    make(map[string]*crash.Report),
 	}
@@ -543,6 +550,7 @@ func (a *App) connect() {
 	// Auto-wire the UI glue so the tabs have their callbacks set even
 	// before the first successful dial lands.
 	a.wireConcepts()
+	a.wirePacks()
 	a.wireCluster()
 	// Exactly one live connection at boot: the selected cluster gets
 	// the full lifecycle; everything else is registered (listed) but
@@ -1119,6 +1127,7 @@ func (a *App) afterSelectedConnected(name string, entry *connEntry) {
 	}
 	a.refreshMyAccess(name, conn)
 	go a.refreshConcepts(context.Background())
+	go a.refreshPacks(context.Background())
 }
 
 // replaceWithRegistered swaps a pool entry for a fresh registered-idle
@@ -1162,6 +1171,55 @@ func (a *App) refreshConcepts(ctx context.Context) {
 		return
 	}
 	a.conceptsView.SetConcepts(concepts)
+	if a.screen != nil {
+		a.screen.PostEvent(tcell.NewEventInterrupt(nil))
+	}
+}
+
+// wirePacks connects the Editor tab's pack browser to the active
+// cluster's dispatcher (same fresh-on-each-call closure pattern as
+// wireConcepts, so a cluster switch transparently retargets) and wires
+// its status callback to the notification bar.
+func (a *App) wirePacks() {
+	a.dsleditView.PackClient = func() *pack.Client {
+		d := a.activeDispatcher()
+		if d == nil {
+			return nil
+		}
+		return pack.NewClient(d)
+	}
+	a.dsleditView.OnStatus = func(msg string) {
+		if a.notifications != nil {
+			a.notifications.Sync("editor", ui.SeverityWarning, msg)
+		}
+	}
+	a.dsleditView.OnRedraw = a.postRedraw
+
+	// Initial fetch -- usually a no-op at app-init (no cluster
+	// connected yet); re-fired on connect via refreshPacks.
+	go a.refreshPacks(context.Background())
+}
+
+// refreshPacks fetches the connected cluster's browsable DSL domains
+// and pushes them into the Editor view. Safe to call when no cluster
+// is connected (no-ops on a nil pack client). Called at app init + on
+// every transition of the selected cluster into stateConnected.
+func (a *App) refreshPacks(ctx context.Context) {
+	if a.dsleditView == nil || a.dsleditView.PackClient == nil {
+		return
+	}
+	pc := a.dsleditView.PackClient()
+	if pc == nil {
+		return
+	}
+	domains, err := pc.ListDomains(ctx)
+	if err != nil {
+		if a.logger != nil {
+			a.logger.Warn("editor: ListDomains failed", "error", err)
+		}
+		return
+	}
+	a.dsleditView.SetDomains(domains)
 	if a.screen != nil {
 		a.screen.PostEvent(tcell.NewEventInterrupt(nil))
 	}
@@ -2072,6 +2130,7 @@ func (a *App) deleteCluster(clusterName string) {
 func (a *App) updateTabGating() {
 	setGated := func(msg string) {
 		a.conceptsView.GatedMessage = msg
+		a.dsleditView.GatedMessage = msg
 	}
 	name := a.selectedName()
 	if name == "" {

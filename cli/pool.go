@@ -1077,6 +1077,7 @@ func (a *App) onEntryConnected(e *connEntry) {
 	if a.isSelectedCluster(e.Config.Name) {
 		a.refreshMyAccess(e.Config.Name, e.Conn)
 		go a.refreshConcepts(context.Background())
+		go a.refreshPacks(context.Background())
 	}
 
 	// Auto-select a just-added cluster on its first successful connect
