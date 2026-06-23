@@ -95,11 +95,21 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
    `ConceptInfo.display_card` (memql#160). v1:agents:agent rows live
    here too -- the dedicated Agents tab was retired in
    memql-cockpit#126 once Concepts could render them well.
-3. **Settings (F3)** -- credentials, theme, version
+3. **Editor (F3)** -- read-only DSL pack browser (memql-cockpit#228).
+   Three panes: DOMAINS (the node's embedded + plugin-registered DSL
+   namespaces, each with an `embedded`/`pack:<name>` origin label and
+   file count) -> FILES (the `.memql`/`.tmpl` files in the selected
+   domain) -> SOURCE (the selected file's source). Backed by the
+   `memql/sdk/go/pack` SDK (`ListDomains`/`ListFiles`/`ReadFile`),
+   wired to the active cluster's dispatcher like Concepts. `Enter`
+   loads the next pane; `Tab` cycles focus. B2 renders source as plain
+   text; B3 (#229) swaps in MemQL Sense coloring, C2/C3 add bundle
+   authoring. Lives in `cli/dsledit/`.
+4. **Settings (F4)** -- credentials, theme, version
 
-The Concepts tab is gated on a connected, selected cluster -- it shows
-a placeholder message until the user presses Enter on a cluster row in
-the Clusters tab.
+The Concepts and Editor tabs are gated on a connected, selected
+cluster -- they show a placeholder message until the user presses Enter
+on a cluster row in the DevOps tab.
 
 > The Planner, Skills, Workers, Safety, and Bundles tabs were removed in
 > memql-cockpit#216 -- the cockpit is scoped to cluster management +
@@ -371,7 +381,7 @@ The single-connection invariant + stable-frame behavior is locked by
 ### Global
 | Key      | Action                                                         |
 |----------|----------------------------------------------------------------|
-| F1..F3   | Switch tab                                                     |
+| F1..F4   | Switch tab                                                     |
 | Ctrl+Q   | Quit                                                           |
 | Ctrl+T   | Cycle theme                                                    |
 
@@ -482,6 +492,7 @@ pans the grid). There is no toggle.
 | `sense/`                 | `SenseClient` over the SDK Dispatcher -- editor-side wrappers for MemQL Sense (Tokenize / Diagnose / Complete / Hover). |
 | `config/clusters.go`     | `~/.memql/clusters.yaml` load/save                            |
 | `concepts/`              | Concepts tab (concept picker + row list + generic renderer)   |
+| `dsledit/`               | Editor tab: read-only DSL pack browser (domains/files/source) over `memql/sdk/go/pack` (memql-cockpit#228); grows the Sense viewer (#229) + bundle authoring (C2/C3) |
 | `editor/`                | Reusable text editor with Sense integration                   |
 | `settings/`              | Settings tab                                                  |
 | `ui/`                    | Theme, screen, tab bar, layout primitives                     |
