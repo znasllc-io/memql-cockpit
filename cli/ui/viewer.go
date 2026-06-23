@@ -54,6 +54,16 @@ type Viewer struct {
 	Focused      bool
 	EmptyMessage string
 
+	// CursorLine is the 0-based source-line index of an optional
+	// "active line" highlight, used by read-only inspectors (e.g. the
+	// Editor tab's hover cursor). Honored only when ShowCursor is true;
+	// the default zero value leaves the viewer in its original
+	// scroll-only mode (the Concepts detail pane relies on that). When
+	// shown, Draw tints the cursor line's rows -- wrapping included --
+	// and auto-scrolls to keep the line in view.
+	CursorLine int
+	ShowCursor bool
+
 	// viewportRowsCache is populated by Draw so HandleEvent's PgUp /
 	// PgDn can size their jumps using the bounds Draw last saw, and
 	// maxScrollCache so KeyDown / KeyEnd / KeyPgDn can stop ScrollY
@@ -115,6 +125,20 @@ func (v *Viewer) Draw(screen *Screen, bounds Rect, theme Theme) {
 		maxScroll = 0
 	}
 	v.maxScrollCache = maxScroll
+
+	// When the cursor is shown, auto-scroll so its (possibly wrapped)
+	// source line stays in view -- the wrap math lives here because
+	// only flatten knows how a source line maps onto rendered rows.
+	if v.ShowCursor {
+		if first := firstRowForLine(rows, v.CursorLine); first >= 0 {
+			if first < v.ScrollY {
+				v.ScrollY = first
+			} else if first >= v.ScrollY+bounds.Height {
+				v.ScrollY = first - bounds.Height + 1
+			}
+		}
+	}
+
 	if v.ScrollY > maxScroll {
 		v.ScrollY = maxScroll
 	}
@@ -128,8 +152,26 @@ func (v *Viewer) Draw(screen *Screen, bounds Rect, theme Theme) {
 		end = len(rows)
 	}
 
-	for i := v.ScrollY; i < end; i++ {
+	// Track which source line each rendered row belongs to (continuation
+	// rows carry lineNum 0) so the cursor tint can span a wrapped line.
+	cursorBG := tcell.StyleDefault.Foreground(theme.FG).Background(tcell.NewRGBColor(45, 50, 60))
+	curLine := -1
+	for i := 0; i < end; i++ {
+		if rows[i].lineNum > 0 {
+			curLine = rows[i].lineNum - 1
+		}
+		if i < v.ScrollY {
+			continue
+		}
 		r := rows[i]
+		// When this row is part of the cursor's source line and carries
+		// no block tint, render it with the cursor highlight (drawRow
+		// applies the bg to the gutter + every token, so colored tokens
+		// keep their fg under the highlight).
+		if v.ShowCursor && r.blockBG == nil && curLine == v.CursorLine {
+			cb := cursorBG
+			r.blockBG = &cb
+		}
 		y := bounds.Y + (i - v.ScrollY)
 		// Block tint covers the entire inner width (gutter + content)
 		// so the band reads as one continuous chrome stripe.
@@ -144,6 +186,22 @@ func (v *Viewer) Draw(screen *Screen, bounds Rect, theme Theme) {
 		// `maxPosition`, not `total`, so pass maxScroll directly.
 		DrawScrollbar(screen, theme, bounds, v.ScrollY, maxScroll)
 	}
+}
+
+// firstRowForLine returns the index of the first rendered row that
+// belongs to source line `line` (0-based), or -1 if no such row. Used
+// to map a source-line cursor onto the flattened rendered rows for
+// auto-scroll.
+func firstRowForLine(rows []renderedViewerRow, line int) int {
+	if line < 0 {
+		return -1
+	}
+	for i, r := range rows {
+		if r.lineNum == line+1 {
+			return i
+		}
+	}
+	return -1
 }
 
 // renderedViewerRow is one terminal row in flattened form. lineNum > 0

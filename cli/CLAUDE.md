@@ -102,9 +102,15 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
    domain) -> SOURCE (the selected file's source). Backed by the
    `memql/sdk/go/pack` SDK (`ListDomains`/`ListFiles`/`ReadFile`),
    wired to the active cluster's dispatcher like Concepts. `Enter`
-   loads the next pane; `Tab` cycles focus. B2 renders source as plain
-   text; B3 (#229) swaps in MemQL Sense coloring, C2/C3 add bundle
-   authoring. Lives in `cli/dsledit/`.
+   loads the next pane; `Tab` cycles focus. The SOURCE pane is
+   **MemQL Sense-colored** (Tokenize, #229) and read-only, with a
+   line cursor (`↑/↓` move, `←/→` column, the viewer auto-scrolls to
+   keep the cursor visible) and **Sense hover** on `H` (a stripped-
+   markdown overlay; `Esc` closes it). Editing embedded/pack files is
+   NOT possible here -- that's the bundle-authoring path (C2/C3). Lives
+   in `cli/dsledit/`; the colored read-only render reuses `cli/ui/viewer.go`
+   (its optional `ShowCursor`/`CursorLine` line-highlight landed for
+   this).
 4. **Settings (F4)** -- credentials, theme, version
 
 The Concepts and Editor tabs are gated on a connected, selected
@@ -471,6 +477,17 @@ pans the grid). There is no toggle.
 | Enter       | Zoom into highlighted node                          |
 | Backspace   | Zoom out one level                                  |
 | Esc / X     | Return to live topology                             |
+
+### Editor tab (read-only pack browser)
+| Key         | Action                                                       |
+|-------------|--------------------------------------------------------------|
+| Tab         | Cycle focus DOMAINS → FILES → SOURCE                          |
+| Enter       | DOMAINS: load the domain's files; FILES: load the file source |
+| ↑/↓         | DOMAINS/FILES: move selection; SOURCE: move the hover cursor line |
+| ←/→         | SOURCE: move the hover cursor column                         |
+| H           | SOURCE: Sense hover at the cursor (overlay)                  |
+| Esc         | SOURCE: close the hover overlay                              |
+| PgUp/PgDn   | SOURCE: scroll the viewport                                  |
 
 ---
 
