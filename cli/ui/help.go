@@ -56,7 +56,7 @@ func (h *HelpOverlay) Draw(screen *Screen, bounds Rect) {
 	alt := AltKey()
 	entries := []helpEntry{
 		{section: "TABS"},
-		{key: "F1 / " + alt + "+1", desc: "Clusters"},
+		{key: "F1 / " + alt + "+1", desc: "DevOps"},
 		{key: "F2 / " + alt + "+2", desc: "Concepts"},
 		{key: "F3 / " + alt + "+3", desc: "Settings"},
 		{},
@@ -65,7 +65,7 @@ func (h *HelpOverlay) Draw(screen *Screen, bounds Rect) {
 		{key: "Ctrl+Q / Ctrl+C", desc: "Quit"},
 		{key: "Escape", desc: "Close popup / cancel"},
 		{},
-		{section: "CLUSTERS"},
+		{section: "DEVOPS"},
 		{key: "Up / Down", desc: "Navigate cluster list"},
 		{key: "Enter", desc: "Connect to selected cluster"},
 		{key: "A / E / D", desc: "Add / Edit / Delete cluster"},
