@@ -473,10 +473,14 @@ func (a *App) Quit() {
 }
 
 // connect is the startup entry point: restores the sticky selection
-// from clusters.yaml, then kicks off a dial goroutine for every
-// cluster in the saved list (local + all user-added). Each runs its
-// own bounded-retry lifecycle in parallel; the UI stays responsive
-// throughout.
+// from clusters.yaml, then opens a full live connection for the
+// SELECTED ("working") cluster ONLY. Every other cluster is
+// registered into the pool as metadata so the row list renders, but
+// is NOT dialed -- no stream, no subscriber, no token refresher, no
+// initial-load query (epic #239). This keeps boot to a single gRPC
+// connection instead of an N-cluster dial storm. Selection drives
+// the connect from here on (CM2 #241); non-selected rows get a
+// lightweight liveness probe (CM3 #242).
 func (a *App) connect() {
 	clusters, err := config.LoadClusters()
 	if err != nil && a.logger != nil {
@@ -529,8 +533,15 @@ func (a *App) connect() {
 	// before the first successful dial lands.
 	a.wireConcepts()
 	a.wireCluster()
+	// Exactly one live connection at boot: the selected cluster gets
+	// the full lifecycle; everything else is registered (listed) but
+	// not dialed. See registerEntry.
 	for _, cfg := range configs {
-		a.openEntry(cfg)
+		if cfg.Name == selected {
+			a.openEntry(cfg)
+		} else {
+			a.registerEntry(cfg)
+		}
 	}
 
 }
@@ -819,12 +830,55 @@ func (a *App) openEntry(cfg config.ClusterConfig) {
 	// bounded number of dials, sleeps backoff between them, handles
 	// reconnects after an unexpected stream close, and responds to
 	// cancel / close signals.
+	entry.markLifecycleStarted()
 	go entry.runLifecycle()
 	// The token refresher silently rolls the cached OIDC token
 	// forward before it expires, so a future reconnect never has
 	// to fall through to the browser flow. PAT clusters short-
 	// circuit inside runTokenRefresher.
 	go entry.runTokenRefresher()
+	a.postRedraw()
+}
+
+// registerEntry adds cfg to the pool as a non-connecting entry: the
+// row is listed in the cluster manager and carries its config-derived
+// status (needs-auth / needs-login / idle), but NO lifecycle or
+// token-refresher goroutine is started and the cluster is never
+// dialed. Used at boot for every cluster except the selected
+// ("working") one -- only the selected cluster holds a live
+// connection (epic #239). A later Enter on a registered row promotes
+// it to a full connection (CM2 #241); CM3 (#242) adds a lightweight
+// liveness probe so the idle rows still show up/down.
+//
+// The needs-config / needs-login classification still runs here
+// because those are facts about the row's configuration, independent
+// of whether it's the selected cluster -- the row must show the right
+// L:Authorize / L:Login hint either way. A fully-configured but
+// non-selected cluster stays stateIdle (listed, not dialed).
+func (a *App) registerEntry(cfg config.ClusterConfig) {
+	a.poolMu.Lock()
+	if a.pool == nil {
+		a.pool = make(map[string]*connEntry)
+	}
+	if _, exists := a.pool[cfg.Name]; exists {
+		a.poolMu.Unlock()
+		return
+	}
+	entry := newConnEntry(a, cfg)
+	a.pool[cfg.Name] = entry
+	a.poolMu.Unlock()
+
+	switch {
+	case cfg.NeedsAuth():
+		entry.setStateAttempt(stateNeedsConfig, 0, time.Time{})
+	case cfg.PAT == "" && !hasValidCachedToken(cfg.Name):
+		entry.setStateAttempt(stateNeedsToken, 0, time.Time{})
+	default:
+		// Fully configured but not the working cluster: leave it in
+		// the newConnEntry default (stateIdle). Still synced to the
+		// row so the icon renders.
+		a.syncRowStatus(cfg.Name, stateIdle)
+	}
 	a.postRedraw()
 }
 

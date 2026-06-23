@@ -119,7 +119,23 @@ type connEntry struct {
 	lifecycleExited  chan struct{}
 	subscriberExited chan struct{}
 
+	// lifecycleStarted is true once runLifecycle has been launched
+	// (via openEntry's markLifecycleStarted). Registered-but-not-
+	// dialed entries (registerEntry, epic #239) never start it, so
+	// Close must not block waiting on lifecycleExited for them.
+	lifecycleStarted bool
+
 	closed bool
+}
+
+// markLifecycleStarted records that runLifecycle was launched for
+// this entry, so Close knows to wait for lifecycleExited. Entries
+// that are only registered (registerEntry) never call this, and
+// Close skips the wait for them.
+func (e *connEntry) markLifecycleStarted() {
+	e.mu.Lock()
+	e.lifecycleStarted = true
+	e.mu.Unlock()
 }
 
 // newConnEntry builds the entry metadata. Start the lifecycle
@@ -759,6 +775,15 @@ func (e *connEntry) Retry() {
 		e.mu.Unlock()
 		return
 	}
+	if !e.lifecycleStarted {
+		// Registered-but-not-dialed entry (registerEntry, epic #239):
+		// there is no lifecycle goroutine listening on cancelCh, so
+		// signalling one would just leave the row wedged in a
+		// cosmetic "connecting". Promoting an idle row to a live
+		// connection is selection's job (CM2 #241), not Retry's.
+		e.mu.Unlock()
+		return
+	}
 	switch e.State {
 	case stateConnecting, stateConnected, stateBackoff:
 		// Already working -- nothing to do.
@@ -863,6 +888,7 @@ func (e *connEntry) Close() {
 	e.SubMgr = nil
 	e.Events = nil
 	subscriberExited := e.subscriberExited
+	lifecycleStarted := e.lifecycleStarted
 	e.mu.Unlock()
 
 	close(e.done)
@@ -876,9 +902,16 @@ func (e *connEntry) Close() {
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
-	select {
-	case <-e.lifecycleExited:
-	case <-time.After(500 * time.Millisecond):
+	// Only wait on lifecycleExited if runLifecycle was actually
+	// launched. Registered-but-not-dialed entries (registerEntry)
+	// never close it, so waiting would just burn the 500ms timeout
+	// per entry -- multiplied across every non-selected cluster at
+	// quit (epic #239).
+	if lifecycleStarted {
+		select {
+		case <-e.lifecycleExited:
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
 }
 
