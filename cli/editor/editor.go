@@ -33,6 +33,23 @@ type Editor struct {
 	// Status
 	ErrorCount   int
 	WarningCount int
+
+	// Cursor screen position cache. Draw records the absolute screen
+	// cell the text cursor was painted at (cursorOnScreen=false when the
+	// cursor scrolled out of view). Hosts read it via CursorScreen() to
+	// anchor completion / hover popups at the cursor instead of the
+	// pane corner.
+	cursorScreenX  int
+	cursorScreenY  int
+	cursorOnScreen bool
+}
+
+// CursorScreen returns the absolute screen cell the text cursor was
+// painted at during the most recent Draw, and whether the cursor was
+// on screen (false before the first Draw, or when it scrolled out of
+// the viewport). Hosts use it to anchor popups at the cursor.
+func (e *Editor) CursorScreen() (x, y int, ok bool) {
+	return e.cursorScreenX, e.cursorScreenY, e.cursorOnScreen
 }
 
 // NewEditor creates an editor with the given buffer and theme.
@@ -84,6 +101,9 @@ func (e *Editor) Draw(screen *ui.Screen, bounds ui.Rect) {
 	// Ensure scroll keeps cursor visible.
 	e.ensureVisible(visibleLines)
 
+	// Recomputed below if the cursor cell is painted this frame.
+	e.cursorOnScreen = false
+
 	// Draw lines.
 	for i := 0; i < visibleLines; i++ {
 		lineIdx := e.ScrollY + i
@@ -121,6 +141,9 @@ func (e *Editor) Draw(screen *ui.Screen, bounds ui.Rect) {
 				}
 				cursorStyle := tcell.StyleDefault.Foreground(e.Theme.BG).Background(e.Theme.FG)
 				screen.SetCell(cursorX, y, ch, cursorStyle)
+				e.cursorScreenX = cursorX
+				e.cursorScreenY = y
+				e.cursorOnScreen = true
 			}
 		}
 	}

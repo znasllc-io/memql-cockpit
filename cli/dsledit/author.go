@@ -507,11 +507,13 @@ func (a *authoring) handleEditorKey(key *tcell.EventKey) bool {
 		return true
 	case key.Key() == tcell.KeyCtrlSpace:
 		line, col, src := a.editor.CursorLine, a.editor.CursorCol, a.editor.Buffer.Source()
-		go a.requestCompletion(src, line, col)
+		cx, cy, _ := a.editor.CursorScreen()
+		go a.requestCompletion(src, line, col, cx, cy)
 		return true
 	case key.Key() == tcell.KeyCtrlK:
 		line, col, src := a.editor.CursorLine, a.editor.CursorCol, a.editor.Buffer.Source()
-		go a.requestHover(src, line, col)
+		cx, cy, _ := a.editor.CursorScreen()
+		go a.requestHover(src, line, col, cx, cy)
 		return true
 	case key.Key() == tcell.KeyEsc:
 		if a.hover.Visible {
@@ -526,9 +528,52 @@ func (a *authoring) handleEditorKey(key *tcell.EventKey) bool {
 	consumed := a.editor.HandleEvent(key)
 	if consumed && a.editor.Buffer.Source() != before {
 		a.hover.Hide()
+		// Live-filter the completion list by the word under the cursor
+		// so the popup narrows as the user types (and closes when the
+		// word ends).
+		if a.completion.Visible {
+			a.filterCompletionLocked()
+		}
 		a.debounce.Trigger()
 	}
 	return consumed
+}
+
+// filterCompletionLocked narrows the open completion popup to the
+// identifier prefix immediately before the cursor, or closes it when
+// the cursor isn't in a word. Caller holds a.mu.
+func (a *authoring) filterCompletionLocked() {
+	if a.editor == nil {
+		return
+	}
+	prefix := identifierPrefix(a.editor.Buffer.Line(a.editor.CursorLine), a.editor.CursorCol)
+	if prefix == "" {
+		a.completion.Hide()
+		return
+	}
+	a.completion.ApplyFilter(prefix) // ApplyFilter hides on an empty result set
+}
+
+// identifierPrefix returns the run of identifier characters
+// ([A-Za-z0-9_]) ending immediately before col in line (byte indexed,
+// matching the editor's ASCII cursor model). Empty when the char
+// before the cursor isn't an identifier char.
+func identifierPrefix(line string, col int) string {
+	if col > len(line) {
+		col = len(line)
+	}
+	start := col
+	for start > 0 && isIdentChar(line[start-1]) {
+		start--
+	}
+	return line[start:col]
+}
+
+func isIdentChar(b byte) bool {
+	return b == '_' ||
+		(b >= 'a' && b <= 'z') ||
+		(b >= 'A' && b <= 'Z') ||
+		(b >= '0' && b <= '9')
 }
 
 func (a *authoring) handlePromptKeyLocked(key *tcell.EventKey) bool {
@@ -652,6 +697,13 @@ func (a *authoring) acceptCompletionLocked(item *sense.CompletionItem) {
 	if text == "" {
 		text = item.Label
 	}
+	// Replace the identifier prefix already typed (the popup was being
+	// filtered by it) so accepting "query" over "que" yields "query",
+	// not "quequery".
+	prefix := identifierPrefix(a.editor.Buffer.Line(a.editor.CursorLine), a.editor.CursorCol)
+	for i := 0; i < len(prefix); i++ {
+		a.editor.CursorLine, a.editor.CursorCol = a.editor.Buffer.DeleteChar(a.editor.CursorLine, a.editor.CursorCol)
+	}
 	for _, r := range text {
 		a.editor.Buffer.InsertChar(a.editor.CursorLine, a.editor.CursorCol, r)
 		a.editor.CursorCol++
@@ -699,7 +751,10 @@ func (a *authoring) senseRefresh() {
 	a.redraw()
 }
 
-func (a *authoring) requestCompletion(src string, line, col int) {
+// requestCompletion fetches completions and anchors the popup at the
+// editor cursor's screen cell (anchorX/anchorY, captured at trigger
+// time from editor.CursorScreen).
+func (a *authoring) requestCompletion(src string, line, col, anchorX, anchorY int) {
 	sc := a.senseClientFn()
 	if sc == nil {
 		a.status("completion unavailable -- no Sense client")
@@ -714,7 +769,10 @@ func (a *authoring) requestCompletion(src string, line, col int) {
 	}
 	a.mu.Lock()
 	if len(items) > 0 {
-		a.completion.Show(items, 0, 0)
+		a.completion.Show(items, anchorX, anchorY)
+		// Pre-filter to the word already under the cursor so the list
+		// opens narrowed (e.g. invoking completion mid-identifier).
+		a.filterCompletionLocked()
 	} else {
 		a.status("no completions here")
 	}
@@ -722,7 +780,9 @@ func (a *authoring) requestCompletion(src string, line, col int) {
 	a.redraw()
 }
 
-func (a *authoring) requestHover(src string, line, col int) {
+// requestHover fetches hover info and anchors the tooltip at the editor
+// cursor's screen cell.
+func (a *authoring) requestHover(src string, line, col, anchorX, anchorY int) {
 	sc := a.senseClientFn()
 	if sc == nil {
 		a.status("hover unavailable -- no Sense client")
@@ -737,7 +797,7 @@ func (a *authoring) requestHover(src string, line, col int) {
 	}
 	a.mu.Lock()
 	if h != nil && h.Contents != "" {
-		a.hover.Show(h.Contents, 0, 1)
+		a.hover.Show(h.Contents, anchorX, anchorY)
 	} else {
 		a.status("no hover info here")
 	}
