@@ -96,11 +96,6 @@ type View struct {
 
 	Focus FocusPane
 
-	// ensureRan flips true after the first successful
-	// ensureDailySpaceForCaller call. Cheap idempotent capability,
-	// but no point hammering it.
-	ensureRan bool
-
 	// spaceList renders the left pane. Selected / ScrollY live in
 	// the widget; the view drives Count + Focused per render.
 	spaceList ui.ListPane
@@ -151,45 +146,16 @@ func (v *View) StartRefreshLoop(stop <-chan struct{}, interval time.Duration) {
 func (v *View) Refresh() { v.refresh() }
 
 func (v *View) refresh() {
-	v.ensureDailyOnce()
+	// No client-side daily-space ensure: provisioning is server-owned.
+	// The CoPresent-pack dailyspace integration guarantees today's
+	// daily exists -- it fires on user-create, on every login
+	// (authSession), and hourly via cron (see memql:dsl/cognition/
+	// mutations.memql). The cockpit just reads + pins it in
+	// refreshSpaces. The old client call (LogicEnsureDailySpaceForCaller)
+	// left core when the construct moved to the pack in memql #1976;
+	// calling it is now redundant (memql-cockpit#212).
 	v.refreshSpaces()
 	v.refreshUtterances()
-}
-
-// ensureDailyOnce fires integration.dailyspace.ensureForCaller exactly
-// once per session, on the first refresh after a cluster connects.
-func (v *View) ensureDailyOnce() {
-	v.Mu.RLock()
-	already := v.ensureRan
-	v.Mu.RUnlock()
-	if already {
-		return
-	}
-	if v.QueryClient == nil {
-		return
-	}
-	qc := v.QueryClient()
-	if qc == nil {
-		return
-	}
-	v.Mu.Lock()
-	v.ensureRan = true
-	v.Mu.Unlock()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := qc.LogicEnsureDailySpaceForCaller(ctx, client.LogicEnsureDailySpaceForCallerArgs{}); err != nil {
-		// Push the failure through the header notifications center
-		// (with copy + dismiss) instead of the chrome strip. Clear
-		// the latch so the next 3s tick retries; a transient failure
-		// shouldn't strand the user without a daily.
-		if v.OnStatus != nil {
-			v.OnStatus("ensure daily space: " + err.Error())
-		}
-		v.Mu.Lock()
-		v.ensureRan = false
-		v.Mu.Unlock()
-	}
 }
 
 func (v *View) refreshSpaces() {

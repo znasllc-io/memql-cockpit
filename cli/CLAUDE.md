@@ -90,9 +90,15 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
 2. **Chat (F2)** -- single-chat-per-space utterance viewer. Today's
    daily space for the connected user (`v1:cognition:space.kind=="daily"`,
    id `daily-{userShortId}-{dateKey}`) is pinned at the top of the
-   space list, auto-selected on first paint, and ensured to exist
-   on connect via the dailyspace integration's `ensureForUser`
-   capability. Archived/saved spaces are filtered out; archived
+   space list and auto-selected on first paint. The cockpit does
+   NOT ensure the daily itself -- provisioning is server-owned: the
+   CoPresent-pack dailyspace integration guarantees today's daily
+   exists (on user-create, on every login/authSession, and hourly
+   via cron -- see `memql:dsl/cognition/mutations.memql`), so the
+   Chat tab just reads + pins it. The old client-side ensure call
+   was dropped when the `logicEnsureDailySpaceForCaller` construct
+   left core for the pack in memql#1976 (memql-cockpit#212).
+   Archived/saved spaces are filtered out; archived
    rows expire and hard-delete via the existing
    `purgeExpiredArchivedSpaces` cron. `v` toggles push-to-talk:
    first press starts microphone capture (requires the `voice`
