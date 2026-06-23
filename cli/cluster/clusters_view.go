@@ -376,7 +376,7 @@ func (v *ClustersView) drawManagement(screen *ui.Screen, bounds ui.Rect) {
 	// can't grow into them when the cluster count balloons. The list
 	// itself is a ui.ListPane with RowsPerItem=2 -- matches every
 	// other list-bearing pane in the cockpit.
-	const detailMaxH = 5 // divider + Endpoint + Auth + Status + (retry|Node)
+	const detailMaxH = 7 // divider + Endpoint label + 2 wrapped value rows + Auth + Status + (retry|Node)
 	const chromeGapH = 1 // clear row above the action hints
 	chromeH := 1
 	if v.confirmDelete && v.Selected >= 0 && v.Selected < len(v.Clusters) && v.Clusters[v.Selected].Config.Name != "local" {
@@ -416,21 +416,35 @@ func (v *ClustersView) drawManagement(screen *ui.Screen, bounds ui.Rect) {
 		subtleDetail := v.Theme.SubtleStyle()
 
 		dy := detailTop
-		screen.DrawHLine(x, dy, min(maxW, 28), '─', v.Theme.SubtleStyle())
+		screen.DrawHLine(x, dy, maxW, '─', v.Theme.SubtleStyle())
 		dy++
 
-		screen.DrawText(x+1, dy, 10, "Endpoint", subtleDetail)
-		screen.DrawText(x+12, dy, maxW-13, cs.Config.Endpoint, detailStyle)
+		// Endpoint gets a full-width, wrapped value -- URLs are long and
+		// must show in full, so the label sits on its own row and the
+		// value wraps beneath at the full pane width (capped at 2 rows so
+		// the block height stays stable as the user arrows around).
+		screen.DrawText(x+1, dy, maxW-1, "Endpoint", subtleDetail)
 		dy++
+		epLines := ui.WrapText(cs.Config.Endpoint, maxW-2)
+		if len(epLines) > 2 {
+			epLines = epLines[:2]
+		}
+		for _, l := range epLines {
+			screen.DrawText(x+2, dy, maxW-2, l, detailStyle)
+			dy++
+		}
+		for i := len(epLines); i < 2; i++ {
+			dy++ // pad to a fixed 2 value rows
+		}
 
 		authStr, authColor := authLabel(cs.Config, v.Theme)
-		screen.DrawText(x+1, dy, 10, "Auth", subtleDetail)
-		screen.DrawText(x+12, dy, maxW-13, authStr, detailStyle.Foreground(authColor))
+		screen.DrawText(x+1, dy, 9, "Auth", subtleDetail)
+		screen.DrawText(x+10, dy, maxW-10, authStr, detailStyle.Foreground(authColor))
 		dy++
 
-		screen.DrawText(x+1, dy, 10, "Status", subtleDetail)
+		screen.DrawText(x+1, dy, 9, "Status", subtleDetail)
 		_, sColor := clusterStatusIcon(cs.Status, v.Theme)
-		screen.DrawText(x+12, dy, maxW-13, cs.Status, detailStyle.Foreground(sColor))
+		screen.DrawText(x+10, dy, maxW-10, cs.Status, detailStyle.Foreground(sColor))
 		dy++
 
 		// Retry progress takes priority over the Node row when both
@@ -454,8 +468,8 @@ func (v *ClustersView) drawManagement(screen *ui.Screen, bounds ui.Rect) {
 			}
 		}
 		if !shown && cs.NodeId != "" {
-			screen.DrawText(x+1, dy, 10, "Node", subtleDetail)
-			screen.DrawText(x+12, dy, maxW-13, cs.NodeId, detailStyle)
+			screen.DrawText(x+1, dy, 9, "Node", subtleDetail)
+			screen.DrawText(x+10, dy, maxW-10, cs.NodeId, detailStyle)
 		}
 	}
 
