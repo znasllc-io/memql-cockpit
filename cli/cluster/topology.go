@@ -14,11 +14,6 @@ import (
 	"github.com/znasllc-io/memql/sdk/go/client"
 )
 
-// deployEnvs is the fixed set of environments the deployment-v2 status
-// strip renders, top-to-bottom. #144 is read-only across both; a future
-// story (#145) may add a selector / per-env controls.
-var deployEnvs = []string{"staging", "prod"}
-
 // NodeInfo describes a cluster node for rendering. The Health field is the
 // proto-defined enum from component/node/node.proto -- the source of truth
 // for node states across backend, concept schema, and CLI. Display labels
@@ -113,17 +108,10 @@ type View struct {
 	// (arrows, Enter, Backspace, Esc); HandleEvent routes accordingly.
 	Arch *ArchView
 
-	// deployStatus is the last-known deployment-v2 status keyed by env
-	// ("staging" / "prod"). Populated by SetDeploymentStatus from the
-	// per-env poll (see app.go refreshDeployStatus); read under RLock
-	// in Draw. A missing key renders as "no data yet" for that env.
-	deployStatus map[string]client.DeploymentStatus
-
 	// clusterRole is the connected caller's cluster-wide role, mirrored
-	// from refreshMyAccess via SetClusterRole. The deployment strip is
-	// only rendered for owner/admin -- the GetDeploymentStatus RPC is
-	// owner/admin-gated server-side, so a non-admin caller would just
-	// get PermissionDenied. Lower roles see a single muted line instead.
+	// from refreshMyAccess via SetClusterRole. Drives the role gating on
+	// the Deployments section's cut/deploy/rollback controls (view = any
+	// role; cut/deploy = developer/admin/owner; rollback = owner only).
 	clusterRole client.Role
 
 	// DeployClient returns a DeployControlClient bound to the currently
@@ -140,29 +128,13 @@ type View struct {
 	// that drive the modal state machine directly don't wire it).
 	OnRedraw func()
 
-	// OnActionComplete, when set, is called after a deploy-control
-	// action succeeds. Wired to App.refreshDeployStatus in app.go so
-	// the Argo/Rollouts overlay reflects the new state right away
-	// rather than on the next 10s poll tick. nil is a no-op.
-	OnActionComplete func()
-
-	// deployActor is the action executor the deploy-control modal fires
-	// against. In production it is left nil and the modal resolves it
-	// lazily from DeployClient() (so a cluster switch retargets); tests
-	// inject a fake to drive an action to SUCCESS / ERROR without a wire.
-	deployActor deployActions
-
-	// ctrl holds the transient deploy-control modal state. nil when the
-	// modal is closed. Guarded by v.mu like every other view field.
-	ctrl *deployControlState
-
-	// --- Deployments section (memql-cockpit#207) ---
+	// --- Deployments section (memql-cockpit#207 / #221) ---
 	//
-	// showDeployments toggles the right pane between the live topology
-	// and the concept-driven Deployments section (history + per-
-	// deployment topology + cut/deploy/rollback controls). Toggled with
-	// 'P'. All fields below are guarded by v.mu.
-	showDeployments bool
+	// The right pane is a persistent vertical split: the live topology
+	// grid on top, the concept-driven Deployments section (history +
+	// per-deployment topology + cut/deploy/rollback controls) anchored
+	// to the bottom. Both are always visible -- there is no toggle. All
+	// fields below are guarded by v.mu.
 	deployments     []DeploymentInfo // v1:cluster:deployment history, newest-first
 	deploySelected  int              // cursor into deployments
 	deployNodes     []NodeInfo       // nodes for the selected deployment (QueryNodesForDeployment)
@@ -179,9 +151,11 @@ type View struct {
 	// from DeployClient() per-fire; tests inject a fake.
 	deployConceptActor deployConceptActions
 
-	// OnDeploymentsShown is called (off-thread) when the Deployments
-	// section is opened, so the app can fetch the deployment history via
-	// QueryDeploymentsForCluster and push it back through SetDeployments.
+	// OnDeploymentsShown is called (off-thread) so the app can fetch the
+	// deployment history via QueryDeploymentsForCluster and push it back
+	// through SetDeployments. Fired when a cluster's topology is wired up
+	// (the Deployments section is always present, so the history is
+	// loaded eagerly rather than on a toggle).
 	OnDeploymentsShown func()
 
 	// OnSelectDeployment is called (off-thread) with the selected
@@ -194,15 +168,6 @@ type View struct {
 	// succeeds, so the app refreshes the history right away rather than on
 	// the next poll tick. nil is a no-op.
 	OnDeploymentsChanged func()
-}
-
-// SetDeployActor overrides the deploy-control action executor. Used by
-// tests to inject a fake DeployControlClient; production leaves it nil
-// and the modal resolves the real client from DeployClient() per-fire.
-func (v *View) SetDeployActor(a deployActions) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	v.deployActor = a
 }
 
 // SetDisconnected toggles the "stream lost" rendering override. Does not
@@ -250,52 +215,14 @@ func (v *View) SetNodeTypes(types []NodeTypeInfo) {
 	v.NodeTypes = types
 }
 
-// SetDeploymentStatus stores the latest deployment-v2 status for env
-// ("staging" / "prod"). Called from the per-env poll goroutine (see
-// app.go refreshDeployStatus). Guarded by the same mu that serializes
-// Draw, so a render can never see a torn map.
-func (v *View) SetDeploymentStatus(env string, st client.DeploymentStatus) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if v.deployStatus == nil {
-		v.deployStatus = make(map[string]client.DeploymentStatus, len(deployEnvs))
-	}
-	v.deployStatus[env] = st
-}
-
 // SetClusterRole mirrors the connected caller's cluster-wide role into
 // the view. Wired from refreshMyAccess alongside the Settings update.
-// Drives whether the deployment strip renders (owner/admin) or shows
-// the "owner/admin only" muted line (everyone else).
+// Drives the role gating on the Deployments section's cut/deploy/rollback
+// controls.
 func (v *View) SetClusterRole(r client.Role) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.clusterRole = r
-}
-
-// canViewDeploymentsLocked reports whether the caller's role admits the
-// deployment-v2 surface. Caller MUST hold v.mu (read or write).
-func (v *View) canViewDeploymentsLocked() bool {
-	return v.clusterRole == client.RoleOwner || v.clusterRole == client.RoleAdmin
-}
-
-// CanViewDeployments reports whether the connected caller's role admits
-// the deployment-v2 surface (owner/admin). Used by the app's poll loop
-// to avoid issuing the owner/admin-gated GetDeploymentStatus RPC for a
-// caller that would just get PermissionDenied. Takes the read lock.
-func (v *View) CanViewDeployments() bool {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-	return v.canViewDeploymentsLocked()
-}
-
-// DeployEnvs returns the fixed set of environments the deployment-v2
-// status strip renders. Exposed so the app's poll loop iterates the
-// same list the renderer does.
-func DeployEnvs() []string {
-	out := make([]string, len(deployEnvs))
-	copy(out, deployEnvs)
-	return out
 }
 
 // ApplyNodeUpdate merges a single-node change into the topology model. If
@@ -403,88 +330,137 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 		return
 	}
 
-	// Deployments section claims the whole pane below the cluster-name
-	// title when toggled on ('P'). It renders its own status bar + hint
-	// chips and overlays the cut/deploy/rollback modal when open.
-	if v.showDeployments {
-		v.drawDeployments(screen, bounds)
-		statusY := bounds.Y + bounds.Height - 1
-		statusStyle := tcell.StyleDefault.Foreground(v.Theme.Subtle).Background(v.Theme.BG)
-		screen.FillRect(bounds.X, statusY, bounds.Width, 1, statusStyle)
-		left := fmt.Sprintf(" Deployments: %d", len(v.deployments))
-		screen.DrawText(bounds.X, statusY, bounds.Width/2, left, statusStyle)
-		drawRightHints(screen, bounds, statusY, v.hintsForDeployments(), statusStyle)
-		if v.dctrl != nil {
-			v.drawDeployConceptModal(screen, bounds)
-		}
-		return
-	}
-
-	if len(v.Nodes) > 0 {
-		v.drawTopology(screen, bounds)
-	}
-
-	// Deployment-v2 status strip. Painted in a fixed band anchored
-	// just above the status bar so it never overlaps the topology's
-	// own status row. Stays inside the RLock frame.
-	v.drawDeployStrip(screen, bounds)
-
-	// Status bar at bottom.
-	statusY := bounds.Y + bounds.Height - 1
+	// --- Persistent vertical split (memql-cockpit#221) ---
+	//
+	// The right pane is split into a live TOPOLOGY region on top and the
+	// per-cluster DEPLOYMENTS section anchored to the bottom, both always
+	// visible. Rect math, top -> bottom:
+	//
+	//   bounds.Y                       cluster-name title (drawn above)
+	//   [topoRegion]                   topology grid + 1-row tally
+	//   dividerY                       1-row full-width `─` divider
+	//   [deployRegion]                 deployments list + detail block
+	//   hintY (last row)               deployments hint bar
+	//
+	// deployRegion height is clamped to 40% of the pane (min 8, max 14)
+	// so a tall terminal doesn't drown the topology and a short one still
+	// shows a usable history list. The hint bar takes the very last row.
 	statusStyle := tcell.StyleDefault.Foreground(v.Theme.Subtle).Background(v.Theme.BG)
-	screen.FillRect(bounds.X, statusY, bounds.Width, 1, statusStyle)
 
-	// Left side of the status row. When there are no nodes yet, the
-	// "Nodes:N Online:..." tally has nothing to say, so the
-	// empty-state hint ("No nodes...") lives here instead -- on the
-	// same row as the WASD/R:Reset hints on the right, which is what
-	// makes the two halves visually balance.
-	statusText := ""
-	if len(v.Nodes) == 0 {
-		statusText = " No nodes. Waiting for cluster data..."
-	} else if v.disconnected {
-		// Force the offline tally to match the override rendering.
-		statusText = fmt.Sprintf(" Nodes: %d  Offline:%d", len(v.Nodes), len(v.Nodes))
-	} else {
-		healthy, degraded, offline := v.healthCounts()
-		statusText = fmt.Sprintf(" Nodes: %d", len(v.Nodes))
-		if healthy > 0 {
-			statusText += fmt.Sprintf("  Online:%d", healthy)
+	hintY := bounds.Y + bounds.Height - 1
+
+	deployH := bounds.Height * 2 / 5 // ~40% of the pane
+	if deployH < 8 {
+		deployH = 8
+	}
+	if deployH > 14 {
+		deployH = 14
+	}
+	// Never let the deployments band + divider + title swallow the whole
+	// pane: keep at least 4 rows for the topology region on a short pane.
+	maxDeployH := bounds.Height - 1 /*title*/ - 1 /*divider*/ - 1 /*hint*/ - 4
+	if maxDeployH < 0 {
+		maxDeployH = 0
+	}
+	if deployH > maxDeployH {
+		deployH = maxDeployH
+	}
+
+	// deployRegion spans the rows above the hint bar; the hint bar lives
+	// on hintY (the pane's last row).
+	deployRegion := ui.Rect{
+		X:      bounds.X,
+		Y:      hintY - deployH,
+		Width:  bounds.Width,
+		Height: deployH,
+	}
+	dividerY := deployRegion.Y - 1
+
+	// topoRegion runs from the title down to (but not including) the
+	// divider. Its Y stays at bounds.Y so drawTopology's internal
+	// title-gap offset (area.Y = region.Y+3) lines up under the cluster
+	// name; its Height clips the grid above the divider so it can't bleed
+	// into the deployments band -- the overlap bug fix.
+	topoRegion := ui.Rect{
+		X:      bounds.X,
+		Y:      bounds.Y,
+		Width:  bounds.Width,
+		Height: dividerY - bounds.Y,
+	}
+
+	// TODO(#221): graphical topology preview of the selected deployment --
+	// for now the selected deployment's node composition is shown
+	// textually in the deployments detail block below; the top region
+	// always renders the live whole-cluster grid.
+	if len(v.Nodes) > 0 && topoRegion.Height > 0 {
+		v.drawTopology(screen, topoRegion)
+	}
+
+	// One-line topology tally at the bottom of the topology region. Same
+	// content the old status bar carried; now it labels the grid above the
+	// divider instead of the whole pane.
+	tallyY := dividerY - 1
+	if tallyY > topoRegion.Y {
+		statusText := ""
+		if len(v.Nodes) == 0 {
+			statusText = " No nodes. Waiting for cluster data..."
+		} else if v.disconnected {
+			statusText = fmt.Sprintf(" Nodes: %d  Offline:%d", len(v.Nodes), len(v.Nodes))
+		} else {
+			healthy, degraded, offline := v.healthCounts()
+			statusText = fmt.Sprintf(" Nodes: %d", len(v.Nodes))
+			if healthy > 0 {
+				statusText += fmt.Sprintf("  Online:%d", healthy)
+			}
+			if degraded > 0 {
+				statusText += fmt.Sprintf("  Degraded:%d", degraded)
+			}
+			if offline > 0 {
+				statusText += fmt.Sprintf("  Offline:%d", offline)
+			}
+			// Count vs expected (memql-cockpit#207): flag any node type
+			// running fewer healthy replicas than expectedNodesPerType so
+			// an understaffed tier is visible at a glance.
+			if short := v.shortTypesLocked(); len(short) > 0 {
+				statusText += "  short: " + strings.Join(short, ",")
+			}
 		}
-		if degraded > 0 {
-			statusText += fmt.Sprintf("  Degraded:%d", degraded)
+		screen.FillRect(bounds.X, tallyY, bounds.Width, 1, statusStyle)
+		screen.DrawText(bounds.X, tallyY, bounds.Width/2, statusText, statusStyle)
+
+		// Right-align the pan/reset/arch hints on the same row.
+		hints := "WASD:Pan  R:Reset  X:Architecture"
+		if v.disconnected {
+			hints += "  stale"
 		}
-		if offline > 0 {
-			statusText += fmt.Sprintf("  Offline:%d", offline)
-		}
-		// Count vs expected (memql-cockpit#207): flag any node type running
-		// fewer healthy replicas than expectedNodesPerType so an
-		// understaffed tier is visible without opening the Deployments
-		// section.
-		if short := v.shortTypesLocked(); len(short) > 0 {
-			statusText += "  short: " + strings.Join(short, ",")
+		drawRightHints(screen, bounds, tallyY, hints, statusStyle)
+	}
+
+	// Full-width divider between the topology and deployments regions.
+	if dividerY > bounds.Y && dividerY < hintY {
+		for i := 0; i < bounds.Width; i++ {
+			screen.SetCell(bounds.X+i, dividerY, '─', statusStyle)
 		}
 	}
-	screen.DrawText(bounds.X, statusY, bounds.Width/2, statusText, statusStyle)
 
-	// Right-align: pan/reset hints. The "live" indicator was redundant
-	// (a healthy stream is the implicit default); only the "stale"
-	// warning surfaces, and only when we've actually lost the stream.
-	hints := "WASD:Pan  R:Reset  X:Architecture  P:Deployments"
-	// Deploy-control menu key is owner/admin-only; only advertise it
-	// when the caller can actually use it (chrome contract: hints that
-	// lie rot trust).
-	if v.canViewDeploymentsLocked() {
-		hints += "  D:Deploy"
+	// DEPLOYMENTS region (Surface B): the per-cluster history list + the
+	// selected deployment's detail block, rendered into its own sub-rect
+	// so its internal bottom-anchored detail math stays scoped to the
+	// band.
+	if deployRegion.Height > 0 {
+		v.drawDeployments(screen, deployRegion)
 	}
-	if v.disconnected {
-		hints += "  stale"
-	}
-	drawRightHints(screen, bounds, statusY, hints, statusStyle)
 
-	// Deploy-control modal overlays everything else in the pane when open.
-	if v.ctrl != nil {
-		v.drawDeployModal(screen, bounds)
+	// Deployments hint bar on the pane's last row.
+	screen.FillRect(bounds.X, hintY, bounds.Width, 1, statusStyle)
+	left := fmt.Sprintf(" Deployments: %d", len(v.deployments))
+	screen.DrawText(bounds.X, hintY, bounds.Width/2, left, statusStyle)
+	drawRightHints(screen, bounds, hintY, v.hintsForDeployments(), statusStyle)
+
+	// Cut/deploy/rollback concept modal overlays everything else in the
+	// pane when open.
+	if v.dctrl != nil {
+		v.drawDeployConceptModal(screen, bounds)
 	}
 }
 
@@ -745,39 +721,20 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 	if v.Arch.Active() {
 		return v.Arch.HandleEvent(ev)
 	}
-	// Deployment-concept modal (cut/deploy/rollback) takes precedence
-	// whenever it's open. handleDeployConceptKeyLocked assumes v.mu held.
+	// Cut/deploy/rollback concept modal takes precedence whenever it's
+	// open. handleDeployConceptKeyLocked assumes v.mu held.
 	if v.dctrl != nil {
 		return v.handleDeployConceptKeyLocked(keyEv)
 	}
-	// Deploy-control modal takes key precedence whenever it's open
-	// (mirrors the workers grant/approval modal). handleDeployKey
-	// assumes v.mu is already held (we took the write lock above).
-	if v.ctrl != nil {
-		return v.handleDeployKeyLocked(keyEv)
-	}
-	// Deployments section owns navigation + control keys (Up/Down/Enter/
-	// Esc plus C/G/B and P) while it's active. Routed before the KeyRune
-	// guard so the arrow/Enter/Esc keys reach it.
-	if v.showDeployments {
+	// Persistent split (memql-cockpit#221): the Deployments section is
+	// always present, so its navigation + control keys are live without a
+	// toggle. Arrow keys + Enter drive the deployment cursor / node load;
+	// they're routed before the KeyRune guard so they reach the handler.
+	switch keyEv.Key() {
+	case tcell.KeyUp, tcell.KeyDown, tcell.KeyEnter:
 		return v.handleDeploymentsKeyLocked(keyEv)
 	}
 	if keyEv.Key() != tcell.KeyRune {
-		return false
-	}
-	// 'P' toggles the Deployments section (any connected role may view).
-	if r := keyEv.Rune(); r == 'p' || r == 'P' {
-		v.toggleDeploymentsLocked()
-		return true
-	}
-	// 'D' opens the deploy-control menu -- owner/admin only. Non-admins
-	// get a no-op (no controls, no hint). Checked before the pan keys so
-	// it isn't shadowed.
-	if r := keyEv.Rune(); r == 'D' {
-		if v.canViewDeploymentsLocked() {
-			v.openDeployModalLocked()
-			return true
-		}
 		return false
 	}
 	switch keyEv.Rune() {
@@ -799,6 +756,10 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 	case 'x', 'X':
 		v.Arch.Toggle()
 		return true
+	case 'c', 'C', 'g', 'G', 'b', 'B':
+		// Deployments cut/deploy/rollback controls (role-gated inside the
+		// handler). 'b'/'B' (rollback) doesn't collide with a pan key.
+		return v.handleDeploymentsKeyLocked(keyEv)
 	}
 	return false
 }

@@ -1,13 +1,14 @@
 package cluster
 
-// Tests for the Deployments section + cut/deploy/rollback modal
-// (memql-cockpit#207). They drive the section + modal state machine
-// through HandleEvent against a fake deployConceptActions (no live
-// gRPC), asserting: 'P' toggles the section for any role; the history
-// list + per-deployment topology render; the role matrix gates the
-// controls (cut/deploy = developer+admin+owner, rollback = owner-only);
-// and each action fires its SDK wrapper with the right args once the
-// confirm gate passes.
+// Tests for the always-on Deployments section + cut/deploy/rollback
+// modal (memql-cockpit#207 / #221). They drive the section + modal state
+// machine through HandleEvent against a fake deployConceptActions (no
+// live gRPC), asserting: the section is always present (no toggle) so its
+// navigation + control keys are live for any role; the history list +
+// per-deployment topology render; the role matrix gates the controls
+// (cut/deploy = developer+admin+owner, rollback = owner-only); and each
+// action fires its SDK wrapper with the right args once the confirm gate
+// passes.
 
 import (
 	"context"
@@ -23,6 +24,42 @@ import (
 	nodev1 "github.com/znasllc-io/memql/component/node/gen"
 	"github.com/znasllc-io/memql/sdk/go/client"
 )
+
+// --- shared test helpers (relocated from the removed deploy_test.go /
+// deploy_controls_test.go when the deployment-v2 "Surface A" was deleted
+// in memql-cockpit#221) ---
+
+// keyRune / keyEnter / keyEsc / keyDown synthesize tcell key events.
+func keyRune(r rune) *tcell.EventKey { return tcell.NewEventKey(tcell.KeyRune, r, tcell.ModNone) }
+func keyEnter() *tcell.EventKey      { return tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone) }
+func keyEsc() *tcell.EventKey        { return tcell.NewEventKey(tcell.KeyEscape, 0, tcell.ModNone) }
+func keyDown() *tcell.EventKey       { return tcell.NewEventKey(tcell.KeyDown, 0, tcell.ModNone) }
+
+// typeStr feeds each rune of s through HandleEvent.
+func typeStr(v *View, s string) {
+	for _, r := range s {
+		v.HandleEvent(keyRune(r))
+	}
+}
+
+// renderTopology draws the View against a fresh SimulationScreen of the
+// given size and returns the flattened rows. Shares flattenSim with
+// chrome_contract_test.go.
+func renderTopology(t *testing.T, v *View, w, h int) []string {
+	t.Helper()
+	sim := tcell.NewSimulationScreen("UTF-8")
+	if err := sim.Init(); err != nil {
+		t.Fatalf("sim init: %v", err)
+	}
+	defer sim.Fini()
+	sim.SetSize(w, h)
+	sim.Clear()
+
+	screen := ui.NewScreenFromTcell(sim)
+	v.Draw(screen, ui.Rect{X: 0, Y: 0, Width: w, Height: h})
+	sim.Show()
+	return flattenSim(sim)
+}
 
 // fakeConceptActor is a stub deployConceptActions recording call args.
 type fakeConceptActor struct {
@@ -99,20 +136,32 @@ func waitForConceptResult(t *testing.T, v *View, redrawCh chan struct{}) string 
 	}
 }
 
-func TestDeployments_PToggleAnyRole(t *testing.T) {
+// TestDeployments_AlwaysPresentNavForAnyRole asserts the always-on
+// Deployments section's navigation keys (Up/Down/Enter) are live for any
+// role without a toggle, and that the now-removed 'P'/'Esc' toggle keys
+// are inert (no toggle exists in the persistent split).
+func TestDeployments_AlwaysPresentNavForAnyRole(t *testing.T) {
 	for _, role := range []client.Role{client.RoleReader, client.RoleWriter, client.RoleDeveloper, client.RoleAdmin, client.RoleOwner} {
 		v := NewView(ui.DefaultTheme())
 		v.SetClusterRole(role)
-		if !v.HandleEvent(keyRune('P')) {
-			t.Fatalf("role %q: 'P' should toggle the Deployments section", role)
+		v.SetDeployments([]DeploymentInfo{
+			{ID: "dep-1", Version: "1.0.0", Status: "succeeded"},
+			{ID: "dep-2", Version: "0.9.0", Status: "superseded"},
+		})
+		// Down moves the deployment cursor without any toggle.
+		if !v.HandleEvent(keyDown()) {
+			t.Fatalf("role %q: Down should move the deployment cursor", role)
 		}
-		if !v.DeploymentsActive() {
-			t.Errorf("role %q: section should be active after 'P'", role)
+		if got := v.SelectedDeploymentID(); got != "dep-2" {
+			t.Errorf("role %q: Down should select dep-2, got %q", role, got)
 		}
-		// Esc leaves the section.
-		v.HandleEvent(keyEsc())
-		if v.DeploymentsActive() {
-			t.Errorf("role %q: Esc should close the section", role)
+		// 'P' is no longer a toggle key -- it's inert here.
+		if v.HandleEvent(keyRune('P')) {
+			t.Errorf("role %q: 'P' should be inert (no toggle in the persistent split)", role)
+		}
+		// Esc is likewise inert (nothing to close).
+		if v.HandleEvent(keyEsc()) {
+			t.Errorf("role %q: Esc should be inert with no modal open", role)
 		}
 	}
 }
@@ -124,7 +173,6 @@ func TestDeployments_HistoryAndTopologyRender(t *testing.T) {
 		{ID: "dep-aaaaaaaaaaaa", Version: "2026.6.21", Environment: "staging", Provider: "azure", Status: "succeeded"},
 		{ID: "dep-bbbbbbbbbbbb", Version: "2026.6.20", Environment: "staging", Provider: "azure", Status: "superseded"},
 	})
-	v.HandleEvent(keyRune('P'))
 	// Load the selected deployment's topology.
 	v.SetDeploymentNodes("dep-aaaaaaaaaaaa",
 		[]NodeInfo{{Type: "bff", Health: nodev1.NodeHealthStatus_NODE_HEALTH_HEALTHY, Version: "2026.6.21"}},
@@ -145,7 +193,6 @@ func TestDeployments_SelectFiresOnSelect(t *testing.T) {
 	got := make(chan string, 1)
 	v.OnSelectDeployment = func(id string) { got <- id }
 	v.SetDeployments([]DeploymentInfo{{ID: "dep-xyz", Version: "1.0.0", Status: "succeeded"}})
-	v.HandleEvent(keyRune('P'))
 	v.HandleEvent(keyEnter()) // drill into the selected deployment
 	select {
 	case id := <-got:
@@ -163,7 +210,6 @@ func TestDeployments_CutRoleGate(t *testing.T) {
 	can := []client.Role{client.RoleDeveloper, client.RoleAdmin, client.RoleOwner}
 	for _, role := range cannot {
 		v, _ := newConceptView(t, role, &fakeConceptActor{})
-		v.HandleEvent(keyRune('P'))
 		v.HandleEvent(keyRune('C'))
 		if modalOpen(v) {
 			t.Errorf("role %q must not open the cut modal", role)
@@ -171,7 +217,6 @@ func TestDeployments_CutRoleGate(t *testing.T) {
 	}
 	for _, role := range can {
 		v, _ := newConceptView(t, role, &fakeConceptActor{})
-		v.HandleEvent(keyRune('P'))
 		v.HandleEvent(keyRune('C'))
 		if !modalOpen(v) {
 			t.Errorf("role %q should open the cut modal", role)
@@ -185,7 +230,6 @@ func TestDeployments_CutFiresWithEnvAndBump(t *testing.T) {
 		sugg:   client.NextVersionSuggestion{CurrentVersion: "2026.6.20", NextPatch: "2026.6.21"},
 	}
 	v, redrawCh := newConceptView(t, client.RoleDeveloper, fa)
-	v.HandleEvent(keyRune('P'))
 	v.HandleEvent(keyRune('C')) // open cut -> env picker
 	// env picker: cutEnvs[0]=staging. Down once -> production, Enter.
 	v.HandleEvent(keyDown())
@@ -213,7 +257,6 @@ func TestDeployments_DeployPendingFires(t *testing.T) {
 	fa := &fakeConceptActor{result: client.ActionResult{OK: true, Message: "shipping"}}
 	v, redrawCh := newConceptView(t, client.RoleDeveloper, fa)
 	v.SetDeployments([]DeploymentInfo{{ID: "dep-pending", Version: "9.9.9", Status: "pending"}})
-	v.HandleEvent(keyRune('P'))
 	v.HandleEvent(keyRune('G')) // deploy the selected pending deployment
 	if !modalOpen(v) {
 		t.Fatal("G should open the deploy-confirm for a pending deployment")
@@ -232,7 +275,6 @@ func TestDeployments_DeployBlockedWhenNotPending(t *testing.T) {
 	fa := &fakeConceptActor{}
 	v, _ := newConceptView(t, client.RoleDeveloper, fa)
 	v.SetDeployments([]DeploymentInfo{{ID: "dep-done", Version: "1.0.0", Status: "succeeded"}})
-	v.HandleEvent(keyRune('P'))
 	v.HandleEvent(keyRune('G'))
 	if modalOpen(v) {
 		t.Error("G must not open deploy-confirm for a non-pending deployment")
@@ -244,7 +286,6 @@ func TestDeployments_RollbackOwnerOnly(t *testing.T) {
 	for _, role := range []client.Role{client.RoleDeveloper, client.RoleAdmin} {
 		v, _ := newConceptView(t, role, &fakeConceptActor{})
 		v.SetDeployments([]DeploymentInfo{{ID: "dep-s", Version: "1.0.0", Status: "succeeded"}})
-		v.HandleEvent(keyRune('P'))
 		v.HandleEvent(keyRune('B'))
 		if modalOpen(v) {
 			t.Errorf("role %q must not open rollback", role)
@@ -253,7 +294,6 @@ func TestDeployments_RollbackOwnerOnly(t *testing.T) {
 	fa := &fakeConceptActor{result: client.ActionResult{OK: true, Message: "rolled back", AuditEventID: "evt-rb"}}
 	v, redrawCh := newConceptView(t, client.RoleOwner, fa)
 	v.SetDeployments([]DeploymentInfo{{ID: "dep-succeeded", Version: "3.0.0", Status: "succeeded"}})
-	v.HandleEvent(keyRune('P'))
 	v.HandleEvent(keyRune('B'))
 	if !modalOpen(v) {
 		t.Fatal("owner B should open rollback confirm for a succeeded deployment")
@@ -282,7 +322,6 @@ func TestDeployments_RollbackPermissionDeniedMapped(t *testing.T) {
 	fa := &fakeConceptActor{err: status.Error(codes.PermissionDenied, "nope")}
 	v, redrawCh := newConceptView(t, client.RoleOwner, fa)
 	v.SetDeployments([]DeploymentInfo{{ID: "dep-x", Version: "1.0.0", Status: "succeeded"}})
-	v.HandleEvent(keyRune('P'))
 	v.HandleEvent(keyRune('B'))
 	typeStr(v, "rollback")
 	v.HandleEvent(keyEnter())
@@ -296,7 +335,6 @@ func TestDeployments_HintsRoleGated(t *testing.T) {
 	owner := NewView(ui.DefaultTheme())
 	owner.SetClusterRole(client.RoleOwner)
 	owner.SetDeployments([]DeploymentInfo{{ID: "d", Version: "1", Status: "succeeded"}})
-	owner.HandleEvent(keyRune('P'))
 	joined := strings.Join(renderTopology(t, owner, 120, 30), "\n")
 	if !strings.Contains(joined, "Rollback") {
 		t.Errorf("owner should see the Rollback hint; got:\n%s", joined)
@@ -305,7 +343,6 @@ func TestDeployments_HintsRoleGated(t *testing.T) {
 	reader := NewView(ui.DefaultTheme())
 	reader.SetClusterRole(client.RoleReader)
 	reader.SetDeployments([]DeploymentInfo{{ID: "d", Version: "1", Status: "succeeded"}})
-	reader.HandleEvent(keyRune('P'))
 	// The reader still sees the section + hint bar, but Cut/Rollback chips
 	// are disabled (the HintBar renders disabled chips dimmed; the action
 	// keys are no-ops, which the role-gate tests above already assert).

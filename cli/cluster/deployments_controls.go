@@ -1,10 +1,9 @@
 package cluster
 
 // Cut/deploy/rollback modal for the Deployments section (memql-cockpit
-// #207). Concept-driven counterpart to deploy_controls.go: where that
-// modal fires the deployment-v2 overlay actions (DeployStaging / Promote /
-// Rollback / RolloutAction), this one fires the newer deployment-concept
-// lifecycle wrappers landed in memql#1886:
+// #207). Concept-driven: it fires the deployment-concept lifecycle
+// wrappers landed in memql#1886 (this is the single deployment surface
+// now -- the older deployment-v2 overlay modal was removed in #221):
 //
 //	CutVersion(env, bump, version)  -- create a pending deployment
 //	Deploy(deploymentId)            -- ship a pending deployment
@@ -17,7 +16,8 @@ package cluster
 // server re-checks -- a PermissionDenied surfaces as the owner/admin (or
 // owner-only) hint via formatActionOutcome.
 //
-// Thread-safety: state lives in v.dctrl under v.mu, exactly like v.ctrl.
+// Thread-safety: state lives in v.dctrl under v.mu (the same lock that
+// serializes Draw against the per-cluster subscriber goroutine).
 // Async fires run in a goroutine that re-acquires the lock to store the
 // result, then triggers OnDeploymentsChanged so the history refreshes.
 

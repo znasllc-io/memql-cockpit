@@ -1,21 +1,19 @@
 package cluster
 
-// Deployments section for the Clusters tab (memql-cockpit#207). This is
-// the integrative deliverable of the Deployment & Topology Overhaul
-// (epic znasllc-io/memql#1871): a section *within* the right pane of the
-// Clusters tab -- toggled alongside the live Topology -- that renders the
-// v1:cluster:deployment history newest-first, lets the operator select a
-// deployment to see its own topology (nodes filtered by deploymentId,
-// with orphans highlighted), and exposes the deploy-control lifecycle
-// (cut-version / deploy / rollback) through the SDK DeployControlClient
-// wrappers landed in memql#1886.
+// Deployments section for the Clusters tab (memql-cockpit#207 / #221).
+// This is the integrative deliverable of the Deployment & Topology
+// Overhaul (epic znasllc-io/memql#1871): the bottom band of the right
+// pane's persistent split (#221) -- always visible below the live
+// topology grid -- that renders the v1:cluster:deployment history
+// newest-first, lets the operator select a deployment to see its own
+// topology (nodes filtered by deploymentId, with orphans highlighted),
+// and exposes the deploy-control lifecycle (cut-version / deploy /
+// rollback) through the SDK DeployControlClient wrappers landed in
+// memql#1886.
 //
-// Distinct from the deployment-v2 status strip (deploy.go / #144) and the
-// deployment-v2 control modal (deploy_controls.go / #145): those render
-// the per-env Argo/Rollouts overlay state and fire DeployStaging /
-// Promote / Rollback / RolloutAction. THIS section is concept-driven --
-// it reads the deployment concept rows and fires the newer
-// CutVersion / Deploy / RollbackDeployment wrappers.
+// This concept-driven section is the SINGLE deployment surface: the
+// earlier deployment-v2 status strip + control modal (deploy.go /
+// deploy_controls.go / deploy_grpcstatus.go) were removed in #221.
 //
 // Role gating (the locked matrix, epic #1871):
 //   - view              -- any connected role
@@ -24,10 +22,9 @@ package cluster
 //
 // Thread-safety: all state below lives on the topology View under v.mu,
 // reusing the same lock that serializes Draw against the per-cluster
-// subscriber goroutine. Mutators (SetDeployments / loadSelectedNodes)
+// subscriber goroutine. Mutators (SetDeployments / SetDeploymentNodes)
 // take the write lock; Draw reads under RLock. Async SDK calls fire in a
-// goroutine that re-acquires the lock to store results, mirroring the
-// deploy_controls.go modal.
+// goroutine that re-acquires the lock to store results.
 
 import (
 	"fmt"
@@ -120,14 +117,6 @@ func (v *View) SetDeployments(deps []DeploymentInfo) {
 	}
 }
 
-// DeploymentsActive reports whether the right pane is currently showing
-// the Deployments section (vs the live topology). Takes the read lock.
-func (v *View) DeploymentsActive() bool {
-	v.mu.RLock()
-	defer v.mu.RUnlock()
-	return v.showDeployments
-}
-
 // SelectedDeploymentID returns the deploymentId under the cursor, or "".
 // Used by the app's node-load hook so it can fetch the right rows.
 func (v *View) SelectedDeploymentID() string {
@@ -181,23 +170,6 @@ func (v *View) CanRollback() bool {
 	return v.canRollbackLocked()
 }
 
-// toggleDeploymentsLocked flips the Deployments section on/off. Entering
-// requests a fresh history load via OnDeploymentsShown so the section
-// opens populated rather than blank. Caller MUST hold v.mu (write).
-func (v *View) toggleDeploymentsLocked() {
-	v.showDeployments = !v.showDeployments
-	if v.showDeployments {
-		// Leaving any pan offset behind is fine; the section has its own
-		// scroll model (cursor-based) and ignores panX/panY.
-		if cb := v.OnDeploymentsShown; cb != nil {
-			// Fire outside the lock to avoid re-entrant SetDeployments
-			// deadlocking on v.mu (the callback queries off-thread and
-			// calls back via SetDeployments).
-			go cb()
-		}
-	}
-}
-
 // requestDeploymentNodesLocked asks the app layer to load the selected
 // deployment's node/orphan split. Caller MUST hold v.mu (write); the
 // callback runs off-thread and stores results via SetDeploymentNodes.
@@ -213,15 +185,19 @@ func (v *View) requestDeploymentNodesLocked() {
 	go cb(id)
 }
 
-// drawDeployments renders the Deployments section into the right pane.
-// Caller (Draw) holds v.mu.RLock. Layout, top-to-bottom:
+// drawDeployments renders the Deployments section into the bottom band
+// of the persistent split (memql-cockpit#221). `bounds` is the
+// deployments sub-region Draw computed -- NOT the whole pane -- so the
+// list + detail block bottom-anchor cleanly to the band floor and the
+// region's own internal math never bleeds into the topology grid above.
+// Caller (Draw) holds v.mu.RLock. The deployments hint bar lives on the
+// pane's last row, drawn by Draw (just below this region). Layout,
+// top-to-bottom within the band:
 //
-//	[name]      cluster name (drawn by Draw before this)
 //	HISTORY     section header
 //	<list>      deployment rows, newest-first, cursor-highlighted
 //	─────
 //	DETAIL      selected deployment fields + its topology (nodes/orphans)
-//	[status]    bottom hint bar (role-gated controls)
 func (v *View) drawDeployments(screen *ui.Screen, bounds ui.Rect) {
 	x := bounds.X + 2
 	maxW := bounds.Width - 4
@@ -376,7 +352,6 @@ func (v *View) hintsForDeployments() string {
 		ui.HintChip{Key: "C", Label: "Cut", Disabled: !canCut},
 		ui.HintChip{Key: "G", Label: "Deploy", Disabled: !canCut || !haveSel || !sel.isPending()},
 		ui.HintChip{Key: "B", Label: "Rollback", Disabled: !v.canRollbackLocked() || !haveSel || !sel.reachedSucceeded()},
-		ui.HintChip{Key: "P", Label: "Topology view"},
 	)
 	return ui.HintBar{Chips: chips}.String()
 }
@@ -403,16 +378,8 @@ func (v *View) handleDeploymentsKeyLocked(key *tcell.EventKey) bool {
 		v.requestDeploymentNodesLocked()
 		v.requestRedrawLocked()
 		return true
-	case tcell.KeyEscape:
-		v.showDeployments = false
-		v.requestRedrawLocked()
-		return true
 	case tcell.KeyRune:
 		switch key.Rune() {
-		case 'p', 'P':
-			v.showDeployments = false
-			v.requestRedrawLocked()
-			return true
 		case 'c', 'C':
 			if v.canCutDeployLocked() {
 				v.openCutModalLocked()
@@ -453,7 +420,7 @@ func (v *View) selectedReachedSucceededLocked() bool {
 }
 
 // colorStyle is a small helper wrapping a foreground color over the base
-// background, mirroring successStyle/warningStyle/errorStyle.
+// background, mirroring warningStyle (deploy_shared.go).
 func (v *View) colorStyle(c tcell.Color) tcell.Style {
 	return tcell.StyleDefault.Foreground(c).Background(v.Theme.BG)
 }
