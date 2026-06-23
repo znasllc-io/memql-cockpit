@@ -230,10 +230,11 @@ func TestDeployments_CutFiresWithEnvAndBump(t *testing.T) {
 		sugg:   client.NextVersionSuggestion{CurrentVersion: "2026.6.20", NextPatch: "2026.6.21"},
 	}
 	v, redrawCh := newConceptView(t, client.RoleDeveloper, fa)
-	v.HandleEvent(keyRune('C')) // open cut -> env picker
-	// env picker: cutEnvs[0]=staging. Down once -> production, Enter.
-	v.HandleEvent(keyDown())
-	v.HandleEvent(keyEnter()) // env=production -> bump picker (+ fires SuggestNextVersion)
+	// A cluster IS one environment (memql-cockpit#226): the cut flow uses
+	// the cluster's resolved env, no picker. Set it, then open cut -> the
+	// modal opens straight on the bump picker.
+	v.SetClusterEnvironment("production")
+	v.HandleEvent(keyRune('C')) // open cut -> bump picker (env already resolved)
 	// bump picker: cutBumps[0]=patch. Enter selects patch -> confirm.
 	v.HandleEvent(keyEnter())
 	// confirm stage: Enter fires CutVersion.

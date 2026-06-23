@@ -1369,7 +1369,10 @@ func (a *App) refreshDeployments() {
 
 // resolveClusterId returns the active connection's cluster id via
 // ExistingCluster, or "" when unknown. Single-cluster staging
-// returns one row; the first non-empty id wins.
+// returns one row; the first non-empty id wins. As a side effect it also
+// mirrors the cluster's single environment onto the topology view (a
+// cluster IS one environment, memql-cockpit#226) so the cut flow can use
+// it without a picker.
 func (a *App) resolveClusterId(ctx context.Context, qc *client.QueryClient) string {
 	res, err := qc.ExistingCluster(ctx, client.ExistingClusterArgs{})
 	if err != nil {
@@ -1380,6 +1383,11 @@ func (a *App) resolveClusterId(ctx context.Context, qc *client.QueryClient) stri
 	}
 	for _, r := range res.Rows() {
 		if id := client.RowString(r, "id"); id != "" {
+			if a.clustersView != nil && a.clustersView.Topology != nil {
+				if env := client.RowString(r, "environment"); env != "" {
+					a.clustersView.Topology.SetClusterEnvironment(env)
+				}
+			}
 			return id
 		}
 	}

@@ -114,6 +114,15 @@ type View struct {
 	// role; cut/deploy = developer/admin/owner; rollback = owner only).
 	clusterRole client.Role
 
+	// clusterEnv is the connected cluster's single environment
+	// (development|staging|production), resolved from the v1:cluster:cluster
+	// record via ExistingCluster and mirrored in via SetClusterEnvironment.
+	// A cluster IS one environment (memql-cockpit#226), so the cut flow uses
+	// this directly instead of asking the operator to pick. Empty until
+	// resolved; the cut modal falls back to the newest deployment's
+	// environment, then "development".
+	clusterEnv string
+
 	// DeployClient returns a DeployControlClient bound to the currently
 	// active cluster's connection, or nil when none is connected. Wired
 	// in app.go's wireCluster() using the same closure pattern the other
