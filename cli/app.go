@@ -1248,7 +1248,41 @@ func (a *App) loadDeploymentNodes(deploymentID string) {
 		a.logger.Debug("queryNodesNotInDeployment failed", "deployment", deploymentID, "error", err)
 	}
 	a.clustersView.Topology.SetDeploymentNodes(deploymentID, nodes, orphans)
+
+	// Desired per-node-type spec (Epic 2 deploymentNodeSpec, memql#2094):
+	// version / replicas / image digest per tier. Best-effort -- a cluster
+	// predating the deploy-pack returns no spec rows and the composition
+	// view simply omits the intent line.
+	if res, err := qc.NodeSpecsForDeployment(ctx, client.NodeSpecsForDeploymentArgs{DeploymentId: deploymentID}); err == nil {
+		a.clustersView.Topology.SetDeploymentNodeSpecs(deploymentID, parseDeploymentSpecs(res))
+	} else if a.logger != nil {
+		a.logger.Debug("queryNodeSpecsForDeployment failed", "deployment", deploymentID, "error", err)
+	}
 	a.postRedraw()
+}
+
+// parseDeploymentSpecs converts a nodeSpecsForDeployment result into the
+// view's NodeSpecInfo slice -- the deployment's desired per-node-type spec
+// (version / replicas / image digest). Rows missing a nodeType are skipped.
+func parseDeploymentSpecs(res *client.Result) []cluster.NodeSpecInfo {
+	if res == nil {
+		return nil
+	}
+	rows := res.Rows()
+	out := make([]cluster.NodeSpecInfo, 0, len(rows))
+	for _, r := range rows {
+		nodeType := firstNonEmpty(client.RowString(r, "nodeType"), client.RowString(r, "type"))
+		if nodeType == "" {
+			continue
+		}
+		out = append(out, cluster.NodeSpecInfo{
+			NodeType:    nodeType,
+			Version:     client.RowString(r, "version"),
+			Replicas:    client.RowInt(r, "replicas"),
+			ImageDigest: firstNonEmpty(client.RowString(r, "imageDigest"), client.RowString(r, "image_digest")),
+		})
+	}
+	return out
 }
 
 // parseDeployments converts a queryDeploymentsForCluster result into the
