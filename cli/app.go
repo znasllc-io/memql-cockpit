@@ -1016,14 +1016,12 @@ func (a *App) refreshMyAccess(clusterName string, conn *client.Connection) {
 		}
 		a.settingsView.SetMyAccess(clusterName, access)
 		// Mirror the cluster role onto the Topology view so the
-		// deployment-v2 strip knows whether to render the panel
-		// (owner/admin) or the muted "owner/admin only" line. Same
-		// access record, two consumers. A fresh role also lets the
-		// next refreshDeployStatus tick start (or stop) polling the
-		// owner/admin-gated GetDeploymentStatus RPC.
+		// Deployments section knows which cut/deploy/rollback controls
+		// the caller may use (view = any role; cut/deploy =
+		// developer/admin/owner; rollback = owner only). Same access
+		// record, two consumers.
 		if a.clustersView != nil && a.clustersView.Topology != nil && access != nil {
 			a.clustersView.Topology.SetClusterRole(access.ClusterRole)
-			go a.refreshDeployStatus()
 		}
 		a.postRedraw()
 	}()
@@ -1084,9 +1082,8 @@ func (a *App) wireCluster() {
 	// DeployClient resolves a DeployControlClient against whichever
 	// cluster is active right now, so a cluster switch transparently
 	// retargets -- same closure pattern as the other views' QueryClient.
-	// Returns nil when no cluster is connected; refreshDeployStatus
-	// no-ops on nil. Per #144 the deployment-v2 status surface is
-	// read-only.
+	// Returns nil when no cluster is connected. Used by the Deployments
+	// section's cut/deploy/rollback controls.
 	a.clustersView.Topology.DeployClient = func() *client.DeployControlClient {
 		a.poolMu.RLock()
 		name := a.selected
@@ -1105,21 +1102,19 @@ func (a *App) wireCluster() {
 		return client.NewDeployControlClient(conn)
 	}
 
-	// #145 deploy-control modal hooks. OnRedraw lands an in-flight
-	// action's result line on screen the moment the SDK call returns
-	// (no waiting for the next poll tick); OnActionComplete kicks an
-	// immediate status refresh after a successful action so the
-	// Argo/Rollouts overlay reflects the new state right away.
+	// OnRedraw lands an in-flight cut/deploy/rollback action's result
+	// line on screen the moment the SDK call returns, without waiting for
+	// the next poll tick.
 	a.clustersView.Topology.OnRedraw = a.postRedraw
-	a.clustersView.Topology.OnActionComplete = func() {
-		go a.refreshDeployStatus()
-	}
 
-	// #207 Deployments section hooks. OnDeploymentsShown loads the
+	// #207/#221 Deployments section hooks. OnDeploymentsShown loads the
 	// deployment history (QueryExistingCluster -> QueryDeploymentsForCluster);
 	// OnSelectDeployment loads the selected deployment's nodes + orphans;
 	// OnDeploymentsChanged re-loads the history after a cut/deploy/rollback
-	// action so the list reflects the new state right away.
+	// action so the list reflects the new state right away. The section is
+	// always visible in the persistent split, so the history is loaded
+	// eagerly here and refreshed on the periodic ticker below rather than
+	// on a toggle.
 	a.clustersView.Topology.OnDeploymentsShown = func() {
 		go a.refreshDeployments()
 	}
@@ -1130,22 +1125,21 @@ func (a *App) wireCluster() {
 		go a.refreshDeployments()
 	}
 
-	// Poll the deployment-v2 status on a periodic ticker. The loop
-	// self-gates on the connected caller's cluster role (owner/admin
-	// only) inside refreshDeployStatus.
-	go a.deployStatusRefreshLoop()
+	// Periodically refresh the deployment history so the always-on
+	// Deployments section reflects new cuts/deploys without a manual
+	// reload.
+	go a.deploymentsRefreshLoop()
 }
 
-// deployStatusRefreshLoop periodically refreshes the deployment-v2
-// status strip in the Topology pane. It runs for the life of the app;
-// each tick calls refreshDeployStatus, which is a no-op unless a cluster
-// is connected AND the caller's role is owner/admin. The cadence mirrors
-// the architecture-metrics refresh -- deploy state changes on human
-// timescales, so a slow tick is correct.
-func (a *App) deployStatusRefreshLoop() {
-	// One eager refresh so the strip populates on first connect without
+// deploymentsRefreshLoop periodically refreshes the per-cluster
+// deployment history feeding the always-on Deployments section. It runs
+// for the life of the app; each tick is a no-op unless a cluster is
+// connected. The cadence mirrors the architecture-metrics refresh --
+// deploy state changes on human timescales, so a slow tick is correct.
+func (a *App) deploymentsRefreshLoop() {
+	// One eager refresh so the section populates on first connect without
 	// waiting a full tick, then periodic.
-	a.refreshDeployStatus()
+	a.refreshDeployments()
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -1153,47 +1147,9 @@ func (a *App) deployStatusRefreshLoop() {
 		case <-a.quitCh:
 			return
 		case <-ticker.C:
-			a.refreshDeployStatus()
+			a.refreshDeployments()
 		}
 	}
-}
-
-// refreshDeployStatus fetches GetDeploymentStatus for each env
-// (staging, prod) and stores the result on the Topology view. Role
-// gating: GetDeploymentStatus is owner/admin-gated server-side, so we
-// only call it when the connected caller's cluster role is owner/admin
-// (mirrored onto the view via SetClusterRole from refreshMyAccess). A
-// PermissionDenied or any other error stores nothing for that env and
-// is logged at debug level -- never crashes the poll loop.
-func (a *App) refreshDeployStatus() {
-	if a.clustersView == nil || a.clustersView.Topology == nil {
-		return
-	}
-	topo := a.clustersView.Topology
-	if !topo.CanViewDeployments() {
-		return
-	}
-	if topo.DeployClient == nil {
-		return
-	}
-	dc := topo.DeployClient()
-	if dc == nil {
-		return
-	}
-	for _, env := range cluster.DeployEnvs() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		st, err := dc.GetDeploymentStatus(ctx, env)
-		cancel()
-		if err != nil {
-			if a.logger != nil {
-				a.logger.Debug("deploy status fetch failed",
-					"env", env, "error", err)
-			}
-			continue
-		}
-		topo.SetDeploymentStatus(env, st)
-	}
-	a.postRedraw()
 }
 
 // activeQueryClient resolves a QueryClient bound to the currently active

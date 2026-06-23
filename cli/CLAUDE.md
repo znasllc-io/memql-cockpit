@@ -138,17 +138,48 @@ chrome-contract) below. Tab cycles focus between the three panes.
 ```
 
 - **Left pane**: cluster manager (list + detail + add/edit form).
-- **Right pane**: topology diagram (current cluster's nodes +
-  health), or the architecture-model drill-down navigator when
-  toggled with `X`, or the Deployments section when toggled with `P`.
+- **Right pane**: a **persistent vertical split** (memql-cockpit#221) --
+  the live topology grid on TOP and the per-cluster Deployments section
+  anchored to the BOTTOM, both always visible. The top region can be
+  swapped for the architecture-model drill-down navigator with `X`.
 
-### Deployments section (the `P` toggle, memql-cockpit#207)
+### Persistent split (memql-cockpit#221)
 
-The right pane's third mode (alongside live topology and the `X`
-architecture navigator) is the concept-driven **Deployments
-section**. Toggle in/out with `P`. It is the integrative deliverable
-of the Deployment & Topology Overhaul (epic memql#1871) and reads the
-`v1:cluster:deployment` concept rows landed in that epic.
+The right pane is a vertical split with two always-on regions:
+
+```
+┌───────────────────────────────────┐
+│ local                             │  cluster-name title
+│   [bff] ── [cognition]            │  TOPOLOGY region (live grid)
+│        \                          │
+│         [agent]                   │
+│  Nodes: 4  Online:4   WASD:Pan …  │  one-line topology tally + pan hints
+│ ───────────────────────────────── │  divider
+│ DEPLOYMENT HISTORY                │  DEPLOYMENTS region (bottom band)
+│  succeeded 2026.6.21 staging azure│
+│  ─────                            │
+│ DEPLOYMENT dep-aaaa  succeeded    │  detail block (selected deployment)
+│ Deployments: 2     Up/Dn:Move … │  deployments hint bar (last row)
+└───────────────────────────────────┘
+```
+
+The split layout lives in `cluster/topology.go` `View.Draw`:
+the deployments band height is `clamp(40% of pane, min 8, max 14)`
+rows, bottom-anchored, with a 1-row `─` divider above it and the
+topology grid filling the rest. `drawTopology` is handed only the top
+sub-`Rect`, which is what stops the grid from bleeding into the
+deployments band (the overlap bug #221/#220 fixed). There is **no
+toggle** -- both regions are always present. (A graphical topology
+preview of the *selected* deployment is a follow-up; for now the
+selected deployment's node composition is shown textually in the
+deployments detail block -- see the `TODO(#221)` in `View.Draw`.)
+
+### Deployments section (memql-cockpit#207)
+
+The bottom band is the concept-driven **Deployments section**. It is
+the integrative deliverable of the Deployment & Topology Overhaul
+(epic memql#1871) and reads the `v1:cluster:deployment` concept rows
+landed in that epic.
 
 - **History list** -- `QueryDeploymentsForCluster` (clusterId resolved
   via `QueryExistingCluster`), rendered newest-first by createdAt with
@@ -169,20 +200,31 @@ of the Deployment & Topology Overhaul (epic memql#1871) and reads the
   owner only. Disallowed controls are hidden/disabled in the hint
   bar and the keys are no-ops.
 
-The **live topology** also got truthfulness upgrades from the same
-issue: each node box carries a third line (running version + short
-deploymentId, or an `[orphan]` tag), orphaned/stale nodes (stopped,
-or carrying a non-current deploymentId) render with the warning
-border, the status tally flags any node type below the expected
-replica count (`expectedNodesPerType`), and `parentId` discovery
-links are drawn as edges on top of the static service-relationship
-map.
+The **live topology** (top region) also got truthfulness upgrades from
+the same issue: each node box carries a third line (running version +
+short deploymentId, or an `[orphan]` tag), orphaned/stale nodes
+(stopped, or carrying a non-current deploymentId) render with the
+warning border, the topology tally flags any node type below the
+expected replica count (`expectedNodesPerType`), and `parentId`
+discovery links are drawn as edges on top of the static
+service-relationship map.
 
 Files: `cluster/deployments.go` (section view + history + per-
 deployment topology), `cluster/deployments_controls.go` (cut/deploy/
-rollback modal). The app wires the SDK closures in `wireCluster`
-(`OnDeploymentsShown` / `OnSelectDeployment` / `OnDeploymentsChanged`)
-and parses rows in `app.go` (`parseDeployments` / `parseDeploymentNodes`).
+rollback modal), `cluster/deploy_shared.go` (shared async-fire +
+gRPC-status + draw helpers the section reuses). The app wires the SDK
+closures in `wireCluster` (`OnDeploymentsShown` / `OnSelectDeployment`
+/ `OnDeploymentsChanged`), refreshes the history on a periodic
+`deploymentsRefreshLoop`, and parses rows in `app.go`
+(`parseDeployments` / `parseDeploymentNodes`).
+
+> The earlier **deployment-v2 surface** (an always-on STAGING/PROD
+> Argo/Rollouts status strip + a `D`-key DeployStaging/Promote/Rollback
+> modal; files `cluster/deploy.go` / `deploy_controls.go` /
+> `deploy_grpcstatus.go` plus `app.go`'s `refreshDeployStatus` poll) was
+> removed in memql-cockpit#221 when the persistent split landed. The
+> concept-driven Deployments section above is the single deployment
+> surface now.
 
 ### Architecture navigator (the `X` toggle)
 
@@ -293,22 +335,23 @@ memql-cockpit#197.)
 | Esc       | Cancel                              |
 
 ### Clusters tab (Topology pane focus)
-| Key         | Action                                              |
-|-------------|-----------------------------------------------------|
-| WASD        | Pan the live-topology grid                          |
-| R           | Reset pan to origin                                 |
-| X           | Toggle Architecture navigator (drill-down)          |
-| P           | Toggle the Deployments section (history + controls) |
 
-### Clusters tab (Deployments section, P-toggled)
+The right pane is a persistent split: the topology grid (top) and the
+always-on Deployments section (bottom). The topology pan/reset/arch
+keys and the deployments navigation/control keys are both live at once
+(they don't collide -- `B`/`C`/`G` + arrows drive deployments; `WASD`
+pans the grid). There is no toggle.
+
 | Key         | Action                                                  |
 |-------------|---------------------------------------------------------|
-| ↑/↓         | Move the history cursor                                 |
+| WASD        | Pan the live-topology grid (top region)                 |
+| R           | Reset pan to origin                                     |
+| X           | Toggle Architecture navigator (drill-down, top region)  |
+| ↑/↓         | Move the Deployments history cursor (bottom region)     |
 | Enter       | Load the selected deployment's topology (nodes/orphans) |
 | C           | Cut a new version (developer/admin/owner)               |
 | G           | Deploy the selected pending deployment (developer+)     |
 | B           | Roll back to the selected succeeded deployment (owner)  |
-| Esc / P     | Return to the live topology                             |
 
 ### Architecture navigator (X-toggled)
 | Key         | Action                                              |
@@ -327,7 +370,10 @@ memql-cockpit#197.)
 | `app.go`                 | Top-level App: tab bar, screen loop, callback wiring          |
 | `pool.go`                | Per-cluster `connEntry` + lifecycle state machine             |
 | `cluster/clusters_view.go` | Clusters tab layout, focus, cluster manager                |
-| `cluster/topology.go`    | Live cluster topology grid (right pane) + Architecture toggle |
+| `cluster/topology.go`    | Right-pane persistent split: live topology grid (top) + Architecture toggle + `View.Draw` split layout |
+| `cluster/deployments.go` | Deployments section (bottom band): history list + per-deployment detail/topology |
+| `cluster/deployments_controls.go` | Cut/deploy/rollback concept modal for the Deployments section |
+| `cluster/deploy_shared.go` | Shared deploy helpers (async-fire outcome, gRPC PermissionDenied mapping, colored-token / wrapped-text writers) reused by the Deployments section |
 | `cluster/architecture.go`| `ArchView`: drill-down navigator over `topology.model.json`   |
 | `cluster/metrics_fetcher.go` | `QueryClientMetricsFetcher`: codeMetric overlay fetch      |
 | _gRPC client_            | Lives in `memql/sdk/go/client/` -- `Connection`, `Dispatcher`, `QueryClient`, `SubscriptionManager`. Cockpit imports the SDK rather than reimplementing the wire layer. |
