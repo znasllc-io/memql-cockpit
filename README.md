@@ -29,7 +29,7 @@ memQL Cockpit is the terminal-native IDE and operations console for [memQL](http
 
 ## Features
 
-- **Multi-tab TUI** — clusters, concepts, planner, settings — all in one terminal; the unified Concepts tab consumes `@displayCard` hints to render rows nicely per concept
+- **Multi-tab TUI** — clusters, concepts, settings — all in one terminal; the unified Concepts tab consumes `@displayCard` hints to render rows nicely per concept
 - **DSL editor + linter** — write `.memql` files with structured validation
 - **Worker modes** — per-user workers bring computer use into the platform: `HEADLESS` (shell / fs / http tools) on every build, `GUI` on the gui variant
 - **GUI variant** — opt-in CGO build with screenshot, mouse, keyboard, and window control via RobotGo; see [docs/computer-use.md](docs/computer-use.md)
@@ -105,16 +105,15 @@ memql-cockpit worker consent status                        # show current state
 memql-cockpit worker consent watch                         # live event tail
 ```
 
-`--strict` adds **per-action approval** on the high-risk subset
-(`key_type`, `key_hold`, `mouse_click`, `mouse_down`, `mouse_up`):
-those calls block until the operator clicks Allow or Deny in the
-Workers tab (F6), timing out to deny after 30 seconds. A strict grant
-made from the Workers tab can carry a screen-region rect that
-pre-authorises in-region `mouse_click`s. A global kill switch
-(`Ctrl+E` from any tab) revokes the window and cancels pending
-approvals. Details, including the Workers-tab dashboard and region
-picker: [docs/computer-use.md](docs/computer-use.md) and
-memql-cockpit#64.
+`--strict` flags the window for **per-action approval** on the
+high-risk subset (`key_type`, `key_hold`, `mouse_click`, `mouse_down`,
+`mouse_up`); interactive Allow/Deny enforcement is a follow-up under
+memql-cockpit#64. Close a window immediately with `worker consent
+revoke`. (The in-TUI Workers consent dashboard + region picker and the
+global `Ctrl+E` kill switch were removed with the other panels in
+memql-cockpit#216 -- consent is managed via the `worker consent`
+subcommands above; the worker daemon itself is unaffected.) Details:
+[docs/computer-use.md](docs/computer-use.md).
 
 ### Credential storage
 

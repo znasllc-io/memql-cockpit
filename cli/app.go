@@ -16,20 +16,15 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/znasllc-io/memql-cockpit/cli/auth"
-	"github.com/znasllc-io/memql-cockpit/cli/bundles"
 	"github.com/znasllc-io/memql-cockpit/cli/cluster"
 	"github.com/znasllc-io/memql-cockpit/cli/concepts"
 	"github.com/znasllc-io/memql-cockpit/cli/config"
 	"github.com/znasllc-io/memql-cockpit/cli/crash"
-	"github.com/znasllc-io/memql-cockpit/cli/planner"
-	"github.com/znasllc-io/memql-cockpit/cli/safety"
 	"github.com/znasllc-io/memql-cockpit/cli/settings"
-	"github.com/znasllc-io/memql-cockpit/cli/skills"
 	"github.com/znasllc-io/memql-cockpit/cli/splash"
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
 	genesiswizard "github.com/znasllc-io/memql-cockpit/cli/wizard/genesis"
 	"github.com/znasllc-io/memql-cockpit/cli/wizard/runlocal"
-	"github.com/znasllc-io/memql-cockpit/cli/workers"
 	corgenesis "github.com/znasllc-io/memql/component/genesis"
 	"github.com/znasllc-io/memql/component/node"
 	nodev1 "github.com/znasllc-io/memql/component/node/gen"
@@ -79,7 +74,7 @@ type App struct {
 	// viewed is the cluster the topology pane is currently rendering
 	// (follows arrow-key highlight).
 	// selected is the cluster the user has chosen as their "working
-	// cluster" via Enter. Drives the Concepts / Planner tabs.
+	// cluster" via Enter. Drives the Concepts tab.
 	// Auto-set to the first cluster that successfully connects on
 	// startup (typically "local").
 	viewed   string
@@ -94,11 +89,6 @@ type App struct {
 	// Tab views
 	conceptsView *concepts.View
 	clustersView *cluster.ClustersView
-	plannerView  *planner.View
-	skillsView   *skills.View
-	bundlesView  *bundles.View
-	workersView  *workers.View
-	safetyView   *safety.View
 	settingsView *settings.View
 
 	// getQueries returns a QueryClient bound to the currently active
@@ -136,31 +126,15 @@ func NewApp(cfg AppConfig) *App {
 
 	conceptsView := concepts.NewView(theme)
 	clustersView := cluster.NewClustersView(theme)
-	plannerView := planner.NewView(theme)
-	skillsView := skills.NewView(theme)
-	bundlesView := bundles.NewView(theme)
-	workersView := workers.NewView(theme)
-	safetyView := safety.NewView(theme)
 
 	// Clusters comes first -- it's the starting context for the session.
-	// Concepts / Planner follow as operations-console reads. Skills (F4)
-	// is the read-only catalog browser for v1:agents:skill rows
-	// introduced by memql#158 + memql-cockpit#124 -- agents themselves
-	// live under the Concepts tab now (post the memql-cockpit#126 retire)
-	// but the skill catalog is dense enough to earn its own surface with
-	// category + tier grouping. Workers (F5) hosts the computer-use
-	// consent dashboard + live audit tail introduced in memql-cockpit#64
-	// -- not gated on a cluster connection because it talks to a local
-	// worker daemon over a Unix socket, not over the cluster gRPC.
-	// Settings stays last.
+	// Concepts follows as the operations-console read surface. Settings
+	// stays last. (Planner / Skills / Workers / Safety / Bundles panels
+	// were removed in memql-cockpit#216 -- the cockpit is scoped to
+	// cluster management + concept browsing + settings for now.)
 	tabBar := ui.NewTabBar(theme,
 		ui.Tab{Name: "Clusters", Content: clustersView},
 		ui.Tab{Name: "Concepts", Content: conceptsView},
-		ui.Tab{Name: "Planner", Content: plannerView},
-		ui.Tab{Name: "Skills", Content: skillsView},
-		ui.Tab{Name: "Workers", Content: workersView},
-		ui.Tab{Name: "Safety", Content: safetyView},
-		ui.Tab{Name: "Bundles", Content: bundlesView},
 		ui.Tab{Name: "Settings", Content: settingsView},
 	)
 	tabBar.SetActive(0)
@@ -177,11 +151,6 @@ func NewApp(cfg AppConfig) *App {
 		pool:          make(map[string]*connEntry),
 		conceptsView:  conceptsView,
 		clustersView:  clustersView,
-		plannerView:   plannerView,
-		skillsView:    skillsView,
-		bundlesView:   bundlesView,
-		workersView:   workersView,
-		safetyView:    safetyView,
 		settingsView:  settingsView,
 		helpOverlay:   ui.NewHelpOverlay(theme),
 		tabCrashes:    make(map[string]*crash.Report),
@@ -410,17 +379,6 @@ func (a *App) dispatchEvent(ev tcell.Event) bool {
 			return false
 		}
 
-		// Ctrl+E is the global computer-use kill switch from any
-		// tab. Calls workersView.Revoke() over the consent socket;
-		// the response surfaces as a notification. Available even
-		// while a modal is open in the Workers tab so the operator
-		// can always cut access in one keystroke without first
-		// closing whatever else they were doing. Per memql-cockpit#64.
-		if ev.Key() == tcell.KeyCtrlE {
-			a.handleKillSwitch()
-			return false
-		}
-
 		// Help overlay consumes Escape when visible.
 		if a.helpOverlay.Visible {
 			if ev.Key() == tcell.KeyEscape {
@@ -489,35 +447,6 @@ func (a *App) dispatchEvent(ev tcell.Event) bool {
 		}
 	}
 	return false
-}
-
-// handleKillSwitch is the global Ctrl+E action. Calls
-// workersView.Revoke synchronously (the socket op is local-host
-// and fast) and surfaces the outcome on the notification feed.
-// No-op (with an explanatory notification) when no window is
-// currently open, so the operator gets honest feedback instead of
-// a silent shrug.
-func (a *App) handleKillSwitch() {
-	if a.workersView == nil {
-		return
-	}
-	if !a.workersView.IsGranted() {
-		if a.notifications != nil {
-			a.notifications.Sync("workers", ui.SeverityInfo, "Kill switch: no consent window was open -- nothing to revoke.")
-		}
-		a.draw()
-		return
-	}
-	go func() {
-		if err := a.workersView.Revoke(); err != nil {
-			if a.notifications != nil {
-				a.notifications.Sync("workers", ui.SeverityError, fmt.Sprintf("Kill switch: revoke failed: %v", err))
-			}
-		} else if a.notifications != nil {
-			a.notifications.Sync("workers", ui.SeverityInfo, "Kill switch: computer-use consent revoked.")
-		}
-		a.postRedraw()
-	}()
 }
 
 // Quit signals the application to shut down. Closes every pool
@@ -599,12 +528,6 @@ func (a *App) connect() {
 	// before the first successful dial lands.
 	a.wireConcepts()
 	a.wireCluster()
-	a.wirePlanner()
-	a.wireSkills()
-	a.wireBundles()
-	a.wireWorkers()
-	a.wireSafety()
-
 	for _, cfg := range configs {
 		a.openEntry(cfg)
 	}
@@ -950,8 +873,8 @@ func (a *App) viewedEntry() *connEntry {
 
 // setViewed updates which cluster the topology pane renders.
 // Called by OnHighlight (arrow keys). No side effects on the
-// Concepts / Planner workspace -- those follow a.selected, which
-// is a separate concept changed by OnEnter, not arrow keys.
+// Concepts workspace -- that follows a.selected, which is a separate
+// concept changed by OnEnter, not arrow keys.
 func (a *App) setViewed(name string) {
 	a.poolMu.Lock()
 	a.viewed = name
@@ -986,14 +909,14 @@ func (a *App) setViewed(name string) {
 }
 
 // setSelected promotes a cluster to "my working cluster" -- drives
-// Concepts/Planner. Called by OnEnter. If the entry is in
+// the Concepts tab. Called by OnEnter. If the entry is in
 // stateFailed, also kicks a manual Retry so Enter on a dead cluster
 // means "I want this to come back". Persists the choice to
 // clusters.yaml so the next launch restores it.
 func (a *App) setSelected(name string) {
 	// Only CONNECTED clusters can become the working cluster.
 	// Selecting a still-dialing or unreachable cluster has no useful
-	// effect (Concepts/Planner are gated on a connected
+	// effect (Concepts is gated on a connected
 	// dispatcher anyway), so Enter is a no-op for those rows. The
 	// hint strip already hides "Enter:Select" in those states; this
 	// is the matching guard at the action layer.
@@ -1039,17 +962,6 @@ func (a *App) setSelected(name string) {
 	// connected yet, so without this re-trigger the Concepts tab stays
 	// empty even though ListConcepts would return data the moment we ask.
 	go a.refreshConcepts(context.Background())
-
-	// Same one-shot refresh for the Planner tab. The 3s background
-	// refresher in plannerView will keep it fresh after this; we just
-	// want the first paint on cluster-up to not wait the full tick.
-	if a.plannerView != nil {
-		go func() {
-			a.plannerView.RefreshPlans()
-			a.plannerView.RefreshTasksForSelected()
-			a.postRedraw()
-		}()
-	}
 
 	a.postRedraw()
 }
@@ -1154,154 +1066,6 @@ func (a *App) wireConcepts() {
 	// cluster (e.g. local) is already in stateConnected by the time
 	// wireConcepts runs.
 	go a.refreshConcepts(context.Background())
-}
-
-// wirePlanner connects the Planner tab callbacks to the gRPC client.
-// Same getQueries closure pattern as wireConcepts: every call resolves
-// against the currently active dispatcher, so a cluster switch is
-// transparent to the view. Also kicks off a background refresh loop
-// that polls queryAllPlans + queryTasksForPlan periodically so Plan /
-// Task state appears live without subscriptions.
-func (a *App) wirePlanner() {
-	if a.plannerView == nil {
-		return
-	}
-	getQueries := func() *client.QueryClient {
-		d := a.activeDispatcher()
-		if d == nil {
-			return nil
-		}
-		return client.NewQueryClient(d)
-	}
-	a.plannerView.QueryClient = getQueries
-	a.plannerView.OnStatus = func(msg string) {
-		if a.notifications != nil {
-			a.notifications.Sync("planner", ui.SeverityWarning, msg)
-		}
-	}
-	a.plannerView.OnRedraw = func() {
-		// Background refresher landed new data. Post an Interrupt so
-		// the tcell event loop re-renders even though no key was
-		// pressed.
-		if a.screen != nil {
-			a.screen.PostEvent(tcell.NewEventInterrupt(nil))
-		}
-	}
-	a.plannerView.StartRefreshLoop(a.quitCh, 3*time.Second)
-}
-
-// wireWorkers connects the Workers tab's OnRedraw to the central
-// redraw queue and starts the long-lived Watch goroutine that
-// streams consent events from the local worker daemon. No
-// QueryClient -- the Workers view talks to a per-user Unix socket
-// (~/.memql/worker.sock), not the cluster's gRPC plane, so it
-// works even when no cluster is connected.
-func (a *App) wireWorkers() {
-	if a.workersView == nil {
-		return
-	}
-	a.workersView.OnStatus = func(msg string) {
-		if a.notifications != nil {
-			a.notifications.Sync("workers", ui.SeverityWarning, msg)
-		}
-	}
-	a.workersView.OnRedraw = a.postRedraw
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		<-a.quitCh
-		cancel()
-		a.workersView.Stop()
-	}()
-	a.workersView.Start(ctx)
-}
-
-// wireSkills connects the Skills tab to the gRPC client. The view
-// polls queryActiveSkillsFull every 30s -- the catalog is small and
-// re-seeded only at cluster startup + via planner mints (Phase 3),
-// so a slower cadence than agents/chat is correct.
-func (a *App) wireSkills() {
-	if a.skillsView == nil {
-		return
-	}
-	getQueries := func() *client.QueryClient {
-		d := a.activeDispatcher()
-		if d == nil {
-			return nil
-		}
-		return client.NewQueryClient(d)
-	}
-	a.skillsView.QueryClient = getQueries
-	a.skillsView.OnStatus = func(msg string) {
-		if a.notifications != nil {
-			a.notifications.Sync("skills", ui.SeverityWarning, msg)
-		}
-	}
-	a.skillsView.OnRedraw = func() {
-		if a.screen != nil {
-			a.screen.PostEvent(tcell.NewEventInterrupt(nil))
-		}
-	}
-	a.skillsView.StartRefreshLoop(a.quitCh, 30*time.Second)
-}
-
-// wireBundles connects the Bundles tab to the gRPC client. The view
-// polls queryAuthoringBundlesForOwner every 15s -- authored bundles land
-// post-hoc as everyday tasks complete (memql#1161), so a steady cadence
-// surfaces a freshly-captured bundle shortly after its task finishes,
-// without the churn of the chat/planner loops.
-func (a *App) wireBundles() {
-	if a.bundlesView == nil {
-		return
-	}
-	getQueries := func() *client.QueryClient {
-		d := a.activeDispatcher()
-		if d == nil {
-			return nil
-		}
-		return client.NewQueryClient(d)
-	}
-	a.bundlesView.QueryClient = getQueries
-	a.bundlesView.OnStatus = func(msg string) {
-		if a.notifications != nil {
-			a.notifications.Sync("bundles", ui.SeverityWarning, msg)
-		}
-	}
-	a.bundlesView.OnRedraw = func() {
-		if a.screen != nil {
-			a.screen.PostEvent(tcell.NewEventInterrupt(nil))
-		}
-	}
-	a.bundlesView.StartRefreshLoop(a.quitCh, 15*time.Second)
-}
-
-// wireSafety connects the Command Safety tab to the gRPC client.
-// The view polls queryAllSafetyClassifications every 5s -- rows
-// land per Gate.Evaluate call so they accumulate steadily under
-// shadow mode; a faster cadence than the skills catalog is
-// warranted while operators are watching the rollout.
-func (a *App) wireSafety() {
-	if a.safetyView == nil {
-		return
-	}
-	getQueries := func() *client.QueryClient {
-		d := a.activeDispatcher()
-		if d == nil {
-			return nil
-		}
-		return client.NewQueryClient(d)
-	}
-	a.safetyView.QueryClient = getQueries
-	a.safetyView.OnStatus = func(msg string) {
-		if a.notifications != nil {
-			a.notifications.Sync("safety", ui.SeverityWarning, msg)
-		}
-	}
-	a.safetyView.OnRedraw = func() {
-		if a.screen != nil {
-			a.screen.PostEvent(tcell.NewEventInterrupt(nil))
-		}
-	}
-	a.safetyView.StartRefreshLoop(a.quitCh, 5*time.Second)
 }
 
 // wireCluster wires the topology pane's OnInitialLoad callback to the
@@ -1940,7 +1704,7 @@ func (a *App) wireClustersCallbacks() {
 	}
 
 	// OnEnter fires when the user presses Enter on a row. Promotes
-	// that cluster to "selected" (drives Concepts / Planner) and,
+	// that cluster to "selected" (drives the Concepts tab) and,
 	// if its pool entry is in stateFailed, kicks a manual retry.
 	a.clustersView.OnEnter = func(clusterName string) {
 		a.setSelected(clusterName)
@@ -2120,7 +1884,7 @@ func (a *App) wireClustersCallbacks() {
 // keyring delete can pop a system permission dialog that's invisible
 // behind the full-screen TUI, hanging the loop indefinitely if run
 // inline (memql-cockpit#191). This mirrors the clipboard-copy (Ctrl+Y)
-// and kill-switch (Ctrl+E) goroutine-fork pattern.
+// goroutine-fork pattern.
 func (a *App) deleteCluster(clusterName string) {
 	if clusterName == "local" {
 		return
@@ -2199,25 +1963,13 @@ func (a *App) deleteCluster(clusterName string) {
 	}
 }
 
-// updateTabGating sets the GatedMessage on the cluster-dependent tabs
-// (Concepts, Planner, Skills, Safety, Bundles) based on whether the
-// user's selected cluster has a live connection. Called from draw() so
-// state changes show up on the next repaint.
+// updateTabGating sets the GatedMessage on the cluster-dependent
+// Concepts tab based on whether the user's selected cluster has a live
+// connection. Called from draw() so state changes show up on the next
+// repaint.
 func (a *App) updateTabGating() {
 	setGated := func(msg string) {
 		a.conceptsView.GatedMessage = msg
-		if a.plannerView != nil {
-			a.plannerView.GatedMessage = msg
-		}
-		if a.skillsView != nil {
-			a.skillsView.GatedMessage = msg
-		}
-		if a.safetyView != nil {
-			a.safetyView.GatedMessage = msg
-		}
-		if a.bundlesView != nil {
-			a.bundlesView.GatedMessage = msg
-		}
 	}
 	name := a.selectedName()
 	if name == "" {
@@ -2419,8 +2171,8 @@ func (a *App) draw() {
 	contentHeight := h - 4
 
 	contentBounds := ui.Rect{X: 0, Y: 2, Width: w, Height: contentHeight}
-	// Gate Concepts / Planner on the selected cluster being
-	// connected. When it isn't, those views render a centered
+	// Gate Concepts on the selected cluster being
+	// connected. When it isn't, that view renders a centered
 	// "not available" message instead of their usual content.
 	a.updateTabGating()
 

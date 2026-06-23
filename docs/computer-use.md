@@ -467,19 +467,18 @@ memql-cockpit worker consent watch                         # live event tail
 
 - A second `grant` overwrites the active window (most recent decision
   wins). `revoke` also denies every pending strict-mode approval.
-- **Strict mode** (`--strict`): the high-risk subset (`key_type`,
-  `key_hold`, `mouse_click`, `mouse_down`, `mouse_up`) blocks on a
-  per-call Allow/Deny approval, surfaced in the cockpit's Workers tab
-  (F6); unanswered approvals deny after 30 seconds. Other interact
+- **Strict mode** (`--strict`): flags the window for per-call
+  Allow/Deny approval on the high-risk subset (`key_type`, `key_hold`,
+  `mouse_click`, `mouse_down`, `mouse_up`). Interactive Allow/Deny
+  enforcement is a follow-up under memql-cockpit#64; the in-TUI
+  approval modal + region picker that surfaced it lived in the cockpit
+  Workers tab, which was removed in memql-cockpit#216. Other interact
   actions (`exec`, `fs_write`, `mouse_move`, `key_combo`, ...) stay
   admitted by the standing window.
-- **Region exemption** (memql-cockpit#131): a strict grant made
-  through the Workers-tab picker can carry a static screen rect; a
-  `mouse_click` whose live cursor is inside it skips the approval
-  modal. `key_type` has no cursor coordinate so it never qualifies.
-  The CLI `grant` path never sets a region.
-- A global kill switch (`Ctrl+E` from any cockpit tab) revokes the
-  window and cancels pending approvals.
+- Close the active window immediately with `memql-cockpit worker
+  consent revoke` (this also cancels any pending approvals). The
+  previous global `Ctrl+E` cockpit kill switch went away with the
+  Workers tab (memql-cockpit#216).
 
 This gate is cockpit-side and operator-facing. It is independent of
 the memql-side gates (per-task Plan approval, user kill-switch
@@ -490,7 +489,7 @@ worker.
 
 | Error code | Cause | Fix |
 |---|---|---|
-| `consent_required` | No active consent window on the worker host (or the window expired). | On the worker host: `memql-cockpit worker consent grant --window=<duration>`, or grant from the Workers tab (F6). |
+| `consent_required` | No active consent window on the worker host (or the window expired). | On the worker host: `memql-cockpit worker consent grant --window=<duration>`. |
 | `permission_denied` | macOS TCC grant missing or revoked: Accessibility (input actions) or Screen Recording (screenshot). Checked per call, so mid-session revocation surfaces immediately. | System Settings -> Privacy & Security -> Accessibility / Screen Recording: enable `memql-cockpit-gui` (the binary itself, not just Terminal, for LaunchAgent use). Re-run `memql-cockpit-gui worker setup` to verify. |
 | `display_server_unsupported` | Linux session is Wayland (`WAYLAND_DISPLAY`/`XDG_SESSION_TYPE` -- wins even when `DISPLAY` is set) or has no display server at all; RobotGo drives X11 only. | Log into an X11 (Xorg) session, or register the worker HEADLESS-only (`install-linux.sh` does this automatically on Wayland). |
 | `out_of_bounds` | Coordinates outside the emitted screenshot rect, or the mapped logical point falls in a gap between displays (union-of-rects validation). The message names the valid rect(s). | Take a fresh default-policy `screenshot` of the target display and derive coordinates from THAT image; pass the same `display` arg on the mouse action. Don't target dead zones between monitors. |
