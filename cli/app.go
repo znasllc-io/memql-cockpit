@@ -1426,31 +1426,14 @@ func detectNodeType(nodeId string) string {
 }
 
 // parseSpawnEvents extracts node info from v1:cluster:spawnEvent records.
-func parseSpawnEvents(result any) []cluster.NodeInfo {
-	if result == nil {
+func parseSpawnEvents(res *client.Result) []cluster.NodeInfo {
+	rows := res.Rows()
+	if len(rows) == 0 {
 		return nil
-	}
-	items, ok := result.([]any)
-	if !ok {
-		if m, ok := result.(map[string]any); ok {
-			for _, key := range []string{"items", "results", "data"} {
-				if arr, ok := m[key].([]any); ok {
-					items = arr
-					break
-				}
-			}
-		}
-		if items == nil {
-			return nil
-		}
 	}
 
 	latest := make(map[string]map[string]any)
-	for _, item := range items {
-		m, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
+	for _, m := range rows {
 		payload := m
 		if p, ok := m["payload"].(map[string]any); ok {
 			payload = p
@@ -1489,25 +1472,16 @@ func parseSpawnEvents(result any) []cluster.NodeInfo {
 // The concept is a time-series so the query returns every historical
 // row. We dedupe to one entry per node id by keeping the row with the
 // highest createdAt (or, failing that, the last one encountered).
-func parseClusterNodes(result any) []cluster.NodeInfo {
-	if result == nil {
-		return nil
-	}
+func parseClusterNodes(res *client.Result) []cluster.NodeInfo {
+	return nodesFromRows(res.Rows())
+}
 
-	var items []any
-
-	switch v := result.(type) {
-	case []any:
-		items = v
-	case map[string]any:
-		// MemQL returns { bundle: { nodes: [...] } } or { result: { bundle: { nodes: [...] } } }
-		// Dig through nested wrappers to find the array.
-		items = extractNodeArray(v)
-		if items == nil {
-			// Single node as a map.
-			items = []any{v}
-		}
-	default:
+// nodesFromRows maps already-unwrapped query rows to NodeInfo. Split out
+// from parseClusterNodes so the row-shape handling (flat vs nested
+// payload) + the dedupe-by-id is unit-testable without constructing an
+// opaque *client.Result.
+func nodesFromRows(rows []client.Row) []cluster.NodeInfo {
+	if len(rows) == 0 {
 		return nil
 	}
 
@@ -1521,13 +1495,9 @@ func parseClusterNodes(result any) []cluster.NodeInfo {
 	}
 	latest := make(map[string]rowWithTime)
 
-	for _, item := range items {
-		m, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-
-		// Try flat fields first, then nested payload.
+	for _, m := range rows {
+		// Result.Rows() flattens payload into the row for bundle
+		// results; a raw []any result keeps it nested -- check both.
 		payload := m
 		if p, ok := m["payload"].(map[string]any); ok {
 			payload = p
@@ -1589,20 +1559,9 @@ func parseClusterNodes(result any) []cluster.NodeInfo {
 // createdAt so the topology row order matches seed file order
 // (bff -> voice -> cognition -> agent -> planner with the current
 // seed).
-func parseClusterNodeTypes(result any) []cluster.NodeTypeInfo {
-	if result == nil {
-		return nil
-	}
-	var items []any
-	switch v := result.(type) {
-	case []any:
-		items = v
-	case map[string]any:
-		items = extractNodeArray(v)
-		if items == nil {
-			items = []any{v}
-		}
-	default:
+func parseClusterNodeTypes(res *client.Result) []cluster.NodeTypeInfo {
+	rows := res.Rows()
+	if len(rows) == 0 {
 		return nil
 	}
 
@@ -1611,11 +1570,7 @@ func parseClusterNodeTypes(result any) []cluster.NodeTypeInfo {
 		created string
 	}
 	latest := make(map[string]rowWithTime)
-	for _, item := range items {
-		m, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
+	for _, m := range rows {
 		payload := m
 		if p, ok := m["payload"].(map[string]any); ok {
 			payload = p
@@ -1650,32 +1605,6 @@ func parseClusterNodeTypes(result any) []cluster.NodeTypeInfo {
 		typed[i] = r.info
 	}
 	return typed
-}
-
-// extractNodeArray digs through nested map wrappers to find an array.
-// Handles MemQL response formats: {bundle: {nodes: [...]}} or {result: {bundle: {nodes: [...]}}}
-func extractNodeArray(m map[string]any) []any {
-	// Direct array keys.
-	for _, key := range []string{"nodes", "items", "results", "data"} {
-		if arr, ok := m[key].([]any); ok {
-			return arr
-		}
-	}
-	// Nested: { bundle: { nodes: [...] } }
-	if bundle, ok := m["bundle"].(map[string]any); ok {
-		if arr, ok := bundle["nodes"].([]any); ok {
-			return arr
-		}
-	}
-	// Nested: { result: { bundle: { nodes: [...] } } }
-	if result, ok := m["result"].(map[string]any); ok {
-		if bundle, ok := result["bundle"].(map[string]any); ok {
-			if arr, ok := bundle["nodes"].([]any); ok {
-				return arr
-			}
-		}
-	}
-	return nil
 }
 
 func firstNonEmpty(values ...string) string {

@@ -620,10 +620,24 @@ func (e *connEntry) initialLoad(ctx context.Context) []cluster.NodeInfo {
 	defer cancel()
 
 	var allNodes []cluster.NodeInfo
-	if result, err := queries.QueryClusterNodes(ctx, client.QueryClusterNodesArgs{}); err == nil {
+	if result, err := queries.QueryClusterNodes(ctx, client.QueryClusterNodesArgs{}); err != nil {
+		// Don't swallow: an error here is indistinguishable from "no
+		// nodes" and silently degrades the topology to the single
+		// synthesized connection node below. Log it so the real cause
+		// (authz / shape / timeout) is visible.
+		if e.app.logger != nil {
+			e.app.logger.Warn("queryClusterNodes failed, topology will fall back to the connected node",
+				"cluster", e.Config.Name, "error", err)
+		}
+	} else {
 		allNodes = parseClusterNodes(result)
 	}
-	if spawnResult, err := queries.QueryClusterSpawnEvents(ctx, client.QueryClusterSpawnEventsArgs{}); err == nil {
+	if spawnResult, err := queries.QueryClusterSpawnEvents(ctx, client.QueryClusterSpawnEventsArgs{}); err != nil {
+		if e.app.logger != nil {
+			e.app.logger.Warn("queryClusterSpawnEvents failed",
+				"cluster", e.Config.Name, "error", err)
+		}
+	} else {
 		spawnNodes := parseSpawnEvents(spawnResult)
 		seen := make(map[string]bool)
 		for _, n := range allNodes {
