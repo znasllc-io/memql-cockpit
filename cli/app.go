@@ -127,13 +127,14 @@ func NewApp(cfg AppConfig) *App {
 	conceptsView := concepts.NewView(theme)
 	clustersView := cluster.NewClustersView(theme)
 
-	// Clusters comes first -- it's the starting context for the session.
-	// Concepts follows as the operations-console read surface. Settings
-	// stays last. (Planner / Skills / Workers / Safety / Bundles panels
-	// were removed in memql-cockpit#216 -- the cockpit is scoped to
-	// cluster management + concept browsing + settings for now.)
+	// DevOps comes first -- it's the starting context for the session
+	// (cluster management + live topology + deployments). Concepts
+	// follows as the operations-console read surface. Settings stays
+	// last. (Planner / Skills / Workers / Safety / Bundles panels were
+	// removed in memql-cockpit#216 -- the cockpit is scoped to DevOps
+	// + concept browsing + settings for now.)
 	tabBar := ui.NewTabBar(theme,
-		ui.Tab{Name: "Clusters", Content: clustersView},
+		ui.Tab{Name: "DevOps", Content: clustersView},
 		ui.Tab{Name: "Concepts", Content: conceptsView},
 		ui.Tab{Name: "Settings", Content: settingsView},
 	)
@@ -318,7 +319,7 @@ func (a *App) dispatchEvent(ev tcell.Event) bool {
 		}
 
 		// Help overlay toggle (Ctrl+?). F1 is dedicated to the
-		// Clusters tab now; toggling help on Settings-tab F1 would
+		// DevOps tab now; toggling help on Settings-tab F1 would
 		// conflict with users who just pressed F1 to switch tabs.
 		if ev.Key() == tcell.KeyRune && ev.Rune() == '?' && ev.Modifiers()&tcell.ModCtrl != 0 {
 			a.helpOverlay.Toggle()

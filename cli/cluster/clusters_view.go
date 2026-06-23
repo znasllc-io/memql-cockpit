@@ -302,7 +302,7 @@ func (v *ClustersView) SetRowStatus(name, status string) {
 	}
 }
 
-// Draw renders the Clusters tab. Holds the read lock for the full
+// Draw renders the DevOps tab. Holds the read lock for the full
 // frame so a concurrent pool-lifecycle mutator (SetClusters /
 // SetConnected / SetRowStatus) can't tear the Clusters slice or
 // per-row Status mid-render.
