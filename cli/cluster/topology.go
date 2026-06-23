@@ -137,8 +137,8 @@ type View struct {
 	// fields below are guarded by v.mu.
 	deployments     []DeploymentInfo // v1:cluster:deployment history, newest-first
 	deploySelected  int              // cursor into deployments
-	deployNodes     []NodeInfo       // nodes for the selected deployment (QueryNodesForDeployment)
-	deployOrphans   []NodeInfo       // nodes NOT in the selected deployment (QueryNodesNotInDeployment)
+	deployNodes     []NodeInfo       // nodes for the selected deployment (NodesForDeployment)
+	deployOrphans   []NodeInfo       // nodes NOT in the selected deployment (NodesNotInDeployment)
 	deployLoadedFor string           // deploymentId the node/orphan cache was loaded for
 
 	// dctrl holds the transient cut/deploy/rollback modal state for the
@@ -152,7 +152,7 @@ type View struct {
 	deployConceptActor deployConceptActions
 
 	// OnDeploymentsShown is called (off-thread) so the app can fetch the
-	// deployment history via QueryDeploymentsForCluster and push it back
+	// deployment history via DeploymentsForCluster and push it back
 	// through SetDeployments. Fired when a cluster's topology is wired up
 	// (the Deployments section is always present, so the history is
 	// loaded eagerly rather than on a toggle).
@@ -160,8 +160,8 @@ type View struct {
 
 	// OnSelectDeployment is called (off-thread) with the selected
 	// deploymentId when the operator drills into a deployment, so the app
-	// can load its nodes (QueryNodesForDeployment) + orphans
-	// (QueryNodesNotInDeployment) and push them back via SetDeploymentNodes.
+	// can load its nodes (NodesForDeployment) + orphans
+	// (NodesNotInDeployment) and push them back via SetDeploymentNodes.
 	OnSelectDeployment func(deploymentID string)
 
 	// OnDeploymentsChanged is called after a cut/deploy/rollback action

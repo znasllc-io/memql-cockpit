@@ -1108,7 +1108,7 @@ func (a *App) wireCluster() {
 	a.clustersView.Topology.OnRedraw = a.postRedraw
 
 	// #207/#221 Deployments section hooks. OnDeploymentsShown loads the
-	// deployment history (QueryExistingCluster -> QueryDeploymentsForCluster);
+	// deployment history (ExistingCluster -> DeploymentsForCluster);
 	// OnSelectDeployment loads the selected deployment's nodes + orphans;
 	// OnDeploymentsChanged re-loads the history after a cut/deploy/rollback
 	// action so the list reflects the new state right away. The section is
@@ -1175,8 +1175,8 @@ func (a *App) activeQueryClient() *client.QueryClient {
 
 // refreshDeployments loads the deployment history for the active cluster
 // and pushes it onto the Topology view's Deployments section. Resolves
-// the clusterId via QueryExistingCluster first (single-cluster staging),
-// then QueryDeploymentsForCluster. Errors leave the existing list intact
+// the clusterId via ExistingCluster first (single-cluster staging),
+// then DeploymentsForCluster. Errors leave the existing list intact
 // and log at debug. Per memql-cockpit#207.
 func (a *App) refreshDeployments() {
 	if a.clustersView == nil || a.clustersView.Topology == nil {
@@ -1192,7 +1192,7 @@ func (a *App) refreshDeployments() {
 	if clusterId == "" {
 		return
 	}
-	res, err := qc.QueryDeploymentsForCluster(ctx, client.QueryDeploymentsForClusterArgs{ClusterId: clusterId})
+	res, err := qc.DeploymentsForCluster(ctx, client.DeploymentsForClusterArgs{ClusterId: clusterId})
 	if err != nil {
 		if a.logger != nil {
 			a.logger.Debug("queryDeploymentsForCluster failed", "cluster", clusterId, "error", err)
@@ -1204,10 +1204,10 @@ func (a *App) refreshDeployments() {
 }
 
 // resolveClusterId returns the active connection's cluster id via
-// QueryExistingCluster, or "" when unknown. Single-cluster staging
+// ExistingCluster, or "" when unknown. Single-cluster staging
 // returns one row; the first non-empty id wins.
 func (a *App) resolveClusterId(ctx context.Context, qc *client.QueryClient) string {
-	res, err := qc.QueryExistingCluster(ctx, client.QueryExistingClusterArgs{})
+	res, err := qc.ExistingCluster(ctx, client.ExistingClusterArgs{})
 	if err != nil {
 		if a.logger != nil {
 			a.logger.Debug("queryExistingCluster failed", "error", err)
@@ -1223,7 +1223,7 @@ func (a *App) resolveClusterId(ctx context.Context, qc *client.QueryClient) stri
 }
 
 // loadDeploymentNodes loads the selected deployment's node set
-// (QueryNodesForDeployment) + orphans (QueryNodesNotInDeployment) and
+// (NodesForDeployment) + orphans (NodesNotInDeployment) and
 // pushes them onto the view. Called off-thread from OnSelectDeployment.
 func (a *App) loadDeploymentNodes(deploymentID string) {
 	if deploymentID == "" || a.clustersView == nil || a.clustersView.Topology == nil {
@@ -1236,12 +1236,12 @@ func (a *App) loadDeploymentNodes(deploymentID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	var nodes, orphans []cluster.NodeInfo
-	if res, err := qc.QueryNodesForDeployment(ctx, client.QueryNodesForDeploymentArgs{DeploymentId: deploymentID}); err == nil {
+	if res, err := qc.NodesForDeployment(ctx, client.NodesForDeploymentArgs{DeploymentId: deploymentID}); err == nil {
 		nodes = parseDeploymentNodes(res)
 	} else if a.logger != nil {
 		a.logger.Debug("queryNodesForDeployment failed", "deployment", deploymentID, "error", err)
 	}
-	if res, err := qc.QueryNodesNotInDeployment(ctx, client.QueryNodesNotInDeploymentArgs{DeploymentId: deploymentID}); err == nil {
+	if res, err := qc.NodesNotInDeployment(ctx, client.NodesNotInDeploymentArgs{DeploymentId: deploymentID}); err == nil {
 		orphans = parseDeploymentNodes(res)
 	} else if a.logger != nil {
 		a.logger.Debug("queryNodesNotInDeployment failed", "deployment", deploymentID, "error", err)

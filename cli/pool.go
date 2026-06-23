@@ -594,7 +594,7 @@ func (e *connEntry) nodeTypesInitialLoad(ctx context.Context) []cluster.NodeType
 	queries := client.NewQueryClient(conn.Dispatcher())
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	result, err := queries.QueryClusterNodeTypes(ctx, client.QueryClusterNodeTypesArgs{})
+	result, err := queries.ClusterNodeTypes(ctx, client.ClusterNodeTypesArgs{})
 	if err != nil {
 		if e.app.logger != nil {
 			e.app.logger.Warn("queryClusterNodeTypes failed, topology will fall back to node order",
@@ -620,7 +620,7 @@ func (e *connEntry) initialLoad(ctx context.Context) []cluster.NodeInfo {
 	defer cancel()
 
 	var allNodes []cluster.NodeInfo
-	if result, err := queries.QueryClusterNodes(ctx, client.QueryClusterNodesArgs{}); err != nil {
+	if result, err := queries.ClusterNodes(ctx, client.ClusterNodesArgs{}); err != nil {
 		// Don't swallow: an error here is indistinguishable from "no
 		// nodes" and silently degrades the topology to the single
 		// synthesized connection node below. Log it so the real cause
@@ -632,7 +632,7 @@ func (e *connEntry) initialLoad(ctx context.Context) []cluster.NodeInfo {
 	} else {
 		allNodes = parseClusterNodes(result)
 	}
-	if spawnResult, err := queries.QueryClusterSpawnEvents(ctx, client.QueryClusterSpawnEventsArgs{}); err != nil {
+	if spawnResult, err := queries.ClusterSpawnEvents(ctx, client.ClusterSpawnEventsArgs{}); err != nil {
 		if e.app.logger != nil {
 			e.app.logger.Warn("queryClusterSpawnEvents failed",
 				"cluster", e.Config.Name, "error", err)
