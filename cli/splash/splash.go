@@ -21,6 +21,7 @@ const (
 	ChoiceQuit             Choice = iota // Ctrl+Q / Ctrl+C / 'q'
 	ChoiceOperatingConsole               // '1' -- open the multi-tab IDE
 	ChoiceRunLocalCluster                // '2' -- placeholder wizard for now
+	ChoiceConfiguration                  // '3' -- env-var registry view/edit screen
 )
 
 // Run blocks polling events from screen until the user picks an
@@ -44,6 +45,8 @@ func Run(screen *ui.Screen, theme ui.Theme) Choice {
 				return ChoiceOperatingConsole
 			case '2':
 				return ChoiceRunLocalCluster
+			case '3':
+				return ChoiceConfiguration
 			case 'q', 'Q':
 				return ChoiceQuit
 			}
@@ -80,6 +83,7 @@ func draw(screen *ui.Screen, theme ui.Theme) {
 	options := []string{
 		"  1   Take the controls",
 		"  2   Set up local cluster",
+		"  3   Configuration",
 		"  Q   Quit",
 	}
 	optY := titleY + 4
@@ -87,7 +91,7 @@ func draw(screen *ui.Screen, theme ui.Theme) {
 		screen.DrawText(px+4, optY+i, panelW-8, opt, theme.BaseStyle())
 	}
 
-	hint := "Press 1 / 2 / Q ..."
+	hint := "Press 1 / 2 / 3 / Q ..."
 	screen.DrawText(px+(panelW-len(hint))/2, py+panelH-2, len(hint), hint, theme.SubtleStyle())
 
 	screen.Show()

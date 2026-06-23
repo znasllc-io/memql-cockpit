@@ -23,6 +23,7 @@ import (
 	"github.com/znasllc-io/memql-cockpit/cli/settings"
 	"github.com/znasllc-io/memql-cockpit/cli/splash"
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
+	configwizard "github.com/znasllc-io/memql-cockpit/cli/wizard/config"
 	genesiswizard "github.com/znasllc-io/memql-cockpit/cli/wizard/genesis"
 	"github.com/znasllc-io/memql-cockpit/cli/wizard/runlocal"
 	corgenesis "github.com/znasllc-io/memql/component/genesis"
@@ -211,6 +212,13 @@ func (a *App) Run() error {
 			case runlocal.ChoiceQuit:
 				return nil
 			case runlocal.ChoiceBack:
+				// loop back to splash
+			}
+		case splash.ChoiceConfiguration:
+			switch configwizard.Run(a.screen, a.theme) {
+			case configwizard.ChoiceQuit:
+				return nil
+			case configwizard.ChoiceBack:
 				// loop back to splash
 			}
 		case splash.ChoiceOperatingConsole:
