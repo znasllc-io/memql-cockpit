@@ -41,10 +41,25 @@ const (
 
 const focusPaneCount = 3
 
+// editMode selects the Editor tab's surface: the read-only pack
+// browser (B2/B3) or the bundle authoring mode (C2 #230). Ctrl+B
+// toggles between them.
+type editMode int
+
+const (
+	modeBrowse editMode = iota
+	modeAuthor
+)
+
 // View is the Editor tab. It holds the browsed pack tree and the
 // currently-loaded file source, plus the three list/viewer widgets.
 type View struct {
 	ui.BaseView
+
+	// mode toggles the read-only pack browser vs. the authoring mode.
+	// author is lazily built on the first switch into authoring.
+	mode   editMode
+	author *authoring
 
 	// domains is the node's full domain set (left pane). files is the
 	// file list for loadedDomain (middle pane). loadedDomain /
@@ -125,6 +140,11 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 
 	if v.GatedMessage != "" {
 		v.drawGated(screen, bounds)
+		return
+	}
+
+	if v.mode == modeAuthor && v.author != nil {
+		v.author.Draw(screen, bounds)
 		return
 	}
 
@@ -291,6 +311,21 @@ func (v *View) renderFileRow(screen *ui.Screen, bounds ui.Rect, idx int, sel boo
 func (v *View) HandleEvent(ev tcell.Event) bool {
 	key, ok := ev.(*tcell.EventKey)
 	if !ok {
+		return false
+	}
+
+	// Ctrl+B toggles between the read-only browser and the authoring
+	// mode. Handled before any pane dispatch so it works from any focus
+	// (incl. the editor, where printable keys are typed).
+	if key.Key() == tcell.KeyCtrlB {
+		v.toggleMode()
+		return true
+	}
+
+	if v.modeIsAuthor() {
+		if v.author != nil {
+			return v.author.HandleEvent(key)
+		}
 		return false
 	}
 
@@ -551,6 +586,29 @@ func (v *View) senseClient() *sense.Client {
 	return v.SenseClient()
 }
 
+// modeIsAuthor reports whether the Editor tab is in authoring mode.
+func (v *View) modeIsAuthor() bool {
+	v.Mu.RLock()
+	defer v.Mu.RUnlock()
+	return v.mode == modeAuthor
+}
+
+// toggleMode flips between the read-only browser and authoring mode,
+// lazily building the authoring sub-view on the first switch.
+func (v *View) toggleMode() {
+	v.Mu.Lock()
+	if v.mode == modeBrowse {
+		if v.author == nil {
+			v.author = newAuthoring(v.Theme, v.SenseClient, v.OnStatus, v.Redraw)
+		}
+		v.mode = modeAuthor
+	} else {
+		v.mode = modeBrowse
+	}
+	v.Mu.Unlock()
+	v.Redraw()
+}
+
 func (v *View) status(msg string) {
 	if v.OnStatus != nil {
 		v.OnStatus(msg)
@@ -618,8 +676,12 @@ func spansFromTokens(tokens []sense.Token, theme ui.Theme) map[int][]ui.Highligh
 
 func (v *View) hintsForDomains() string {
 	if len(v.domains) == 0 {
-		return "Tab:Cycle"
+		return "Ctrl+B:Author  Tab:Cycle"
 	}
+	// Ctrl+B:Author is the tab-level toggle; it's advertised in the
+	// empty-state hint + cli/CLAUDE.md rather than crammed into this
+	// narrow pane's populated hint (which would push Enter:Open off the
+	// chrome band).
 	return ui.HintBar{Chips: []ui.HintChip{
 		{Key: "↑/↓", Label: "Move"},
 		{Key: "Enter", Label: "Open"},
