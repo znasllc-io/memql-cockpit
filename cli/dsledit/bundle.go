@@ -151,6 +151,30 @@ func readBundleFile(bundle, name string) (string, error) {
 	return string(b), nil
 }
 
+// bundleSources concatenates every .memql/.tmpl file in a bundle into
+// one source string (blank-line separated) for Validate / Inject. The
+// Gate-1 / session-define APIs take the whole bundle as one `sources`
+// payload (a single file may hold many constructs, and constructs can
+// reference each other across files).
+func bundleSources(bundle string) (string, error) {
+	files, err := listBundleFiles(bundle)
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	for i, f := range files {
+		src, err := readBundleFile(bundle, f)
+		if err != nil {
+			return "", err
+		}
+		if i > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(src)
+	}
+	return b.String(), nil
+}
+
 // writeBundleFile saves a bundle file's source to disk.
 func writeBundleFile(bundle, name, content string) error {
 	if err := safeName(bundle); err != nil {

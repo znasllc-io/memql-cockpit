@@ -112,12 +112,16 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
    Sense IntelliSense -- coloring, inline diagnostics, completion
    (`Ctrl+Space`), hover (`Ctrl+K`), save (`Ctrl+S`) -- reusing
    `cli/editor`. BUNDLES → FILES → EDITOR panes; `N` creates a
-   bundle/file. Embedded/pack files stay read-only; authored bundles
-   are validated/injected into a session in C3 (#231). Lives in
-   `cli/dsledit/` (`view.go` browser, `author.go` authoring, `bundle.go`
-   workspace IO); the colored read-only render reuses `cli/ui/viewer.go`
-   (its optional `ShowCursor`/`CursorLine` line-highlight landed for
-   this).
+   bundle/file. `Ctrl+G` **validates** the bundle (Gate-1 sandbox, no
+   mutation) and `Ctrl+R` **injects** it (session-define) so its
+   constructs become callable by name for the session -- never
+   shadowing core, dropped at session end (C3 #231); both render a
+   per-construct results overlay (`Esc` closes). Embedded/pack files
+   stay read-only. Lives in `cli/dsledit/` (`view.go` browser,
+   `author.go` authoring + validate/inject, `bundle.go` workspace IO);
+   the colored read-only render reuses `cli/ui/viewer.go` (its optional
+   `ShowCursor`/`CursorLine` line-highlight landed for this). Validate /
+   Inject go through the `memql/sdk/go/authoring` SDK.
 4. **Settings (F4)** -- credentials, theme, version
 
 The Concepts and Editor tabs are gated on a connected, selected
@@ -507,7 +511,9 @@ pans the grid). There is no toggle.
 | Ctrl+S      | EDITOR: save the buffer to disk                              |
 | Ctrl+Space  | EDITOR: Sense completion at the cursor                       |
 | Ctrl+K      | EDITOR: Sense hover at the cursor                            |
-| Esc         | EDITOR: dismiss completion/hover; prompt: cancel             |
+| Ctrl+G      | Validate the bundle (Gate-1 sandbox; no engine mutation)     |
+| Ctrl+R      | Inject the bundle (session-define; session-scoped, never shadows core) |
+| Esc         | Dismiss the validate/inject overlay; completion/hover; prompt: cancel |
 
 ---
 
@@ -529,7 +535,7 @@ pans the grid). There is no toggle.
 | `sense/`                 | `SenseClient` over the SDK Dispatcher -- editor-side wrappers for MemQL Sense (Tokenize / Diagnose / Complete / Hover). |
 | `config/clusters.go`     | `~/.memql/clusters.yaml` load/save                            |
 | `concepts/`              | Concepts tab (concept picker + row list + generic renderer)   |
-| `dsledit/`               | Editor tab: `view.go` read-only DSL pack browser (domains/files/source) over `memql/sdk/go/pack` (#228) + Sense coloring/hover (#229); `author.go` Ctrl+B authoring mode (editable bundles via `cli/editor`, #230); `bundle.go` local `~/.memql/bundles` workspace IO |
+| `dsledit/`               | Editor tab: `view.go` read-only DSL pack browser (domains/files/source) over `memql/sdk/go/pack` (#228) + Sense coloring/hover (#229); `author.go` Ctrl+B authoring mode (editable bundles via `cli/editor`, #230) + Validate/Inject over `memql/sdk/go/authoring` (#231); `bundle.go` local `~/.memql/bundles` workspace IO |
 | `editor/`                | Reusable text editor with Sense integration                   |
 | `settings/`              | Settings tab                                                  |
 | `ui/`                    | Theme, screen, tab bar, layout primitives                     |
