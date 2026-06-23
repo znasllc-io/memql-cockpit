@@ -1188,6 +1188,15 @@ func (a *App) wirePacks() {
 		}
 		return pack.NewClient(d)
 	}
+	// Sense client for SOURCE-pane coloring + hover (#229), bound to
+	// the active cluster's dispatcher like the Concepts tab's.
+	a.dsleditView.SenseClient = func() *sense.Client {
+		d := a.activeDispatcher()
+		if d == nil {
+			return nil
+		}
+		return sense.NewClient(d)
+	}
 	a.dsleditView.OnStatus = func(msg string) {
 		if a.notifications != nil {
 			a.notifications.Sync("editor", ui.SeverityWarning, msg)

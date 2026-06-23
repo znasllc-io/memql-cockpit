@@ -352,3 +352,45 @@ func TestViewer_EmptyLineRendersBlankRowWithNumber(t *testing.T) {
 		t.Errorf("blank-line content area not empty: %q", got)
 	}
 }
+
+// TestViewer_CursorAutoScrolls: with ShowCursor set, Draw scrolls so
+// the cursor's source line is visible even when it's far below the
+// initial viewport top. The off-by-default cursor leaves the
+// scroll-only mode (and the Concepts detail pane) untouched.
+func TestViewer_CursorAutoScrolls(t *testing.T) {
+	screen, sim := makeViewerSim(t, 30, 6)
+	defer sim.Fini()
+
+	lines := make([]ViewerLine, 40)
+	for i := range lines {
+		lines[i] = ViewerLine{Text: "line"}
+	}
+	v := Viewer{Lines: lines, ShowCursor: true, CursorLine: 30}
+	v.Draw(screen, Rect{X: 0, Y: 0, Width: 30, Height: 6}, DefaultTheme())
+	sim.Sync()
+
+	// Cursor line 30 (1-indexed 31) must be within the visible window
+	// [ScrollY, ScrollY+6). Since these lines don't wrap, row index ==
+	// source line, so ScrollY should have advanced from 0.
+	if v.ScrollY > 30 || v.ScrollY+6 <= 30 {
+		t.Fatalf("cursor line 30 not visible: ScrollY=%d window=[%d,%d)", v.ScrollY, v.ScrollY, v.ScrollY+6)
+	}
+}
+
+// TestViewer_NoCursorByDefault: ShowCursor=false leaves ScrollY at 0
+// (the original scroll-only contract the Concepts pane depends on).
+func TestViewer_NoCursorByDefault(t *testing.T) {
+	screen, sim := makeViewerSim(t, 30, 6)
+	defer sim.Fini()
+
+	lines := make([]ViewerLine, 40)
+	for i := range lines {
+		lines[i] = ViewerLine{Text: "line"}
+	}
+	v := Viewer{Lines: lines, CursorLine: 30} // ShowCursor defaults false
+	v.Draw(screen, Rect{X: 0, Y: 0, Width: 30, Height: 6}, DefaultTheme())
+	sim.Sync()
+	if v.ScrollY != 0 {
+		t.Fatalf("ScrollY moved to %d with ShowCursor=false; cursor must be ignored", v.ScrollY)
+	}
+}

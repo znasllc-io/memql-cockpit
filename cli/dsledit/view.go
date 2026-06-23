@@ -5,12 +5,14 @@
 // multi-pane View embedding ui.BaseView, wired to the active cluster's
 // dispatcher by the app layer.
 //
-// B2 (memql-cockpit#228) is the scaffold + read-only browser: a
+// B2 (memql-cockpit#228) was the scaffold + read-only browser: a
 // domain tree (left), the files in the selected domain (middle), and
-// the selected file's raw source (right). B3 (#229) swaps the raw
-// source pane for a MemQL Sense-colored render; C2/C3 add the bundle
-// authoring surface. Per the cockpit SDK-only rule, every wire call
-// goes through the SDK pack.Client -- no raw DSL, no memqlv1 imports.
+// the selected file's raw source (right). B3 (#229) colors the SOURCE
+// pane with MemQL Sense tokens and adds a line cursor + Sense hover
+// (read-only -- editing embedded/pack files is the bundle-authoring
+// path, C2/C3). Per the cockpit SDK-only rule, every wire call goes
+// through the SDK pack.Client / sense.Client -- no raw DSL, no memqlv1
+// import.
 package dsledit
 
 import (
@@ -22,6 +24,7 @@ import (
 	"github.com/gdamore/tcell/v2"
 
 	"github.com/znasllc-io/memql/sdk/go/pack"
+	"github.com/znasllc-io/memql/sdk/go/sense"
 
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
 )
@@ -58,11 +61,31 @@ type View struct {
 	fileList   ui.ListPane
 	viewer     ui.Viewer
 
+	// srcText is the raw source backing the SOURCE viewer (kept so
+	// Sense hover can be requested against the exact text the user
+	// sees). cursorLine / cursorCol are the 0-based hover cursor
+	// position within srcText, navigated in the SOURCE pane.
+	srcText    string
+	cursorLine int
+	cursorCol  int
+
+	// hover holds the last Sense hover result for the cursor position;
+	// hoverShown gates the overlay.
+	hoverShown bool
+	hoverText  string
+
 	// PackClient returns a pack client bound to the active cluster's
 	// dispatcher, or nil when no cluster is connected. Set by the app
 	// layer; the gated placeholder shows when it (or its result) is
 	// nil. Mirrors the Concepts tab's QueryClient closure.
 	PackClient func() *pack.Client
+
+	// SenseClient returns a Sense client bound to the active cluster's
+	// dispatcher, or nil when none is connected. Used to color the
+	// SOURCE pane (Tokenize) and answer hover (Hover). The viewer
+	// degrades to plain text when this is nil. Mirrors the Concepts
+	// tab's SenseClient closure.
+	SenseClient func() *sense.Client
 }
 
 // NewView builds an empty Editor view.
@@ -181,9 +204,55 @@ func (v *View) drawSource(screen *ui.Screen, bounds ui.Rect) {
 	}.Draw(screen, bounds, v.Theme)
 
 	v.viewer.Focused = v.Focus == FocusSource
-	v.viewer.Draw(screen, paneChromeBounds(bounds), v.Theme)
+	// Show the hover cursor only when the SOURCE pane is focused and has
+	// content -- otherwise the viewer stays in plain scroll mode.
+	v.viewer.ShowCursor = v.Focus == FocusSource && len(v.viewer.Lines) > 0
+	v.viewer.CursorLine = v.cursorLine
+	chrome := paneChromeBounds(bounds)
+	v.viewer.Draw(screen, chrome, v.Theme)
+
+	if v.hoverShown && v.hoverText != "" {
+		v.drawHoverOverlay(screen, chrome)
+	}
 
 	ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1, v.hintsForSource())
+}
+
+// drawHoverOverlay paints the Sense hover result as a small bordered
+// box anchored to the top of the SOURCE content area. Markdown is
+// stripped to plain text (the cockpit terminal can't render it) and
+// the box is clamped to the pane so it never overflows.
+func (v *View) drawHoverOverlay(screen *ui.Screen, bounds ui.Rect) {
+	lines := hoverLines(v.hoverText, bounds.Width-4)
+	if len(lines) == 0 {
+		return
+	}
+	maxLines := bounds.Height - 2
+	if maxLines < 1 {
+		return
+	}
+	if len(lines) > maxLines {
+		lines = lines[:maxLines]
+	}
+	w := 0
+	for _, ln := range lines {
+		if len([]rune(ln)) > w {
+			w = len([]rune(ln))
+		}
+	}
+	boxW := w + 4
+	if boxW > bounds.Width {
+		boxW = bounds.Width
+	}
+	boxH := len(lines) + 2
+	x := bounds.X
+	y := bounds.Y
+	bg := tcell.StyleDefault.Background(tcell.NewRGBColor(50, 54, 62)).Foreground(v.Theme.FG)
+	screen.FillRect(x, y, boxW, boxH, bg)
+	screen.DrawBox(x, y, boxW, boxH, bg.Foreground(v.Theme.Subtle))
+	for i, ln := range lines {
+		screen.DrawText(x+2, y+1+i, boxW-4, ln, bg)
+	}
 }
 
 func (v *View) renderDomainRow(screen *ui.Screen, bounds ui.Rect, idx int, sel bool, theme ui.Theme) {
@@ -260,9 +329,121 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 	case FocusFiles:
 		return v.fileList.HandleEvent(ev)
 	case FocusSource:
-		return v.viewer.HandleEvent(ev)
+		return v.handleSourceKey(key)
 	}
 	return false
+}
+
+// handleSourceKey drives the SOURCE pane's read-only hover cursor:
+// Up/Down move the cursor line (the viewer auto-scrolls to keep it
+// visible), Left/Right move the column, H requests Sense hover at the
+// cursor, Esc dismisses the hover. PgUp/PgDn/Home/End fall through to
+// the viewer's scroll bindings.
+func (v *View) handleSourceKey(key *tcell.EventKey) bool {
+	v.Mu.Lock()
+	nLines := len(v.viewer.Lines)
+	if nLines == 0 {
+		v.Mu.Unlock()
+		return v.viewer.HandleEvent(key)
+	}
+	switch key.Key() {
+	case tcell.KeyUp:
+		if v.cursorLine > 0 {
+			v.cursorLine--
+			v.clampCursorColLocked()
+		}
+		v.hoverShown = false
+		v.Mu.Unlock()
+		return true
+	case tcell.KeyDown:
+		if v.cursorLine < nLines-1 {
+			v.cursorLine++
+			v.clampCursorColLocked()
+		}
+		v.hoverShown = false
+		v.Mu.Unlock()
+		return true
+	case tcell.KeyLeft:
+		if v.cursorCol > 0 {
+			v.cursorCol--
+		}
+		v.hoverShown = false
+		v.Mu.Unlock()
+		return true
+	case tcell.KeyRight:
+		v.cursorCol++
+		v.clampCursorColLocked()
+		v.hoverShown = false
+		v.Mu.Unlock()
+		return true
+	case tcell.KeyEsc:
+		if v.hoverShown {
+			v.hoverShown = false
+			v.Mu.Unlock()
+			return true
+		}
+		v.Mu.Unlock()
+		return false
+	case tcell.KeyRune:
+		if r := key.Rune(); r == 'h' || r == 'H' {
+			line, col := v.cursorLine, v.cursorCol
+			v.Mu.Unlock()
+			v.requestHover(line, col)
+			return true
+		}
+	}
+	// Everything else (PgUp/PgDn/Home/End/j/k) is viewport scrolling.
+	v.Mu.Unlock()
+	return v.viewer.HandleEvent(key)
+}
+
+// clampCursorColLocked keeps cursorCol within the current cursor
+// line's rune length. Caller holds v.Mu.
+func (v *View) clampCursorColLocked() {
+	lines := strings.Split(v.srcText, "\n")
+	if v.cursorLine < 0 || v.cursorLine >= len(lines) {
+		v.cursorCol = 0
+		return
+	}
+	n := len([]rune(lines[v.cursorLine]))
+	if v.cursorCol > n {
+		v.cursorCol = n
+	}
+	if v.cursorCol < 0 {
+		v.cursorCol = 0
+	}
+}
+
+// requestHover asks Sense for hover info at the (0-based) line/col and
+// shows the result in the overlay. Runs off the UI goroutine.
+func (v *View) requestHover(line, col int) {
+	sc := v.senseClient()
+	v.Mu.RLock()
+	src := v.srcText
+	v.Mu.RUnlock()
+	if sc == nil || src == "" {
+		v.status("hover unavailable -- no Sense client for the active cluster")
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		// Sense positions are 1-indexed (line + column).
+		h, err := sc.Hover(ctx, src, sense.Position{Line: line + 1, Column: col + 1})
+		if err != nil {
+			v.status(fmt.Sprintf("hover: %v", err))
+			return
+		}
+		v.Mu.Lock()
+		if h == nil || strings.TrimSpace(h.Contents) == "" {
+			v.hoverText = "(no hover info here)"
+		} else {
+			v.hoverText = h.Contents
+		}
+		v.hoverShown = true
+		v.Mu.Unlock()
+		v.Redraw()
+	}()
 }
 
 // loadFiles fetches the file list for domain and moves focus to the
@@ -287,16 +468,18 @@ func (v *View) loadFiles(domain string) {
 		v.fileList.ScrollY = 0
 		v.loadedFile = ""
 		v.viewer.Lines = nil
-		v.viewer.ScrollY = 0
+		v.srcText = ""
+		v.resetSourceCursorLocked()
 		v.Focus = FocusFiles
 		v.Mu.Unlock()
 		v.Redraw()
 	}()
 }
 
-// loadSource fetches a single file's source and moves focus to the
-// Source pane. Renders the raw source as plain viewer lines -- Sense
-// coloring is B3 (#229).
+// loadSource fetches a single file's source, colors it with Sense
+// tokens (when a Sense client is available), and moves focus to the
+// Source pane. Coloring failures fall back to plain text -- the source
+// still renders, just uncolored.
 func (v *View) loadSource(domain, path string) {
 	client := v.packClient()
 	if client == nil || domain == "" {
@@ -310,18 +493,48 @@ func (v *View) loadSource(domain, path string) {
 			v.status(fmt.Sprintf("read %s/%s: %v", domain, path, err))
 			return
 		}
-		v.Mu.Lock()
 		if src == nil || !src.Found {
+			v.Mu.Lock()
 			v.viewer.Lines = []ui.ViewerLine{{Text: fmt.Sprintf("(file not found: %s/%s)", domain, path)}}
-		} else {
-			v.viewer.Lines = plainLines(src.Source)
+			v.srcText = ""
+			v.resetSourceCursorLocked()
+			v.loadedFile = path
+			v.Focus = FocusSource
+			v.Mu.Unlock()
+			v.Redraw()
+			return
 		}
-		v.viewer.ScrollY = 0
+
+		// Color via Sense if available. The tokenize call is best-
+		// effort: on error (or no Sense client) we render plain.
+		var tokens []sense.Token
+		if sc := v.senseClient(); sc != nil {
+			if toks, terr := sc.Tokenize(ctx, src.Source); terr != nil {
+				v.status(fmt.Sprintf("tokenize %s/%s: %v", domain, path, terr))
+			} else {
+				tokens = toks
+			}
+		}
+
+		v.Mu.Lock()
+		v.srcText = src.Source
+		v.viewer.Lines = coloredLines(src.Source, tokens, v.Theme)
+		v.resetSourceCursorLocked()
 		v.loadedFile = path
 		v.Focus = FocusSource
 		v.Mu.Unlock()
 		v.Redraw()
 	}()
+}
+
+// resetSourceCursorLocked rewinds the SOURCE viewport + hover cursor to
+// the top. Caller holds v.Mu.
+func (v *View) resetSourceCursorLocked() {
+	v.viewer.ScrollY = 0
+	v.cursorLine = 0
+	v.cursorCol = 0
+	v.hoverShown = false
+	v.hoverText = ""
 }
 
 func (v *View) packClient() *pack.Client {
@@ -331,24 +544,74 @@ func (v *View) packClient() *pack.Client {
 	return v.PackClient()
 }
 
+func (v *View) senseClient() *sense.Client {
+	if v.SenseClient == nil {
+		return nil
+	}
+	return v.SenseClient()
+}
+
 func (v *View) status(msg string) {
 	if v.OnStatus != nil {
 		v.OnStatus(msg)
 	}
 }
 
-// plainLines splits source into viewer lines with no highlight spans
-// (B3 adds Sense coloring). A trailing newline is dropped so the
-// viewer doesn't show a spurious empty last line.
-func plainLines(source string) []ui.ViewerLine {
+// coloredLines splits source into viewer lines and overlays Sense
+// token highlight spans. With no tokens (Sense unavailable or a
+// tokenize failure) it degrades to plain text. A trailing newline is
+// dropped so the viewer doesn't show a spurious empty last line.
+func coloredLines(source string, tokens []sense.Token, theme ui.Theme) []ui.ViewerLine {
 	source = strings.TrimSuffix(source, "\n")
 	if source == "" {
 		return nil
 	}
 	raw := strings.Split(source, "\n")
+	spansByLine := spansFromTokens(tokens, theme)
 	out := make([]ui.ViewerLine, len(raw))
 	for i, ln := range raw {
-		out[i] = ui.ViewerLine{Text: ln}
+		out[i] = ui.ViewerLine{
+			Text:  ln,
+			Spans: spansByLine[i+1], // Sense lines are 1-indexed
+		}
+	}
+	return out
+}
+
+// plainLines is coloredLines with no tokens -- kept as a named helper
+// for the not-found placeholder + tests.
+func plainLines(source string) []ui.ViewerLine {
+	return coloredLines(source, nil, ui.Theme{})
+}
+
+// spansFromTokens converts Sense tokens (1-indexed line/column) into
+// per-line viewer HighlightSpans, keyed by 1-indexed line. Mirrors the
+// Concepts detail renderer (cli/concepts/render.go) -- duplicated here
+// because a tab package must not import another tab package.
+func spansFromTokens(tokens []sense.Token, theme ui.Theme) map[int][]ui.HighlightSpan {
+	out := map[int][]ui.HighlightSpan{}
+	for _, tok := range tokens {
+		if tok.Range.Start.Line < 1 {
+			continue
+		}
+		style := theme.TokenStyle(tok.Type)
+		if tok.Range.Start.Line == tok.Range.End.Line {
+			line := tok.Range.Start.Line
+			out[line] = append(out[line], ui.HighlightSpan{
+				Start: tok.Range.Start.Column - 1,
+				End:   tok.Range.End.Column - 1,
+				Style: style,
+			})
+			continue
+		}
+		// Multi-line token (rare in MemQL): clamp the first line to
+		// end-of-line and drop continuation lines.
+		first := tok.Range.Start.Line
+		out[first] = append(out[first], ui.HighlightSpan{
+			Start: tok.Range.Start.Column - 1,
+			End:   1 << 30, // "to end of line" -- styleRunes clamps
+			Style: style,
+		})
 	}
 	return out
 }
@@ -379,10 +642,40 @@ func (v *View) hintsForSource() string {
 	if len(v.viewer.Lines) == 0 {
 		return "Tab:Cycle"
 	}
+	if v.hoverShown {
+		return ui.HintBar{Chips: []ui.HintChip{
+			{Key: "Esc", Label: "CloseHover"},
+			{Key: "↑/↓", Label: "Move"},
+			{Key: "Tab", Label: "Cycle"},
+		}}.String()
+	}
 	return ui.HintBar{Chips: []ui.HintChip{
-		{Key: "↑/↓", Label: "Scroll"},
+		{Key: "↑/↓", Label: "Move"},
+		{Key: "←/→", Label: "Col"},
+		{Key: "H", Label: "Hover"},
 		{Key: "Tab", Label: "Cycle"},
 	}}.String()
+}
+
+// hoverLines strips basic markdown from Sense hover content and wraps
+// it to width. Empty result when the content is blank.
+func hoverLines(content string, width int) []string {
+	if width < 1 {
+		width = 1
+	}
+	for _, m := range []string{"**", "__", "`", "###", "##", "#"} {
+		content = strings.ReplaceAll(content, m, "")
+	}
+	var out []string
+	for _, raw := range strings.Split(content, "\n") {
+		raw = strings.TrimRight(raw, " ")
+		if raw == "" {
+			out = append(out, "")
+			continue
+		}
+		out = append(out, ui.WrapText(raw, width)...)
+	}
+	return out
 }
 
 // paneChromeBounds carves the list/viewer region out of a pane's
