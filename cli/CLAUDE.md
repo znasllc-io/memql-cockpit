@@ -93,85 +93,19 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
    `ConceptInfo.display_card` (memql#160). v1:agents:agent rows live
    here too -- the dedicated Agents tab was retired in
    memql-cockpit#126 once Concepts could render them well.
-3. **Planner (F3)** -- observe v1:planner:plan + child v1:planner:task
-   rows. Read-only: the cockpit is an operations console, not a
-   conversation surface, so there is no goal-submission entry point
-   here. The one mutation that remains is R:Run on a queued
-   plan -- flips it to running via mutationStartPlan. The plan list is
-   keyset-paginated (`queryAllPlans` is `sort` + `paginate 50`,
-   memql#1997): the 3s poll re-fetches the operator's current page
-   depth and `M:More` appends the next page until the cursor is
-   exhausted, so the list isn't silently capped at the newest 50 plans.
-   Gated on a connected, selected cluster.
-4. **Skills (F4)** -- read-only catalog browser for `v1:agents:skill`
-   rows, grouped by category + tier. Agents themselves live under the
-   Concepts tab (post the memql-cockpit#126 retire); Skills earns its
-   own surface because the catalog is dense enough that the generic
-   browser muddles the picture. Polls `queryActiveSkillsFull` every
-   30s -- the catalog is small and re-seeded only at cluster startup
-   + via planner mints. Gated on a connected, selected cluster.
-5. **Workers (F5)** -- computer-use consent dashboard. Long-lived
-   `watch` connection to `~/.memql/worker.sock` renders the active
-   consent window state + a live audit tail of every worker tool
-   dispatch (newest first, capped at 256). `G` opens the duration
-   picker, `R` revokes immediately. **Strict-mode per-action
-   approval** (64-B): when the granted window has `strict=true` and
-   the agent dispatches a high-risk `workerComputer` action
-   (`key_type`, `key_hold`, `mouse_click`, `mouse_down`, `mouse_up`
-   -- see `worker/consent/consent.go` `isHighRiskAction`),
-   the worker blocks awaiting an Allow/Deny in this tab. A modal
-   overlay names the tool + action; `A` allows once, `D` denies.
-   Pending approvals queue FIFO and the modal cycles as the operator
-   responds. The 30-second default timeout (worker side) denies
-   unanswered approvals; Revoke cancels every pending approval too.
-   **Region exemption** (#131): a strict grant can carry a
-   screen-coordinate region rect. Toggling strict on in the Grant
-   modal makes `Enter` advance to a region picker (schematic of the
-   screen + an arrow-key-movable / Shift+Arrow-resizable box);
-   `Enter` grants with the region, `N` skips it, `Esc` steps back.
-   A `mouse_click` whose cursor is inside the region skips the
-   approval gate; out-of-region clicks + all other high-risk
-   actions still gate. The region is a static rect in a fixed
-   1920x1080 reference space; window-relative regions are future
-   work now that the window-bounds API exists (window_list /
-   window_focus, memql-cockpit#167 -- see docs/computer-use.md).
-   NOT gated on a cluster connection --
-   the IPC is local-host between cockpit processes. Per
-   memql-cockpit#64. A global `Ctrl+E` kill switch in
-   `dispatchEvent` calls into `workersView.Revoke()` from any tab
-   without making the operator switch tabs first.
-6. **Safety (F6)** -- Command Safety view: paginated decision list
-   over `v1:safety:classification` rows, with filter chips
-   (decision / source / tier / surface / mode), a drill-down detail
-   pane (redacted args + full reason + rule id), and an aggregate
-   strip (totals + breakdown by decision / source / mode). Backs the
-   classifier rollout (memql#235) by letting operators decide when to
-   flip `MEMQL_COMMAND_CLASSIFIER_MODE=enforce` per surface with
-   FP/FN data instead of by gut feel. Polls
-   `queryAllSafetyClassifications` every 5s. Per memql-cockpit#134.
-   Gated on a connected, selected cluster.
-7. **Bundles (F7)** -- read-only browser for the planner-authored
-   automation bundles (`v1:authoring:bundle` + `v1:authoring:construct`)
-   the authoring capture spine (memql#1160 / #1161) produces -- one
-   reproducible, inspectable bundle per completed everyday task. Left
-   pane lists the caller's bundles (newest first); the detail pane shows
-   the bundle's lifecycle metadata + the raw authored `.memql` source of
-   every member construct. `X` exports the selected bundle's source to
-   `~/.memql/bundles/<bundleId>/` (one `.memql` per construct + a
-   MANIFEST). Polls `queryAuthoringBundlesForOwner` every 15s (which is
-   `sort` + `paginate 50`, memql#1997 -- the poll re-fetches the
-   operator's current page depth and `M:More` appends the next keyset
-   page so the bundle list isn't silently capped at 50); member
-   constructs load lazily per selected bundle via
-   `queryAuthoringConstructsForBundle`. Gated on a connected, selected
-   cluster. Per memql#1162.
-8. **Settings (F8)** -- credentials, theme, version
+3. **Settings (F3)** -- credentials, theme, version
 
-Concepts, Planner, Skills, Safety, and Bundles are all gated on a
-connected, selected cluster -- they show a placeholder message
-until the user presses Enter on a cluster row in the Clusters tab.
-Workers is NOT gated on a cluster -- it speaks to the local worker
-daemon over a Unix socket.
+The Concepts tab is gated on a connected, selected cluster -- it shows
+a placeholder message until the user presses Enter on a cluster row in
+the Clusters tab.
+
+> The Planner, Skills, Workers, Safety, and Bundles tabs were removed in
+> memql-cockpit#216 -- the cockpit is scoped to cluster management +
+> concept browsing + settings for now. The `memql-cockpit worker run`
+> computer-use daemon (and its `worker setup` / `worker consent`
+> subcommands) is unaffected; only the in-TUI Workers monitor panel +
+> the global Ctrl+E consent kill switch went away. See docs/computer-use.md
+> for the daemon, which stays.
 
 ### Concepts tab layout
 
@@ -306,10 +240,9 @@ via `Cancel()` does NOT trigger reconnect; only `Unexpected()` does.
 ### Global
 | Key      | Action                                                         |
 |----------|----------------------------------------------------------------|
-| F1..F8   | Switch tab                                                     |
+| F1..F3   | Switch tab                                                     |
 | Ctrl+Q   | Quit                                                           |
 | Ctrl+T   | Cycle theme                                                    |
-| Ctrl+E   | Computer-use kill switch (revoke worker consent from any tab)  |
 
 ### Clusters tab (Cluster Manager focus)
 | Key   | Action                                              |
@@ -401,10 +334,6 @@ memql-cockpit#197.)
 | `sense/`                 | `SenseClient` over the SDK Dispatcher -- editor-side wrappers for MemQL Sense (Tokenize / Diagnose / Complete / Hover). |
 | `config/clusters.go`     | `~/.memql/clusters.yaml` load/save                            |
 | `concepts/`              | Concepts tab (concept picker + row list + generic renderer)   |
-| `planner/`               | Planner tab (read-only plan list + task list + detail; R:Run)  |
-| `workers/`               | Workers tab (computer-use consent dashboard + live audit tail; subscribes to `~/.memql/worker.sock`). Hosts the global Ctrl+E kill switch path. |
-| `safety/`                | Safety tab (`v1:safety:classification` decision list + filters + drill-down; polls `queryAllSafetyClassifications`). |
-| `bundles/`               | Bundles tab (read-only `v1:authoring:bundle` list + per-construct authored `.memql` source viewer + `X`:export-to-files; polls `queryAuthoringBundlesForOwner`, lazy `queryAuthoringConstructsForBundle`). |
 | `editor/`                | Reusable text editor with Sense integration                   |
 | `settings/`              | Settings tab                                                  |
 | `ui/`                    | Theme, screen, tab bar, layout primitives                     |
