@@ -357,8 +357,10 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 		deployH = 14
 	}
 	// Never let the deployments band + divider + title swallow the whole
-	// pane: keep at least 4 rows for the topology region on a short pane.
-	maxDeployH := bounds.Height - 1 /*title*/ - 1 /*divider*/ - 1 /*hint*/ - 4
+	// pane: reserve 1 row each for the title, divider and hint bar, plus a
+	// 4-row floor for the topology region on a short pane.
+	const reservedAboveBand = 1 + 1 + 1 + 4 // title + divider + hint + topology floor
+	maxDeployH := bounds.Height - reservedAboveBand
 	if maxDeployH < 0 {
 		maxDeployH = 0
 	}
