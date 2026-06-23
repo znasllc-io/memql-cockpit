@@ -63,13 +63,6 @@ cockpit-all-platforms: cockpit-darwin-arm64 cockpit-darwin-amd64 cockpit-linux-a
 cockpit-gui:
 	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags gui -o $(BIN_DIR)/memql-cockpit-gui ./cmd/memql-cockpit
 
-## Build memQL Cockpit with the voice tag -- enables push-to-talk
-## microphone capture via malgo (miniaudio). Requires CGO. Default
-## `make cockpit` ships without it so the headless cross-compiles
-## stay CGO-free; opt in with this target when you want voice.
-cockpit-voice:
-	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags voice -o $(BIN_DIR)/memql-cockpit-voice ./cmd/memql-cockpit
-
 cockpit-gui-darwin-arm64:
 	GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags gui -o $(BIN_DIR)/memql-cockpit-gui-darwin-arm64 ./cmd/memql-cockpit
 
