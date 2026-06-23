@@ -17,7 +17,6 @@ import (
 	"github.com/gdamore/tcell/v2"
 	"github.com/znasllc-io/memql-cockpit/cli/auth"
 	"github.com/znasllc-io/memql-cockpit/cli/bundles"
-	"github.com/znasllc-io/memql-cockpit/cli/chat"
 	"github.com/znasllc-io/memql-cockpit/cli/cluster"
 	"github.com/znasllc-io/memql-cockpit/cli/concepts"
 	"github.com/znasllc-io/memql-cockpit/cli/config"
@@ -98,7 +97,6 @@ type App struct {
 	plannerView  *planner.View
 	skillsView   *skills.View
 	bundlesView  *bundles.View
-	chatView     *chat.View
 	workersView  *workers.View
 	safetyView   *safety.View
 	settingsView *settings.View
@@ -141,25 +139,22 @@ func NewApp(cfg AppConfig) *App {
 	plannerView := planner.NewView(theme)
 	skillsView := skills.NewView(theme)
 	bundlesView := bundles.NewView(theme)
-	chatView := chat.NewView(theme)
 	workersView := workers.NewView(theme)
 	safetyView := safety.NewView(theme)
 
 	// Clusters comes first -- it's the starting context for the session.
-	// Chat sits next (F2) because the daily-space conversation is the
-	// primary surface users open after connecting; Concepts / Planner
-	// follow as operations-console reads. Skills (F5) is the read-only
-	// catalog browser for v1:agents:skill rows introduced by memql#158
-	// + memql-cockpit#124 -- agents themselves live under the Concepts
-	// tab now (post the memql-cockpit#126 retire) but the skill catalog
-	// is dense enough to earn its own surface with category + tier
-	// grouping. Workers (F6) hosts the computer-use consent dashboard +
-	// live audit tail introduced in memql-cockpit#64 -- not gated on a
-	// cluster connection because it talks to a local worker daemon over
-	// a Unix socket, not over the cluster gRPC. Settings stays last.
+	// Concepts / Planner follow as operations-console reads. Skills (F4)
+	// is the read-only catalog browser for v1:agents:skill rows
+	// introduced by memql#158 + memql-cockpit#124 -- agents themselves
+	// live under the Concepts tab now (post the memql-cockpit#126 retire)
+	// but the skill catalog is dense enough to earn its own surface with
+	// category + tier grouping. Workers (F5) hosts the computer-use
+	// consent dashboard + live audit tail introduced in memql-cockpit#64
+	// -- not gated on a cluster connection because it talks to a local
+	// worker daemon over a Unix socket, not over the cluster gRPC.
+	// Settings stays last.
 	tabBar := ui.NewTabBar(theme,
 		ui.Tab{Name: "Clusters", Content: clustersView},
-		ui.Tab{Name: "Chat", Content: chatView},
 		ui.Tab{Name: "Concepts", Content: conceptsView},
 		ui.Tab{Name: "Planner", Content: plannerView},
 		ui.Tab{Name: "Skills", Content: skillsView},
@@ -185,7 +180,6 @@ func NewApp(cfg AppConfig) *App {
 		plannerView:   plannerView,
 		skillsView:    skillsView,
 		bundlesView:   bundlesView,
-		chatView:      chatView,
 		workersView:   workersView,
 		safetyView:    safetyView,
 		settingsView:  settingsView,
@@ -608,7 +602,6 @@ func (a *App) connect() {
 	a.wirePlanner()
 	a.wireSkills()
 	a.wireBundles()
-	a.wireChat()
 	a.wireWorkers()
 	a.wireSafety()
 
@@ -1309,37 +1302,6 @@ func (a *App) wireSafety() {
 		}
 	}
 	a.safetyView.StartRefreshLoop(a.quitCh, 5*time.Second)
-}
-
-// wireChat connects the Chat tab to the gRPC client. The chat view
-// polls v1:cognition:space + v1:cognition:utterance every 3s and
-// renders the single-chat-per-space stream. OnRedraw posts an
-// EventInterrupt after each refresh so the event loop repaints the
-// new data without waiting for a keystroke -- same pattern as
-// wirePlanner.
-func (a *App) wireChat() {
-	if a.chatView == nil {
-		return
-	}
-	a.chatView.QueryClient = func() *client.QueryClient {
-		d := a.activeDispatcher()
-		if d == nil {
-			return nil
-		}
-		return client.NewQueryClient(d)
-	}
-	a.chatView.Dispatcher = a.activeDispatcher
-	a.chatView.OnStatus = func(msg string) {
-		if a.notifications != nil {
-			a.notifications.Sync("chat", ui.SeverityError, msg)
-		}
-	}
-	a.chatView.OnRedraw = func() {
-		if a.screen != nil {
-			a.screen.PostEvent(tcell.NewEventInterrupt(nil))
-		}
-	}
-	a.chatView.StartRefreshLoop(a.quitCh, 3*time.Second)
 }
 
 // wireCluster wires the topology pane's OnInitialLoad callback to the

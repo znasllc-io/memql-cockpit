@@ -2,9 +2,8 @@
 // surface for observing v1:planner:plan + v1:planner:task rows in the
 // connected cluster.
 //
-// Goal submission lives in the Chat tab now -- the user talks to the
-// assistant, which decides whether to escalate to the planner via its
-// tools. This tab is for watching what the planner is doing, not for
+// Goal submission is not a cockpit surface -- the cockpit is an
+// operations console for watching what the planner is doing, not for
 // driving it. The one mutation that remains is mutationStartPlan:
 // when a plan sits in status="queued" awaiting user confirmation,
 // pressing R on the Plans pane flips it to running.

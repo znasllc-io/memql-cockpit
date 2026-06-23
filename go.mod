@@ -5,7 +5,6 @@ go 1.26.1
 require (
 	github.com/99designs/keyring v1.2.2
 	github.com/gdamore/tcell/v2 v2.13.10
-	github.com/gen2brain/malgo v0.11.25
 	github.com/go-vgo/robotgo v1.0.2
 	github.com/jezek/xgb v1.3.1
 	github.com/jezek/xgbutil v0.0.0-20260124183602-9fd151d6a51a

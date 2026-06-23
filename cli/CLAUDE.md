@@ -87,52 +87,30 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
 "connect to a cluster" is the first thing the user sees:
 
 1. **Clusters (F1)** -- cluster manager + topology
-2. **Chat (F2)** -- single-chat-per-space utterance viewer. Today's
-   daily space for the connected user (`v1:cognition:space.kind=="daily"`,
-   id `daily-{userShortId}-{dateKey}`) is pinned at the top of the
-   space list and auto-selected on first paint. The cockpit does
-   NOT ensure the daily itself -- provisioning is server-owned: the
-   CoPresent-pack dailyspace integration guarantees today's daily
-   exists (on user-create, on every login/authSession, and hourly
-   via cron -- see `memql:dsl/cognition/mutations.memql`), so the
-   Chat tab just reads + pins it. The old client-side ensure call
-   was dropped when the `logicEnsureDailySpaceForCaller` construct
-   left core for the pack in memql#1976 (memql-cockpit#212).
-   Archived/saved spaces are filtered out; archived
-   rows expire and hard-delete via the existing
-   `purgeExpiredArchivedSpaces` cron. `v` toggles push-to-talk:
-   first press starts microphone capture (requires the `voice`
-   build tag -- `make cockpit-voice`), second press releases the
-   mic and the SDK finalizes the transcript via `memql-sdk-go`'s
-   `voice.PushToTalk`. The status strip above the chrome shows the
-   partial transcript while recording and the final text once
-   resolved. Without the `voice` tag the key surfaces a clear
-   "voice support not compiled in" message. Gated on a connected,
-   selected cluster.
-3. **Concepts (F3)** -- generic browser for every registered concept.
+2. **Concepts (F2)** -- generic browser for every registered concept.
    Renders rows + detail uniformly per concept by consuming the
    `@displayCard(...)` hints memql core publishes on
    `ConceptInfo.display_card` (memql#160). v1:agents:agent rows live
    here too -- the dedicated Agents tab was retired in
    memql-cockpit#126 once Concepts could render them well.
-4. **Planner (F4)** -- observe v1:planner:plan + child v1:planner:task
-   rows. Read-only: goal submission moved to the Chat tab (the user
-   talks to the assistant, which decides when to escalate to the
-   planner). The one mutation that remains is R:Run on a queued
+3. **Planner (F3)** -- observe v1:planner:plan + child v1:planner:task
+   rows. Read-only: the cockpit is an operations console, not a
+   conversation surface, so there is no goal-submission entry point
+   here. The one mutation that remains is R:Run on a queued
    plan -- flips it to running via mutationStartPlan. The plan list is
    keyset-paginated (`queryAllPlans` is `sort` + `paginate 50`,
    memql#1997): the 3s poll re-fetches the operator's current page
    depth and `M:More` appends the next page until the cursor is
    exhausted, so the list isn't silently capped at the newest 50 plans.
    Gated on a connected, selected cluster.
-5. **Skills (F5)** -- read-only catalog browser for `v1:agents:skill`
+4. **Skills (F4)** -- read-only catalog browser for `v1:agents:skill`
    rows, grouped by category + tier. Agents themselves live under the
    Concepts tab (post the memql-cockpit#126 retire); Skills earns its
    own surface because the catalog is dense enough that the generic
    browser muddles the picture. Polls `queryActiveSkillsFull` every
    30s -- the catalog is small and re-seeded only at cluster startup
    + via planner mints. Gated on a connected, selected cluster.
-6. **Workers (F6)** -- computer-use consent dashboard. Long-lived
+5. **Workers (F5)** -- computer-use consent dashboard. Long-lived
    `watch` connection to `~/.memql/worker.sock` renders the active
    consent window state + a live audit tail of every worker tool
    dispatch (newest first, capped at 256). `G` opens the duration
@@ -162,7 +140,7 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
    memql-cockpit#64. A global `Ctrl+E` kill switch in
    `dispatchEvent` calls into `workersView.Revoke()` from any tab
    without making the operator switch tabs first.
-7. **Safety (F7)** -- Command Safety view: paginated decision list
+6. **Safety (F6)** -- Command Safety view: paginated decision list
    over `v1:safety:classification` rows, with filter chips
    (decision / source / tier / surface / mode), a drill-down detail
    pane (redacted args + full reason + rule id), and an aggregate
@@ -172,7 +150,7 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
    FP/FN data instead of by gut feel. Polls
    `queryAllSafetyClassifications` every 5s. Per memql-cockpit#134.
    Gated on a connected, selected cluster.
-8. **Bundles (F8)** -- read-only browser for the planner-authored
+7. **Bundles (F7)** -- read-only browser for the planner-authored
    automation bundles (`v1:authoring:bundle` + `v1:authoring:construct`)
    the authoring capture spine (memql#1160 / #1161) produces -- one
    reproducible, inspectable bundle per completed everyday task. Left
@@ -187,9 +165,9 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
    constructs load lazily per selected bundle via
    `queryAuthoringConstructsForBundle`. Gated on a connected, selected
    cluster. Per memql#1162.
-9. **Settings (F9)** -- credentials, theme, version
+8. **Settings (F8)** -- credentials, theme, version
 
-Concepts, Planner, Skills, Chat, Safety, and Bundles are all gated on a
+Concepts, Planner, Skills, Safety, and Bundles are all gated on a
 connected, selected cluster -- they show a placeholder message
 until the user presses Enter on a cluster row in the Clusters tab.
 Workers is NOT gated on a cluster -- it speaks to the local worker
@@ -421,11 +399,9 @@ memql-cockpit#197.)
 | `cluster/metrics_fetcher.go` | `QueryClientMetricsFetcher`: codeMetric overlay fetch      |
 | _gRPC client_            | Lives in `memql/sdk/go/client/` -- `Connection`, `Dispatcher`, `QueryClient`, `SubscriptionManager`. Cockpit imports the SDK rather than reimplementing the wire layer. |
 | `sense/`                 | `SenseClient` over the SDK Dispatcher -- editor-side wrappers for MemQL Sense (Tokenize / Diagnose / Complete / Hover). |
-| `audio/`                 | Microphone capture for push-to-talk (malgo / miniaudio). Build-tag-gated (`voice`); stub returns a clear error on default headless builds. |
 | `config/clusters.go`     | `~/.memql/clusters.yaml` load/save                            |
 | `concepts/`              | Concepts tab (concept picker + row list + generic renderer)   |
 | `planner/`               | Planner tab (read-only plan list + task list + detail; R:Run)  |
-| `chat/`                  | Chat tab (space list + utterance scroll + `v`:PTT via memql-sdk-go voice.PushToTalk) |
 | `workers/`               | Workers tab (computer-use consent dashboard + live audit tail; subscribes to `~/.memql/worker.sock`). Hosts the global Ctrl+E kill switch path. |
 | `safety/`                | Safety tab (`v1:safety:classification` decision list + filters + drill-down; polls `queryAllSafetyClassifications`). |
 | `bundles/`               | Bundles tab (read-only `v1:authoring:bundle` list + per-construct authored `.memql` source viewer + `X`:export-to-files; polls `queryAuthoringBundlesForOwner`, lazy `queryAuthoringConstructsForBundle`). |
@@ -552,8 +528,8 @@ Rules:
   `Esc:ClearSearch`, `Esc:CloseVersions`). `Enter:Save` not
   `Enter: Save` and not `Enter (Save)`.
 - **Single-letter keys are UPPERCASE** -- `R:Refresh` not `r:Refresh`,
-  `V:PTT` not `v:PTT`. Keystroke handlers stay case-tolerant
-  (`'v' || 'V'`), but the chip displays the canonical uppercase form
+  `X:Export` not `x:Export`. Keystroke handlers stay case-tolerant
+  (`'x' || 'X'`), but the chip displays the canonical uppercase form
   so it reads as a single recognizable shape across every pane.
   Multi-key combos (`↑/↓`, `PgUp/PgDn`) and named keys (`Esc`,
   `Enter`, `Tab`) keep their natural casing; this rule applies to
@@ -671,9 +647,8 @@ bug.
 ## SDK-only rule
 
 Every wire call from `cli/**` goes through `memql/sdk/go/` --
-`client/` for queries / mutations / subscriptions, `voice/` for
-push-to-talk, `sense/` for editor language intelligence, and
-`worker/` once #117 lands.
+`client/` for queries / mutations / subscriptions, `sense/` for
+editor language intelligence, and `worker/` once #117 lands.
 
 What that means concretely:
 
