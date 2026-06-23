@@ -45,7 +45,7 @@ const expectedNodesPerType = 2
 
 // DeploymentInfo is one v1:cluster:deployment row, projected for display.
 // Mirrors the concept fields the Deployments section renders; populated
-// from QueryDeploymentsForCluster by the app layer's parse helper.
+// from DeploymentsForCluster by the app layer's parse helper.
 type DeploymentInfo struct {
 	ID                   string // deploymentId (also the row id / Argo rollout hash)
 	Version              string // memQL semver being deployed, e.g. "2026.6.21"
@@ -129,7 +129,7 @@ func (v *View) SelectedDeploymentID() string {
 }
 
 // SetDeploymentNodes stores the node/orphan split for a deployment,
-// loaded via QueryNodesForDeployment + QueryNodesNotInDeployment. Keyed
+// loaded via NodesForDeployment + NodesNotInDeployment. Keyed
 // by deploymentId so a stale async result for a since-changed selection
 // is dropped rather than rendered against the wrong row.
 func (v *View) SetDeploymentNodes(deploymentID string, nodes, orphans []NodeInfo) {

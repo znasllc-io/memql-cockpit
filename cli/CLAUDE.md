@@ -181,13 +181,13 @@ the integrative deliverable of the Deployment & Topology Overhaul
 (epic memql#1871) and reads the `v1:cluster:deployment` concept rows
 landed in that epic.
 
-- **History list** -- `QueryDeploymentsForCluster` (clusterId resolved
-  via `QueryExistingCluster`), rendered newest-first by createdAt with
+- **History list** -- `DeploymentsForCluster` (clusterId resolved
+  via `ExistingCluster`), rendered newest-first by createdAt with
   a status token (succeeded / in-progress / pending / failed /
   superseded / rolled-back) + version + env + provider.
 - **Select -> topology** -- `Enter` on a row loads that deployment's
-  nodes (`QueryNodesForDeployment`) and the orphans
-  (`QueryNodesNotInDeployment`), rendered as a count-vs-expected
+  nodes (`NodesForDeployment`) and the orphans
+  (`NodesNotInDeployment`), rendered as a count-vs-expected
   summary + per-node health/version, with orphans flagged in the
   warning color.
 - **Controls** (SDK `DeployControlClient` wrappers): `C` cut-version
