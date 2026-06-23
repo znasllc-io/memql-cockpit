@@ -578,7 +578,8 @@ func (v *ClustersView) hintsForManagement() string {
 	// needs-login). Compute booleans for each and let the HintBar
 	// omit the disabled ones.
 	var (
-		canSelect    bool // Enter:Select
+		canSelect    bool // Enter:Select  (promote an already-live cluster)
+		canConnect   bool // Enter:Connect (selection drives the dial, epic #239)
 		canCancel    bool // Esc:Cancel
 		canRetry     bool // R:Retry
 		canAuthorize bool // L:Authorize
@@ -594,7 +595,17 @@ func (v *ClustersView) hintsForManagement() string {
 			case "connecting", "backoff":
 				canCancel = true
 			case "failed":
+				// Selection now drives the (re)connect: Enter on a
+				// non-selected dead cluster brings it up as the working
+				// cluster. R:Retry stays for the in-place repair (and
+				// works on the selected row, where Enter is hidden).
+				canConnect = !alreadySelected
 				canRetry = true
+			case "idle":
+				// Registered-but-not-dialed (epic #239): Enter connects
+				// it. The selected cluster is never idle, so this only
+				// surfaces on non-selected rows.
+				canConnect = !alreadySelected
 			case "needs-auth":
 				canAuthorize = true
 			case "needs-login":
@@ -607,6 +618,7 @@ func (v *ClustersView) hintsForManagement() string {
 		{Key: "A", Label: "Add"},
 		{Key: "E", Label: "Edit", Disabled: !canEdit},
 		{Key: "Enter", Label: "Select", Disabled: !canSelect},
+		{Key: "Enter", Label: "Connect", Disabled: !canConnect},
 		{Key: "Esc", Label: "Cancel", Disabled: !canCancel},
 		{Key: "R", Label: "Retry", Disabled: !canRetry},
 		{Key: "L", Label: "Authorize", Disabled: !canAuthorize},

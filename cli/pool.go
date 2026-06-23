@@ -1002,6 +1002,7 @@ func (a *App) onEntryConnected(e *connEntry) {
 	// every fresh launch even though ListConcepts would return
 	// concepts the moment we ask.
 	if a.isSelectedCluster(e.Config.Name) {
+		a.refreshMyAccess(e.Config.Name, e.Conn)
 		go a.refreshConcepts(context.Background())
 	}
 
