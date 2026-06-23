@@ -168,6 +168,26 @@ type View struct {
 	// succeeds, so the app refreshes the history right away rather than on
 	// the next poll tick. nil is a no-op.
 	OnDeploymentsChanged func()
+
+	// --- Deployment topology preview (memql-cockpit#225) ---
+	//
+	// previewActive flips the topology region from the live whole-cluster
+	// grid to a graphical render of the SELECTED deployment's composition
+	// (deployNodes drawn normally + deployOrphans flagged). previewFullscreen
+	// expands that preview to the whole pane (the deployments band is hidden)
+	// for an unobstructed drill-down. Esc steps back out (fullscreen ->
+	// preview -> live). Both guarded by v.mu.
+	previewActive     bool
+	previewFullscreen bool
+
+	// deploySpecs is the selected deployment's per-node-type spec set
+	// (v1:cluster:deploymentNodeSpec: version / replicas / imageDigest),
+	// loaded via NodeSpecsForDeployment -- the Epic 2 deploy-pack query
+	// (memql#2094). Keyed by deploySpecsLoadedFor so a stale async result
+	// for a since-changed selection is dropped. Surfaced in the composition
+	// view (detail block + preview header). Guarded by v.mu.
+	deploySpecs          []NodeSpecInfo
+	deploySpecsLoadedFor string
 }
 
 // SetDisconnected toggles the "stream lost" rendering override. Does not
@@ -330,6 +350,25 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 		return
 	}
 
+	// Fullscreen deployment drill-down (memql-cockpit#225): the selected
+	// deployment's composition owns the whole pane below the cluster-name
+	// title; the live grid + deployments band are hidden until Esc / F
+	// collapses back to the split.
+	if v.previewActive && v.previewFullscreen {
+		region := ui.Rect{X: bounds.X, Y: bounds.Y, Width: bounds.Width, Height: bounds.Height - 1}
+		v.drawDeploymentPreview(screen, region)
+
+		hintStyle := tcell.StyleDefault.Foreground(v.Theme.Subtle).Background(v.Theme.BG)
+		hintY := bounds.Y + bounds.Height - 1
+		screen.FillRect(bounds.X, hintY, bounds.Width, 1, hintStyle)
+		screen.DrawText(bounds.X, hintY, bounds.Width/2, " Fullscreen drill-down", hintStyle)
+		drawRightHints(screen, bounds, hintY, "Up/Dn:Switch  WASD:Pan  F/Esc:Back", hintStyle)
+		if v.dctrl != nil {
+			v.drawDeployConceptModal(screen, bounds)
+		}
+		return
+	}
+
 	// --- Persistent vertical split (memql-cockpit#221) ---
 	//
 	// The right pane is split into a live TOPOLOGY region on top and the
@@ -390,19 +429,42 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 		Height: dividerY - bounds.Y,
 	}
 
-	// TODO(#221): graphical topology preview of the selected deployment --
-	// for now the selected deployment's node composition is shown
-	// textually in the deployments detail block below; the top region
-	// always renders the live whole-cluster grid.
-	if len(v.Nodes) > 0 && topoRegion.Height > 0 {
-		v.drawTopology(screen, topoRegion)
+	// Topology region. In preview mode (memql-cockpit#225) it renders the
+	// SELECTED deployment's composition graphically (deployment nodes +
+	// flagged orphans); otherwise the live whole-cluster grid. The
+	// deployments band below stays visible in (non-fullscreen) preview so
+	// the operator can keep navigating the history.
+	if topoRegion.Height > 0 {
+		if v.previewActive {
+			v.drawDeploymentPreview(screen, topoRegion)
+		} else if len(v.Nodes) > 0 {
+			current := v.currentDeploymentIdLocked()
+			v.drawTopology(screen, topoRegion, v.Nodes, v.Edges, func(i int) bool {
+				return v.isOrphanLocked(v.Nodes[i], current)
+			})
+		}
 	}
 
 	// One-line topology tally at the bottom of the topology region. Same
 	// content the old status bar carried; now it labels the grid above the
 	// divider instead of the whole pane.
 	tallyY := dividerY - 1
-	if tallyY > topoRegion.Y {
+	if tallyY > topoRegion.Y && v.previewActive {
+		// In preview the grid above shows a deployment, not the cluster --
+		// label the tally to match so the counts aren't misread as live.
+		statusText := " preview mode"
+		if v.previewReadyLocked() {
+			statusText = fmt.Sprintf(" Deployment nodes: %d", len(v.deployNodes))
+			if o := len(v.deployOrphans); o > 0 {
+				statusText += fmt.Sprintf("  Orphans:%d", o)
+			}
+		} else {
+			statusText = " loading deployment topology..."
+		}
+		screen.FillRect(bounds.X, tallyY, bounds.Width, 1, statusStyle)
+		screen.DrawText(bounds.X, tallyY, bounds.Width/2, statusText, statusStyle)
+		drawRightHints(screen, bounds, tallyY, "Up/Dn:Switch  Enter:Fullscreen  Esc:Live", statusStyle)
+	} else if tallyY > topoRegion.Y {
 		statusText := ""
 		if len(v.Nodes) == 0 {
 			statusText = " No nodes. Waiting for cluster data..."
@@ -466,13 +528,18 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 	}
 }
 
-// drawTopology renders nodes as boxes with connection lines.
+// drawTopology renders an explicit node set as boxes with connection
+// lines. The node slice, its precomputed edges, and an orphan predicate
+// (called per node index) are all passed in, so the SAME renderer paints
+// both the live whole-cluster grid (v.Nodes / v.Edges) and a deployment
+// preview (deployNodes+deployOrphans / computeEdges(...)) -- the
+// parameterization deferred from #221, delivered for #225.
 //
 // Layout is computed in an unbounded "world" coordinate space (positions
 // ignore the pane size), then every cell is shifted by (-panX, -panY) and
 // clipped to the drawing area. That keeps the pan logic trivial and
 // guarantees we never bleed into the clusters pane on the left.
-func (v *View) drawTopology(screen *ui.Screen, bounds ui.Rect) {
+func (v *View) drawTopology(screen *ui.Screen, bounds ui.Rect, nodes []NodeInfo, edges [][2]int, isOrphan func(i int) bool) {
 	const boxW = 16
 	// boxH is 5 so each box carries three content rows: type, health, and
 	// a version + short-deploymentId line (the topology-truthfulness data
@@ -485,7 +552,7 @@ func (v *View) drawTopology(screen *ui.Screen, bounds ui.Rect) {
 	// from that list gets appended at the end so we still render
 	// unexpected nodes rather than silently dropping them.
 	groups := map[string][]int{}
-	for i, n := range v.Nodes {
+	for i, n := range nodes {
 		groups[n.Type] = append(groups[n.Type], i)
 	}
 	typeOrder := v.buildTypeOrder(groups)
@@ -494,7 +561,7 @@ func (v *View) drawTopology(screen *ui.Screen, bounds ui.Rect) {
 		x, y int // top-left of box (world coords)
 		cx   int // center x for connections
 	}
-	positions := make([]nodePos, len(v.Nodes))
+	positions := make([]nodePos, len(nodes))
 
 	// Drawing area (below title, above status). Anything outside this
 	// rectangle is clipped by plotCell/plotText below.
@@ -532,7 +599,7 @@ func (v *View) drawTopology(screen *ui.Screen, bounds ui.Rect) {
 	}
 
 	// Draw connection lines first.
-	for _, edge := range v.Edges {
+	for _, edge := range edges {
 		p1 := positions[edge[0]]
 		p2 := positions[edge[1]]
 
@@ -587,10 +654,15 @@ func (v *View) drawTopology(screen *ui.Screen, bounds ui.Rect) {
 	// Draw node boxes. Orphan/stale nodes (stopped, or carrying a
 	// non-current deploymentId) render with the warning border + an
 	// [orphan] tag so a half-finished rollout or leftover node is obvious.
-	current := v.currentDeploymentIdLocked()
-	for i, node := range v.Nodes {
+	// The orphan decision is supplied by the caller (live grid: compares
+	// against the current deploymentId; preview: nodes-not-in-deployment).
+	for i, node := range nodes {
 		pos := positions[i]
-		v.drawNodeBox(screen, pos.x, pos.y, boxW, boxH, area, node, v.isOrphanLocked(node, current))
+		orphan := false
+		if isOrphan != nil {
+			orphan = isOrphan(i)
+		}
+		v.drawNodeBox(screen, pos.x, pos.y, boxW, boxH, area, node, orphan)
 	}
 }
 
@@ -731,9 +803,11 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 	// Persistent split (memql-cockpit#221): the Deployments section is
 	// always present, so its navigation + control keys are live without a
 	// toggle. Arrow keys + Enter drive the deployment cursor / node load;
-	// they're routed before the KeyRune guard so they reach the handler.
+	// Esc steps back out of the deployment preview / fullscreen drill-down
+	// (memql-cockpit#225). They're routed before the KeyRune guard so they
+	// reach the handler.
 	switch keyEv.Key() {
-	case tcell.KeyUp, tcell.KeyDown, tcell.KeyEnter:
+	case tcell.KeyUp, tcell.KeyDown, tcell.KeyEnter, tcell.KeyEscape:
 		return v.handleDeploymentsKeyLocked(keyEv)
 	}
 	if keyEv.Key() != tcell.KeyRune {
@@ -758,6 +832,10 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 	case 'x', 'X':
 		v.Arch.Toggle()
 		return true
+	case 'f', 'F':
+		// Fullscreen deployment drill-down toggle (memql-cockpit#225).
+		// 'f' doesn't collide with a WASD pan key.
+		return v.handleDeploymentsKeyLocked(keyEv)
 	case 'c', 'C', 'g', 'G', 'b', 'B':
 		// Deployments cut/deploy/rollback controls (role-gated inside the
 		// handler). 'b'/'B' (rollback) doesn't collide with a pan key.
@@ -804,14 +882,35 @@ var edgeRelations = [][2]string{
 // buildEdgesLocked rebuilds v.Edges from v.Nodes. Caller MUST hold
 // v.mu (write). Renamed to *Locked to make the contract obvious;
 // every caller in this file is inside a mutator that already holds
-// the lock.
+// the lock. The actual graph derivation lives in the pure computeEdges
+// helper so the parameterized renderer (deployment preview, #225) and
+// the unit tests can derive edges for an arbitrary node set without
+// touching view state.
 func (v *View) buildEdgesLocked() {
-	v.Edges = nil
+	v.Edges = computeEdges(v.Nodes)
+}
+
+// computeEdges derives the topology connection set for an arbitrary node
+// slice. It is PURE -- it reads only its argument and never touches view
+// state -- so the live grid (v.Nodes) and a deployment-preview node set
+// (#225) share one edge model, and the result is straightforward to
+// unit-test. Returned pairs are indices INTO nodes.
+//
+// Two edge sources are merged, deduped:
+//   - the static service-relationship map (edgeRelations), fanned out
+//     from the first node of each parent type to the first of each child
+//     type; an edge is dropped when either endpoint type is absent.
+//   - real discovery edges from ParentId: a node that joined the mesh
+//     through a peer carries that peer's id; the actual parent/child link
+//     is drawn on top of the static map. Self-edges and dangling parents
+//     (peer not in the slice) are skipped.
+func computeEdges(nodes []NodeInfo) [][2]int {
+	var edges [][2]int
 	// First index per type (multiple BFFs in the cluster: edges
 	// fan out from the first one; the others render side-by-side
 	// in the same row but don't double-up the line drawing).
-	firstByType := make(map[string]int, len(v.Nodes))
-	for i, n := range v.Nodes {
+	firstByType := make(map[string]int, len(nodes))
+	for i, n := range nodes {
 		if _, exists := firstByType[n.Type]; !exists {
 			firstByType[n.Type] = i
 		}
@@ -827,7 +926,7 @@ func (v *View) buildEdgesLocked() {
 		e := [2]int{parentIdx, childIdx}
 		if !seen[e] {
 			seen[e] = true
-			v.Edges = append(v.Edges, e)
+			edges = append(edges, e)
 		}
 	}
 
@@ -837,13 +936,13 @@ func (v *View) buildEdgesLocked() {
 	// static service-relationship map so the diagram reflects the live
 	// discovery graph. Indexed by node id; self-edges and dangling
 	// parents (peer not in the current node set) are skipped.
-	idToIdx := make(map[string]int, len(v.Nodes))
-	for i, n := range v.Nodes {
+	idToIdx := make(map[string]int, len(nodes))
+	for i, n := range nodes {
 		if n.ID != "" {
 			idToIdx[n.ID] = i
 		}
 	}
-	for childIdx, n := range v.Nodes {
+	for childIdx, n := range nodes {
 		if n.ParentId == "" {
 			continue
 		}
@@ -854,9 +953,10 @@ func (v *View) buildEdgesLocked() {
 		e := [2]int{parentIdx, childIdx}
 		if !seen[e] {
 			seen[e] = true
-			v.Edges = append(v.Edges, e)
+			edges = append(edges, e)
 		}
 	}
+	return edges
 }
 
 // currentDeploymentIdLocked returns the deploymentId treated as the live

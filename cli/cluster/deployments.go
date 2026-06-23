@@ -107,13 +107,20 @@ func (v *View) SetDeployments(deps []DeploymentInfo) {
 	if v.deploySelected >= len(deps) {
 		v.deploySelected = 0
 	}
-	// Drop the node/orphan cache if it no longer matches the selection.
+	// Drop the node/orphan + spec caches if they no longer match the
+	// selection. A preview already on screen for the previous selection is
+	// stale once the row underneath it changed, so reloads are requested
+	// lazily by the key handler / app poll loop.
 	if v.deployLoadedFor != "" {
 		if v.deploySelected >= len(deps) || deps[v.deploySelected].ID != v.deployLoadedFor {
-			v.deployNodes = nil
-			v.deployOrphans = nil
-			v.deployLoadedFor = ""
+			v.clearPreviewCacheLocked()
 		}
+	}
+	// If the selection became invalid (history shrank to empty), there is
+	// nothing to preview -- fall back to the live grid.
+	if v.deploySelected >= len(deps) {
+		v.previewActive = false
+		v.previewFullscreen = false
 	}
 }
 
@@ -138,6 +145,65 @@ func (v *View) SetDeploymentNodes(deploymentID string, nodes, orphans []NodeInfo
 	v.deployNodes = nodes
 	v.deployOrphans = orphans
 	v.deployLoadedFor = deploymentID
+}
+
+// NodeSpecInfo is one v1:cluster:deploymentNodeSpec row, projected for
+// display: the desired per-node-type spec (version / replicas / image
+// digest) for a deployment. Loaded via NodeSpecsForDeployment -- the
+// Epic 2 deploy-pack query (memql#2094) -- and surfaced in the
+// composition view so the operator sees the INTENT (what each tier should
+// run) next to the live node reality.
+type NodeSpecInfo struct {
+	NodeType    string
+	Version     string
+	Replicas    int
+	ImageDigest string
+}
+
+// SetDeploymentNodeSpecs stores the per-node-type spec set for a
+// deployment. Keyed by deploymentId like SetDeploymentNodes so a stale
+// async result is dropped. Wired from the app's loadDeploymentNodes
+// alongside the node/orphan load.
+func (v *View) SetDeploymentNodeSpecs(deploymentID string, specs []NodeSpecInfo) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.deploySpecs = specs
+	v.deploySpecsLoadedFor = deploymentID
+}
+
+// previewReadyLocked reports whether a deployment preview can be rendered:
+// preview mode is on, a deployment is selected, and its node set has
+// finished loading for the current selection. Caller MUST hold v.mu.
+func (v *View) previewReadyLocked() bool {
+	if !v.previewActive {
+		return false
+	}
+	if v.deploySelected < 0 || v.deploySelected >= len(v.deployments) {
+		return false
+	}
+	sel := v.deployments[v.deploySelected].ID
+	return sel != "" && v.deployLoadedFor == sel
+}
+
+// previewNodesLocked returns the node set the preview renders -- the
+// deployment's own nodes followed by its orphans -- plus an orphan
+// predicate keyed by index (orphans are the tail). The combined set feeds
+// computeEdges so the preview gets the same hierarchical layout + lines as
+// the live grid. Caller MUST hold v.mu.
+func (v *View) previewNodesLocked() ([]NodeInfo, func(i int) bool) {
+	n := len(v.deployNodes)
+	nodes := make([]NodeInfo, 0, n+len(v.deployOrphans))
+	nodes = append(nodes, v.deployNodes...)
+	nodes = append(nodes, v.deployOrphans...)
+	return nodes, func(i int) bool { return i >= n }
+}
+
+// clearPreviewCacheLocked drops the per-deployment node + spec caches and
+// resets the loaded-for keys, used when the selection moves. Caller MUST
+// hold v.mu.
+func (v *View) clearPreviewCacheLocked() {
+	v.deployNodes, v.deployOrphans, v.deployLoadedFor = nil, nil, ""
+	v.deploySpecs, v.deploySpecsLoadedFor = nil, ""
 }
 
 // canCutDeployLocked reports whether the caller's role admits cut-version
@@ -183,6 +249,65 @@ func (v *View) requestDeploymentNodesLocked() {
 	}
 	cb := v.OnSelectDeployment
 	go cb(id)
+}
+
+// specSummaryLocked renders the loaded deploymentNodeSpec set as a compact
+// "type ver xN" comma list, ordered as the specs arrived. Caller holds
+// v.mu. Empty when no specs are loaded.
+func (v *View) specSummaryLocked() string {
+	parts := make([]string, 0, len(v.deploySpecs))
+	for _, s := range v.deploySpecs {
+		seg := nodeTypeShort(s.NodeType)
+		if s.Version != "" {
+			seg += " " + s.Version
+		}
+		if s.Replicas > 0 {
+			seg += fmt.Sprintf(" x%d", s.Replicas)
+		}
+		parts = append(parts, seg)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// drawDeploymentPreview renders the selected deployment's composition
+// graphically into region (memql-cockpit#225): a "preview: deployment
+// <id>" header, optionally the desired per-tier spec (Epic 2
+// deploymentNodeSpec), then the deployment's nodes drawn with the shared
+// topology renderer -- its own nodes laid out normally and its orphans
+// (nodes-not-in-deployment) flagged. Used by both the split top region and
+// the fullscreen drill-down. Caller holds v.mu; assumes v.previewActive.
+func (v *View) drawDeploymentPreview(screen *ui.Screen, region ui.Rect) {
+	hdrStyle := tcell.StyleDefault.Foreground(v.Theme.Warning).Background(v.Theme.BG).Bold(true)
+	muted := v.Theme.SubtleStyle()
+
+	if v.deploySelected < 0 || v.deploySelected >= len(v.deployments) {
+		screen.DrawText(region.X+2, region.Y+1, region.Width-3, "preview: no deployment selected", hdrStyle)
+		return
+	}
+	d := v.deployments[v.deploySelected]
+	hdr := "preview: deployment " + shortID(d.ID)
+	if tok, _ := deployStatusToken(d.Status, v.Theme); tok != "" {
+		hdr += " (" + tok + ")"
+	}
+	screen.DrawText(region.X+2, region.Y+1, region.Width-3, clipText(hdr, region.Width-3), hdrStyle)
+
+	// Desired per-tier spec (Epic 2 deploymentNodeSpec, memql#2094), when
+	// loaded for this deployment -- the intent next to the live composition.
+	if v.deploySpecsLoadedFor == d.ID && len(v.deploySpecs) > 0 {
+		spec := "spec: " + v.specSummaryLocked()
+		screen.DrawText(region.X+2, region.Y+2, region.Width-3, clipText(spec, region.Width-3), muted)
+	}
+
+	if !v.previewReadyLocked() {
+		screen.DrawText(region.X+2, region.Y+3, region.Width-4, "loading deployment topology...", muted)
+		return
+	}
+	nodes, isOrphan := v.previewNodesLocked()
+	if len(nodes) == 0 {
+		screen.DrawText(region.X+2, region.Y+3, region.Width-4, "This deployment has no recorded nodes.", muted)
+		return
+	}
+	v.drawTopology(screen, region, nodes, computeEdges(nodes), isOrphan)
 }
 
 // drawDeployments renders the Deployments section into the bottom band
@@ -309,6 +434,20 @@ func (v *View) drawDeploymentDetail(screen *ui.Screen, x, y, maxW int, bounds ui
 	}
 	screen.DrawText(x, y, maxW, summary, label)
 	y++
+	if y > bottom {
+		return
+	}
+
+	// Desired per-tier spec (Epic 2 deploymentNodeSpec, memql#2094): the
+	// intent -- what version + how many replicas each node type should run --
+	// alongside the live node reality below.
+	if v.deploySpecsLoadedFor == d.ID && len(v.deploySpecs) > 0 {
+		screen.DrawText(x, y, maxW, clipText("spec: "+v.specSummaryLocked(), maxW), muted)
+		y++
+		if y > bottom {
+			return
+		}
+	}
 
 	// Per-node lines: type health version -- the node belongs to THIS
 	// deployment, so deploymentId is implied; we surface health+version
@@ -340,7 +479,12 @@ func (v *View) drawDeploymentDetail(screen *ui.Screen, x, y, maxW int, bounds ui
 func (v *View) hintsForDeployments() string {
 	chips := []ui.HintChip{
 		{Key: "Up/Dn", Label: "Move"},
-		{Key: "Enter", Label: "Topology"},
+		{Key: "Enter", Label: "Preview"},
+		{Key: "F", Label: "Fullscreen"},
+	}
+	// While a preview is on screen, surface the way back to the live grid.
+	if v.previewActive {
+		chips = append(chips, ui.HintChip{Key: "Esc", Label: "Live"})
 	}
 	canCut := v.canCutDeployLocked()
 	var sel DeploymentInfo
@@ -363,23 +507,69 @@ func (v *View) handleDeploymentsKeyLocked(key *tcell.EventKey) bool {
 	case tcell.KeyUp:
 		if v.deploySelected > 0 {
 			v.deploySelected--
-			v.deployNodes, v.deployOrphans, v.deployLoadedFor = nil, nil, ""
+			v.clearPreviewCacheLocked()
+			// While previewing, arrow keys switch which deployment is
+			// previewed: reload the newly selected row's composition so the
+			// graphical preview tracks the cursor.
+			if v.previewActive {
+				v.requestDeploymentNodesLocked()
+			}
 			v.requestRedrawLocked()
 		}
 		return true
 	case tcell.KeyDown:
 		if v.deploySelected < len(v.deployments)-1 {
 			v.deploySelected++
-			v.deployNodes, v.deployOrphans, v.deployLoadedFor = nil, nil, ""
+			v.clearPreviewCacheLocked()
+			if v.previewActive {
+				v.requestDeploymentNodesLocked()
+			}
 			v.requestRedrawLocked()
 		}
 		return true
 	case tcell.KeyEnter:
-		v.requestDeploymentNodesLocked()
+		// Enter is the drill-down escalator: live -> preview (graphical
+		// composition in the top region) -> fullscreen drill-down. Esc
+		// steps back out.
+		if !v.previewActive {
+			v.previewActive = true
+			v.requestDeploymentNodesLocked()
+		} else if !v.previewFullscreen {
+			v.previewFullscreen = true
+		}
 		v.requestRedrawLocked()
 		return true
+	case tcell.KeyEscape:
+		// Step back out one level: fullscreen -> preview -> live. Only
+		// consume the key when there's a preview level to collapse, so Esc
+		// is otherwise free for higher-level handlers.
+		if v.previewFullscreen {
+			v.previewFullscreen = false
+			v.requestRedrawLocked()
+			return true
+		}
+		if v.previewActive {
+			v.previewActive = false
+			v.requestRedrawLocked()
+			return true
+		}
+		return false
 	case tcell.KeyRune:
 		switch key.Rune() {
+		case 'f', 'F':
+			// Jump straight to (or out of) the fullscreen drill-down,
+			// activating preview + loading the composition on the way in.
+			if v.previewFullscreen {
+				v.previewFullscreen = false
+			} else {
+				if !v.previewActive {
+					v.previewActive = true
+					v.requestDeploymentNodesLocked()
+				}
+				v.previewFullscreen = true
+			}
+			v.requestRedrawLocked()
+			return true
 		case 'c', 'C':
 			if v.canCutDeployLocked() {
 				v.openCutModalLocked()
