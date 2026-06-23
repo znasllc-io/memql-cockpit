@@ -340,11 +340,28 @@ func (v *View) drawDeployments(screen *ui.Screen, bounds ui.Rect) {
 		screen.DrawText(x, y, maxW, "No deployments recorded for this cluster yet.", muted)
 	}
 
-	// History list. Reserve the lower third of the pane for the detail
-	// block + status bar; the list scrolls within what's left. The list
-	// is small (latest + a handful of previous) so a simple cursor-window
-	// is enough -- no scrollbar chrome.
-	detailH := 9
+	// History list + detail block share the band. The detail block prefers
+	// detailMax rows (id/provenance/spec + per-node composition) but is
+	// shrunk toward detailMin so the list always keeps a few rows -- a
+	// "deployment list" that only ever shows one entry isn't a list
+	// (memql-cockpit#235). The list scrolls within what remains via a simple
+	// cursor-window (no scrollbar chrome).
+	const (
+		detailMax = 9
+		detailMin = 6
+		wantList  = 3 // rows we try to keep for the history list
+	)
+	detailH := detailMax
+	avail := bounds.Height - 3 // rows below the header, for list + detail
+	if avail-detailH < wantList {
+		detailH = avail - wantList
+	}
+	if detailH < detailMin {
+		detailH = detailMin
+	}
+	if detailH > avail {
+		detailH = avail
+	}
 	listBottom := bounds.Y + bounds.Height - 1 - detailH
 	if listBottom < y+1 {
 		listBottom = y + 1
@@ -354,10 +371,14 @@ func (v *View) drawDeployments(screen *ui.Screen, bounds ui.Rect) {
 	if rows > 0 && v.deploySelected >= rows {
 		start = v.deploySelected - rows + 1
 	}
+	// The current (live) deployment is resolved once and flagged per row so
+	// the newest-first list shows which entry is actually running (green).
+	currentID := v.currentDeploymentIdLocked()
 	for i := start; i < len(v.deployments) && y < listBottom; i++ {
 		d := v.deployments[i]
 		sel := i == v.deploySelected
-		v.drawDeploymentRow(screen, x, y, maxW, d, sel)
+		isCurrent := d.ID != "" && d.ID == currentID
+		v.drawDeploymentRow(screen, x, y, maxW, d, sel, isCurrent)
 		y++
 	}
 
@@ -371,25 +392,44 @@ func (v *View) drawDeployments(screen *ui.Screen, bounds ui.Rect) {
 	}
 }
 
-// drawDeploymentRow paints one history row: status token + version + env
-// + provider + relative summary. The selected row gets the selection
-// background; the status token keeps its semantic color.
-func (v *View) drawDeploymentRow(screen *ui.Screen, x, y, maxW int, d DeploymentInfo, sel bool) {
+// drawDeploymentRow paints one history row: a current-deployment marker +
+// status token + version + env + provider summary. The selected row gets
+// the selection background; the status token keeps its semantic color. The
+// CURRENT (live) deployment is flagged with a green "●" marker and its
+// version/meta rendered in green so the operator can pick out -- at a
+// glance, in a newest-first list -- which historical row is the one
+// actually running now (memql-cockpit#235).
+func (v *View) drawDeploymentRow(screen *ui.Screen, x, y, maxW int, d DeploymentInfo, sel, isCurrent bool) {
 	rowStyle := v.Theme.BaseStyle()
 	if sel {
 		rowStyle = v.Theme.SelectionStyle()
 		screen.FillRect(x-2, y, maxW+4, 1, rowStyle)
 	}
+	// Two-column current marker, always reserved so current + non-current
+	// rows stay column-aligned. Green dot == the live deployment.
+	marker := "  "
+	markerStyle := rowStyle
+	if isCurrent {
+		marker = "● " // ● + space
+		markerStyle = rowStyle.Foreground(v.Theme.Success)
+	}
+	screen.DrawText(x, y, 2, marker, markerStyle)
+	tx := x + 2
+
 	// Status token, ASCII-only and color-coded (no edge glyphs -- this is
 	// interior text, but keep it ASCII so width is unambiguous).
 	token, tokenColor := deployStatusToken(d.Status, v.Theme)
-	cx := drawColoredToken(screen, x, y, x+maxW, fmt.Sprintf("%-11s", token), rowStyle.Foreground(tokenColor))
+	cx := drawColoredToken(screen, tx, y, x+maxW, fmt.Sprintf("%-11s", token), rowStyle.Foreground(tokenColor))
 	version := d.Version
 	if version == "" {
 		version = "(no version)"
 	}
 	rest := fmt.Sprintf(" %s  %s  %s", version, shortEnv(d.Environment), d.Provider)
-	screen.DrawText(cx, y, x+maxW-cx, rest, rowStyle)
+	restStyle := rowStyle
+	if isCurrent {
+		restStyle = rowStyle.Foreground(v.Theme.Success)
+	}
+	screen.DrawText(cx, y, x+maxW-cx, rest, restStyle)
 }
 
 // drawDeploymentDetail renders the selected deployment's fields plus its
@@ -405,10 +445,13 @@ func (v *View) drawDeploymentDetail(screen *ui.Screen, x, y, maxW int, bounds ui
 	}
 	d := v.deployments[v.deploySelected]
 
-	// Line 1: id + status + version.
+	// Line 1: id + status + (current) marker.
 	token, tokenColor := deployStatusToken(d.Status, v.Theme)
 	screen.DrawText(x, y, maxW, "DEPLOYMENT "+shortID(d.ID), label)
-	drawColoredToken(screen, x+len("DEPLOYMENT ")+len(shortID(d.ID))+2, y, x+maxW, token, v.colorStyle(tokenColor))
+	cx := drawColoredToken(screen, x+len("DEPLOYMENT ")+len(shortID(d.ID))+2, y, x+maxW, token, v.colorStyle(tokenColor))
+	if d.ID != "" && d.ID == v.currentDeploymentIdLocked() {
+		drawColoredToken(screen, cx+1, y, x+maxW, "(current)", v.colorStyle(v.Theme.Success))
+	}
 	y++
 	if y > bottom {
 		return
