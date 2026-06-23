@@ -106,9 +106,16 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
    **MemQL Sense-colored** (Tokenize, #229) and read-only, with a
    line cursor (`↑/↓` move, `←/→` column, the viewer auto-scrolls to
    keep the cursor visible) and **Sense hover** on `H` (a stripped-
-   markdown overlay; `Esc` closes it). Editing embedded/pack files is
-   NOT possible here -- that's the bundle-authoring path (C2/C3). Lives
-   in `cli/dsledit/`; the colored read-only render reuses `cli/ui/viewer.go`
+   markdown overlay; `Esc` closes it). `Ctrl+B` toggles into
+   **authoring mode** (C2 #230): a local *bundle* (a directory of
+   `.memql` files under `~/.memql/bundles/<name>/`) edited with full
+   Sense IntelliSense -- coloring, inline diagnostics, completion
+   (`Ctrl+Space`), hover (`Ctrl+K`), save (`Ctrl+S`) -- reusing
+   `cli/editor`. BUNDLES → FILES → EDITOR panes; `N` creates a
+   bundle/file. Embedded/pack files stay read-only; authored bundles
+   are validated/injected into a session in C3 (#231). Lives in
+   `cli/dsledit/` (`view.go` browser, `author.go` authoring, `bundle.go`
+   workspace IO); the colored read-only render reuses `cli/ui/viewer.go`
    (its optional `ShowCursor`/`CursorLine` line-highlight landed for
    this).
 4. **Settings (F4)** -- credentials, theme, version
@@ -478,7 +485,7 @@ pans the grid). There is no toggle.
 | Backspace   | Zoom out one level                                  |
 | Esc / X     | Return to live topology                             |
 
-### Editor tab (read-only pack browser)
+### Editor tab -- browse mode (read-only pack browser)
 | Key         | Action                                                       |
 |-------------|--------------------------------------------------------------|
 | Tab         | Cycle focus DOMAINS → FILES → SOURCE                          |
@@ -488,6 +495,19 @@ pans the grid). There is no toggle.
 | H           | SOURCE: Sense hover at the cursor (overlay)                  |
 | Esc         | SOURCE: close the hover overlay                              |
 | PgUp/PgDn   | SOURCE: scroll the viewport                                  |
+| Ctrl+B      | Switch to authoring mode                                     |
+
+### Editor tab -- authoring mode (bundle editor, Ctrl+B-toggled)
+| Key         | Action                                                       |
+|-------------|--------------------------------------------------------------|
+| Ctrl+B      | Switch back to the read-only browser                         |
+| Tab         | Cycle focus BUNDLES → FILES → EDITOR                          |
+| N           | BUNDLES: new bundle; FILES: new file (prompts for a name)    |
+| Enter       | BUNDLES: open the bundle's files; FILES: open the file in the editor |
+| Ctrl+S      | EDITOR: save the buffer to disk                              |
+| Ctrl+Space  | EDITOR: Sense completion at the cursor                       |
+| Ctrl+K      | EDITOR: Sense hover at the cursor                            |
+| Esc         | EDITOR: dismiss completion/hover; prompt: cancel             |
 
 ---
 
@@ -509,7 +529,7 @@ pans the grid). There is no toggle.
 | `sense/`                 | `SenseClient` over the SDK Dispatcher -- editor-side wrappers for MemQL Sense (Tokenize / Diagnose / Complete / Hover). |
 | `config/clusters.go`     | `~/.memql/clusters.yaml` load/save                            |
 | `concepts/`              | Concepts tab (concept picker + row list + generic renderer)   |
-| `dsledit/`               | Editor tab: read-only DSL pack browser (domains/files/source) over `memql/sdk/go/pack` (memql-cockpit#228); grows the Sense viewer (#229) + bundle authoring (C2/C3) |
+| `dsledit/`               | Editor tab: `view.go` read-only DSL pack browser (domains/files/source) over `memql/sdk/go/pack` (#228) + Sense coloring/hover (#229); `author.go` Ctrl+B authoring mode (editable bundles via `cli/editor`, #230); `bundle.go` local `~/.memql/bundles` workspace IO |
 | `editor/`                | Reusable text editor with Sense integration                   |
 | `settings/`              | Settings tab                                                  |
 | `ui/`                    | Theme, screen, tab bar, layout primitives                     |
