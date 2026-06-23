@@ -252,28 +252,87 @@ the same pane, not a replacement.
 
 ## Connection Pool
 
-Each cluster the user opens this session gets its own `connEntry` in
-`a.pool[clusterName]` (see `pool.go`). Switching clusters is a pool
-lookup, not a reconnect. Each entry runs an independent lifecycle
-goroutine driving an `entryState` machine:
+Every configured cluster gets a `connEntry` in `a.pool[clusterName]`
+(see `pool.go`), but **only ONE entry holds a live connection at a
+time -- the selected ("working") cluster** (epic #239). This is the
+single-live-connection model; the rest are listed but not dialed.
+
+### Single live connection (the rule)
+
+- **Boot** (`connect()`): opens the full lifecycle for the **selected**
+  cluster only (restored from `~/.memql/clusters.yaml`). Every other
+  cluster is **registered** (`registerEntry`) into the pool as metadata
+  -- the row renders with its config-derived status, but no lifecycle
+  goroutine, no stream, no subscriber, no token refresher, no initial
+  load. This is what kills the old boot-time N-cluster dial storm.
+- **Selection drives the connection** (`setSelected`, CM2): pressing
+  Enter on a cluster makes it the working cluster AND brings it up.
+  The previously-selected cluster is **demoted** (`demoteToIdle`) back
+  to a registered-idle row -- its full connection (stream + subscriber
+  + refresher) is torn down. So the single live connection FOLLOWS the
+  selection. The teardown's `Close()` runs OFF the UI thread
+  (`replaceWithRegistered`) so a switch never freezes the event loop on
+  the stream-drain wait (cf. #191).
+- **`setViewed` (arrow-key highlight) is side-effect-free** -- it only
+  repaints the topology pane for the highlighted cluster; it never
+  connects. A non-selected, non-connected highlight shows status + an
+  `Enter:Connect` hint, not a stale topology.
+
+### Live-connection lifecycle (the selected cluster)
+
+The selected cluster's entry runs a lifecycle goroutine driving an
+`entryState` machine:
 
 | State       | Meaning                                                    |
 |-------------|------------------------------------------------------------|
-| Idle        | Created, lifecycle hasn't tried to dial yet.               |
+| Idle        | Registered, not dialed (every non-selected configured row).|
 | Connecting  | Active dial in flight.                                     |
 | Connected   | Stream up; subscribers running.                            |
 | Backoff     | Attempt N failed; sleeping before attempt N+1 (15/30/45s). |
 | Failed      | Cycle exhausted (3 attempts). Waits for manual `R:Retry`.  |
+| NeedsConfig | Missing endpoint/auth -- `L:Authorize`. Never dials.       |
+| NeedsToken  | Configured but no cached token -- `L:Login`. Never dials.  |
+
+`connEntry.lifecycleStarted` records whether `runLifecycle` was
+launched; registered-idle entries never start one, and `Close()` skips
+the stream-drain wait for them so quit stays fast across N clusters.
 
 The lifecycle uses **bounded retry**: at most 3 attempts per cycle with
 linear backoff (15s → 30s → 45s). After failure the entry sits in
 `Failed` until the user explicitly retries -- no infinite reconnect
 storms. On stream loss after a successful connect the entry transitions
-back to `Backoff` and re-enters the cycle automatically.
+back to `Backoff` and re-enters the cycle automatically. The CLI
+distinguishes intentional shutdowns from stream errors via
+`Dispatcher.Done()` vs `Dispatcher.Unexpected()`; switching clusters
+via `Close()`/`Cancel()` does NOT trigger reconnect, only
+`Unexpected()` does.
 
-The CLI distinguishes intentional shutdowns from stream errors via
-`Dispatcher.Done()` vs `Dispatcher.Unexpected()`. Switching clusters
-via `Cancel()` does NOT trigger reconnect; only `Unexpected()` does.
+### Liveness probe (the non-selected clusters)
+
+Registered-idle clusters get a lightweight periodic **liveness probe**
+(`livenessProbeLoop`, CM3) so their row shows an at-a-glance up/down
+dot without a full connection. One shared ~25s ticker; each sweep
+probes every eligible (non-selected, `stateIdle`) cluster through a
+bounded worker pool (`probeConcurrency`) -- no probe storm. A probe is
+a single short-timeout `client.Connect` + immediate `Close`: **no
+token, no subscribe, no initial loads, no refresher**. The handshake
+completes without credentials and an auth rejection still proves
+reachability, so only a transport failure (dial refused / TLS /
+timeout) counts as down. The result lives on `connEntry.probe`
+(`probeStatus`, distinct from the lifecycle `State`) and maps onto the
+existing `available` (reachable) / `unreachable` (down) row dots.
+`setProbe` only triggers a redraw on a real transition, so a
+steady-state sweep produces zero frames.
+
+### Redraw coalescing (no flicker)
+
+All of the above churn collapses into minimal frames: `postRedraw`
+coalesces bursts via the `redrawPending` atomic (only the first caller
+in a quiet window posts an `EventInterrupt`; the event loop clears the
+flag before `draw()` so nothing is dropped), and the probe's `setProbe`
+change-gate means re-confirming the same reachability emits no redraw.
+The single-connection invariant + stable-frame behavior is locked by
+`cli/single_connection_invariant_test.go`.
 
 ---
 
@@ -290,7 +349,7 @@ via `Cancel()` does NOT trigger reconnect; only `Unexpected()` does.
 | Key   | Action                                              |
 |-------|-----------------------------------------------------|
 | ↑/↓   | Move highlight (also moves topology view)           |
-| Enter | Select cluster (drives Explorer/Agents)             |
+| Enter | Make highlighted the working cluster -- connects it if not already live, tears the previous one down to probe-only (single live connection, #239) |
 | A     | Add a new cluster                                   |
 | E     | Edit highlighted cluster                            |
 | D     | Delete highlighted cluster (not "local")            |
