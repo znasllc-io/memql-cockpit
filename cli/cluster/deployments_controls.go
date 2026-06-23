@@ -55,18 +55,43 @@ func (v *View) SetDeployConceptActor(a deployConceptActions) {
 type deployConceptStage int
 
 const (
-	dcStageCutEnv          deployConceptStage = iota // pick env
-	dcStageCutBump                                   // pick bump (patch/minor/major)
+	dcStageCutBump         deployConceptStage = iota // pick bump (patch/minor/major)
 	dcStageCutConfirm                                // confirm cut
 	dcStageDeployConfirm                             // confirm deploy of selected pending deployment
 	dcStageRollbackConfirm                           // type-to-confirm rollback to selected
 	dcStageResult                                    // terminal: result line shown
 )
 
-// cutEnvs / cutBumps are the pickers the cut flow offers. Least-impactful
-// first so a blind Enter lands on staging + patch.
-var cutEnvs = []string{"staging", "production", "development"}
+// cutBumps is the only picker the cut flow offers now. A cluster IS one
+// environment (memql-cockpit#226), so the env is resolved from the cluster
+// record rather than picked -- the flow opens straight on the bump picker.
+// Least-impactful first so a blind Enter lands on patch.
 var cutBumps = []string{"patch", "minor", "major"}
+
+// SetClusterEnvironment mirrors the connected cluster's single environment
+// (development|staging|production) into the view, resolved from the
+// v1:cluster:cluster record. Wired from the app's deployment refresh.
+func (v *View) SetClusterEnvironment(env string) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.clusterEnv = strings.TrimSpace(env)
+}
+
+// cutEnvLocked resolves the environment a cut targets: the cluster's own
+// environment when known, else the newest deployment's environment, else
+// "development" (the engine's own default). A cluster IS one environment,
+// so there is nothing to pick. Caller MUST hold v.mu.
+func (v *View) cutEnvLocked() string {
+	if v.clusterEnv != "" {
+		return v.clusterEnv
+	}
+	for _, d := range v.deployments { // newest-first
+		if e := strings.TrimSpace(d.Environment); e != "" {
+			return e
+		}
+	}
+	return "development"
+}
 
 // deployConceptState is the transient modal state.
 type deployConceptState struct {
@@ -88,10 +113,19 @@ type deployConceptState struct {
 	resultOK bool
 }
 
-// openCutModalLocked opens the cut-version flow at the env picker. Caller
-// MUST hold v.mu (write); the caller already gated on canCutDeployLocked.
+// openCutModalLocked opens the cut-version flow directly on the bump
+// picker -- the environment is the cluster's own (a cluster IS one
+// environment, memql-cockpit#226), resolved here rather than picked.
+// Fires the best-effort next-version suggestion for that env right away.
+// Caller MUST hold v.mu (write); the caller already gated on
+// canCutDeployLocked.
 func (v *View) openCutModalLocked() {
-	v.dctrl = &deployConceptState{stage: dcStageCutEnv, action: "cut"}
+	v.dctrl = &deployConceptState{
+		stage:  dcStageCutBump,
+		action: "cut",
+		env:    v.cutEnvLocked(),
+	}
+	v.fireSuggestLocked()
 }
 
 // openDeployModalConceptLocked opens the deploy-confirm for the selected
@@ -136,13 +170,6 @@ func (v *View) handleDeployConceptKeyLocked(key *tcell.EventKey) bool {
 		return true // swallow input while a fire is in flight
 	}
 	switch m.stage {
-	case dcStageCutEnv:
-		return v.handleConceptPickLocked(key, cutEnvs, func() {
-			m.env = cutEnvs[m.selected]
-			m.selected = 0
-			m.stage = dcStageCutBump
-			v.fireSuggestLocked() // best-effort next-version hint
-		})
 	case dcStageCutBump:
 		return v.handleConceptPickLocked(key, cutBumps, func() {
 			m.bump = cutBumps[m.selected]
@@ -183,15 +210,12 @@ func (v *View) handleDeployConceptKeyLocked(key *tcell.EventKey) bool {
 func (v *View) deployConceptEscapeLocked() {
 	m := v.dctrl
 	switch m.stage {
-	case dcStageCutBump:
-		m.stage = dcStageCutEnv
-		m.selected = 0
 	case dcStageCutConfirm:
 		m.stage = dcStageCutBump
 		m.selected = 0
 	default:
-		// Env picker, deploy/rollback confirm, and the result stage all
-		// close the modal outright.
+		// Bump picker (now the first cut stage), deploy/rollback confirm,
+		// and the result stage all close the modal outright.
 		v.dctrl = nil
 	}
 }
@@ -448,10 +472,8 @@ func (v *View) drawDeployConceptBody(screen *ui.Screen, x, y, w, h int, base, su
 	}
 
 	switch m.stage {
-	case dcStageCutEnv:
-		drawList("Cut a new version -- pick environment:", cutEnvs, m.selected)
 	case dcStageCutBump:
-		drawList(fmt.Sprintf("Cut for %s -- pick semver bump:", strings.ToUpper(m.env)), cutBumps, m.selected)
+		drawList(fmt.Sprintf("Cut for %s (the cluster's env) -- pick semver bump:", strings.ToUpper(m.env)), cutBumps, m.selected)
 		if m.suggestion != "" {
 			screen.DrawText(x, y+len(cutBumps)+2, w, m.suggestion, subtle)
 		}
@@ -485,8 +507,8 @@ func (v *View) drawDeployConceptBody(screen *ui.Screen, x, y, w, h int, base, su
 func (v *View) deployConceptHint() string {
 	m := v.dctrl
 	switch m.stage {
-	case dcStageCutEnv, dcStageCutBump:
-		return "Up/Dn:Move  Enter:Next  Esc:Back"
+	case dcStageCutBump:
+		return "Up/Dn:Move  Enter:Next  Esc:Cancel"
 	case dcStageCutConfirm, dcStageDeployConfirm:
 		return "Enter:Confirm  Esc:Back"
 	case dcStageRollbackConfirm:
