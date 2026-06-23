@@ -20,6 +20,7 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 
+	authoringsdk "github.com/znasllc-io/memql/sdk/go/authoring"
 	"github.com/znasllc-io/memql/sdk/go/sense"
 
 	"github.com/znasllc-io/memql-cockpit/cli/editor"
@@ -70,22 +71,45 @@ type authoring struct {
 	promptInput string
 	promptErr   string
 
-	senseClient func() *sense.Client
-	onStatus    func(string)
-	onRedraw    func()
+	// resultShown gates the Validate/Inject results overlay; resultTitle
+	// + resultLines hold the per-construct outcome (C3 #231).
+	resultShown bool
+	resultTitle string
+	resultLines []resultEntry
+
+	senseClient     func() *sense.Client
+	authoringClient func() *authoringsdk.Client
+	onStatus        func(string)
+	onRedraw        func()
 
 	debounce *ui.Debouncer
 }
 
-func newAuthoring(theme ui.Theme, senseClient func() *sense.Client, onStatus func(string), onRedraw func()) *authoring {
+// resultSev colors a result line in the overlay.
+type resultSev int
+
+const (
+	sevPlain resultSev = iota
+	sevOK
+	sevWarn
+	sevErr
+)
+
+type resultEntry struct {
+	text string
+	sev  resultSev
+}
+
+func newAuthoring(theme ui.Theme, senseClient func() *sense.Client, authoringClient func() *authoringsdk.Client, onStatus func(string), onRedraw func()) *authoring {
 	a := &authoring{
-		theme:       theme,
-		focus:       authorBundles,
-		completion:  editor.NewCompletionPopup(theme),
-		hover:       editor.NewHoverTooltip(theme),
-		senseClient: senseClient,
-		onStatus:    onStatus,
-		onRedraw:    onRedraw,
+		theme:           theme,
+		focus:           authorBundles,
+		completion:      editor.NewCompletionPopup(theme),
+		hover:           editor.NewHoverTooltip(theme),
+		senseClient:     senseClient,
+		authoringClient: authoringClient,
+		onStatus:        onStatus,
+		onRedraw:        onRedraw,
 	}
 	a.bundleList.Render = a.renderBundleRow
 	a.fileList.Render = a.renderFileRow
@@ -145,6 +169,58 @@ func (a *authoring) Draw(screen *ui.Screen, bounds ui.Rect) {
 	a.drawBundleList(screen, bundleBounds)
 	a.drawFileList(screen, fileBounds)
 	a.drawEditor(screen, editorBounds)
+
+	// The Validate/Inject results overlay sits over the (widest) editor
+	// pane.
+	if a.resultShown {
+		a.drawResults(screen, editorBounds)
+	}
+}
+
+// drawResults paints the Validate/Inject outcome as a bordered overlay
+// over the editor pane: a title row, the per-construct lines (colored
+// by severity, clipped to the box), and an Esc:Close chrome row.
+func (a *authoring) drawResults(screen *ui.Screen, bounds ui.Rect) {
+	if bounds.Width < 8 || bounds.Height < 4 {
+		return
+	}
+	bg := tcell.StyleDefault.Background(tcell.NewRGBColor(28, 30, 36)).Foreground(a.theme.FG)
+	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, bg)
+	screen.DrawBox(bounds.X, bounds.Y, bounds.Width, bounds.Height, bg.Foreground(a.theme.Subtle))
+
+	innerW := bounds.Width - 4
+	screen.DrawText(bounds.X+2, bounds.Y+1, innerW, a.resultTitle, a.theme.AccentStyle())
+
+	// Body rows: title(1) + blank(1) at top, hint(1) at bottom.
+	bodyTop := bounds.Y + 3
+	bodyBottom := bounds.Y + bounds.Height - 2
+	y := bodyTop
+	for _, e := range a.resultLines {
+		for _, ln := range ui.WrapText(e.text, innerW) {
+			if y >= bodyBottom {
+				break
+			}
+			screen.DrawText(bounds.X+2, y, innerW, ln, a.resultStyle(e.sev, bg))
+			y++
+		}
+		if y >= bodyBottom {
+			break
+		}
+	}
+	ui.DrawBottom(screen, bounds, a.theme.SubtleStyle(), 2, "Esc:Close")
+}
+
+func (a *authoring) resultStyle(sev resultSev, base tcell.Style) tcell.Style {
+	switch sev {
+	case sevOK:
+		return base.Foreground(a.theme.Success)
+	case sevWarn:
+		return base.Foreground(a.theme.Warning)
+	case sevErr:
+		return base.Foreground(a.theme.Error)
+	default:
+		return base
+	}
 }
 
 func (a *authoring) drawBundleList(screen *ui.Screen, bounds ui.Rect) {
@@ -285,12 +361,16 @@ func (a *authoring) hintsForFiles() string {
 
 func (a *authoring) hintsForEditor() string {
 	if a.editor == nil {
-		return "Tab:Cycle"
+		// Validate/Inject act on the whole bundle, so they're available
+		// even before a file is opened (Ctrl combos work from any focus).
+		return "Ctrl+G:Validate  Ctrl+R:Inject  Tab:Cycle"
 	}
+	// Ctrl+Space:Complete + Ctrl+K:Hover work too (documented in
+	// cli/CLAUDE.md); the band shows the most-used four so it fits.
 	return ui.HintBar{Chips: []ui.HintChip{
 		{Key: "Ctrl+S", Label: "Save"},
-		{Key: "Ctrl+Space", Label: "Complete"},
-		{Key: "Ctrl+K", Label: "Hover"},
+		{Key: "Ctrl+G", Label: "Validate"},
+		{Key: "Ctrl+R", Label: "Inject"},
 		{Key: "Tab", Label: "Cycle"},
 	}}.String()
 }
@@ -307,6 +387,34 @@ func (a *authoring) HandleEvent(key *tcell.EventKey) bool {
 		consumed := a.handlePromptKeyLocked(key)
 		a.mu.Unlock()
 		return consumed
+	}
+
+	// Esc dismisses the Validate/Inject results overlay.
+	if a.resultShown && key.Key() == tcell.KeyEsc {
+		a.resultShown = false
+		a.mu.Unlock()
+		return true
+	}
+
+	// Validate (Ctrl+G, Gate-1) + Inject (Ctrl+R, session-define) are
+	// bundle-level and work from any focus -- Ctrl combos never collide
+	// with editor typing. Gather under the lock, then run the gRPC call
+	// off the UI goroutine.
+	switch key.Key() {
+	case tcell.KeyCtrlG:
+		sources, bundle, ok := a.gatherForActionLocked()
+		a.mu.Unlock()
+		if ok {
+			go a.runValidate(bundle, sources)
+		}
+		return true
+	case tcell.KeyCtrlR:
+		sources, bundle, ok := a.gatherForActionLocked()
+		a.mu.Unlock()
+		if ok {
+			go a.runInject(bundle, sources)
+		}
+		return true
 	}
 
 	if key.Key() == tcell.KeyTab {
@@ -642,4 +750,152 @@ func (a *authoring) senseClientFn() *sense.Client {
 		return nil
 	}
 	return a.senseClient()
+}
+
+func (a *authoring) authoringClientFn() *authoringsdk.Client {
+	if a.authoringClient == nil {
+		return nil
+	}
+	return a.authoringClient()
+}
+
+// --- Validate (Gate-1) + Inject (session-define), C3 #231 -----------
+
+// gatherForActionLocked saves the open buffer (so disk is current),
+// then returns the bundle's combined .memql source for Validate /
+// Inject. Caller holds a.mu. ok is false (with a status message) when
+// there's nothing to act on.
+func (a *authoring) gatherForActionLocked() (sources, bundle string, ok bool) {
+	if a.openBundle == "" {
+		a.status("open a bundle first (Enter on a bundle)")
+		return "", "", false
+	}
+	if a.editor != nil && a.openFile != "" && a.editor.IsDirty() {
+		if err := writeBundleFile(a.openBundle, a.openFile, a.editor.Buffer.Source()); err == nil {
+			a.editor.ClearDirty()
+		}
+	}
+	src, err := bundleSources(a.openBundle)
+	if err != nil {
+		a.status(fmt.Sprintf("read bundle %q: %v", a.openBundle, err))
+		return "", "", false
+	}
+	return src, a.openBundle, true
+}
+
+// runValidate runs the Gate-1 sandbox over the bundle and shows the
+// per-construct diagnostics. Never mutates engine state.
+func (a *authoring) runValidate(bundle, sources string) {
+	ac := a.authoringClientFn()
+	if ac == nil {
+		a.status("validate needs a connected cluster")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	res, err := ac.ValidateBundle(ctx, sources)
+	if err != nil {
+		a.status(fmt.Sprintf("validate: %v", err))
+		return
+	}
+	a.mu.Lock()
+	a.showValidateResultLocked(res)
+	a.mu.Unlock()
+	a.redraw()
+}
+
+// runInject session-defines the bundle (validate + register) so its
+// constructs become callable by name for the session.
+func (a *authoring) runInject(bundle, sources string) {
+	ac := a.authoringClientFn()
+	if ac == nil {
+		a.status("inject needs a connected cluster")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	res, err := ac.SessionDefineBundle(ctx, sources)
+	if err != nil {
+		a.status(fmt.Sprintf("inject: %v", err))
+		return
+	}
+	a.mu.Lock()
+	a.showInjectResultLocked(res)
+	a.mu.Unlock()
+	a.redraw()
+}
+
+func (a *authoring) showValidateResultLocked(res *authoringsdk.ValidateResult) {
+	if res == nil {
+		return
+	}
+	verdict := "FAILED"
+	if res.OK {
+		verdict = "OK"
+	}
+	a.resultTitle = "VALIDATE -- Gate-1: " + verdict
+	a.resultLines = a.resultLines[:0]
+	for _, d := range res.Diagnostics {
+		a.resultLines = append(a.resultLines, diagnosticLine(d))
+	}
+	if len(res.Diagnostics) == 0 {
+		a.resultLines = append(a.resultLines, resultEntry{"(no constructs found in the bundle)", sevPlain})
+	}
+	a.resultShown = true
+}
+
+func (a *authoring) showInjectResultLocked(res *authoringsdk.SessionDefineResult) {
+	if res == nil {
+		return
+	}
+	a.resultLines = a.resultLines[:0]
+	if res.OK {
+		a.resultTitle = "INJECT -- session-define: OK"
+		a.resultLines = append(a.resultLines, resultEntry{
+			fmt.Sprintf("Defined %d construct(s). Session-scoped: callable by name now, never shadows core, dropped when this session ends.", len(res.Defined)),
+			sevPlain,
+		})
+		for _, c := range res.Defined {
+			a.resultLines = append(a.resultLines, resultEntry{fmt.Sprintf("[ok] %s (%s)", c.Name, c.Kind), sevOK})
+		}
+		if len(res.Defined) == 0 {
+			a.resultLines = append(a.resultLines, resultEntry{"(nothing was defined)", sevPlain})
+		}
+	} else {
+		a.resultTitle = "INJECT -- session-define: REJECTED"
+		if res.Error != "" {
+			a.resultLines = append(a.resultLines, resultEntry{res.Error, sevErr})
+		}
+		for _, d := range res.Diagnostics {
+			if d.OK || d.Skipped {
+				continue
+			}
+			a.resultLines = append(a.resultLines, diagnosticLine(d))
+		}
+		if len(a.resultLines) == 0 {
+			a.resultLines = append(a.resultLines, resultEntry{"(rejected, no detail)", sevErr})
+		}
+	}
+	a.resultShown = true
+}
+
+// diagnosticLine formats one Gate-1 diagnostic with an ASCII status
+// marker (no ambiguous-width glyphs per the layout-edge rule).
+func diagnosticLine(d authoringsdk.Diagnostic) resultEntry {
+	switch {
+	case d.Skipped:
+		line := fmt.Sprintf("[--] %s (%s) skipped", d.Name, d.Kind)
+		if d.Error != "" {
+			line += ": " + d.Error
+		}
+		return resultEntry{line, sevWarn}
+	case d.OK:
+		return resultEntry{fmt.Sprintf("[ok] %s (%s)", d.Name, d.Kind), sevOK}
+	default:
+		line := fmt.Sprintf("[!!] %s (%s)", d.Name, d.Kind)
+		if d.Error != "" {
+			line += ": " + d.Error
+		}
+		return resultEntry{line, sevErr}
+	}
 }

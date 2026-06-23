@@ -30,6 +30,7 @@ import (
 	corgenesis "github.com/znasllc-io/memql/component/genesis"
 	"github.com/znasllc-io/memql/component/node"
 	nodev1 "github.com/znasllc-io/memql/component/node/gen"
+	"github.com/znasllc-io/memql/sdk/go/authoring"
 	"github.com/znasllc-io/memql/sdk/go/client"
 	"github.com/znasllc-io/memql/sdk/go/pack"
 	"github.com/znasllc-io/memql/sdk/go/sense"
@@ -1196,6 +1197,15 @@ func (a *App) wirePacks() {
 			return nil
 		}
 		return sense.NewClient(d)
+	}
+	// Authoring client for the bundle Validate (Gate-1) + Inject
+	// (session-define) actions (#231).
+	a.dsleditView.AuthoringClient = func() *authoring.Client {
+		d := a.activeDispatcher()
+		if d == nil {
+			return nil
+		}
+		return authoring.NewClient(d)
 	}
 	a.dsleditView.OnStatus = func(msg string) {
 		if a.notifications != nil {

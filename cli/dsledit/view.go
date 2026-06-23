@@ -23,6 +23,7 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 
+	authoringsdk "github.com/znasllc-io/memql/sdk/go/authoring"
 	"github.com/znasllc-io/memql/sdk/go/pack"
 	"github.com/znasllc-io/memql/sdk/go/sense"
 
@@ -101,6 +102,12 @@ type View struct {
 	// degrades to plain text when this is nil. Mirrors the Concepts
 	// tab's SenseClient closure.
 	SenseClient func() *sense.Client
+
+	// AuthoringClient returns an authoring client bound to the active
+	// cluster's dispatcher, or nil when none is connected. Backs the
+	// authoring mode's Validate (Gate-1) + Inject (session-define)
+	// actions (C3 #231).
+	AuthoringClient func() *authoringsdk.Client
 }
 
 // NewView builds an empty Editor view.
@@ -599,7 +606,7 @@ func (v *View) toggleMode() {
 	v.Mu.Lock()
 	if v.mode == modeBrowse {
 		if v.author == nil {
-			v.author = newAuthoring(v.Theme, v.SenseClient, v.OnStatus, v.Redraw)
+			v.author = newAuthoring(v.Theme, v.SenseClient, v.AuthoringClient, v.OnStatus, v.Redraw)
 		}
 		v.mode = modeAuthor
 	} else {
