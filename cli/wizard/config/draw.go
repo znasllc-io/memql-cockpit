@@ -6,6 +6,7 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
+	"github.com/znasllc-io/memql/component/secret"
 )
 
 const maskGlyph = "********"
@@ -35,8 +36,8 @@ func (s *state) draw() {
 	screen.DrawText(px+(panelW-len(title))/2, py+1, len(title), title, theme.AccentStyle().Bold(true))
 
 	switch s.step {
-	case stepMasterKey:
-		s.drawMasterKeyPlaceholder(px, py, panelW, panelH)
+	case stepMasterKey, stepConfirmRegenerate:
+		s.drawMasterKey(px, py, panelW, panelH)
 	default:
 		s.drawList(px, py, panelW, panelH)
 	}
@@ -212,25 +213,121 @@ func (s *state) drawEditField(x, y, w int) {
 	}
 }
 
-func (s *state) drawMasterKeyPlaceholder(px, py, panelW, panelH int) {
+// drawMasterKey renders the read-only master-key panel (7.8 / #2111):
+// the current MEMQL_MASTER_KEY (masked unless revealed) with a
+// provenance note, and the regenerate action. There is intentionally
+// no editable field -- the key is display + regenerate only.
+func (s *state) drawMasterKey(px, py, panelW, panelH int) {
 	theme := s.theme
 	screen := s.screen
-	// 7.8 (#2111) mounts the real master-key display / regenerate panel
-	// here. This is the reserved section -- keep it inert until then.
-	lines := []string{
-		"Master key panel",
-		"",
-		"Display + regenerate of MEMQL_MASTER_KEY ships in issue #2111 (7.8).",
-		"This section is reserved for that follow-up.",
-		"",
-		"Press any key to return to the configuration list.",
+
+	subtitle := "MEMQL_MASTER_KEY -- read-only. Regenerate to rotate + re-seal the envelope."
+	screen.DrawText(px+4, py+3, panelW-8, subtitle, theme.SubtleStyle())
+
+	key := s.currentMasterKey()
+	y := py + 5
+
+	// The key value (masked by default; reveal toggle via R).
+	keyLabel := "Master key:"
+	screen.DrawText(px+4, y, panelW-8, keyLabel, theme.BaseStyle().Bold(true))
+	y++
+	var shown string
+	switch {
+	case key == "":
+		shown = "(not set -- " + secret.EnvMasterKey + " is absent from this shell)"
+	case s.keyRevealed:
+		shown = key
+	default:
+		shown = maskGlyph + maskGlyph + "  (R to reveal)"
 	}
-	y := py + 4
-	for _, ln := range lines {
-		screen.DrawText(px+4, y, panelW-8, ln, theme.BaseStyle())
-		y++
+	screen.DrawText(px+6, y, panelW-10, shown, theme.AccentStyle())
+	y += 2
+
+	// Provenance note.
+	provLabel := "Source:"
+	screen.DrawText(px+4, y, panelW-8, provLabel, theme.BaseStyle().Bold(true))
+	y++
+	screen.DrawText(px+6, y, panelW-10, s.provenanceNote(), theme.SubtleStyle())
+	y += 2
+
+	// Regenerate description / confirm prompt.
+	if s.step == stepConfirmRegenerate {
+		warn := []string{
+			"Regenerate the master key?",
+			"",
+			"This generates a NEW key, re-encrypts the WHOLE genesis envelope",
+			"under it, and rewrites the MEMQL_MASTER_KEY line in ~/.bashrc and",
+			"~/.zshrc. The old key stops decrypting the envelope. Make sure no",
+			"other shell or process is mid-read.",
+		}
+		for _, ln := range warn {
+			screen.DrawText(px+4, y, panelW-8, ln, theme.BaseStyle())
+			y++
+		}
+	} else {
+		info := []string{
+			"Regenerate (G) rotates the key: a fresh key is generated, the whole",
+			"envelope is re-sealed under it, and your shell rc files are re-synced.",
+			"The key is never typed or edited -- generate-only.",
+		}
+		for _, ln := range info {
+			screen.DrawText(px+4, y, panelW-8, ln, theme.SubtleStyle())
+			y++
+		}
 	}
-	screen.DrawText(px+4, py+panelH-2, panelW-8, "Any key: Back", theme.SubtleStyle())
+
+	// Status line (regenerate progress / result), one row above the hint.
+	statusRow := py + panelH - 3
+	if s.status != "" {
+		style := theme.BaseStyle().Foreground(theme.Success)
+		if s.statusError {
+			style = theme.ErrorStyle()
+		}
+		screen.DrawText(px+4, statusRow, panelW-8, s.status, style)
+	}
+
+	// Hint bar.
+	screen.DrawText(px+4, py+panelH-2, panelW-8, s.masterKeyHint(), theme.SubtleStyle())
+}
+
+// provenanceNote returns the human-readable provenance line for the
+// current master key.
+func (s *state) provenanceNote() string {
+	if s.currentMasterKey() == "" {
+		return "no master key available"
+	}
+	switch s.keyProvenance {
+	case provenanceShellRC:
+		return "loaded from shell rc (present in the environment at launch)"
+	case provenanceGenerated:
+		return "generated this session"
+	default:
+		return "unknown"
+	}
+}
+
+// masterKeyHint returns the context-aware hint bar for the master-key
+// panel and its confirm-regenerate gate.
+func (s *state) masterKeyHint() string {
+	if s.keyBusy {
+		return "Working..."
+	}
+	if s.step == stepConfirmRegenerate {
+		return "Y:Confirm regenerate  N/Esc:Cancel"
+	}
+	chips := []string{}
+	if s.currentMasterKey() != "" {
+		if s.keyRevealed {
+			chips = append(chips, "R:Hide")
+		} else {
+			chips = append(chips, "R:Reveal")
+		}
+		if s.envelopeReady() {
+			chips = append(chips, "G:Regenerate")
+		}
+	}
+	chips = append(chips, "B:Back")
+	return strings.Join(chips, "  ")
 }
 
 // hint returns the context-aware hint bar for the current step.

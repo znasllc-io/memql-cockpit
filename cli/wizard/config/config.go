@@ -50,11 +50,40 @@ const (
 type step int
 
 const (
-	stepList       step = iota // browsing the registry rows
-	stepEdit                   // editing the selected row's value
-	stepConfirmKey             // Seal generated a fresh master key (shouldn't happen on update; defensive)
-	stepMasterKey              // RESERVED for 7.8 (#2111) master-key panel
+	stepList              step = iota // browsing the registry rows
+	stepEdit                          // editing the selected row's value
+	stepConfirmKey                    // Seal generated a fresh master key (shouldn't happen on update; defensive)
+	stepMasterKey                     // 7.8 (#2111) master-key display panel
+	stepConfirmRegenerate             // 7.8 (#2111) yes/no gate before rotating the master key
 )
+
+// masterKeyProvenance records where the master key the cockpit is
+// using came from.
+type masterKeyProvenance int
+
+const (
+	// provenanceShellRC means MEMQL_MASTER_KEY was already present in
+	// the process environment when the cockpit launched -- i.e. the
+	// operator's shell sourced it from ~/.bashrc / ~/.zshrc.
+	provenanceShellRC masterKeyProvenance = iota
+	// provenanceGenerated means the key was generated during this
+	// cockpit session (the operator pressed Regenerate on this screen).
+	provenanceGenerated
+	// provenanceMissing means no master key is available at all -- the
+	// envelope can't be opened and there's nothing to display.
+	provenanceMissing
+)
+
+// launchMasterKeyPresent records whether MEMQL_MASTER_KEY was set in
+// the process environment when the cockpit binary started. Captured at
+// package-init time so it reflects launch state regardless of any
+// in-process os.Setenv the seal path performs later. This is the
+// provenance signal for "loaded from shell rc" (true) vs "generated
+// this session" (false, once a regenerate runs).
+var launchMasterKeyPresent = func() bool {
+	_, ok := os.LookupEnv(secret.EnvMasterKey)
+	return ok
+}()
 
 // row is one merged registry entry: the manifest definition plus the
 // value currently in the envelope (or the manifest default when the
@@ -94,6 +123,11 @@ type state struct {
 
 	// scroll offset for the row list.
 	scroll int
+
+	// Master-key panel state (7.8 / #2111).
+	keyProvenance masterKeyProvenance // shell-rc vs generated-this-session vs missing
+	keyRevealed   bool                // reveal toggle on the master-key panel
+	keyBusy       bool                // a regenerate is in flight (block re-entry)
 }
 
 // Run loads the registry + envelope and drives the screen until the
@@ -107,6 +141,14 @@ func Run(screen *ui.Screen, theme ui.Theme) Choice {
 		revealed: map[int]bool{},
 		edits:    map[string]string{},
 		envPath:  defaultGenesisPath(),
+	}
+	// Initial provenance: if the launch environment carried
+	// MEMQL_MASTER_KEY the operator's shell rc sourced it; otherwise we
+	// have no key in hand. A regenerate flips this to "generated".
+	if launchMasterKeyPresent {
+		s.keyProvenance = provenanceShellRC
+	} else {
+		s.keyProvenance = provenanceMissing
 	}
 	s.load()
 
@@ -246,8 +288,70 @@ func (s *state) handleKey(ev *tcell.EventKey) (bool, Choice) {
 		s.handleConfirmKey(ev)
 		return false, ChoiceBack
 	case stepMasterKey:
-		// 7.8 (#2111) lands here. For now any key returns to the list.
+		return s.handleMasterKeyKey(ev)
+	case stepConfirmRegenerate:
+		return s.handleConfirmRegenerateKey(ev)
+	}
+	return false, ChoiceBack
+}
+
+// currentMasterKey returns the master key the cockpit is currently
+// using (the value that opened the envelope), read live from the
+// process environment. Empty when no key is set.
+func (s *state) currentMasterKey() string {
+	return strings.TrimSpace(os.Getenv(secret.EnvMasterKey))
+}
+
+// handleMasterKeyKey drives the read-only master-key display panel:
+// R reveals/masks the key, G opens the regenerate confirm, Esc/B
+// returns to the list. There is intentionally NO key that edits the
+// value -- the master key is display + regenerate only.
+func (s *state) handleMasterKeyKey(ev *tcell.EventKey) (bool, Choice) {
+	if ev.Key() == tcell.KeyEscape {
 		s.step = stepList
+		s.keyRevealed = false
+		return false, ChoiceBack
+	}
+	switch ev.Rune() {
+	case 'b', 'B':
+		s.step = stepList
+		s.keyRevealed = false
+		return false, ChoiceBack
+	case 'r', 'R':
+		if s.currentMasterKey() != "" {
+			s.keyRevealed = !s.keyRevealed
+		}
+		return false, ChoiceBack
+	case 'g', 'G':
+		// Regenerate is only meaningful when there's an envelope to
+		// re-encrypt and a current key that opened it.
+		if !s.envelopeReady() || s.currentMasterKey() == "" {
+			s.status = "Cannot regenerate: the envelope is not open (need " + secret.EnvMasterKey + " in this shell)."
+			s.statusError = true
+			return false, ChoiceBack
+		}
+		s.step = stepConfirmRegenerate
+		s.status = ""
+		s.statusError = false
+		return false, ChoiceBack
+	}
+	return false, ChoiceBack
+}
+
+// handleConfirmRegenerateKey answers the yes/no gate before a rotate.
+// Y runs the regenerate (which rewrites the operator's shell rc), N /
+// Esc backs out to the display panel.
+func (s *state) handleConfirmRegenerateKey(ev *tcell.EventKey) (bool, Choice) {
+	if ev.Key() == tcell.KeyEscape {
+		s.step = stepMasterKey
+		return false, ChoiceBack
+	}
+	switch ev.Rune() {
+	case 'y', 'Y':
+		s.regenerate()
+		return false, ChoiceBack
+	case 'n', 'N':
+		s.step = stepMasterKey
 		return false, ChoiceBack
 	}
 	return false, ChoiceBack
@@ -498,4 +602,179 @@ func (s *state) handleConfirmKey(ev *tcell.EventKey) {
 	// path only runs if a stray key arrives at stepConfirmKey outside
 	// that loop. Treat any key as a return to the list.
 	s.step = stepList
+}
+
+// regenerate rotates MEMQL_MASTER_KEY: it decrypts the WHOLE envelope
+// under the current key, generates a fresh key, re-encrypts the entire
+// envelope under it, and re-syncs ~/.bashrc + ~/.zshrc to the new key.
+// On success the in-process MEMQL_MASTER_KEY becomes the new key, the
+// provenance flips to "generated this session", and the screen reloads
+// from the rotated envelope.
+//
+// There is NO edit path -- the key is generated, never typed.
+//
+// Why a temp-file first-time seal instead of an update-in-place:
+// genesis.Seal's update path (OutPath already exists) requires the
+// supplied key to DECRYPT the existing envelope, which a freshly-
+// generated key cannot. So a rotate cannot ride Seal's update branch.
+// Instead we seal the already-decrypted entries to a temp path -- the
+// non-existent OutPath drives Seal's first-time branch, which encrypts
+// under the supplied new key with full manifest validation -- then
+// atomically rename the temp over the real envelope. Only after the
+// new envelope is on disk do we publish the new key into the process
+// env and reconcile the shell rc files. If the seal fails the original
+// envelope and shell rc are untouched (no orphaned envelope).
+//
+// Runs the seal on a goroutine while the screen keeps polling, the
+// same pattern as save().
+func (s *state) regenerate() {
+	if s.keyBusy {
+		return
+	}
+	current := s.currentMasterKey()
+	if current == "" {
+		s.step = stepMasterKey
+		s.status = "Cannot regenerate: " + secret.EnvMasterKey + " is not set in this shell."
+		s.statusError = true
+		return
+	}
+	if !s.envelopeReady() {
+		s.step = stepMasterKey
+		s.status = "Cannot regenerate: the envelope is not open."
+		s.statusError = true
+		return
+	}
+
+	s.keyBusy = true
+	s.step = stepMasterKey
+	s.status = "Regenerating master key + re-sealing envelope..."
+	s.statusError = false
+
+	// Decrypt the WHOLE envelope under the CURRENT key, so the rotate
+	// re-encrypts every entry, not just the rows the screen merged.
+	entries := make([]corgenesis.EnvEntry, len(s.envEntries))
+	copy(entries, s.envEntries)
+
+	type regenOutcome struct {
+		newKey string
+		err    error
+	}
+	outcomeCh := make(chan regenOutcome, 1)
+
+	go func() {
+		newKey, rerr := s.rotateMasterKey(entries, current)
+		outcomeCh <- regenOutcome{newKey: newKey, err: rerr}
+		s.screen.PostEvent(tcell.NewEventInterrupt(nil))
+	}()
+
+	for {
+		select {
+		case out := <-outcomeCh:
+			s.applyRegenResult(out.newKey, out.err)
+			return
+		default:
+		}
+
+		s.draw()
+		ev := s.screen.PollEvent()
+		switch ev := ev.(type) {
+		case *tcell.EventInterrupt:
+		case *tcell.EventResize:
+			s.screen.Sync()
+		case *tcell.EventKey:
+			// Ctrl+C / Ctrl+Q during a rotate: let the seal finish (it's
+			// atomic) but don't act on other keys. We simply keep polling
+			// until the outcome lands; a hard quit is handled by Run's
+			// outer loop after we return.
+			_ = ev
+		}
+	}
+}
+
+// rotateMasterKey performs the actual rotation off the UI goroutine.
+// entries are the full decrypted envelope; current is the key that
+// opened it. On success it returns the new key and has already written
+// the rotated envelope, published the new key into the process env,
+// and synced the shell rc files.
+func (s *state) rotateMasterKey(entries []corgenesis.EnvEntry, current string) (string, error) {
+	newKey, err := corgenesis.GenerateMasterKey()
+	if err != nil {
+		return "", fmt.Errorf("generate master key: %w", err)
+	}
+
+	// Seal the decrypted entries under the NEW key to a temp path. A
+	// non-existent OutPath drives Seal's first-time branch (encrypt
+	// under the supplied key, no decrypt-the-existing check), with
+	// manifest validation still enforced.
+	tmpPath := s.envPath + ".rotate.tmp"
+	_ = os.Remove(tmpPath) // clear any stale temp from a prior aborted run
+	if _, err := corgenesis.Seal(corgenesis.SealOptions{
+		Entries:       entries,
+		Manifest:      s.manifest,
+		OutPath:       tmpPath,
+		SourceEnvPath: "",
+		SyncShellRCs:  false, // sync after the real envelope is in place
+		MasterKey:     newKey,
+		// First-time + supplied key skips the confirm gate, but wire a
+		// no-op anyway so an unexpected generated-key path can't block.
+		ConfirmMasterKey: func(string) (bool, error) { return true, nil },
+	}); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("re-seal envelope: %w", err)
+	}
+
+	// Atomically swap the rotated envelope in over the original. After
+	// this point the envelope on disk is the new key's.
+	if err := os.Rename(tmpPath, s.envPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("install rotated envelope: %w", err)
+	}
+
+	// The in-process key MUST become the new key so the reload below
+	// (and the rest of the session) decrypts the rotated envelope.
+	if err := os.Setenv(secret.EnvMasterKey, newKey); err != nil {
+		return newKey, fmt.Errorf("set %s in-process: %w", secret.EnvMasterKey, err)
+	}
+
+	// Re-sync the operator's shell rc files to the new key so future
+	// shells decrypt the rotated envelope.
+	paths, perr := corgenesis.RcCandidatePaths()
+	if perr != nil {
+		return newKey, fmt.Errorf("resolve shell rc paths: %w", perr)
+	}
+	for _, p := range paths {
+		if _, rerr := corgenesis.ReconcileShellRC(p, newKey); rerr != nil {
+			return newKey, fmt.Errorf("shell rc sync (%s): %w", p, rerr)
+		}
+	}
+
+	return newKey, nil
+}
+
+// applyRegenResult lands the rotate outcome: on success the provenance
+// flips to generated-this-session and the screen reloads from the
+// rotated envelope; on error the status line carries the message.
+func (s *state) applyRegenResult(newKey string, err error) {
+	s.keyBusy = false
+	s.step = stepMasterKey
+	if err != nil {
+		s.status = "Regenerate failed: " + err.Error()
+		s.statusError = true
+		// If the env key was already advanced but a later sync failed,
+		// the envelope is the new key's -- mark provenance accordingly so
+		// the panel doesn't claim the key is still the shell-rc one.
+		if newKey != "" && s.currentMasterKey() == newKey {
+			s.keyProvenance = provenanceGenerated
+		}
+		return
+	}
+	s.keyProvenance = provenanceGenerated
+	s.keyRevealed = false
+	// Reload row values + envEntries from the freshly-rotated envelope
+	// (now decrypted under the new in-process key) and drop pending edits
+	// so the screen reflects on-disk state.
+	s.edits = map[string]string{}
+	s.load()
+	s.status = "Master key regenerated. Envelope re-sealed and ~/.bashrc / ~/.zshrc synced."
+	s.statusError = false
 }
