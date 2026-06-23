@@ -963,62 +963,171 @@ func (a *App) setViewed(name string) {
 	a.postRedraw()
 }
 
-// setSelected promotes a cluster to "my working cluster" -- drives
-// the Concepts tab. Called by OnEnter. If the entry is in
-// stateFailed, also kicks a manual Retry so Enter on a dead cluster
-// means "I want this to come back". Persists the choice to
+// setSelected makes a cluster the user's "working cluster" and DRIVES
+// its connection (epic #239). Under the single-live-connection model,
+// selection is what brings a cluster up: Enter on a not-yet-connected
+// row initiates the dial, and the previously-selected cluster's full
+// connection is torn back down to registered-idle (probe-only) so only
+// one live connection exists at a time. Persists the choice to
 // clusters.yaml so the next launch restores it.
+//
+// Called by OnEnter. setViewed (arrow-key highlight) stays
+// side-effect-free -- it never connects; only Enter does.
 func (a *App) setSelected(name string) {
-	// Only CONNECTED clusters can become the working cluster.
-	// Selecting a still-dialing or unreachable cluster has no useful
-	// effect (Concepts is gated on a connected
-	// dispatcher anyway), so Enter is a no-op for those rows. The
-	// hint strip already hides "Enter:Select" in those states; this
-	// is the matching guard at the action layer.
+	a.poolMu.RLock()
+	prev := a.selected
+	a.poolMu.RUnlock()
+
+	if name == prev {
+		// Already the working cluster -- Enter is a no-op (the hint
+		// strip hides Enter:Select/Connect on the active row).
+		return
+	}
+
+	cfg, ok := a.lookupConfig(name)
+	if !ok {
+		// Unknown row (shouldn't happen for a rendered cluster).
+		return
+	}
+
+	// Promote the selection immediately so the UI and the
+	// onEntryConnected refresh hook both observe the new working
+	// cluster, even while its dial is still in flight.
+	a.poolMu.Lock()
+	a.selected = name
+	a.poolMu.Unlock()
+	a.clustersView.SelectedCluster = name
+	a.persistSelected(name)
+
+	// Single live connection: tear the previously-selected cluster's
+	// full connection back down to registered-idle before bringing up
+	// the new one.
+	if prev != "" && prev != name {
+		a.demoteToIdle(prev)
+	}
+
+	// Bring up (or, if already live, refresh against) the newly-
+	// selected cluster.
+	a.promoteSelected(name, cfg)
+
+	a.postRedraw()
+}
+
+// lookupConfig resolves a cluster's config by name: the user-saved row
+// from clusters.yaml, falling back to the built-in local default for
+// the reserved "local" slot. Returns false for an unknown name.
+func (a *App) lookupConfig(name string) (config.ClusterConfig, bool) {
+	if clusters, err := config.LoadClusters(); err == nil && clusters != nil {
+		if cfg, ok := clusters.Get(name); ok {
+			return cfg, true
+		}
+	}
+	if name == "local" {
+		return cluster.LocalClusterConfig(), true
+	}
+	return config.ClusterConfig{}, false
+}
+
+// demoteToIdle tears down a cluster's full live connection (stream +
+// subscriber + token refresher) and re-registers its row as idle
+// (listed, probe-only). Used when selection moves to another cluster
+// so only the selected cluster holds a live connection (epic #239).
+// The teardown's Close() runs OFF the UI thread (cf. #191) so a switch
+// never freezes the event loop on the 500ms drain.
+func (a *App) demoteToIdle(name string) {
 	a.poolMu.RLock()
 	entry := a.pool[name]
 	a.poolMu.RUnlock()
 	if entry == nil {
-		// Brand-new row from a current-frame add: no entry yet.
-		// Open the lifecycle so a subsequent Enter (once connected)
-		// can promote it.
-		if name == "local" {
-			a.openEntry(cluster.LocalClusterConfig())
-		} else if clusters, err := config.LoadClusters(); err == nil {
-			if cfg, ok := clusters.Get(name); ok {
-				a.openEntry(cfg)
-			}
-		}
-		a.postRedraw()
 		return
 	}
+	cfg, ok := a.lookupConfig(name)
+	if !ok {
+		// Fall back to the entry's own config so a row that's no
+		// longer in clusters.yaml still tears down cleanly.
+		cfg = entry.Config
+	}
+	a.replaceWithRegistered(cfg)
+}
+
+// promoteSelected ensures the newly-selected cluster ends up live (or,
+// if it's already connected, refreshes the cluster-dependent tabs).
+// Drives the connection according to the entry's current state without
+// ever blocking the UI thread on a teardown.
+func (a *App) promoteSelected(name string, cfg config.ClusterConfig) {
+	a.poolMu.RLock()
+	entry := a.pool[name]
+	a.poolMu.RUnlock()
+
+	if entry == nil {
+		// Brand-new row (added this frame, no pool entry yet). Open a
+		// fresh lifecycle.
+		a.openEntry(cfg)
+		return
+	}
+
+	state, _, _ := entry.stateSnapshot()
+	switch state {
+	case stateConnected:
+		// Already live -- onEntryConnected won't fire again (e.g. the
+		// pendingSelect auto-select path, or re-selecting a cluster
+		// that's still up), so refresh the dependent tabs here.
+		a.afterSelectedConnected(name, entry)
+	case stateConnecting, stateBackoff:
+		// Lifecycle already dialing; onEntryConnected fires the refresh
+		// once it lands. Nothing to start.
+	case stateFailed:
+		// Parked lifecycle goroutine -- wake it for a fresh attempt
+		// cycle without tearing anything down (no UI-thread Close).
+		entry.Retry()
+	default:
+		// stateIdle (registered, not dialed) or needs-config /
+		// needs-login: no lifecycle is running, so start one. The
+		// existing entry never dialed, so its Close is fast.
+		// needs-config / needs-login re-register in the same waiting
+		// state (openEntry short-circuits) -- selecting them makes
+		// them the working cluster but L:Login still does the auth.
+		a.replaceEntry(cfg)
+	}
+}
+
+// afterSelectedConnected refreshes the cluster-dependent surfaces
+// (topology if viewed, Settings "My Access", Concepts tab) for a
+// newly-selected cluster that is ALREADY connected -- the path
+// onEntryConnected doesn't cover because it already fired before the
+// selection landed.
+func (a *App) afterSelectedConnected(name string, entry *connEntry) {
 	entry.mu.Lock()
-	state := entry.State
 	conn := entry.Conn
 	entry.mu.Unlock()
-	if state != stateConnected {
-		// Silent no-op. Retry uses R, not Enter.
-		return
-	}
 
+	if a.isViewed(name) {
+		a.clustersView.Topology.SetNodeTypes(entry.snapshotNodeTypes())
+		a.clustersView.Topology.SetNodes(entry.snapshotNodes())
+		a.clustersView.Topology.SetDisconnected(false)
+	}
+	a.refreshMyAccess(name, conn)
+	go a.refreshConcepts(context.Background())
+}
+
+// replaceWithRegistered swaps a pool entry for a fresh registered-idle
+// one (listed, not dialed) and tears the old connection down in the
+// background. The pool swap + re-register happen synchronously so the
+// row keeps rendering; the old entry's Close() -- which can wait up to
+// 500ms draining a live stream -- is forked off the UI thread (#191).
+func (a *App) replaceWithRegistered(cfg config.ClusterConfig) {
 	a.poolMu.Lock()
-	a.selected = name
+	old := a.pool[cfg.Name]
+	delete(a.pool, cfg.Name)
 	a.poolMu.Unlock()
 
-	a.clustersView.SelectedCluster = name
-	a.persistSelected(name)
+	// Register the idle replacement first (fast) so a.pool[name] is
+	// never absent for a rendered row.
+	a.registerEntry(cfg)
 
-	// Refresh the Settings tab's "My Access" block with the new
-	// cluster's access record. Async so the UI stays responsive.
-	a.refreshMyAccess(name, conn)
-
-	// Refresh the Concepts tab against the newly-connected cluster.
-	// wireConcepts fires its first call at app-init when no cluster is
-	// connected yet, so without this re-trigger the Concepts tab stays
-	// empty even though ListConcepts would return data the moment we ask.
-	go a.refreshConcepts(context.Background())
-
-	a.postRedraw()
+	if old != nil {
+		go old.Close()
+	}
 }
 
 // refreshConcepts fetches the connected cluster's concept registry
