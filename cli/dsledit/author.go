@@ -87,6 +87,12 @@ type authoring struct {
 	promoteConfirm bool
 	promoteSources string
 	promoteBundle  string
+	// demoteConfirm gates the durable-DEMOTE (retire) blast-radius confirm
+	// (over the same overlay as resultShown) -- the inverse of promote
+	// (memql#2163). demoteSources/demoteBundle hold the gathered bundle.
+	demoteConfirm bool
+	demoteSources string
+	demoteBundle  string
 
 	senseClient     func() *sense.Client
 	authoringClient func() *authoringsdk.Client
@@ -229,6 +235,9 @@ func (a *authoring) drawResults(screen *ui.Screen, bounds ui.Rect) {
 	hint := "Esc:Close"
 	if a.promoteConfirm {
 		hint = "Y:Promote  N/Esc:Cancel"
+	}
+	if a.demoteConfirm {
+		hint = "Y:Retire  N/Esc:Cancel"
 	}
 	ui.DrawBottom(screen, bounds, a.theme.SubtleStyle(), 2, hint)
 }
@@ -386,9 +395,10 @@ func (a *authoring) hintsForEditor() string {
 	if a.editor == nil {
 		// Validate/Inject act on the whole bundle, so they're available
 		// even before a file is opened (Ctrl combos work from any focus).
-		// Promote is owner-only (#232), so only advertise it to owners.
+		// Promote + Demote are owner-only (#232/#2163), so only advertise
+		// them to owners.
 		if a.canPromote {
-			return "Ctrl+G:Validate  Ctrl+R:Inject  Ctrl+P:Promote  Tab:Cycle"
+			return "Ctrl+G:Validate  Ctrl+R:Inject  Ctrl+P:Promote  Ctrl+D:Retire  Tab:Cycle"
 		}
 		return "Ctrl+G:Validate  Ctrl+R:Inject  Tab:Cycle"
 	}
@@ -400,8 +410,9 @@ func (a *authoring) hintsForEditor() string {
 		{Key: "Ctrl+R", Label: "Inject"},
 	}
 	if a.canPromote {
-		// Owner-only durable activation (#232).
+		// Owner-only durable activation + retire (#232 / #2163).
 		chips = append(chips, ui.HintChip{Key: "Ctrl+P", Label: "Promote"})
+		chips = append(chips, ui.HintChip{Key: "Ctrl+D", Label: "Retire"})
 	}
 	chips = append(chips, ui.HintChip{Key: "Tab", Label: "Cycle"})
 	return ui.HintBar{Chips: chips}.String()
@@ -443,7 +454,28 @@ func (a *authoring) HandleEvent(key *tcell.EventKey) bool {
 		}
 	}
 
-	// Esc dismisses the Validate/Inject/Promote results overlay.
+	// The durable-DEMOTE (retire) blast-radius confirm (#2163) owns all
+	// keys while it is up, mirroring the promote confirm: Y retires, N/Esc
+	// cancels, anything else is swallowed.
+	if a.demoteConfirm {
+		switch {
+		case key.Key() == tcell.KeyRune && (key.Rune() == 'y' || key.Rune() == 'Y'):
+			sources, bundle := a.demoteSources, a.demoteBundle
+			a.demoteConfirm = false
+			a.resultShown = false
+			a.mu.Unlock()
+			go a.runDemote(bundle, sources)
+			return true
+		default:
+			a.demoteConfirm = false
+			a.resultShown = false
+			a.mu.Unlock()
+			a.redraw()
+			return true
+		}
+	}
+
+	// Esc dismisses the Validate/Inject/Promote/Demote results overlay.
 	if a.resultShown && key.Key() == tcell.KeyEsc {
 		a.resultShown = false
 		a.mu.Unlock()
@@ -486,6 +518,26 @@ func (a *authoring) HandleEvent(key *tcell.EventKey) bool {
 		a.resultShown = true
 		a.resultTitle = "PROMOTE -- durable activation (owner)"
 		a.resultLines = promoteBlastRadiusLines(bundle)
+		a.mu.Unlock()
+		a.redraw()
+		return true
+	case tcell.KeyCtrlD:
+		// Durable DEMOTE / retire (#2163) -- owner-only, inverse of Promote.
+		if !a.canPromote {
+			a.status("durable demotion requires the owner role")
+			a.mu.Unlock()
+			return true
+		}
+		sources, bundle, ok := a.gatherForActionLocked()
+		if !ok {
+			a.mu.Unlock()
+			return true
+		}
+		a.demoteSources, a.demoteBundle = sources, bundle
+		a.demoteConfirm = true
+		a.resultShown = true
+		a.resultTitle = "DEMOTE -- durable retire (owner)"
+		a.resultLines = demoteBlastRadiusLines(bundle)
 		a.mu.Unlock()
 		a.redraw()
 		return true
@@ -1023,11 +1075,84 @@ func promoteBlastRadiusLines(bundle string) []resultEntry {
 		{"", sevPlain},
 		{"[!!] This PERSISTS the constructs (survives restarts) and", sevWarn},
 		{"     propagates them cluster-wide to every node.", sevWarn},
-		{"[!!] There is no un-promote / demote yet (tracked in memql#2163);", sevWarn},
-		{"     to undo you must edit + re-promote or redeploy.", sevWarn},
+		{"To undo, use Ctrl+D (Retire) to durably demote (memql#2163).", sevPlain},
 		{"", sevPlain},
 		{"Owner-gated. Press Y to promote, N/Esc to cancel.", sevPlain},
 	}
+}
+
+// demoteBlastRadiusLines is the confirm body shown before a durable
+// DEMOTE / retire (#2163): the inverse of promote -- it unregisters the
+// bundle's constructs from the shared cluster registry and marks the
+// persisted rows retired, cluster-wide.
+func demoteBlastRadiusLines(bundle string) []resultEntry {
+	return []resultEntry{
+		{fmt.Sprintf("Durably retire bundle %q from the shared cluster schema?", bundle), sevPlain},
+		{"", sevPlain},
+		{"[!!] This UNREGISTERS the bundle's promoted constructs from the", sevWarn},
+		{"     shared registry on every node and marks the persisted rows", sevWarn},
+		{"     retired, so they stop being callable cluster-wide.", sevWarn},
+		{"Only author-promoted constructs are affected; core is never touched.", sevPlain},
+		{"", sevPlain},
+		{"Owner-gated. Press Y to retire, N/Esc to cancel.", sevPlain},
+	}
+}
+
+// runDemote durably retires the bundle's promoted constructs (unregister +
+// mark retired, cluster-wide) via the owner-gated DurableDemoteBundle path
+// (#2163). The owner gate is enforced again server-side.
+func (a *authoring) runDemote(bundle, sources string) {
+	ac := a.authoringClientFn()
+	if ac == nil {
+		a.status("demote needs a connected cluster")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := ac.DurableDemoteBundle(ctx, sources)
+	if err != nil {
+		a.status(fmt.Sprintf("demote: %v", err))
+		return
+	}
+	a.mu.Lock()
+	a.showDemoteResultLocked(res)
+	a.mu.Unlock()
+	a.redraw()
+}
+
+func (a *authoring) showDemoteResultLocked(res *authoringsdk.DemoteResult) {
+	if res == nil {
+		return
+	}
+	a.resultLines = a.resultLines[:0]
+	if res.OK {
+		a.resultTitle = "DEMOTE -- durable retire: OK"
+		a.resultLines = append(a.resultLines, resultEntry{
+			fmt.Sprintf("Retired %d construct(s) durably: unregistered + marked retired cluster-wide.", len(res.Demoted)),
+			sevPlain,
+		})
+		for _, c := range res.Demoted {
+			a.resultLines = append(a.resultLines, resultEntry{fmt.Sprintf("[ok] %s (%s)", c.Name, c.Kind), sevOK})
+		}
+		if len(res.Demoted) == 0 {
+			a.resultLines = append(a.resultLines, resultEntry{"(nothing was retired -- not currently promoted)", sevPlain})
+		}
+	} else {
+		a.resultTitle = "DEMOTE -- durable retire: REJECTED"
+		if res.Error != "" {
+			a.resultLines = append(a.resultLines, resultEntry{res.Error, sevErr})
+		}
+		for _, d := range res.Diagnostics {
+			if d.OK || d.Skipped {
+				continue
+			}
+			a.resultLines = append(a.resultLines, diagnosticLine(d))
+		}
+		if len(a.resultLines) == 0 {
+			a.resultLines = append(a.resultLines, resultEntry{"(rejected, no detail)", sevErr})
+		}
+	}
+	a.resultShown = true
 }
 
 // runPromote durably activates the bundle (validate + promote into the
