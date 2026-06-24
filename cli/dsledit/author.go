@@ -71,11 +71,22 @@ type authoring struct {
 	promptInput string
 	promptErr   string
 
-	// resultShown gates the Validate/Inject results overlay; resultTitle
-	// + resultLines hold the per-construct outcome (C3 #231).
+	// resultShown gates the Validate/Inject/Promote results overlay;
+	// resultTitle + resultLines hold the per-construct outcome (C3 #231).
 	resultShown bool
 	resultTitle string
 	resultLines []resultEntry
+
+	// canPromote mirrors whether the connected caller is the cluster
+	// OWNER -- the only role allowed durable activation (C4 #232,
+	// server-gated by requireOwnerRole). Set via setOwner from the View.
+	canPromote bool
+	// promoteConfirm gates the durable-activation blast-radius confirm
+	// (over the same overlay as resultShown). promoteSources/promoteBundle
+	// hold the gathered bundle to promote on 'Y'.
+	promoteConfirm bool
+	promoteSources string
+	promoteBundle  string
 
 	senseClient     func() *sense.Client
 	authoringClient func() *authoringsdk.Client
@@ -118,6 +129,14 @@ func newAuthoring(theme ui.Theme, senseClient func() *sense.Client, authoringCli
 	a.debounce = ui.NewDebouncer(350*time.Millisecond, a.senseRefresh)
 	a.refreshBundles()
 	return a
+}
+
+// setOwner records whether the connected caller is the cluster owner,
+// which gates the durable-activation (Promote) action (#232).
+func (a *authoring) setOwner(owner bool) {
+	a.mu.Lock()
+	a.canPromote = owner
+	a.mu.Unlock()
 }
 
 func (a *authoring) status(msg string) {
@@ -207,7 +226,11 @@ func (a *authoring) drawResults(screen *ui.Screen, bounds ui.Rect) {
 			break
 		}
 	}
-	ui.DrawBottom(screen, bounds, a.theme.SubtleStyle(), 2, "Esc:Close")
+	hint := "Esc:Close"
+	if a.promoteConfirm {
+		hint = "Y:Promote  N/Esc:Cancel"
+	}
+	ui.DrawBottom(screen, bounds, a.theme.SubtleStyle(), 2, hint)
 }
 
 func (a *authoring) resultStyle(sev resultSev, base tcell.Style) tcell.Style {
@@ -363,16 +386,25 @@ func (a *authoring) hintsForEditor() string {
 	if a.editor == nil {
 		// Validate/Inject act on the whole bundle, so they're available
 		// even before a file is opened (Ctrl combos work from any focus).
+		// Promote is owner-only (#232), so only advertise it to owners.
+		if a.canPromote {
+			return "Ctrl+G:Validate  Ctrl+R:Inject  Ctrl+P:Promote  Tab:Cycle"
+		}
 		return "Ctrl+G:Validate  Ctrl+R:Inject  Tab:Cycle"
 	}
 	// Ctrl+Space:Complete + Ctrl+K:Hover work too (documented in
 	// cli/CLAUDE.md); the band shows the most-used four so it fits.
-	return ui.HintBar{Chips: []ui.HintChip{
+	chips := []ui.HintChip{
 		{Key: "Ctrl+S", Label: "Save"},
 		{Key: "Ctrl+G", Label: "Validate"},
 		{Key: "Ctrl+R", Label: "Inject"},
-		{Key: "Tab", Label: "Cycle"},
-	}}.String()
+	}
+	if a.canPromote {
+		// Owner-only durable activation (#232).
+		chips = append(chips, ui.HintChip{Key: "Ctrl+P", Label: "Promote"})
+	}
+	chips = append(chips, ui.HintChip{Key: "Tab", Label: "Cycle"})
+	return ui.HintBar{Chips: chips}.String()
 }
 
 // --- events ----------------------------------------------------------
@@ -389,7 +421,29 @@ func (a *authoring) HandleEvent(key *tcell.EventKey) bool {
 		return consumed
 	}
 
-	// Esc dismisses the Validate/Inject results overlay.
+	// The durable-activation blast-radius confirm (#232) owns all keys
+	// while it is up: Y promotes, N/Esc cancels, anything else is
+	// swallowed so a stray key can't fall through to a destructive action.
+	if a.promoteConfirm {
+		switch {
+		case key.Key() == tcell.KeyRune && (key.Rune() == 'y' || key.Rune() == 'Y'):
+			sources, bundle := a.promoteSources, a.promoteBundle
+			a.promoteConfirm = false
+			a.resultShown = false
+			a.mu.Unlock()
+			go a.runPromote(bundle, sources)
+			return true
+		default:
+			// N / Esc / anything else cancels.
+			a.promoteConfirm = false
+			a.resultShown = false
+			a.mu.Unlock()
+			a.redraw()
+			return true
+		}
+	}
+
+	// Esc dismisses the Validate/Inject/Promote results overlay.
 	if a.resultShown && key.Key() == tcell.KeyEsc {
 		a.resultShown = false
 		a.mu.Unlock()
@@ -399,7 +453,8 @@ func (a *authoring) HandleEvent(key *tcell.EventKey) bool {
 	// Validate (Ctrl+G, Gate-1) + Inject (Ctrl+R, session-define) are
 	// bundle-level and work from any focus -- Ctrl combos never collide
 	// with editor typing. Gather under the lock, then run the gRPC call
-	// off the UI goroutine.
+	// off the UI goroutine. Promote (Ctrl+P, durable activation) is
+	// owner-gated and routes through a blast-radius confirm first (#232).
 	switch key.Key() {
 	case tcell.KeyCtrlG:
 		sources, bundle, ok := a.gatherForActionLocked()
@@ -414,6 +469,25 @@ func (a *authoring) HandleEvent(key *tcell.EventKey) bool {
 		if ok {
 			go a.runInject(bundle, sources)
 		}
+		return true
+	case tcell.KeyCtrlP:
+		if !a.canPromote {
+			a.status("durable promotion requires the owner role")
+			a.mu.Unlock()
+			return true
+		}
+		sources, bundle, ok := a.gatherForActionLocked()
+		if !ok {
+			a.mu.Unlock()
+			return true
+		}
+		a.promoteSources, a.promoteBundle = sources, bundle
+		a.promoteConfirm = true
+		a.resultShown = true
+		a.resultTitle = "PROMOTE -- durable activation (owner)"
+		a.resultLines = promoteBlastRadiusLines(bundle)
+		a.mu.Unlock()
+		a.redraw()
 		return true
 	}
 
@@ -923,6 +997,81 @@ func (a *authoring) showInjectResultLocked(res *authoringsdk.SessionDefineResult
 		}
 	} else {
 		a.resultTitle = "INJECT -- session-define: REJECTED"
+		if res.Error != "" {
+			a.resultLines = append(a.resultLines, resultEntry{res.Error, sevErr})
+		}
+		for _, d := range res.Diagnostics {
+			if d.OK || d.Skipped {
+				continue
+			}
+			a.resultLines = append(a.resultLines, diagnosticLine(d))
+		}
+		if len(a.resultLines) == 0 {
+			a.resultLines = append(a.resultLines, resultEntry{"(rejected, no detail)", sevErr})
+		}
+	}
+	a.resultShown = true
+}
+
+// promoteBlastRadiusLines is the confirm body shown before a durable
+// activation (#232): it spells out the blast radius (persistence,
+// cluster-wide propagation, no rollback yet) so the owner opts in
+// deliberately.
+func promoteBlastRadiusLines(bundle string) []resultEntry {
+	return []resultEntry{
+		{fmt.Sprintf("Durably promote bundle %q into the shared cluster schema?", bundle), sevPlain},
+		{"", sevPlain},
+		{"[!!] This PERSISTS the constructs (survives restarts) and", sevWarn},
+		{"     propagates them cluster-wide to every node.", sevWarn},
+		{"[!!] There is no un-promote / demote yet (tracked in memql#2163);", sevWarn},
+		{"     to undo you must edit + re-promote or redeploy.", sevWarn},
+		{"", sevPlain},
+		{"Owner-gated. Press Y to promote, N/Esc to cancel.", sevPlain},
+	}
+}
+
+// runPromote durably activates the bundle (validate + promote into the
+// persistent shared registry, cluster-wide) via the owner-gated
+// DurablePromoteBundle path (#232). The owner gate is enforced again
+// server-side; a non-owner caller gets PermissionDenied surfaced here.
+func (a *authoring) runPromote(bundle, sources string) {
+	ac := a.authoringClientFn()
+	if ac == nil {
+		a.status("promote needs a connected cluster")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := ac.DurablePromoteBundle(ctx, sources)
+	if err != nil {
+		a.status(fmt.Sprintf("promote: %v", err))
+		return
+	}
+	a.mu.Lock()
+	a.showPromoteResultLocked(res)
+	a.mu.Unlock()
+	a.redraw()
+}
+
+func (a *authoring) showPromoteResultLocked(res *authoringsdk.PromoteResult) {
+	if res == nil {
+		return
+	}
+	a.resultLines = a.resultLines[:0]
+	if res.OK {
+		a.resultTitle = "PROMOTE -- durable activation: OK"
+		a.resultLines = append(a.resultLines, resultEntry{
+			fmt.Sprintf("Promoted %d construct(s) durably: persisted + shared cluster-wide (survives restarts).", len(res.Promoted)),
+			sevPlain,
+		})
+		for _, c := range res.Promoted {
+			a.resultLines = append(a.resultLines, resultEntry{fmt.Sprintf("[ok] %s (%s)", c.Name, c.Kind), sevOK})
+		}
+		if len(res.Promoted) == 0 {
+			a.resultLines = append(a.resultLines, resultEntry{"(nothing was promoted)", sevPlain})
+		}
+	} else {
+		a.resultTitle = "PROMOTE -- durable activation: REJECTED"
 		if res.Error != "" {
 			a.resultLines = append(a.resultLines, resultEntry{res.Error, sevErr})
 		}

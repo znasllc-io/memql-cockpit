@@ -1275,6 +1275,11 @@ func (a *App) refreshMyAccess(clusterName string, conn *client.Connection) {
 		if a.clustersView != nil && a.clustersView.Topology != nil && access != nil {
 			a.clustersView.Topology.SetClusterRole(access.ClusterRole)
 		}
+		// Mirror owner-ness onto the Editor view too: durable activation
+		// (Promote) in authoring mode is owner-only (#232).
+		if a.dsleditView != nil && access != nil {
+			a.dsleditView.SetOwner(access.ClusterRole == client.RoleOwner)
+		}
 		a.postRedraw()
 	}()
 }

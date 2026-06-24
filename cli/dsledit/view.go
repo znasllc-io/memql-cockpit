@@ -106,8 +106,26 @@ type View struct {
 	// AuthoringClient returns an authoring client bound to the active
 	// cluster's dispatcher, or nil when none is connected. Backs the
 	// authoring mode's Validate (Gate-1) + Inject (session-define)
-	// actions (C3 #231).
+	// actions (C3 #231) + Promote (durable activation, C4 #232).
 	AuthoringClient func() *authoringsdk.Client
+
+	// owner records whether the connected caller is the cluster owner --
+	// gates the authoring-mode Promote (durable activation) action (#232).
+	// Set via SetOwner from the app layer's access refresh; forwarded to
+	// the authoring sub-view when it exists / on creation.
+	owner bool
+}
+
+// SetOwner records whether the connected caller is the cluster owner and
+// forwards it to the authoring sub-view (which gates Promote on it, #232).
+func (v *View) SetOwner(owner bool) {
+	v.Mu.Lock()
+	v.owner = owner
+	a := v.author
+	v.Mu.Unlock()
+	if a != nil {
+		a.setOwner(owner)
+	}
 }
 
 // NewView builds an empty Editor view.
@@ -607,6 +625,7 @@ func (v *View) toggleMode() {
 	if v.mode == modeBrowse {
 		if v.author == nil {
 			v.author = newAuthoring(v.Theme, v.SenseClient, v.AuthoringClient, v.OnStatus, v.Redraw)
+			v.author.setOwner(v.owner)
 		}
 		v.mode = modeAuthor
 	} else {
