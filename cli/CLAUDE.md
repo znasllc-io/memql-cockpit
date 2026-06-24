@@ -118,8 +118,10 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
    shadowing core, dropped at session end (C3 #231) -- and `Ctrl+P`
    (OWNER only) **durably promotes** it into the persistent shared
    cluster schema (survives restarts, propagates cluster-wide) via a
-   blast-radius confirm (C4 #232, server-gated by `requireOwnerRole`;
-   no un-promote yet, tracked in memql#2163); all render a
+   blast-radius confirm (C4 #232, server-gated by `requireOwnerRole`),
+   and `Ctrl+D` (OWNER only) **durably retires / demotes** it -- the
+   inverse, unregistering the promoted constructs cluster-wide + marking
+   the persisted rows retired (memql#2163); all render a
    per-construct results overlay (`Esc` closes). Embedded/pack files
    stay read-only. Lives in `cli/dsledit/` (`view.go` browser,
    `author.go` authoring + validate/inject, `bundle.go` workspace IO);
@@ -534,8 +536,9 @@ pans the grid). There is no toggle.
 | Ctrl+G      | Validate the bundle (Gate-1 sandbox; no engine mutation)     |
 | Ctrl+R      | Inject the bundle (session-define; session-scoped, never shadows core) |
 | Ctrl+P      | Promote the bundle (durable activation; OWNER only, #232) — opens a blast-radius confirm |
-| Y / N / Esc | (promote confirm) Promote durably / cancel / cancel          |
-| Esc         | Dismiss the validate/inject/promote overlay; completion/hover; prompt: cancel |
+| Ctrl+D      | Retire / demote the bundle (durable demote; OWNER only, memql#2163) — opens a blast-radius confirm |
+| Y / N / Esc | (promote/demote confirm) Apply durably / cancel / cancel     |
+| Esc         | Dismiss the validate/inject/promote/demote overlay; completion/hover; prompt: cancel |
 
 ---
 
@@ -559,7 +562,7 @@ pans the grid). There is no toggle.
 | `sense/`                 | `SenseClient` over the SDK Dispatcher -- editor-side wrappers for MemQL Sense (Tokenize / Diagnose / Complete / Hover). |
 | `config/clusters.go`     | `~/.memql/clusters.yaml` load/save                            |
 | `concepts/`              | Concepts tab (concept picker + row list + generic renderer)   |
-| `dsledit/`               | Editor tab: `view.go` read-only DSL pack browser (domains/files/source) over `memql/sdk/go/pack` (#228) + Sense coloring/hover (#229); `author.go` Ctrl+B authoring mode (editable bundles via `cli/editor`, #230) + Validate/Inject over `memql/sdk/go/authoring` (#231) + owner-gated Ctrl+P Promote / durable activation (#232); `bundle.go` local `~/.memql/bundles` workspace IO |
+| `dsledit/`               | Editor tab: `view.go` read-only DSL pack browser (domains/files/source) over `memql/sdk/go/pack` (#228) + Sense coloring/hover (#229); `author.go` Ctrl+B authoring mode (editable bundles via `cli/editor`, #230) + Validate/Inject over `memql/sdk/go/authoring` (#231) + owner-gated Ctrl+P Promote / durable activation (#232) + owner-gated Ctrl+D Retire / durable demote (memql#2163); `bundle.go` local `~/.memql/bundles` workspace IO |
 | `editor/`                | Reusable text editor with Sense integration                   |
 | `settings/`              | Settings tab                                                  |
 | `ui/`                    | Theme, screen, tab bar, layout primitives                     |
