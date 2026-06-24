@@ -7,6 +7,7 @@ import (
 	"github.com/gdamore/tcell/v2"
 
 	authoringsdk "github.com/znasllc-io/memql/sdk/go/authoring"
+	"github.com/znasllc-io/memql/sdk/go/client"
 	"github.com/znasllc-io/memql/sdk/go/sense"
 
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
@@ -14,6 +15,11 @@ import (
 
 func nilSense() *sense.Client            { return nil }
 func nilAuthoring() *authoringsdk.Client { return nil }
+
+// nonOwnerRole / ownerRole are the cluster-role closures the authoring
+// sub-view reads to gate the owner-only Promote action (#232).
+func nonOwnerRole() client.Role { return client.RoleWriter }
+func ownerRole() client.Role    { return client.RoleOwner }
 
 func rune_(r rune) *tcell.EventKey { return tcell.NewEventKey(tcell.KeyRune, r, tcell.ModNone) }
 func typeStr(a *authoring, s string) {
@@ -50,7 +56,7 @@ func TestModeToggle(t *testing.T) {
 // type into it, save, and verify the bytes hit disk.
 func TestAuthoringCreateEditSave(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	a := newAuthoring(ui.DefaultTheme(), nilSense, nilAuthoring, func(string) {}, func() {})
+	a := newAuthoring(ui.DefaultTheme(), nilSense, nilAuthoring, nonOwnerRole, func(string) {}, func() {})
 
 	// New bundle: N -> type -> Enter.
 	a.HandleEvent(rune_('N'))
@@ -116,7 +122,7 @@ func TestAuthoringChromeRenders(t *testing.T) {
 	sim.Clear()
 	screen := ui.NewScreenFromTcell(sim)
 
-	a := newAuthoring(ui.DefaultTheme(), nilSense, nilAuthoring, func(string) {}, func() {})
+	a := newAuthoring(ui.DefaultTheme(), nilSense, nilAuthoring, nonOwnerRole, func(string) {}, func() {})
 	a.Draw(screen, ui.Rect{X: 0, Y: 0, Width: viewWidth, Height: viewHeight})
 	sim.Show()
 

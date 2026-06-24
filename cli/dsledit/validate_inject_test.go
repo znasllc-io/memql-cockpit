@@ -63,7 +63,7 @@ func newTestAuthoring(t *testing.T) (*authoring, *[]string) {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
 	var status []string
-	a := newAuthoring(ui.DefaultTheme(), nilSense, nilAuthoring, func(m string) { status = append(status, m) }, func() {})
+	a := newAuthoring(ui.DefaultTheme(), nilSense, nilAuthoring, nonOwnerRole, func(m string) { status = append(status, m) }, func() {})
 	return a, &status
 }
 

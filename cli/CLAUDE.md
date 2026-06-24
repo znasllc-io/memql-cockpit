@@ -115,10 +115,17 @@ The tab bar lives at the top of the screen. Tabs are ordered so that
    bundle/file. `Ctrl+G` **validates** the bundle (Gate-1 sandbox, no
    mutation) and `Ctrl+R` **injects** it (session-define) so its
    constructs become callable by name for the session -- never
-   shadowing core, dropped at session end (C3 #231); both render a
-   per-construct results overlay (`Esc` closes). Embedded/pack files
+   shadowing core, dropped at session end (C3 #231). `Ctrl+P`
+   **promotes** the bundle durably + cluster-wide (#232) -- OWNER-ONLY
+   (the chip + key are hidden/no-op for non-owners, matching the
+   Deployments-section rollback gate; the engine also enforces
+   owner-only server-side), behind a type-to-confirm blast-radius
+   prompt; promoted constructs are persisted (reviewable +
+   restart-durable) and callable on every node within seconds, vs
+   Inject's session scope. All three render a per-construct results
+   overlay (`Esc` closes). Embedded/pack files
    stay read-only. Lives in `cli/dsledit/` (`view.go` browser,
-   `author.go` authoring + validate/inject, `bundle.go` workspace IO);
+   `author.go` authoring + validate/inject/promote, `bundle.go` workspace IO);
    the colored read-only render reuses `cli/ui/viewer.go` (its optional
    `ShowCursor`/`CursorLine` line-highlight landed for this). Validate /
    Inject go through the `memql/sdk/go/authoring` SDK.
@@ -513,7 +520,8 @@ pans the grid). There is no toggle.
 | Ctrl+K      | EDITOR: Sense hover at the cursor                            |
 | Ctrl+G      | Validate the bundle (Gate-1 sandbox; no engine mutation)     |
 | Ctrl+R      | Inject the bundle (session-define; session-scoped, never shadows core) |
-| Esc         | Dismiss the validate/inject overlay; completion/hover; prompt: cancel |
+| Ctrl+P      | Promote the bundle (durable, cluster-wide; OWNER-ONLY, type-to-confirm) -- persisted + callable on every node, vs Inject's session scope (#232) |
+| Esc         | Dismiss the validate/inject/promote overlay; completion/hover; prompt: cancel |
 
 ---
 

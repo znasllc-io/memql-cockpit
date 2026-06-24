@@ -21,11 +21,18 @@ import (
 	"github.com/gdamore/tcell/v2"
 
 	authoringsdk "github.com/znasllc-io/memql/sdk/go/authoring"
+	"github.com/znasllc-io/memql/sdk/go/client"
 	"github.com/znasllc-io/memql/sdk/go/sense"
 
 	"github.com/znasllc-io/memql-cockpit/cli/editor"
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
 )
+
+// promoteConfirmWord is the literal the operator types to confirm a
+// durable, cluster-wide promote. A type-to-confirm gate (mirroring the
+// Deployments-section rollback control) keeps a destructive cluster-wide
+// write from being a single accidental keystroke.
+const promoteConfirmWord = "promote"
 
 type authorFocus int
 
@@ -43,6 +50,11 @@ const (
 	promptNone promptKind = iota
 	promptNewBundle
 	promptNewFile
+	// promptPromote is the type-to-confirm gate before a durable,
+	// cluster-wide promote (#232). The operator types promoteConfirmWord
+	// to proceed; the gathered bundle sources are stashed on
+	// promotePending* until then.
+	promptPromote
 )
 
 // authoring is the Editor tab's authoring-mode sub-view. Its own mutex
@@ -71,6 +83,13 @@ type authoring struct {
 	promptInput string
 	promptErr   string
 
+	// promotePendingSources / promotePendingBundle hold the gathered
+	// bundle for an in-flight Promote confirmation (promptPromote): the
+	// sources are read once at the moment Ctrl+P is pressed, so the
+	// durable write acts on exactly what the operator saw.
+	promotePendingSources string
+	promotePendingBundle  string
+
 	// resultShown gates the Validate/Inject results overlay; resultTitle
 	// + resultLines hold the per-construct outcome (C3 #231).
 	resultShown bool
@@ -79,8 +98,14 @@ type authoring struct {
 
 	senseClient     func() *sense.Client
 	authoringClient func() *authoringsdk.Client
-	onStatus        func(string)
-	onRedraw        func()
+	// clusterRole returns the connected caller's cluster-wide role, read
+	// fresh on each use so a cluster switch retargets it (mirrors the
+	// other client closures). Owner-only: the Promote action's hint +
+	// keybinding are gated on RoleOwner, matching the Deployments-section
+	// rollback control and the engine's requireOwnerRole server-side gate.
+	clusterRole func() client.Role
+	onStatus    func(string)
+	onRedraw    func()
 
 	debounce *ui.Debouncer
 }
@@ -100,7 +125,7 @@ type resultEntry struct {
 	sev  resultSev
 }
 
-func newAuthoring(theme ui.Theme, senseClient func() *sense.Client, authoringClient func() *authoringsdk.Client, onStatus func(string), onRedraw func()) *authoring {
+func newAuthoring(theme ui.Theme, senseClient func() *sense.Client, authoringClient func() *authoringsdk.Client, clusterRole func() client.Role, onStatus func(string), onRedraw func()) *authoring {
 	a := &authoring{
 		theme:           theme,
 		focus:           authorBundles,
@@ -108,6 +133,7 @@ func newAuthoring(theme ui.Theme, senseClient func() *sense.Client, authoringCli
 		hover:           editor.NewHoverTooltip(theme),
 		senseClient:     senseClient,
 		authoringClient: authoringClient,
+		clusterRole:     clusterRole,
 		onStatus:        onStatus,
 		onRedraw:        onRedraw,
 	}
@@ -284,6 +310,61 @@ func (a *authoring) drawEditor(screen *ui.Screen, bounds ui.Rect) {
 		a.hover.Draw(screen, chrome)
 	}
 	ui.DrawBottom(screen, bounds, a.theme.SubtleStyle(), 1, a.hintsForEditor())
+
+	// The Promote type-to-confirm prompt overlays the editor pane (the
+	// widest), like the Validate/Inject results overlay -- so the
+	// blast-radius warning has room and the operator reads it where the
+	// action lives.
+	if a.prompt == promptPromote {
+		a.drawPromoteConfirm(screen, bounds)
+	}
+}
+
+// drawPromoteConfirm paints the durable-promote blast-radius warning +
+// type-to-confirm field as a bordered overlay over the editor pane. The
+// copy is explicit that the write PERSISTS and becomes callable
+// CLUSTER-WIDE -- the difference from Inject's session-scoped define.
+func (a *authoring) drawPromoteConfirm(screen *ui.Screen, bounds ui.Rect) {
+	if bounds.Width < 12 || bounds.Height < 6 {
+		return
+	}
+	bg := tcell.StyleDefault.Background(tcell.NewRGBColor(28, 30, 36)).Foreground(a.theme.FG)
+	screen.FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, bg)
+	screen.DrawBox(bounds.X, bounds.Y, bounds.Width, bounds.Height, bg.Foreground(a.theme.Warning))
+
+	innerW := bounds.Width - 4
+	x := bounds.X + 2
+	y := bounds.Y + 1
+	screen.DrawText(x, y, innerW, "PROMOTE -- durable, cluster-wide", bg.Foreground(a.theme.Warning).Bold(true))
+	y += 2
+
+	warn := fmt.Sprintf(
+		"This durably promotes bundle %q into the SHARED engine registry. The promoted constructs are PERSISTED (reviewable + restart-durable) and become callable by EVERY session on EVERY node within seconds. Unlike Inject (session-scoped), this is not dropped at session end.",
+		a.promotePendingBundle)
+	for _, ln := range ui.WrapText(warn, innerW) {
+		if y >= bounds.Y+bounds.Height-3 {
+			break
+		}
+		screen.DrawText(x, y, innerW, ln, bg)
+		y++
+	}
+
+	if a.promptErr != "" {
+		screen.DrawText(x, bounds.Y+bounds.Height-3, innerW, a.promptErr, bg.Foreground(a.theme.Error))
+	}
+
+	// Type-to-confirm field on the second-to-last row.
+	fy := bounds.Y + bounds.Height - 2
+	prefix := fmt.Sprintf("Type %q to confirm: ", promoteConfirmWord)
+	screen.DrawText(x, fy, innerW, prefix, bg.Foreground(a.theme.Accent))
+	fieldX := x + len(prefix)
+	fieldW := innerW - len(prefix)
+	if fieldW > 2 {
+		caret := tcell.StyleDefault.Background(a.theme.FG)
+		field := tcell.StyleDefault.Foreground(a.theme.FG)
+		ui.DrawInputValue(screen, fieldX, fy, fieldW, a.promptInput, true, field, caret)
+	}
+	ui.DrawBottom(screen, bounds, a.theme.SubtleStyle(), 1, "Enter:Confirm  Esc:Cancel")
 }
 
 func (a *authoring) drawPrompt(screen *ui.Screen, bounds ui.Rect, label string) {
@@ -360,19 +441,35 @@ func (a *authoring) hintsForFiles() string {
 }
 
 func (a *authoring) hintsForEditor() string {
+	// Promote (Ctrl+P, durable cluster-wide) is OWNER-ONLY -- the chip
+	// only surfaces for an owner, per the context-aware action-hint rule
+	// (a chip that lies rots trust) and mirroring the rollback control's
+	// role gating. Non-owners never see it and the key is a no-op.
 	if a.editor == nil {
 		// Validate/Inject act on the whole bundle, so they're available
 		// even before a file is opened (Ctrl combos work from any focus).
-		return "Ctrl+G:Validate  Ctrl+R:Inject  Tab:Cycle"
+		chips := []ui.HintChip{
+			{Key: "Ctrl+G", Label: "Validate"},
+			{Key: "Ctrl+R", Label: "Inject"},
+		}
+		if a.isOwner() {
+			chips = append(chips, ui.HintChip{Key: "Ctrl+P", Label: "Promote"})
+		}
+		chips = append(chips, ui.HintChip{Key: "Tab", Label: "Cycle"})
+		return ui.HintBar{Chips: chips}.String()
 	}
 	// Ctrl+Space:Complete + Ctrl+K:Hover work too (documented in
-	// cli/CLAUDE.md); the band shows the most-used four so it fits.
-	return ui.HintBar{Chips: []ui.HintChip{
+	// cli/CLAUDE.md); the band shows the most-used actions so it fits.
+	chips := []ui.HintChip{
 		{Key: "Ctrl+S", Label: "Save"},
 		{Key: "Ctrl+G", Label: "Validate"},
 		{Key: "Ctrl+R", Label: "Inject"},
-		{Key: "Tab", Label: "Cycle"},
-	}}.String()
+	}
+	if a.isOwner() {
+		chips = append(chips, ui.HintChip{Key: "Ctrl+P", Label: "Promote"})
+	}
+	chips = append(chips, ui.HintChip{Key: "Tab", Label: "Cycle"})
+	return ui.HintBar{Chips: chips}.String()
 }
 
 // --- events ----------------------------------------------------------
@@ -414,6 +511,19 @@ func (a *authoring) HandleEvent(key *tcell.EventKey) bool {
 		if ok {
 			go a.runInject(bundle, sources)
 		}
+		return true
+	case tcell.KeyCtrlP:
+		// Durable, cluster-wide Promote (#232) -- OWNER-ONLY. The hint is
+		// hidden for non-owners and the key is a no-op for them; the
+		// engine also rejects a non-owner call server-side
+		// (requireOwnerRole), so this is the UI half of a defense-in-depth
+		// gate. Owners get a type-to-confirm prompt before the write.
+		if !a.isOwner() {
+			a.mu.Unlock()
+			return true
+		}
+		a.beginPromoteConfirmLocked()
+		a.mu.Unlock()
 		return true
 	}
 
@@ -582,6 +692,7 @@ func (a *authoring) handlePromptKeyLocked(key *tcell.EventKey) bool {
 		a.prompt = promptNone
 		a.promptInput = ""
 		a.promptErr = ""
+		a.promotePendingSources, a.promotePendingBundle = "", ""
 		return true
 	case tcell.KeyEnter:
 		a.commitPromptLocked()
@@ -596,6 +707,22 @@ func (a *authoring) handlePromptKeyLocked(key *tcell.EventKey) bool {
 		return true
 	}
 	return true
+}
+
+// beginPromoteConfirmLocked gathers the bundle sources (saving the open
+// buffer first) and, if there's something to promote, opens the
+// type-to-confirm prompt. Caller holds a.mu. Owner-gating is checked by
+// the caller (HandleEvent).
+func (a *authoring) beginPromoteConfirmLocked() {
+	sources, bundle, ok := a.gatherForActionLocked()
+	if !ok {
+		return
+	}
+	a.promotePendingSources = sources
+	a.promotePendingBundle = bundle
+	a.prompt = promptPromote
+	a.promptInput = ""
+	a.promptErr = ""
 }
 
 func (a *authoring) commitPromptLocked() {
@@ -628,6 +755,21 @@ func (a *authoring) commitPromptLocked() {
 		a.selectFileLocked(created)
 		a.openFileLocked(created)
 		a.focus = authorEditor
+	case promptPromote:
+		// Type-to-confirm: the operator must type the literal word to
+		// authorize the durable, cluster-wide write. A mismatch re-arms
+		// the prompt with an error rather than promoting.
+		if name != promoteConfirmWord {
+			a.promptErr = fmt.Sprintf("type %q to confirm, or Esc to cancel", promoteConfirmWord)
+			a.promptInput = ""
+			return
+		}
+		bundle, sources := a.promotePendingBundle, a.promotePendingSources
+		a.prompt = promptNone
+		a.promptInput = ""
+		a.promptErr = ""
+		a.promotePendingBundle, a.promotePendingSources = "", ""
+		go a.runPromote(bundle, sources)
 	}
 }
 
@@ -819,6 +961,18 @@ func (a *authoring) authoringClientFn() *authoringsdk.Client {
 	return a.authoringClient()
 }
 
+// isOwner reports whether the connected caller is a cluster owner. The
+// Promote action is owner-only: the hint chip + the Ctrl+P keybinding
+// are both gated on this, matching the Deployments-section rollback
+// control (cli/cluster/deployments.go) and the engine's requireOwnerRole
+// server-side gate.
+func (a *authoring) isOwner() bool {
+	if a.clusterRole == nil {
+		return false
+	}
+	return a.clusterRole() == client.RoleOwner
+}
+
 // --- Validate (Gate-1) + Inject (session-define), C3 #231 -----------
 
 // gatherForActionLocked saves the open buffer (so disk is current),
@@ -883,6 +1037,68 @@ func (a *authoring) runInject(bundle, sources string) {
 	a.showInjectResultLocked(res)
 	a.mu.Unlock()
 	a.redraw()
+}
+
+// runPromote durably promotes the bundle cluster-wide (#232): it
+// validates, then persists every plain construct into the SHARED engine
+// registry so it is restart-durable, callable by every session, and --
+// via the engine's live cross-node broadcast -- callable on every node
+// within seconds. OWNER-only; the engine also enforces this server-side
+// (a non-owner call returns a permission-denied wire error surfaced here
+// as a status message). Renders into the same results overlay as
+// Validate/Inject.
+func (a *authoring) runPromote(bundle, sources string) {
+	ac := a.authoringClientFn()
+	if ac == nil {
+		a.status("promote needs a connected cluster")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := ac.DurablePromoteBundle(ctx, sources)
+	if err != nil {
+		a.status(fmt.Sprintf("promote: %v", err))
+		return
+	}
+	a.mu.Lock()
+	a.showPromoteResultLocked(res)
+	a.mu.Unlock()
+	a.redraw()
+}
+
+func (a *authoring) showPromoteResultLocked(res *authoringsdk.PromoteResult) {
+	if res == nil {
+		return
+	}
+	a.resultLines = a.resultLines[:0]
+	if res.OK {
+		a.resultTitle = "PROMOTE -- durable, cluster-wide: OK"
+		a.resultLines = append(a.resultLines, resultEntry{
+			fmt.Sprintf("Promoted %d construct(s). Durable: persisted (reviewable + restart-durable), callable by every session, and live on every node within seconds.", len(res.Promoted)),
+			sevPlain,
+		})
+		for _, c := range res.Promoted {
+			a.resultLines = append(a.resultLines, resultEntry{fmt.Sprintf("[ok] %s (%s)", c.Name, c.Kind), sevOK})
+		}
+		if len(res.Promoted) == 0 {
+			a.resultLines = append(a.resultLines, resultEntry{"(nothing was promoted)", sevPlain})
+		}
+	} else {
+		a.resultTitle = "PROMOTE -- durable, cluster-wide: REJECTED"
+		if res.Error != "" {
+			a.resultLines = append(a.resultLines, resultEntry{res.Error, sevErr})
+		}
+		for _, d := range res.Diagnostics {
+			if d.OK || d.Skipped {
+				continue
+			}
+			a.resultLines = append(a.resultLines, diagnosticLine(d))
+		}
+		if len(a.resultLines) == 0 {
+			a.resultLines = append(a.resultLines, resultEntry{"(rejected, no detail)", sevErr})
+		}
+	}
+	a.resultShown = true
 }
 
 func (a *authoring) showValidateResultLocked(res *authoringsdk.ValidateResult) {

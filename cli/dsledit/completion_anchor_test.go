@@ -35,7 +35,7 @@ func TestIdentifierPrefix(t *testing.T) {
 func authoringWithEditor(t *testing.T, src string, col int) *authoring {
 	t.Helper()
 	t.Setenv("HOME", t.TempDir())
-	a := newAuthoring(ui.DefaultTheme(), nilSense, nilAuthoring, func(string) {}, func() {})
+	a := newAuthoring(ui.DefaultTheme(), nilSense, nilAuthoring, nonOwnerRole, func(string) {}, func() {})
 	a.editor = editor.NewEditor(editor.NewBuffer(src, "f.memql", false), a.theme)
 	a.editor.CursorLine = 0
 	a.editor.CursorCol = col

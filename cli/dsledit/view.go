@@ -24,6 +24,7 @@ import (
 	"github.com/gdamore/tcell/v2"
 
 	authoringsdk "github.com/znasllc-io/memql/sdk/go/authoring"
+	"github.com/znasllc-io/memql/sdk/go/client"
 	"github.com/znasllc-io/memql/sdk/go/pack"
 	"github.com/znasllc-io/memql/sdk/go/sense"
 
@@ -108,6 +109,33 @@ type View struct {
 	// authoring mode's Validate (Gate-1) + Inject (session-define)
 	// actions (C3 #231).
 	AuthoringClient func() *authoringsdk.Client
+
+	// clusterRole mirrors the connected caller's cluster-wide role,
+	// pushed from the app layer's refreshMyAccess via SetClusterRole
+	// (same access record the Settings + Deployments views consume).
+	// Read under v.Mu; the authoring sub-view gates its owner-only
+	// Promote action (#232) on RoleOwner via the closure passed at
+	// construction.
+	clusterRole client.Role
+}
+
+// SetClusterRole mirrors the connected caller's cluster-wide role into
+// the Editor view so the authoring mode's owner-only Promote action
+// (#232) can gate on it. Wired from the app's refreshMyAccess alongside
+// the Settings + Deployments role updates.
+func (v *View) SetClusterRole(r client.Role) {
+	v.Mu.Lock()
+	v.clusterRole = r
+	v.Mu.Unlock()
+}
+
+// clusterRoleFn reads the mirrored role under the lock; passed as a
+// closure to newAuthoring so the authoring sub-view always sees the
+// latest role even though it's built lazily on the first Ctrl+B.
+func (v *View) clusterRoleFn() client.Role {
+	v.Mu.RLock()
+	defer v.Mu.RUnlock()
+	return v.clusterRole
 }
 
 // NewView builds an empty Editor view.
@@ -606,7 +634,7 @@ func (v *View) toggleMode() {
 	v.Mu.Lock()
 	if v.mode == modeBrowse {
 		if v.author == nil {
-			v.author = newAuthoring(v.Theme, v.SenseClient, v.AuthoringClient, v.OnStatus, v.Redraw)
+			v.author = newAuthoring(v.Theme, v.SenseClient, v.AuthoringClient, v.clusterRoleFn, v.OnStatus, v.Redraw)
 		}
 		v.mode = modeAuthor
 	} else {

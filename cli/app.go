@@ -1275,6 +1275,12 @@ func (a *App) refreshMyAccess(clusterName string, conn *client.Connection) {
 		if a.clustersView != nil && a.clustersView.Topology != nil && access != nil {
 			a.clustersView.Topology.SetClusterRole(access.ClusterRole)
 		}
+		// Same access record drives the Editor tab's owner-only durable
+		// Promote action (#232): the hint chip + Ctrl+P keybinding are
+		// gated on RoleOwner.
+		if a.dsleditView != nil && access != nil {
+			a.dsleditView.SetClusterRole(access.ClusterRole)
+		}
 		a.postRedraw()
 	}()
 }
