@@ -216,15 +216,27 @@ deployment is previewed. The desired per-tier spec (Epic 2
 `deploymentNodeSpec`: version/replicas, via `NodeSpecsForDeployment`) is
 surfaced in the composition view.
 
-**Topology builder (memql-cockpit#237, phase 1).** `N` enters an
-interactive topology-as-canvas builder. Phase 1 is LIST-based: an
-editable per-node-type composition (type x replicas, + version) seeded
-from the selected deployment's `deploymentNodeSpec` set or the cluster's
-known node types + live counts. `Up/Dn` move, `+`/`-` adjust replicas,
-`A` adds the next known type, `D` removes a row, `N`/`Esc` close. The
-model (`composeBuilder`, `cluster/builder.go`) is pure; `toSpecs()` is the
-hand-off point the clickable-node canvas (phase 2, backed by `cli/canvas`)
-will consume.
+**Topology builder (memql-cockpit#237 phase 1 + #253 phase 2).** `N`
+enters an interactive topology-as-canvas builder over a pure
+per-node-type composition (type x replicas, + version) seeded from the
+selected deployment's `deploymentNodeSpec` set or the cluster's known
+node types + live counts. `Up/Dn` move, `+`/`-` adjust replicas, `A`
+adds the next known type, `D` removes a row, `N`/`Esc` close. The model
+(`composeBuilder`, `cluster/builder.go`) is pure; `toSpecs()` is the
+hand-off point.
+
+Phase 2 (#253) adds two things on the same model:
+- **`V` toggles a clickable-node canvas** rendering (`cluster/builder_canvas.go`)
+  via the `cli/canvas` pixel framebuffer -- the composition lays out as a
+  grid of node boxes (origin/zoom-1 camera, so a left **click** maps
+  exactly to the node under the cursor and selects it); `+`/`-`/`A`/`D`
+  still edit the selected node. `V` toggles back to the list.
+- **`Enter` applies / cuts from the composition** (`cluster/builder_apply.go`):
+  a confirm, then `CutVersion` for the cluster's env (patch bump) followed
+  by a `deploymentNodeSpec` write per tier against the new deployment.
+  The two-client orchestration (DeployControl + Query SDK) is wired as the
+  `ApplyComposition` callback in `app.go` (SDK-only rule). Explicit
+  env/bump/version selection stays on the Deployments `C` control.
 
 ### Deployments section (memql-cockpit#207)
 
@@ -463,7 +475,7 @@ pans the grid). There is no toggle.
 | WASD        | Pan the live-topology grid (top region)                 |
 | R           | Reset pan to origin                                     |
 | X           | Toggle Architecture navigator (drill-down, top region)  |
-| N           | Toggle the Topology builder (list-based, phase 1, #237) |
+| N           | Toggle the Topology builder (list + clickable canvas, #237/#253) |
 | ↑/↓         | Move the Deployments history cursor (bottom region)     |
 | Enter       | Preview the selected deployment graphically; again = fullscreen (#225) |
 | F           | Toggle fullscreen deployment drill-down                 |
@@ -472,13 +484,17 @@ pans the grid). There is no toggle.
 | G           | Deploy the selected pending deployment (developer+)     |
 | B           | Roll back to the selected succeeded deployment (owner)  |
 
-### Topology builder (N-toggled, phase 1)
+### Topology builder (N-toggled; #237 list + #253 canvas)
 | Key         | Action                                              |
 |-------------|-----------------------------------------------------|
 | ↑/↓         | Move the row cursor                                 |
 | +/-         | Adjust the selected node type's replica count       |
 | A           | Add the next known node type not yet in the list    |
 | D           | Remove the selected node type                       |
+| V           | Toggle list vs clickable-node canvas rendering (#253) |
+| Click       | (canvas) Select the node under the cursor (#253)    |
+| Enter       | Apply / cut from the composition (#253)             |
+| Y / N / Esc | (apply confirm) Cut / cancel / cancel               |
 | N / Esc     | Close the builder                                   |
 
 ### Architecture navigator (X-toggled)
@@ -525,7 +541,9 @@ pans the grid). There is no toggle.
 | `pool.go`                | Per-cluster `connEntry` + lifecycle state machine             |
 | `cluster/clusters_view.go` | Clusters tab layout, focus, cluster manager                |
 | `cluster/topology.go`    | Right-pane persistent split: live topology grid (top) + parameterized `drawTopology`/`computeEdges` + deployment preview/drill-down + Architecture + builder toggles + `View.Draw` split layout |
-| `cluster/builder.go`     | Interactive topology-as-canvas phase 1: pure `composeBuilder` list model + the `N`-toggled builder mode |
+| `cluster/builder.go`     | Interactive topology-as-canvas phase 1: pure `composeBuilder` list model + the `N`-toggled builder mode (+ `V` canvas / `Enter` apply keys, #253) |
+| `cluster/builder_canvas.go` | Phase 2 (#253): clickable-node canvas rendering of the composition via `cli/canvas` (grid layout + origin/zoom-1 camera + click hit-test) |
+| `cluster/builder_apply.go` | Phase 2 (#253): apply/cut-from-composition flow (confirm -> async `ApplyComposition` -> result); the callback is wired in `app.go` |
 | `cluster/deployments.go` | Deployments section (bottom band): history list (current=green) + per-deployment detail/topology + nodeSpec composition |
 | `cluster/deployments_controls.go` | Cut/deploy/rollback concept modal for the Deployments section |
 | `cluster/deploy_shared.go` | Shared deploy helpers (async-fire outcome, gRPC PermissionDenied mapping, colored-token / wrapped-text writers) reused by the Deployments section |
