@@ -221,8 +221,12 @@ func (v *View) handleBuilderKeyLocked(key *tcell.EventKey) bool {
 	b := v.builder
 	switch key.Key() {
 	case tcell.KeyEscape:
-		v.builder = nil
+		v.closeBuilderLocked()
 		v.requestRedrawLocked()
+		return true
+	case tcell.KeyEnter:
+		// Apply / cut-from-composition (phase 2, #253).
+		v.openComposeApplyLocked()
 		return true
 	case tcell.KeyUp:
 		b.moveUp()
@@ -235,7 +239,10 @@ func (v *View) handleBuilderKeyLocked(key *tcell.EventKey) bool {
 	case tcell.KeyRune:
 		switch key.Rune() {
 		case 'n', 'N':
-			v.builder = nil
+			v.closeBuilderLocked()
+		case 'v', 'V':
+			// Toggle list <-> clickable-node canvas rendering (phase 2, #253).
+			v.builderCanvas = !v.builderCanvas
 		case '+', '=':
 			b.adjustReplicas(1)
 		case '-', '_':
@@ -251,6 +258,15 @@ func (v *View) handleBuilderKeyLocked(key *tcell.EventKey) bool {
 		return true
 	}
 	return true
+}
+
+// closeBuilderLocked exits the builder and resets its phase-2 view + apply
+// state. Caller MUST hold v.mu (write).
+func (v *View) closeBuilderLocked() {
+	v.builder = nil
+	v.builderCanvas = false
+	v.compApply = nil
+	v.composeBoxes = nil
 }
 
 // drawBuilder renders the list-based builder into region. Caller holds

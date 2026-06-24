@@ -1354,6 +1354,50 @@ func (a *App) wireCluster() {
 		return client.NewDeployControlClient(conn)
 	}
 
+	// ApplyComposition cuts-from-composition (memql-cockpit#253): cut a new
+	// patch version for env (the DeployControl gate is enforced server-side),
+	// then persist the builder's per-tier specs as deploymentNodeSpec rows
+	// against the new deployment. Spans the DeployControl + Query SDK clients,
+	// so it lives here (the SDK-only rule keeps wire calls out of cli/cluster).
+	// Explicit env/bump/version selection stays on the Deployments 'C' control;
+	// apply is a fast "cut this whole composition" path defaulting to a patch.
+	a.clustersView.Topology.ApplyComposition = func(env string, specs []cluster.NodeSpecInfo) (string, bool) {
+		dc := a.clustersView.Topology.DeployClient()
+		qc := a.activeQueryClient()
+		if dc == nil || qc == nil {
+			return "ERROR: no connected cluster", false
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		res, err := dc.CutVersion(ctx, env, "patch", "")
+		if err != nil {
+			return fmt.Sprintf("ERROR: cut: %v", err), false
+		}
+		if !res.OK {
+			return "ERROR: " + res.Message, false
+		}
+		depID := res.Details["deploymentId"]
+		if depID == "" {
+			return "ERROR: cut returned no deployment id", false
+		}
+		applied := 0
+		for _, s := range specs {
+			if _, e := qc.CreateDeploymentNodeSpec(ctx, client.CreateDeploymentNodeSpecArgs{
+				DeploymentId: depID,
+				NodeType:     s.NodeType,
+				Replicas:     s.Replicas,
+				Version:      s.Version,
+				ImageDigest:  s.ImageDigest,
+			}); e == nil {
+				applied++
+			} else if a.logger != nil {
+				a.logger.Debug("createDeploymentNodeSpec failed", "deployment", depID, "nodeType", s.NodeType, "error", e)
+			}
+		}
+		line := fmt.Sprintf("cut %s deployment %s; %d/%d tiers applied", env, depID, applied, len(specs))
+		return line, applied == len(specs)
+	}
+
 	// OnRedraw lands an in-flight cut/deploy/rollback action's result
 	// line on screen the moment the SDK call returns, without waiting for
 	// the next poll tick.

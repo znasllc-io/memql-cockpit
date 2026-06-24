@@ -115,6 +115,26 @@ type View struct {
 	// the cluster's known node types. See builder.go.
 	builder *composeBuilder
 
+	// builderCanvas selects the PHASE-2 clickable-node canvas rendering of
+	// the same composeBuilder (memql-cockpit#253) instead of the phase-1
+	// list. Toggled with 'V' while the builder is active. See
+	// builder_canvas.go.
+	builderCanvas bool
+	// composeBoxes / composeRegion are the last canvas-rendered node boxes
+	// + grid region, recorded during Draw so a mouse click can be mapped to
+	// a builder row. Same-goroutine Draw/HandleEvent makes this safe.
+	composeBoxes  []composeNodeBox
+	composeRegion ui.Rect
+	// compApply drives the apply/cut-from-composition confirm + result
+	// (memql-cockpit#253). nil when no apply is in flight. See
+	// builder_apply.go.
+	compApply *composeApplyState
+	// ApplyComposition cuts a new version for env and persists the composed
+	// per-tier node specs against it, returning a single result line + ok.
+	// Wired in app.go (it spans the DeployControl + Query SDK clients, which
+	// live there); nil disables the apply action. See builder_apply.go.
+	ApplyComposition func(env string, specs []NodeSpecInfo) (string, bool)
+
 	// clusterRole is the connected caller's cluster-wide role, mirrored
 	// from refreshMyAccess via SetClusterRole. Drives the role gating on
 	// the Deployments section's cut/deploy/rollback controls (view = any
@@ -366,16 +386,28 @@ func (v *View) Draw(screen *ui.Screen, bounds ui.Rect) {
 		return
 	}
 
-	// Topology builder (memql-cockpit#237, phase 1): when active it owns
-	// the pane below the cluster-name title with its own hint bar.
+	// Topology builder (memql-cockpit#237 phase 1 + #253 phase 2): when
+	// active it owns the pane below the cluster-name title with its own hint
+	// bar. 'V' toggles the list vs the clickable-node canvas; Enter applies.
 	if v.builder != nil {
 		region := ui.Rect{X: bounds.X, Y: bounds.Y, Width: bounds.Width, Height: bounds.Height - 1}
-		v.drawBuilder(screen, region)
 		hintStyle := tcell.StyleDefault.Foreground(v.Theme.Subtle).Background(v.Theme.BG)
 		hintY := bounds.Y + bounds.Height - 1
+		var hint string
+		switch {
+		case v.compApply != nil:
+			v.drawComposeApply(screen, region)
+			hint = v.composeApplyHint()
+		case v.builderCanvas:
+			v.drawBuilderCanvas(screen, region)
+			hint = "Up/Dn:Move  Click:Select  +/-:Replicas  A:Add  D:Del  V:List  Enter:Cut  N/Esc:Close"
+		default:
+			v.drawBuilder(screen, region)
+			hint = "Up/Dn:Move  +/-:Replicas  A:Add  D:Del  V:Canvas  Enter:Cut  N/Esc:Close"
+		}
 		screen.FillRect(bounds.X, hintY, bounds.Width, 1, hintStyle)
 		screen.DrawText(bounds.X, hintY, bounds.Width/2, " Topology builder", hintStyle)
-		drawRightHints(screen, bounds, hintY, "Up/Dn:Move  +/-:Replicas  A:Add  D:Del  N/Esc:Close", hintStyle)
+		drawRightHints(screen, bounds, hintY, hint, hintStyle)
 		return
 	}
 
@@ -813,6 +845,22 @@ func (v *View) drawNodeBox(screen *ui.Screen, x, y, w, h int, area ui.Rect, node
 func (v *View) HandleEvent(ev tcell.Event) bool {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	// Clickable-node canvas (memql-cockpit#253): a left click on the
+	// builder canvas selects the node under the cursor. Only consumed in
+	// canvas view with no apply in flight; all other mouse events fall
+	// through (the cockpit has no other topology mouse interaction).
+	if mev, isMouse := ev.(*tcell.EventMouse); isMouse {
+		if v.builder != nil && v.builderCanvas && v.compApply == nil &&
+			mev.Buttons()&tcell.Button1 != 0 {
+			sx, sy := mev.Position()
+			if idx := v.composeCanvasHit(sx, sy); idx >= 0 {
+				v.builder.cursor = idx
+				v.requestRedrawLocked()
+			}
+			return true
+		}
+		return false
+	}
 	keyEv, ok := ev.(*tcell.EventKey)
 	if !ok {
 		return false
@@ -824,8 +872,13 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 	if v.Arch.Active() {
 		return v.Arch.HandleEvent(ev)
 	}
-	// Topology builder (memql-cockpit#237) owns all keys while active.
+	// Topology builder (memql-cockpit#237) owns all keys while active. The
+	// apply/cut-from-composition confirm (phase 2, #253) takes precedence
+	// over the builder's own keys while it is up.
 	if v.builder != nil {
+		if v.compApply != nil {
+			return v.handleComposeApplyKeyLocked(keyEv)
+		}
 		return v.handleBuilderKeyLocked(keyEv)
 	}
 	// Cut/deploy/rollback concept modal takes precedence whenever it's
