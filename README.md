@@ -29,14 +29,12 @@ memQL Cockpit is the terminal-native IDE and operations console for [memQL](http
 
 ## Features
 
-- **Multi-tab TUI** — clusters, concepts, settings — all in one terminal; the unified Concepts tab consumes `@displayCard` hints to render rows nicely per concept
+- **Multi-tab TUI** — DevOps, Concepts, Editor, Settings — all in one terminal; the unified Concepts tab consumes `@displayCard` hints to render rows nicely per concept
 - **DSL editor + linter** — write `.memql` files with structured validation
 - **Worker modes** — per-user workers bring computer use into the platform: `HEADLESS` (shell / fs / http tools) on every build, `GUI` on the gui variant
 - **GUI variant** — opt-in CGO build with screenshot, mouse, keyboard, and window control via RobotGo; see [docs/computer-use.md](docs/computer-use.md)
 - **Service install** — register as a LaunchAgent (macOS) or systemd user service (Linux)
 - **gRPC client** — talks to memQL cluster nodes; no engine embedded
-
-> Demo recording (asciinema) coming soon.
 
 ---
 
@@ -107,8 +105,10 @@ memql-cockpit worker consent watch                         # live event tail
 
 `--strict` flags the window for **per-action approval** on the
 high-risk subset (`key_type`, `key_hold`, `mouse_click`, `mouse_down`,
-`mouse_up`); interactive Allow/Deny enforcement is a follow-up under
-memql-cockpit#64. Close a window immediately with `worker consent
+`mouse_up`); interactive Allow/Deny enforcement previously lived in the
+Workers tab (memql-cockpit#64, #130) but was removed with that tab in
+memql-cockpit#216 -- worker consent is now managed via the `worker
+consent` subcommands. Close a window immediately with `worker consent
 revoke`. (The in-TUI Workers consent dashboard + region picker and the
 global `Ctrl+E` kill switch were removed with the other panels in
 memql-cockpit#216 -- consent is managed via the `worker consent`
