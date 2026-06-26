@@ -25,7 +25,7 @@ The rule covers two layout patterns:
 ### 1. Multi-tab IDE (the operations console)
 
 The original `memql-cockpit` invocation -- launches `cli.App`, mounts
-the Clusters / Concepts / Settings tabs, full F1..F3 navigation. This
+the DevOps / Concepts / Editor / Settings tabs, full F1..F4 navigation. This
 is what `app.go` orchestrates today; documented in the rest of this
 file. (Previous Explorer + Agents tabs were folded into the unified
 Concepts tab on 2026-05-16 / 2026-05-21 respectively -- the generic
@@ -420,7 +420,7 @@ The single-connection invariant + stable-frame behavior is locked by
 | Ctrl+Q   | Quit                                                           |
 | Ctrl+T   | Cycle theme                                                    |
 
-### Clusters tab (Cluster Manager focus)
+### DevOps tab (Cluster Manager focus)
 | Key   | Action                                              |
 |-------|-----------------------------------------------------|
 | ↑/↓   | Move highlight (also moves topology view)           |
@@ -468,7 +468,7 @@ memql-cockpit#197.)
 | Enter     | Compose + Save                      |
 | Esc       | Cancel                              |
 
-### Clusters tab (Topology pane focus)
+### DevOps tab (Topology pane focus)
 
 The right pane is a persistent split: the topology grid (top) and the
 always-on Deployments section (bottom). The topology pan/reset/arch

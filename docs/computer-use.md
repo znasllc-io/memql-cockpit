@@ -470,9 +470,10 @@ memql-cockpit worker consent watch                         # live event tail
 - **Strict mode** (`--strict`): flags the window for per-call
   Allow/Deny approval on the high-risk subset (`key_type`, `key_hold`,
   `mouse_click`, `mouse_down`, `mouse_up`). Interactive Allow/Deny
-  enforcement is a follow-up under memql-cockpit#64; the in-TUI
-  approval modal + region picker that surfaced it lived in the cockpit
-  Workers tab, which was removed in memql-cockpit#216. Other interact
+  enforcement previously lived in the Workers tab (memql-cockpit#64,
+  #130) -- an in-TUI approval modal + region picker -- but was removed
+  with that tab in memql-cockpit#216; worker consent is now managed via
+  the `worker consent` subcommands. Other interact
   actions (`exec`, `fs_write`, `mouse_move`, `key_combo`, ...) stay
   admitted by the standing window.
 - Close the active window immediately with `memql-cockpit worker
