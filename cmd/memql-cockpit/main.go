@@ -38,6 +38,7 @@ import (
 	"github.com/znasllc-io/memql-cockpit/cli/auth"
 	"github.com/znasllc-io/memql-cockpit/cli/config"
 	"github.com/znasllc-io/memql-cockpit/cli/crash"
+	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/internal/deploy"
 	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/internal/harness"
 	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/internal/lint"
 	"github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit/internal/worker"
@@ -98,6 +99,10 @@ func main() {
 			os.Exit(1)
 		case "lint":
 			os.Exit(lint.HandleCommand(os.Args[2:]))
+		case "deploy":
+			os.Exit(deploy.HandleDeploy(os.Args[2:], version))
+		case "run":
+			os.Exit(deploy.HandleRun(os.Args[2:], version))
 		case "harness":
 			os.Exit(harness.HandleCommand(os.Args[2:]))
 		case "help":
@@ -413,6 +418,8 @@ func printUsage() {
 	fmt.Println("  memql-cockpit worker <subcommand>      Run as a memql worker (computer-use)")
 	fmt.Println("  memql-cockpit creds <subcommand>       Inspect / migrate the credential store")
 	fmt.Println("  memql-cockpit lint [path]              Validate a .memql file or DSL tree")
+	fmt.Println("  memql-cockpit deploy --env=<env>       Deploy the engine cluster via the embedded runtime")
+	fmt.Println("  memql-cockpit run <automation>         Run a named automation via the embedded runtime")
 	fmt.Println("  memql-cockpit harness trace <planId>   Print a harness plan's execution timeline")
 	fmt.Println("")
 	fmt.Println("FIRST-TIME SETUP")
