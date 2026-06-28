@@ -1,0 +1,132 @@
+name: Deploy staging (cockpit)
+
+# I17 / memql#2228 — run `memql-cockpit deploy --env=staging` from a CI runner.
+#
+# This workflow builds the cockpit (headless) and invokes the deploy command
+# the same way an operator would from their machine. It is the CI surface for
+# the DevOps DSL deployment bundle (epic memql#2212).
+#
+# SAFETY / GATING (read before flipping dry_run off):
+#   * Runs in the `staging` GitHub Environment, which REQUIRES a manual
+#     approval (configure required reviewers on the environment) before the
+#     deploy job starts. The owner is the approver.
+#   * Defaults to --dry-run: resolves + previews the deployEngineCluster
+#     automation from the embedded bundle with ZERO side effects.
+#   * A live (dry_run=false) deploy is OWNER-GATED: it needs the runner-surface
+#     secrets below AND the fully-wired runner capability surface from I13
+#     (memql#2220). Until I13 lands, a live run resolves + invokes the embedded
+#     runtime but the DB-backed deployment steps no-op (engine not initialized)
+#     — it does not yet mutate a real cluster. See docs/deploy-runner.md.
+#
+# Runner-surface credentials (set as `staging` Environment secrets — NEVER
+# commit real values; source them from Key Vault):
+#   * MEMQL_COCKPIT_KUBECONFIG_B64   base64 kubeconfig (decoded to a file here)
+#   * MEMQL_COCKPIT_ARGOCD_SERVER    ArgoCD API server URL (non-secret-ish)
+#   * MEMQL_COCKPIT_ARGOCD_AUTH_TOKEN ArgoCD auth token
+#   * MEMQL_COCKPIT_GENESIS_ENVELOPE sealed genesis envelope (base64)
+# When unset, the deploy still runs as a no-op and reports the surface as
+# absent (redacted) — exactly what a CI runner with no creds should do.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Engine version / git ref to deploy (e.g. 0.9.0)"
+        required: true
+        default: "0.9.0"
+      dry_run:
+        description: "Resolve + preview only (no side effects). Owner must approve a live run."
+        type: boolean
+        required: true
+        default: true
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-staging:
+    name: cockpit deploy --env=staging
+    runs-on: ubuntu-latest
+    # Manual-approval gate. Configure required reviewers on the `staging`
+    # environment so the owner approves before this job runs.
+    environment: staging
+    steps:
+      - name: Checkout memql-cockpit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: memql-cockpit
+      - name: Checkout memql (sibling for the ../memql replace directive)
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: znasllc-io/memql
+          path: memql
+          token: ${{ secrets.MEMQL_SIBLING_TOKEN || github.token }}
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: '1.26'
+          cache: true
+          cache-dependency-path: memql-cockpit/go.sum
+
+      - name: Build cockpit (headless)
+        working-directory: memql-cockpit
+        run: make cockpit
+
+      # Materialize the kubeconfig from a base64 secret to a file, so the
+      # cockpit/runner surface can find it. No-op when the secret is unset.
+      - name: Provision runner surface creds (from staging Environment secrets)
+        id: creds
+        env:
+          KUBECONFIG_B64: ${{ secrets.MEMQL_COCKPIT_KUBECONFIG_B64 }}
+        run: |
+          if [ -n "$KUBECONFIG_B64" ]; then
+            mkdir -p "$HOME/.memql"
+            echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.memql/kubeconfig"
+            chmod 600 "$HOME/.memql/kubeconfig"
+            echo "kubeconfig=$HOME/.memql/kubeconfig" >> "$GITHUB_OUTPUT"
+            echo "Wrote kubeconfig to ~/.memql/kubeconfig"
+          else
+            echo "No kubeconfig secret set — deploy will run as a no-op (surface absent)."
+          fi
+
+      - name: Run cockpit deploy (staging)
+        working-directory: memql-cockpit
+        env:
+          # Resolve the deploy mode. release-triggered runs are always dry-run
+          # (publishing a release should never auto-mutate staging); manual
+          # dispatch honors the dry_run input (owner-approved via the env gate).
+          DRY_RUN: ${{ github.event_name == 'release' && 'true' || inputs.dry_run }}
+          REF: ${{ inputs.ref || github.event.release.tag_name }}
+          # Role assertion for the pre-flight gate. TODO(owner): replace with an
+          # identity-derived role once I13 (memql#2220) wires the runner auth
+          # layer; until then the developer-or-above gate is asserted here and
+          # protected by the `staging` environment approval.
+          MEMQL_COCKPIT_ROLE: developer
+          MEMQL_COCKPIT_ACTOR: "ci:${{ github.actor }}"
+          # Runner-surface creds (redacted by the cockpit; never printed).
+          MEMQL_COCKPIT_KUBECONFIG: ${{ steps.creds.outputs.kubeconfig }}
+          MEMQL_COCKPIT_ARGOCD_SERVER: ${{ secrets.MEMQL_COCKPIT_ARGOCD_SERVER }}
+          MEMQL_COCKPIT_ARGOCD_AUTH_TOKEN: ${{ secrets.MEMQL_COCKPIT_ARGOCD_AUTH_TOKEN }}
+          MEMQL_COCKPIT_GENESIS_ENVELOPE: ${{ secrets.MEMQL_COCKPIT_GENESIS_ENVELOPE }}
+        run: |
+          REF="${REF:-0.9.0}"
+          ARGS="--env=staging --ref=$REF"
+          if [ "$DRY_RUN" != "false" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          echo "::notice::cockpit deploy $ARGS (dry_run=$DRY_RUN)"
+          set +e
+          ./bin/memql-cockpit deploy $ARGS
+          code=$?
+          set -e
+          # Exit-code map (see deploy.go printDeployUsage):
+          #   0 success · 1 error/denied · 2 usage · 3 blocked (automation pending)
+          # A "blocked" (3) result is expected while the deployment automation /
+          # runner surface are still landing — treat it as a non-fatal notice so
+          # the wired-but-not-yet-live state doesn't red-X the run.
+          if [ "$code" = "3" ]; then
+            echo "::notice::deploy is wired but blocked (automation/runner surface pending I10/I13). Non-fatal."
+            exit 0
+          fi
+          exit $code

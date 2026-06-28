@@ -112,6 +112,22 @@ func HandleDeploy(args []string, cockpitVersion string) int {
 	inv.gate = GateForward // forward deploy: requiresDeveloperOrAbove
 	resolveActorRole(&inv)
 
+	// Report the runner-surface credential readiness (I17 / memql#2228).
+	// Redacted, never logs secrets. Non-fatal: a dry-run / no-op deploy runs
+	// without creds; a live deploy only WARNS when the surface is incomplete
+	// because the deployEngineCluster capability actions that consume these
+	// creds land fully with I13 (memql#2220).
+	surface := ResolveSurface(os.Getenv)
+	fmt.Println(surface.Summary())
+	if !inv.dryRun {
+		if missing := surface.MissingRequired(); len(missing) > 0 {
+			fmt.Fprintf(os.Stderr,
+				"WARNING: runner surface incomplete; a live deploy will not reach the cluster until these are set:\n  - %s\n"+
+					"Source them from CI secrets / Key Vault (see docs/deploy-runner.md). TODO(owner): becomes fatal once I13 (memql#2220) wires the runner capability surface.\n",
+				strings.Join(missing, "\n  - "))
+		}
+	}
+
 	return runInvocation(inv, cockpitVersion, NewEmbeddedRuntime(newLogger()), DefaultAuditor())
 }
 
