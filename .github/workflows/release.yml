@@ -37,11 +37,11 @@ jobs:
         working-directory: memql-cockpit
         run: go mod tidy
 
-      - name: Build all platforms (headless)
+      - name: Package distributable archives + checksums (headless, all platforms)
         working-directory: memql-cockpit
-        run: make cockpit-all-platforms
+        run: make dist
 
-      - name: Upload binaries to the release
+      - name: Upload raw binaries to the release
         working-directory: memql-cockpit
         env:
           GH_TOKEN: ${{ github.token }}
@@ -53,3 +53,11 @@ jobs:
             bin/memql-cockpit-linux-amd64 \
             bin/memql-cockpit-linux-arm64 \
             --clobber
+
+      - name: Upload distributable archives + SHA256SUMS to the release
+        working-directory: memql-cockpit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          gh release upload "$TAG" dist/*.tar.gz dist/*-SHA256SUMS --clobber

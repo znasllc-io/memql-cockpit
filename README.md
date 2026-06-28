@@ -46,6 +46,7 @@ make cockpit-gui      # GUI variant with screenshot/mouse/keyboard
                       # (requires CGO + RobotGo deps -- see Makefile)
 make cockpit-all-platforms       # cross-compile to darwin/linux x arm64/amd64
 make cockpit-gui-all-platforms   # GUI variant, all platforms
+make dist             # versioned tar.gz archives + SHA256SUMS -> dist/
 ```
 
 Output lands under `bin/`. Check the build's version with
@@ -53,6 +54,13 @@ Output lands under `bin/`. Check the build's version with
 [VERSIONING.md](VERSIONING.md) for the versioning scheme (semver,
 `0.9.0` baseline, git tag as source of truth) and the link to memQL's
 hub compatibility matrix.
+
+`make dist` packages the distributable artifacts operator machines and CI
+runners install (one tar.gz per platform + a checksum manifest). The
+**Release binaries** workflow attaches them to every GitHub Release. For
+how an operator or CI runner installs the cockpit and runs a deploy — and
+how the deploy control surface is provisioned with cluster creds + the
+genesis envelope — see [docs/deploy-runner.md](docs/deploy-runner.md).
 
 ## Run
 

@@ -79,6 +79,42 @@ cockpit-gui-linux-arm64:
 cockpit-gui-all-platforms: cockpit-gui-darwin-arm64 cockpit-gui-darwin-amd64 cockpit-gui-linux-amd64 cockpit-gui-linux-arm64
 
 # ---------------------------------------------------------------------------
+# Distribution / packaging (I17 -- memql#2228)
+# ---------------------------------------------------------------------------
+#
+# `make dist` produces the distributable artifacts operator machines and CI
+# runners install: a versioned tar.gz per platform (binary renamed to the
+# plain `memql-cockpit` + LICENSE + README) plus a single SHA256SUMS manifest.
+# The headless variant ships everywhere (the GUI variant needs CGO + native
+# tooling and is built per-host, so it is intentionally not in the dist set).
+
+DIST_DIR := dist
+DIST_PLATFORMS := darwin-arm64 darwin-amd64 linux-amd64 linux-arm64
+
+.PHONY: dist dist-checksums
+
+## Package versioned release archives (tar.gz) + SHA256 checksums for all
+## headless platforms into dist/. Reuses cockpit-all-platforms.
+dist: cockpit-all-platforms
+	@rm -rf $(DIST_DIR) && mkdir -p $(DIST_DIR)
+	@for triple in $(DIST_PLATFORMS); do \
+		stage="$(DIST_DIR)/stage-$$triple"; \
+		mkdir -p "$$stage"; \
+		cp "$(BIN_DIR)/memql-cockpit-$$triple" "$$stage/memql-cockpit"; \
+		cp LICENSE README.md "$$stage/" 2>/dev/null || true; \
+		tar -czf "$(DIST_DIR)/memql-cockpit-$(VERSION)-$$triple.tar.gz" -C "$$stage" .; \
+		rm -rf "$$stage"; \
+		echo "  packaged $(DIST_DIR)/memql-cockpit-$(VERSION)-$$triple.tar.gz"; \
+	done
+	@$(MAKE) --no-print-directory dist-checksums
+
+## Write a SHA256SUMS manifest over the packaged archives in dist/.
+dist-checksums:
+	@cd $(DIST_DIR) && { command -v sha256sum >/dev/null 2>&1 && sha256sum *.tar.gz || shasum -a 256 *.tar.gz; } \
+		> memql-cockpit-$(VERSION)-SHA256SUMS \
+		&& echo "  wrote $(DIST_DIR)/memql-cockpit-$(VERSION)-SHA256SUMS"
+
+# ---------------------------------------------------------------------------
 # Run targets
 # ---------------------------------------------------------------------------
 
@@ -166,7 +202,7 @@ generate:
 
 ## Remove build artifacts
 clean:
-	rm -rf $(BIN_DIR)/ coverage.out
+	rm -rf $(BIN_DIR)/ $(DIST_DIR)/ coverage.out
 
 ## Print the current version. Resolves to the exact git tag when the
 ## checkout sits on one (the source of truth, see VERSIONING.md),
@@ -192,6 +228,9 @@ help:
 	@echo "  make cockpit-gui-linux-amd64        GUI cross-build for Linux x86_64"
 	@echo "  make cockpit-gui-linux-arm64        GUI cross-build for Linux aarch64"
 	@echo "  make cockpit-gui-all-platforms      GUI cross-build for all platforms"
+	@echo ""
+	@echo "DISTRIBUTION"
+	@echo "  make dist                           Package versioned tar.gz archives + SHA256SUMS into dist/"
 	@echo ""
 	@echo "RUN"
 	@echo "  make run-cockpit      Build and run memQL Cockpit (file cred store; no Keychain prompts)"
