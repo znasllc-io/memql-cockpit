@@ -17,11 +17,22 @@ import (
 )
 
 // ErrAutomationNotFound is returned by Resolve / Run when the requested
-// automation is not present in the embedded deployment bundle. The deploy
-// command special-cases it: deployEngineCluster (I10 / memql#2224) does not
-// exist yet, so `deploy --env` reports a clear "blocked until I10" message
-// instead of a bare resolution error.
+// automation is not present in the embedded deployment bundle. Since I10
+// (memql#2224) landed, deployEngineCluster IS in the bundle, so for the deploy
+// command this is a genuine error (a typo'd / removed automation), not the old
+// "blocked until I10" no-op — it is reported as a hard error like any other
+// `run` of a missing automation.
 var ErrAutomationNotFound = errors.New("automation not found in embedded bundle")
+
+// noEngineDBMarker is the substring the embedded engine surfaces when a step
+// reaches a DB-backed read/write but the cockpit's in-process engine carries
+// no database (memql.New(nil)). The deploy command detects it to report an
+// honest "owner-gated: needs a live engine DB" outcome instead of a crash.
+const noEngineDBMarker = "memory engine not initialized"
+
+// isNoEngineDB reports whether an automation step error is the embedded
+// engine's no-database condition.
+func isNoEngineDB(s string) bool { return strings.Contains(s, noEngineDBMarker) }
 
 // RunRequest parameterizes one embedded-runtime automation invocation.
 type RunRequest struct {
@@ -29,6 +40,11 @@ type RunRequest struct {
 	Owner      string
 	Input      map[string]any
 	DryRun     bool
+	// Topic overrides the triggering-event topic the executor sees. The deploy
+	// command sets it to the automation's declared trigger ("deploy.requested")
+	// so deployEngineCluster runs exactly as an event-driven deploy would;
+	// empty falls back to a synthetic "cockpit.deploy.<name>" topic.
+	Topic string
 }
 
 // RunResult is the outcome of an embedded-runtime invocation.
@@ -64,12 +80,14 @@ type Runtime interface {
 // (memql.New(nil)): bundle resolution and the action/logic/event path run
 // in-process, while DB-backed mutation steps no-op.
 //
-// NOTE (I10 / I13, memql#2224 / #2220): the deployment automations reach the
-// target cluster through capability actions that resolve to the cockpit/runner
-// surface. That surface — and a fully-initialized engine for durable
-// deployment-record mutations — is provided by I13. Until then this runtime
-// proves the embedding (load + resolve + invoke the executor) but cannot run
-// a DB-backed deployment automation to completion. See HandleDeploy.
+// NOTE (I13, memql#2220): deployEngineCluster (I10 / memql#2224) now resolves
+// + executes through this runtime. Its DB-backed steps (createDeployment /
+// updateDeploymentStatus) and capability actions still need a fully-initialized
+// engine + the cockpit/runner surface, both provided by I13. Until then this
+// runtime proves the embedding (load + resolve + invoke the executor) and runs
+// the automation as far as the bare engine allows: a DB-backed step surfaces an
+// honest "memory engine not initialized" error (isNoEngineDB) rather than a
+// crash, which the deploy command reports as owner-gated. See HandleDeploy.
 type embeddedRuntime struct {
 	logger *slog.Logger
 
@@ -157,8 +175,12 @@ func (e *embeddedRuntime) Run(ctx context.Context, req RunRequest) (RunResult, e
 		return res, nil
 	}
 
+	topic := strings.TrimSpace(req.Topic)
+	if topic == "" {
+		topic = "cockpit.deploy." + name
+	}
 	ev := &events.Event{
-		Topic:     "cockpit.deploy." + name,
+		Topic:     topic,
 		Kind:      events.KindNodeCreated,
 		Payload:   req.Input,
 		Timestamp: time.Now().UTC(),
