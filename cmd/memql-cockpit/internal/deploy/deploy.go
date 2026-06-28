@@ -13,13 +13,15 @@
 //	make {up,deploy} → memql-cockpit <cmd> → embedded engine runtime
 //	  → pinned automation → logic/mutations/actions → capability scripts → cluster
 //
-// NOTE: deployEngineCluster (I10 / memql#2224) and the cockpit/runner
-// capability surface (I13 / memql#2220) are not merged yet. This package is
-// the command INFRASTRUCTURE: the role gate, audit trail, version pinning,
-// embedded-runtime wiring, and `run` smoke path are live and proven against
-// an existing engine automation; `deploy --env` resolves to the future
-// deployEngineCluster automation by name and reports a clear blocked message
-// until I10 lands. See the TODO in runtime.go and HandleDeploy.
+// NOTE: deployEngineCluster (I10 / memql#2224) has landed, so `deploy --env`
+// now RESOLVES + INVOKES it through the embedded runtime — the same path
+// `run <automation>` uses — building the canonical `deploy.requested` event
+// payload, enforcing the role gate, emitting the audit trail, and pinning the
+// version. The cockpit/runner capability surface + a fully-initialized engine
+// DB for the DB-backed deployment-record mutations land with I13 (memql#2220):
+// until then the in-process engine carries no database, so a real deploy runs
+// as far as the bare engine allows and reports an honest, owner-gated
+// "needs a live engine DB" outcome rather than a no-op stub. See HandleDeploy.
 package deploy
 
 import (
@@ -29,12 +31,19 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 )
 
 // deployAutomation is the name of the per-environment deployment automation
 // the deploy command drives. It is resolved by name through the embedded
-// runtime; the automation itself lands with I10 (memql#2224).
+// runtime; the automation landed with I10 (memql#2224).
 const deployAutomation = "deployEngineCluster"
+
+// deployRequestedTopic is the automation's declared trigger topic
+// (@trigger(event="deploy.requested") in dsl/deployment/automations.memql).
+// The deploy command emits the run under this topic so deployEngineCluster
+// executes exactly as an event-driven deploy would.
+const deployRequestedTopic = "deploy.requested"
 
 // invocation is the fully-resolved parameters of one deploy / run call.
 type invocation struct {
@@ -46,6 +55,7 @@ type invocation struct {
 	actor      string
 	dryRun     bool
 	input      map[string]any
+	topic      string // triggering-event topic for the embedded runtime (deploy path)
 	gate       Gate
 }
 
@@ -105,12 +115,10 @@ func HandleDeploy(args []string, cockpitVersion string) int {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 		return 2
 	}
-	inv.input["env"] = inv.env
-	if inv.ref != "" {
-		inv.input["ref"] = inv.ref
-	}
 	inv.gate = GateForward // forward deploy: requiresDeveloperOrAbove
+	inv.topic = deployRequestedTopic
 	resolveActorRole(&inv)
+	applyDeployDefaults(&inv) // build the canonical deploy.requested payload
 
 	// Report the runner-surface credential readiness (I17 / memql#2228).
 	// Redacted, never logs secrets. Non-fatal: a dry-run / no-op deploy runs
@@ -229,26 +237,19 @@ func runInvocation(inv invocation, cockpitVersion string, rt Runtime, auditor *A
 	}
 	rec.Decision = DecisionAllowed
 
-	// 2. Execute via the embedded engine automation runtime.
+	// 2. Execute via the embedded engine automation runtime — the same path
+	// `run <automation>` uses. deployEngineCluster (I10) is now in the bundle,
+	// so the deploy command resolves + invokes it here.
 	res, runErr := rt.Run(context.Background(), RunRequest{
 		Automation: inv.automation,
 		Owner:      inv.actor,
 		Input:      inv.input,
 		DryRun:     inv.dryRun,
+		Topic:      inv.topic,
 	})
 	if runErr != nil {
 		rec.Reason = runErr.Error()
 		_ = auditor.Emit(rec)
-		// deployEngineCluster (I10) is not merged: surface a clear,
-		// actionable blocked message rather than a bare resolution error.
-		if inv.command == "deploy" && errorsIsNotFound(runErr) {
-			fmt.Fprintf(os.Stderr,
-				"BLOCKED: the %q automation is not in the deployment bundle yet.\n"+
-					"deploy --env is wired but is a no-op until I10 (memql#2224) ships the\n"+
-					"per-environment deployment automations. The role gate, audit trail, and\n"+
-					"version pin above all ran.\n", inv.automation)
-			return 3
-		}
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", runErr)
 		return 1
 	}
@@ -265,12 +266,55 @@ func runInvocation(inv invocation, cockpitVersion string, rt Runtime, auditor *A
 		fmt.Printf("OK (dry-run): automation %q resolved from the bundle; no side effects.\n", inv.automation)
 	case res.Executed && res.ExecError == "":
 		fmt.Printf("OK: automation %q executed (status=%s id=%s)\n", inv.automation, res.Status, res.ExecutionID)
+	case res.Executed && isNoEngineDB(res.ExecError):
+		// The automation resolved + ran, but the cockpit's in-process engine
+		// carries no database, so the DB-backed deployment steps cannot
+		// complete here. This is the expected, owner-gated condition until the
+		// I13 (memql#2220) runner surface + a live engine DB are wired — report
+		// it HONESTLY (not a no-op stub, not a crash). Role gate, audit, and
+		// version pin above all ran.
+		fmt.Printf("BLOCKED (owner-gated): automation %q resolved + invoked via the embedded runtime, "+
+			"but the cockpit's in-process engine has no database — DB-backed deployment steps cannot "+
+			"complete here. Run against a live engine DB / the I13 runner surface to deploy for real.\n",
+			inv.automation)
 	case res.Executed && res.ExecError != "":
 		fmt.Printf("DONE (with errors): automation %q executed via the embedded runtime; step error: %s\n", inv.automation, res.ExecError)
 	default:
 		fmt.Printf("OK: automation %q resolved.\n", inv.automation)
 	}
 	return 0
+}
+
+// applyDeployDefaults fills the canonical deploy.requested event payload the
+// deployEngineCluster automation reads (event.payload.*), without clobbering
+// anything an operator passed via --input. The automation's contract is in
+// dsl/deployment/automations.memql ("Deploy event taxonomy").
+func applyDeployDefaults(inv *invocation) {
+	setDefault := func(k string, v any) {
+		if _, ok := inv.input[k]; !ok {
+			inv.input[k] = v
+		}
+	}
+	setDefault("environment", inv.env)
+	if inv.ref != "" {
+		setDefault("ref", inv.ref)
+		setDefault("version", inv.ref)
+	}
+	if inv.actor != "" {
+		setDefault("triggeredBy", inv.actor)
+	}
+	// deploymentId is the v1:cluster:deployment timeline id; one per invocation
+	// unless the operator pins it (e.g. to append to an existing timeline).
+	setDefault("deploymentId", fmt.Sprintf("dep-%s-%d", inv.env, time.Now().UTC().Unix()))
+	setDefault("engineNodeTypes", defaultEngineNodeTypes())
+}
+
+// defaultEngineNodeTypes mirrors the canonical engine node-type list the deploy
+// bundle builds + places (logic engineNodeTypes, dsl/deployment/logic.memql):
+// engine mesh ONLY — no bff/copresent. An operator can override or subset it
+// via --input engineNodeTypes for a single-node redeploy.
+func defaultEngineNodeTypes() []string {
+	return []string{"identity", "cognition", "voice", "agent", "planner", "workbench", "mcp", "voice-agent"}
 }
 
 // applyInput parses an optional --input JSON object into inv.input.
@@ -314,10 +358,6 @@ func newLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 }
 
-func errorsIsNotFound(err error) bool {
-	return err != nil && strings.Contains(err.Error(), ErrAutomationNotFound.Error())
-}
-
 func printDeployUsage() {
 	fmt.Println("Usage: memql-cockpit deploy --env=<env> [--ref=<ver>] [flags]")
 	fmt.Println()
@@ -334,7 +374,9 @@ func printDeployUsage() {
 	fmt.Println("  --dry-run       Resolve + preview without executing")
 	fmt.Println("  --help, -h      Show this help")
 	fmt.Println()
-	fmt.Println("Exit codes: 0 success · 1 error/denied · 2 usage · 3 blocked (deployEngineCluster pending I10)")
+	fmt.Println("Exit codes: 0 success/invoked · 1 error/denied · 2 usage")
+	fmt.Println("A development deploy runs through the embedded runtime; DB-backed steps need a")
+	fmt.Println("live engine DB / the I13 runner surface (owner-gated) and report honestly until then.")
 }
 
 func printRunUsage() {
