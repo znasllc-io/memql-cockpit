@@ -18,6 +18,7 @@ package dsledit
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -89,6 +90,15 @@ type View struct {
 	// hoverShown gates the overlay.
 	hoverShown bool
 	hoverText  string
+
+	// copyPrompt gates the browse-mode "fork the viewed pack file into a
+	// bundle" name input (E3, memql#2374). copyPromptInput is the typed
+	// bundle name (an existing name reuses that bundle, a new name creates
+	// it); copyPromptErr surfaces a validation / create / write error
+	// inline without dismissing the prompt.
+	copyPrompt      bool
+	copyPromptInput string
+	copyPromptErr   string
 
 	// PackClient returns a pack client bound to the active cluster's
 	// dispatcher, or nil when no cluster is connected. Set by the app
@@ -260,7 +270,14 @@ func (v *View) drawSource(screen *ui.Screen, bounds ui.Rect) {
 		v.drawHoverOverlay(screen, chrome)
 	}
 
-	ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1, v.hintsForSource())
+	// The copy-to-bundle name prompt (E3) replaces the hint band on the
+	// SOURCE pane while it's open -- it forks whatever source this pane is
+	// showing, so it's anchored here regardless of which pane has focus.
+	if v.copyPrompt {
+		drawNamePrompt(screen, bounds, v.Theme, "Copy to bundle", v.copyPromptInput, v.copyPromptErr)
+	} else {
+		ui.DrawBottom(screen, bounds, v.Theme.SubtleStyle(), 1, v.hintsForSource())
+	}
 }
 
 // drawHoverOverlay paints the Sense hover result as a small bordered
@@ -339,6 +356,18 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 		return false
 	}
 
+	// The copy-to-bundle name prompt (E3, memql#2374) is modal while open:
+	// it owns every key so a stray keystroke can't fall through to a pane
+	// action or the Ctrl+B toggle. Browse-mode only (copyPrompt is never
+	// set in authoring mode).
+	v.Mu.Lock()
+	if v.copyPrompt {
+		consumed := v.handleCopyPromptKeyLocked(key)
+		v.Mu.Unlock()
+		return consumed
+	}
+	v.Mu.Unlock()
+
 	// Ctrl+B toggles between the read-only browser and the authoring
 	// mode. Handled before any pane dispatch so it works from any focus
 	// (incl. the editor, where printable keys are typed).
@@ -352,6 +381,21 @@ func (v *View) HandleEvent(ev tcell.Event) bool {
 			return v.author.HandleEvent(key)
 		}
 		return false
+	}
+
+	// C (browse mode, FILES or SOURCE focus) forks the currently-viewed
+	// pack file into a bundle workspace and drops the user into authoring
+	// mode on the copy (E3, memql#2374). Handled before Tab/Enter/pane
+	// dispatch. Neither the ListPane nor the Viewer consumes 'C'/'c', so
+	// there's no keymap collision.
+	if key.Key() == tcell.KeyRune && (key.Rune() == 'c' || key.Rune() == 'C') {
+		v.Mu.RLock()
+		focus := v.Focus
+		v.Mu.RUnlock()
+		if focus == FocusFiles || focus == FocusSource {
+			v.startCopyPrompt()
+			return true
+		}
 	}
 
 	v.Mu.Lock()
@@ -623,16 +667,100 @@ func (v *View) modeIsAuthor() bool {
 func (v *View) toggleMode() {
 	v.Mu.Lock()
 	if v.mode == modeBrowse {
-		if v.author == nil {
-			v.author = newAuthoring(v.Theme, v.SenseClient, v.AuthoringClient, v.OnStatus, v.Redraw)
-			v.author.setOwner(v.owner)
-		}
+		v.ensureAuthoringLocked()
 		v.mode = modeAuthor
 	} else {
 		v.mode = modeBrowse
 	}
 	v.Mu.Unlock()
 	v.Redraw()
+}
+
+// ensureAuthoringLocked lazily builds the authoring sub-view (wiring the
+// same clients + owner flag as toggleMode) and returns it. Caller holds
+// v.Mu. Shared by the Ctrl+B toggle and the browse-mode copy-to-bundle
+// action, which drops the user straight into authoring on the forked
+// file (E3, memql#2374).
+func (v *View) ensureAuthoringLocked() *authoring {
+	if v.author == nil {
+		v.author = newAuthoring(v.Theme, v.SenseClient, v.AuthoringClient, v.OnStatus, v.Redraw)
+		v.author.setOwner(v.owner)
+	}
+	return v.author
+}
+
+// startCopyPrompt opens the browse-mode copy-to-bundle name prompt, but
+// only when a pack file's source is currently loaded (the fork reuses the
+// already-held srcText). With nothing loaded it nudges the user to open a
+// file first rather than opening an empty prompt.
+func (v *View) startCopyPrompt() {
+	v.Mu.Lock()
+	if v.loadedFile == "" || v.srcText == "" {
+		v.Mu.Unlock()
+		v.status("view a file first (Enter on a file), then C to copy it into a bundle")
+		return
+	}
+	v.copyPrompt = true
+	v.copyPromptInput = ""
+	v.copyPromptErr = ""
+	v.Mu.Unlock()
+}
+
+// handleCopyPromptKeyLocked drives the modal copy-to-bundle name prompt.
+// Caller holds v.Mu (and unlocks after). Returns true unconditionally --
+// the prompt swallows every key while it is open.
+func (v *View) handleCopyPromptKeyLocked(key *tcell.EventKey) bool {
+	switch key.Key() {
+	case tcell.KeyEsc:
+		v.copyPrompt = false
+		v.copyPromptInput = ""
+		v.copyPromptErr = ""
+	case tcell.KeyEnter:
+		v.commitCopyPromptLocked()
+	case tcell.KeyBackspace, tcell.KeyBackspace2:
+		if n := len(v.copyPromptInput); n > 0 {
+			v.copyPromptInput = v.copyPromptInput[:n-1]
+		}
+	case tcell.KeyRune:
+		v.copyPromptInput += string(key.Rune())
+	}
+	return true
+}
+
+// commitCopyPromptLocked validates the typed bundle name, forks the
+// currently-viewed pack file into that bundle (created if new, reused if
+// it already exists), and switches into authoring mode on the copy. On a
+// validation / write error it leaves the prompt open with an inline
+// message. Caller holds v.Mu.
+func (v *View) commitCopyPromptLocked() {
+	name := strings.TrimSpace(v.copyPromptInput)
+	if err := safeName(name); err != nil {
+		v.copyPromptErr = err.Error()
+		return
+	}
+	if v.loadedFile == "" || v.srcText == "" {
+		// Defensive: the prompt shouldn't have opened without a source.
+		v.copyPrompt = false
+		v.status("nothing to copy -- no file is loaded")
+		return
+	}
+	orig, src := v.loadedFile, v.srcText
+	written, err := copyFileIntoBundle(name, orig, src)
+	if err != nil {
+		v.copyPromptErr = err.Error()
+		return
+	}
+	// Success: dismiss the prompt, build the authoring sub-view if needed,
+	// open the forked file in it (which also refreshes the BUNDLES list so
+	// a brand-new bundle appears immediately -- deliverable 2), and flip
+	// the Editor tab into authoring mode.
+	v.copyPrompt = false
+	v.copyPromptInput = ""
+	v.copyPromptErr = ""
+	author := v.ensureAuthoringLocked()
+	v.mode = modeAuthor
+	author.openCopiedFile(name, written) // takes the authoring lock (!= v.Mu)
+	v.status(fmt.Sprintf("copied %s into bundle %q as %s -- editing the copy", filepath.Base(orig), name, written))
 }
 
 func (v *View) status(msg string) {
@@ -737,10 +865,14 @@ func (v *View) hintsForSource() string {
 			{Key: "Tab", Label: "Cycle"},
 		}}.String()
 	}
+	// C:Copy (fork the viewed file into a bundle, E3 memql#2374) takes the
+	// slot the ←/→:Col hint used to hold so the band still fits the narrow
+	// SOURCE pane; column-cursor move (←/→) still works, it's just no
+	// longer advertised here (documented in cli/CLAUDE.md).
 	return ui.HintBar{Chips: []ui.HintChip{
 		{Key: "↑/↓", Label: "Move"},
-		{Key: "←/→", Label: "Col"},
 		{Key: "H", Label: "Hover"},
+		{Key: "C", Label: "Copy"},
 		{Key: "Tab", Label: "Cycle"},
 	}}.String()
 }

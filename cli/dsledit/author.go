@@ -319,20 +319,29 @@ func (a *authoring) drawEditor(screen *ui.Screen, bounds ui.Rect) {
 }
 
 func (a *authoring) drawPrompt(screen *ui.Screen, bounds ui.Rect, label string) {
+	drawNamePrompt(screen, bounds, a.theme, label, a.promptInput, a.promptErr)
+}
+
+// drawNamePrompt renders a single-line ":<label> <input>" name-entry
+// prompt anchored to the bottom row of bounds, with an optional error
+// line just above it. Shared by the authoring new-bundle / new-file
+// prompts and the browse-mode copy-to-bundle prompt (E3, memql#2374) so
+// both surfaces use the identical bundle-name input UI.
+func drawNamePrompt(screen *ui.Screen, bounds ui.Rect, theme ui.Theme, label, input, errMsg string) {
 	y := bounds.Y + bounds.Height - 1
-	accent := a.theme.AccentStyle()
+	accent := theme.AccentStyle()
 	prefix := ":" + label + " "
 	screen.DrawText(bounds.X+1, y, bounds.Width-2, prefix, accent)
 	fieldX := bounds.X + 1 + len(prefix)
 	fieldW := bounds.Width - 2 - len(prefix)
 	if fieldW > 2 {
-		caret := tcell.StyleDefault.Background(a.theme.FG)
-		field := tcell.StyleDefault.Foreground(a.theme.FG)
-		ui.DrawInputValue(screen, fieldX, y, fieldW, a.promptInput, true, field, caret)
+		caret := tcell.StyleDefault.Background(theme.FG)
+		field := tcell.StyleDefault.Foreground(theme.FG)
+		ui.DrawInputValue(screen, fieldX, y, fieldW, input, true, field, caret)
 	}
-	if a.promptErr != "" {
-		errStyle := tcell.StyleDefault.Foreground(a.theme.Error)
-		screen.DrawText(bounds.X+1, y-1, bounds.Width-2, a.promptErr, errStyle)
+	if errMsg != "" {
+		errStyle := tcell.StyleDefault.Foreground(theme.Error)
+		screen.DrawText(bounds.X+1, y-1, bounds.Width-2, errMsg, errStyle)
 	}
 }
 
@@ -801,6 +810,26 @@ func (a *authoring) openFileLocked(name string) {
 	// Kick an initial Sense pass so coloring + diagnostics appear
 	// without the user having to type first.
 	a.debounce.Trigger()
+}
+
+// openCopiedFile refreshes the bundle list, then opens (bundle, file) in
+// the editor with the editor pane focused. Called by the browse-mode
+// copy-to-bundle action (E3, memql#2374) right after it writes the forked
+// pack file: the bundle may be brand-new (created by the copy) or an
+// existing one just written to, so the list is reloaded here rather than
+// waiting for the first manual entry into authoring mode. Takes its own
+// lock (the caller is the View, holding a different mutex).
+func (a *authoring) openCopiedFile(bundle, file string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if bundles, err := listBundles(); err == nil {
+		a.bundles = bundles
+	}
+	a.selectBundleLocked(bundle)
+	a.loadBundleFilesLocked(bundle) // sets a.openBundle
+	a.selectFileLocked(file)
+	a.openFileLocked(file)
+	a.focus = authorEditor
 }
 
 func (a *authoring) saveLocked() {
