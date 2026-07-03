@@ -220,3 +220,66 @@ func writeBundleFile(bundle, name, content string) error {
 	}
 	return os.WriteFile(filepath.Join(bundleRoot(), bundle, name), []byte(content), 0o644)
 }
+
+// uniqueBundleFileName returns the first non-colliding file name for a
+// bundle, starting from name and appending "-N" before the extension on
+// collision ("automations.memql" -> "automations-1.memql" -> ...). name
+// must already be a safe single segment. This is the auto-suffix
+// collision policy for copy-to-bundle (E3, memql#2374): never clobber an
+// existing bundle file, so an owner's edits are safe if they fork the
+// same pack file twice.
+func uniqueBundleFileName(bundle, name string) (string, error) {
+	dir := filepath.Join(bundleRoot(), bundle)
+	ext := filepath.Ext(name)
+	stem := strings.TrimSuffix(name, ext)
+	candidate := name
+	// Bounded loop -- a bundle can't realistically hold thousands of
+	// same-named forks; the cap is a runaway guard, not a real limit.
+	for i := 1; i < 10000; i++ {
+		_, err := os.Stat(filepath.Join(dir, candidate))
+		switch {
+		case os.IsNotExist(err):
+			return candidate, nil // free name
+		case err != nil:
+			return "", err // some other stat error (permissions, etc.)
+		}
+		// err == nil -> the candidate exists; try the next suffix.
+		candidate = fmt.Sprintf("%s-%d%s", stem, i, ext)
+	}
+	return "", fmt.Errorf("could not find a free file name for %q in bundle %q", name, bundle)
+}
+
+// copyFileIntoBundle forks a pack file's source into a bundle workspace
+// under a name derived from origName, creating the bundle directory if it
+// doesn't exist yet. On a name collision it auto-suffixes (see
+// uniqueBundleFileName) rather than overwriting. Returns the actual file
+// name written. This is the non-TUI backend for the Editor browse-mode
+// "copy pack file into a bundle" action (E3, memql#2374): pick-or-create
+// a bundle, write the currently-viewed source, then open it in authoring
+// mode.
+func copyFileIntoBundle(bundle, origName, source string) (string, error) {
+	if err := safeName(bundle); err != nil {
+		return "", err
+	}
+	// Pack file paths may carry a sub-directory (e.g. "prompts/x.tmpl");
+	// the bundle is flat, so fork under the base name only.
+	name := ensureMemqlExt(filepath.Base(strings.TrimSpace(origName)))
+	if err := safeName(name); err != nil {
+		return "", err
+	}
+	dir := filepath.Join(bundleRoot(), bundle)
+	// MkdirAll is idempotent -- create-or-reuse the bundle directory so
+	// the caller's "pick an existing bundle OR create a new one" is one
+	// path.
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	name, err := uniqueBundleFileName(bundle, name)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(source), 0o644); err != nil {
+		return "", err
+	}
+	return name, nil
+}
