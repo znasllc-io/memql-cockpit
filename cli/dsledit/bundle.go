@@ -175,6 +175,41 @@ func bundleSources(bundle string) (string, error) {
 	return b.String(), nil
 }
 
+// bundleFileForLine maps a 1-based line in the concatenated bundle source (the
+// coordinate space AuthoringDiagnostic reports its positions in, #2375) back to
+// the owning file and the 1-based line WITHIN that file. It reconstructs the
+// exact same concatenation bundleSources builds -- files sorted, blank-line
+// ("\n\n") separated -- and tracks each file's start line. ok is false when the
+// bundle is unreadable, empty, or the line falls in a separator gap / out of
+// range (so the caller omits the jump rather than landing on the wrong line).
+func bundleFileForLine(bundle string, blobLine int) (file string, fileLine int, ok bool) {
+	if blobLine < 1 {
+		return "", 0, false
+	}
+	files, err := listBundleFiles(bundle)
+	if err != nil {
+		return "", 0, false
+	}
+	var b strings.Builder
+	for i, f := range files {
+		if i > 0 {
+			b.WriteString("\n\n")
+		}
+		// The file's first char lands on this 1-based line of the blob so far.
+		startLine := 1 + strings.Count(b.String(), "\n")
+		src, rerr := readBundleFile(bundle, f)
+		if rerr != nil {
+			return "", 0, false
+		}
+		b.WriteString(src)
+		endLine := 1 + strings.Count(b.String(), "\n")
+		if blobLine >= startLine && blobLine <= endLine {
+			return f, blobLine - startLine + 1, true
+		}
+	}
+	return "", 0, false
+}
+
 // writeBundleFile saves a bundle file's source to disk.
 func writeBundleFile(bundle, name, content string) error {
 	if err := safeName(bundle); err != nil {
@@ -184,4 +219,67 @@ func writeBundleFile(bundle, name, content string) error {
 		return err
 	}
 	return os.WriteFile(filepath.Join(bundleRoot(), bundle, name), []byte(content), 0o644)
+}
+
+// uniqueBundleFileName returns the first non-colliding file name for a
+// bundle, starting from name and appending "-N" before the extension on
+// collision ("automations.memql" -> "automations-1.memql" -> ...). name
+// must already be a safe single segment. This is the auto-suffix
+// collision policy for copy-to-bundle (E3, memql#2374): never clobber an
+// existing bundle file, so an owner's edits are safe if they fork the
+// same pack file twice.
+func uniqueBundleFileName(bundle, name string) (string, error) {
+	dir := filepath.Join(bundleRoot(), bundle)
+	ext := filepath.Ext(name)
+	stem := strings.TrimSuffix(name, ext)
+	candidate := name
+	// Bounded loop -- a bundle can't realistically hold thousands of
+	// same-named forks; the cap is a runaway guard, not a real limit.
+	for i := 1; i < 10000; i++ {
+		_, err := os.Stat(filepath.Join(dir, candidate))
+		switch {
+		case os.IsNotExist(err):
+			return candidate, nil // free name
+		case err != nil:
+			return "", err // some other stat error (permissions, etc.)
+		}
+		// err == nil -> the candidate exists; try the next suffix.
+		candidate = fmt.Sprintf("%s-%d%s", stem, i, ext)
+	}
+	return "", fmt.Errorf("could not find a free file name for %q in bundle %q", name, bundle)
+}
+
+// copyFileIntoBundle forks a pack file's source into a bundle workspace
+// under a name derived from origName, creating the bundle directory if it
+// doesn't exist yet. On a name collision it auto-suffixes (see
+// uniqueBundleFileName) rather than overwriting. Returns the actual file
+// name written. This is the non-TUI backend for the Editor browse-mode
+// "copy pack file into a bundle" action (E3, memql#2374): pick-or-create
+// a bundle, write the currently-viewed source, then open it in authoring
+// mode.
+func copyFileIntoBundle(bundle, origName, source string) (string, error) {
+	if err := safeName(bundle); err != nil {
+		return "", err
+	}
+	// Pack file paths may carry a sub-directory (e.g. "prompts/x.tmpl");
+	// the bundle is flat, so fork under the base name only.
+	name := ensureMemqlExt(filepath.Base(strings.TrimSpace(origName)))
+	if err := safeName(name); err != nil {
+		return "", err
+	}
+	dir := filepath.Join(bundleRoot(), bundle)
+	// MkdirAll is idempotent -- create-or-reuse the bundle directory so
+	// the caller's "pick an existing bundle OR create a new one" is one
+	// path.
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	name, err := uniqueBundleFileName(bundle, name)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(source), 0o644); err != nil {
+		return "", err
+	}
+	return name, nil
 }
