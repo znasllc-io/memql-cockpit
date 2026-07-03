@@ -138,7 +138,7 @@ func TestResultsOverlayRendersAndDismiss(t *testing.T) {
 	a, _ := newTestAuthoring(t)
 	a.resultShown = true
 	a.resultTitle = "VALIDATE -- Gate-1: OK"
-	a.resultLines = []resultEntry{{"[ok] myQuery (query)", sevOK}}
+	a.resultLines = []resultEntry{{text: "[ok] myQuery (query)", sev: sevOK}}
 
 	sim := tcell.NewSimulationScreen("UTF-8")
 	if err := sim.Init(); err != nil {

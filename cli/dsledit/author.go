@@ -76,6 +76,12 @@ type authoring struct {
 	resultShown bool
 	resultTitle string
 	resultLines []resultEntry
+	// resultSel is the index into resultLines of the currently-highlighted
+	// jumpable entry (a failing diagnostic that carries an authored position,
+	// #2375). -1 when the overlay has no jumpable entry (promote/demote confirm,
+	// or an all-OK validate). Up/Down move it among jumpable entries; Enter
+	// jumps the editor to that entry's line:col.
+	resultSel int
 
 	// canPromote mirrors whether the connected caller is the cluster
 	// OWNER -- the only role allowed durable activation (C4 #232,
@@ -115,7 +121,16 @@ const (
 type resultEntry struct {
 	text string
 	sev  resultSev
+	// line + col are the 1-based authored position (in the concatenated bundle
+	// source, the same coordinate space AuthoringDiagnostic reports) of a
+	// failing construct, so the overlay can jump the editor to it (#2375). Zero
+	// line means the entry is not jumpable (OK / skipped / no reliable position).
+	line int
+	col  int
 }
+
+// jumpable reports whether the entry carries an authored position to jump to.
+func (e resultEntry) jumpable() bool { return e.line > 0 }
 
 func newAuthoring(theme ui.Theme, senseClient func() *sense.Client, authoringClient func() *authoringsdk.Client, onStatus func(string), onRedraw func()) *authoring {
 	a := &authoring{
@@ -220,12 +235,18 @@ func (a *authoring) drawResults(screen *ui.Screen, bounds ui.Rect) {
 	bodyTop := bounds.Y + 3
 	bodyBottom := bounds.Y + bounds.Height - 2
 	y := bodyTop
-	for _, e := range a.resultLines {
+	for i, e := range a.resultLines {
+		style := a.resultStyle(e.sev, bg)
+		// Highlight the currently-selected jumpable diagnostic (#2375) so the
+		// user sees which line Enter will jump to.
+		if i == a.resultSel && e.jumpable() {
+			style = style.Reverse(true).Bold(true)
+		}
 		for _, ln := range ui.WrapText(e.text, innerW) {
 			if y >= bodyBottom {
 				break
 			}
-			screen.DrawText(bounds.X+2, y, innerW, ln, a.resultStyle(e.sev, bg))
+			screen.DrawText(bounds.X+2, y, innerW, ln, style)
 			y++
 		}
 		if y >= bodyBottom {
@@ -233,6 +254,10 @@ func (a *authoring) drawResults(screen *ui.Screen, bounds ui.Rect) {
 		}
 	}
 	hint := "Esc:Close"
+	if a.resultSel >= 0 {
+		// A jumpable diagnostic is selected -- advertise navigation + jump.
+		hint = "Up/Down:Select  Enter:Jump  Esc:Close"
+	}
 	if a.promoteConfirm {
 		hint = "Y:Promote  N/Esc:Cancel"
 	}
@@ -484,6 +509,32 @@ func (a *authoring) HandleEvent(key *tcell.EventKey) bool {
 		}
 	}
 
+	// Jump-to-line (#2375): while a Validate/Inject results overlay carries a
+	// positioned diagnostic, Up/Down move the selection among jumpable entries
+	// and Enter jumps the editor to the selected construct's line:col. Gated on
+	// !promoteConfirm/!demoteConfirm (those own their keys above) and on there
+	// being a jumpable selection, so an all-OK result or a confirm falls through
+	// to Esc-only.
+	if a.resultShown && !a.promoteConfirm && !a.demoteConfirm && a.resultSel >= 0 {
+		switch key.Key() {
+		case tcell.KeyUp:
+			a.moveResultSelection(-1)
+			a.mu.Unlock()
+			a.redraw()
+			return true
+		case tcell.KeyDown:
+			a.moveResultSelection(1)
+			a.mu.Unlock()
+			a.redraw()
+			return true
+		case tcell.KeyEnter:
+			a.jumpToSelectedResultLocked()
+			a.mu.Unlock()
+			a.redraw()
+			return true
+		}
+	}
+
 	// Esc dismisses the Validate/Inject/Promote/Demote results overlay.
 	if a.resultShown && key.Key() == tcell.KeyEsc {
 		a.resultShown = false
@@ -525,6 +576,7 @@ func (a *authoring) HandleEvent(key *tcell.EventKey) bool {
 		a.promoteSources, a.promoteBundle = sources, bundle
 		a.promoteConfirm = true
 		a.resultShown = true
+		a.resultSel = -1
 		a.resultTitle = "PROMOTE -- durable activation (owner)"
 		a.resultLines = promoteBlastRadiusLines(bundle)
 		a.mu.Unlock()
@@ -545,6 +597,7 @@ func (a *authoring) HandleEvent(key *tcell.EventKey) bool {
 		a.demoteSources, a.demoteBundle = sources, bundle
 		a.demoteConfirm = true
 		a.resultShown = true
+		a.resultSel = -1
 		a.resultTitle = "DEMOTE -- durable retire (owner)"
 		a.resultLines = demoteBlastRadiusLines(bundle)
 		a.mu.Unlock()
@@ -1054,9 +1107,101 @@ func (a *authoring) showValidateResultLocked(res *authoringsdk.ValidateResult) {
 		a.resultLines = append(a.resultLines, diagnosticLine(d))
 	}
 	if len(res.Diagnostics) == 0 {
-		a.resultLines = append(a.resultLines, resultEntry{"(no constructs found in the bundle)", sevPlain})
+		a.resultLines = append(a.resultLines, resultEntry{text: "(no constructs found in the bundle)", sev: sevPlain})
 	}
+	a.selectFirstJumpable()
 	a.resultShown = true
+}
+
+// selectFirstJumpable points resultSel at the first jumpable entry (a failing
+// diagnostic carrying an authored position), or -1 when none is jumpable.
+func (a *authoring) selectFirstJumpable() {
+	a.resultSel = -1
+	for i, e := range a.resultLines {
+		if e.jumpable() {
+			a.resultSel = i
+			return
+		}
+	}
+}
+
+// moveResultSelection advances resultSel by delta to the next/previous jumpable
+// entry, wrapping at the ends and skipping non-jumpable (OK / skipped / prose)
+// entries. A no-op when nothing is jumpable. Caller holds a.mu.
+func (a *authoring) moveResultSelection(delta int) {
+	n := len(a.resultLines)
+	if n == 0 || a.resultSel < 0 || delta == 0 {
+		return
+	}
+	for i := 1; i <= n; i++ {
+		idx := ((a.resultSel+delta*i)%n + n) % n
+		if a.resultLines[idx].jumpable() {
+			a.resultSel = idx
+			return
+		}
+	}
+}
+
+// jumpToSelectedResultLocked moves the editor cursor to the selected
+// diagnostic's authored line:col (#2375): it maps the bundle-source line to the
+// owning file (the diagnostic position is in the concatenated bundle source, so
+// a multi-file bundle needs the per-file offset), opens that file if it is not
+// already open, positions the cursor, focuses the editor, and dismisses the
+// overlay. Caller holds a.mu.
+func (a *authoring) jumpToSelectedResultLocked() {
+	if a.resultSel < 0 || a.resultSel >= len(a.resultLines) {
+		return
+	}
+	e := a.resultLines[a.resultSel]
+	if !e.jumpable() {
+		return
+	}
+	file, fileLine, ok := bundleFileForLine(a.openBundle, e.line)
+	if !ok {
+		a.status(fmt.Sprintf("cannot locate bundle line %d in a file", e.line))
+		return
+	}
+	if file != a.openFile {
+		a.openFileLocked(file)
+		a.fileList.Selected = indexOfString(a.files, file)
+	}
+	if a.editor != nil {
+		lastLine := a.editor.Buffer.LineCount() - 1
+		a.editor.CursorLine = clampInt(fileLine-1, 0, lastLine)
+		targetCol := 0
+		if e.col > 0 {
+			targetCol = e.col - 1
+		}
+		a.editor.CursorCol = clampInt(targetCol, 0, len(a.editor.Buffer.Line(a.editor.CursorLine)))
+	}
+	a.focus = authorEditor
+	a.resultShown = false
+	a.status(fmt.Sprintf("jumped to %s:%d", file, fileLine))
+}
+
+// indexOfString returns the index of s in xs, or 0 when absent (a safe default
+// for a list selection).
+func indexOfString(xs []string, s string) int {
+	for i, x := range xs {
+		if x == s {
+			return i
+		}
+	}
+	return 0
+}
+
+// clampInt clamps v to [lo, hi] (returns lo when hi < lo, e.g. an empty buffer).
+func clampInt(v, lo, hi int) int {
+	if hi < lo {
+		return lo
+	}
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
 
 func (a *authoring) showInjectResultLocked(res *authoringsdk.SessionDefineResult) {
@@ -1067,19 +1212,19 @@ func (a *authoring) showInjectResultLocked(res *authoringsdk.SessionDefineResult
 	if res.OK {
 		a.resultTitle = "INJECT -- session-define: OK"
 		a.resultLines = append(a.resultLines, resultEntry{
-			fmt.Sprintf("Defined %d construct(s). Session-scoped: callable by name now, never shadows core, dropped when this session ends.", len(res.Defined)),
-			sevPlain,
+			text: fmt.Sprintf("Defined %d construct(s). Session-scoped: callable by name now, never shadows core, dropped when this session ends.", len(res.Defined)),
+			sev:  sevPlain,
 		})
 		for _, c := range res.Defined {
-			a.resultLines = append(a.resultLines, resultEntry{fmt.Sprintf("[ok] %s (%s)", c.Name, c.Kind), sevOK})
+			a.resultLines = append(a.resultLines, resultEntry{text: fmt.Sprintf("[ok] %s (%s)", c.Name, c.Kind), sev: sevOK})
 		}
 		if len(res.Defined) == 0 {
-			a.resultLines = append(a.resultLines, resultEntry{"(nothing was defined)", sevPlain})
+			a.resultLines = append(a.resultLines, resultEntry{text: "(nothing was defined)", sev: sevPlain})
 		}
 	} else {
 		a.resultTitle = "INJECT -- session-define: REJECTED"
 		if res.Error != "" {
-			a.resultLines = append(a.resultLines, resultEntry{res.Error, sevErr})
+			a.resultLines = append(a.resultLines, resultEntry{text: res.Error, sev: sevErr})
 		}
 		for _, d := range res.Diagnostics {
 			if d.OK || d.Skipped {
@@ -1088,9 +1233,10 @@ func (a *authoring) showInjectResultLocked(res *authoringsdk.SessionDefineResult
 			a.resultLines = append(a.resultLines, diagnosticLine(d))
 		}
 		if len(a.resultLines) == 0 {
-			a.resultLines = append(a.resultLines, resultEntry{"(rejected, no detail)", sevErr})
+			a.resultLines = append(a.resultLines, resultEntry{text: "(rejected, no detail)", sev: sevErr})
 		}
 	}
+	a.selectFirstJumpable()
 	a.resultShown = true
 }
 
@@ -1100,13 +1246,13 @@ func (a *authoring) showInjectResultLocked(res *authoringsdk.SessionDefineResult
 // deliberately.
 func promoteBlastRadiusLines(bundle string) []resultEntry {
 	return []resultEntry{
-		{fmt.Sprintf("Durably promote bundle %q into the shared cluster schema?", bundle), sevPlain},
-		{"", sevPlain},
-		{"[!!] This PERSISTS the constructs (survives restarts) and", sevWarn},
-		{"     propagates them cluster-wide to every node.", sevWarn},
-		{"To undo, use Ctrl+D (Retire) to durably demote (memql#2163).", sevPlain},
-		{"", sevPlain},
-		{"Owner-gated. Press Y to promote, N/Esc to cancel.", sevPlain},
+		{text: fmt.Sprintf("Durably promote bundle %q into the shared cluster schema?", bundle), sev: sevPlain},
+		{text: "", sev: sevPlain},
+		{text: "[!!] This PERSISTS the constructs (survives restarts) and", sev: sevWarn},
+		{text: "     propagates them cluster-wide to every node.", sev: sevWarn},
+		{text: "To undo, use Ctrl+D (Retire) to durably demote (memql#2163).", sev: sevPlain},
+		{text: "", sev: sevPlain},
+		{text: "Owner-gated. Press Y to promote, N/Esc to cancel.", sev: sevPlain},
 	}
 }
 
@@ -1116,14 +1262,14 @@ func promoteBlastRadiusLines(bundle string) []resultEntry {
 // persisted rows retired, cluster-wide.
 func demoteBlastRadiusLines(bundle string) []resultEntry {
 	return []resultEntry{
-		{fmt.Sprintf("Durably retire bundle %q from the shared cluster schema?", bundle), sevPlain},
-		{"", sevPlain},
-		{"[!!] This UNREGISTERS the bundle's promoted constructs from the", sevWarn},
-		{"     shared registry on every node and marks the persisted rows", sevWarn},
-		{"     retired, so they stop being callable cluster-wide.", sevWarn},
-		{"Only author-promoted constructs are affected; core is never touched.", sevPlain},
-		{"", sevPlain},
-		{"Owner-gated. Press Y to retire, N/Esc to cancel.", sevPlain},
+		{text: fmt.Sprintf("Durably retire bundle %q from the shared cluster schema?", bundle), sev: sevPlain},
+		{text: "", sev: sevPlain},
+		{text: "[!!] This UNREGISTERS the bundle's promoted constructs from the", sev: sevWarn},
+		{text: "     shared registry on every node and marks the persisted rows", sev: sevWarn},
+		{text: "     retired, so they stop being callable cluster-wide.", sev: sevWarn},
+		{text: "Only author-promoted constructs are affected; core is never touched.", sev: sevPlain},
+		{text: "", sev: sevPlain},
+		{text: "Owner-gated. Press Y to retire, N/Esc to cancel.", sev: sevPlain},
 	}
 }
 
@@ -1157,19 +1303,19 @@ func (a *authoring) showDemoteResultLocked(res *authoringsdk.DemoteResult) {
 	if res.OK {
 		a.resultTitle = "DEMOTE -- durable retire: OK"
 		a.resultLines = append(a.resultLines, resultEntry{
-			fmt.Sprintf("Retired %d construct(s) durably: unregistered + marked retired cluster-wide.", len(res.Demoted)),
-			sevPlain,
+			text: fmt.Sprintf("Retired %d construct(s) durably: unregistered + marked retired cluster-wide.", len(res.Demoted)),
+			sev:  sevPlain,
 		})
 		for _, c := range res.Demoted {
-			a.resultLines = append(a.resultLines, resultEntry{fmt.Sprintf("[ok] %s (%s)", c.Name, c.Kind), sevOK})
+			a.resultLines = append(a.resultLines, resultEntry{text: fmt.Sprintf("[ok] %s (%s)", c.Name, c.Kind), sev: sevOK})
 		}
 		if len(res.Demoted) == 0 {
-			a.resultLines = append(a.resultLines, resultEntry{"(nothing was retired -- not currently promoted)", sevPlain})
+			a.resultLines = append(a.resultLines, resultEntry{text: "(nothing was retired -- not currently promoted)", sev: sevPlain})
 		}
 	} else {
 		a.resultTitle = "DEMOTE -- durable retire: REJECTED"
 		if res.Error != "" {
-			a.resultLines = append(a.resultLines, resultEntry{res.Error, sevErr})
+			a.resultLines = append(a.resultLines, resultEntry{text: res.Error, sev: sevErr})
 		}
 		for _, d := range res.Diagnostics {
 			if d.OK || d.Skipped {
@@ -1178,9 +1324,10 @@ func (a *authoring) showDemoteResultLocked(res *authoringsdk.DemoteResult) {
 			a.resultLines = append(a.resultLines, diagnosticLine(d))
 		}
 		if len(a.resultLines) == 0 {
-			a.resultLines = append(a.resultLines, resultEntry{"(rejected, no detail)", sevErr})
+			a.resultLines = append(a.resultLines, resultEntry{text: "(rejected, no detail)", sev: sevErr})
 		}
 	}
+	a.selectFirstJumpable()
 	a.resultShown = true
 }
 
@@ -1215,19 +1362,19 @@ func (a *authoring) showPromoteResultLocked(res *authoringsdk.PromoteResult) {
 	if res.OK {
 		a.resultTitle = "PROMOTE -- durable activation: OK"
 		a.resultLines = append(a.resultLines, resultEntry{
-			fmt.Sprintf("Promoted %d construct(s) durably: persisted + shared cluster-wide (survives restarts).", len(res.Promoted)),
-			sevPlain,
+			text: fmt.Sprintf("Promoted %d construct(s) durably: persisted + shared cluster-wide (survives restarts).", len(res.Promoted)),
+			sev:  sevPlain,
 		})
 		for _, c := range res.Promoted {
-			a.resultLines = append(a.resultLines, resultEntry{fmt.Sprintf("[ok] %s (%s)", c.Name, c.Kind), sevOK})
+			a.resultLines = append(a.resultLines, resultEntry{text: fmt.Sprintf("[ok] %s (%s)", c.Name, c.Kind), sev: sevOK})
 		}
 		if len(res.Promoted) == 0 {
-			a.resultLines = append(a.resultLines, resultEntry{"(nothing was promoted)", sevPlain})
+			a.resultLines = append(a.resultLines, resultEntry{text: "(nothing was promoted)", sev: sevPlain})
 		}
 	} else {
 		a.resultTitle = "PROMOTE -- durable activation: REJECTED"
 		if res.Error != "" {
-			a.resultLines = append(a.resultLines, resultEntry{res.Error, sevErr})
+			a.resultLines = append(a.resultLines, resultEntry{text: res.Error, sev: sevErr})
 		}
 		for _, d := range res.Diagnostics {
 			if d.OK || d.Skipped {
@@ -1236,9 +1383,10 @@ func (a *authoring) showPromoteResultLocked(res *authoringsdk.PromoteResult) {
 			a.resultLines = append(a.resultLines, diagnosticLine(d))
 		}
 		if len(a.resultLines) == 0 {
-			a.resultLines = append(a.resultLines, resultEntry{"(rejected, no detail)", sevErr})
+			a.resultLines = append(a.resultLines, resultEntry{text: "(rejected, no detail)", sev: sevErr})
 		}
 	}
+	a.selectFirstJumpable()
 	a.resultShown = true
 }
 
@@ -1251,14 +1399,28 @@ func diagnosticLine(d authoringsdk.Diagnostic) resultEntry {
 		if d.Error != "" {
 			line += ": " + d.Error
 		}
-		return resultEntry{line, sevWarn}
+		return resultEntry{text: line, sev: sevWarn}
 	case d.OK:
-		return resultEntry{fmt.Sprintf("[ok] %s (%s)", d.Name, d.Kind), sevOK}
+		return resultEntry{text: fmt.Sprintf("[ok] %s (%s)", d.Name, d.Kind), sev: sevOK}
 	default:
-		line := fmt.Sprintf("[!!] %s (%s)", d.Name, d.Kind)
-		if d.Error != "" {
-			line += ": " + d.Error
+		head := fmt.Sprintf("[!!] %s (%s)", d.Name, d.Kind)
+		// Prefix the authored position when the diagnostic carries one (#2375),
+		// so the overlay shows name + line:col and the entry becomes jumpable.
+		if d.Line > 0 {
+			head += " " + formatPosition(d.Line, d.Column)
 		}
-		return resultEntry{line, sevErr}
+		if d.Error != "" {
+			head += ": " + d.Error
+		}
+		return resultEntry{text: head, sev: sevErr, line: d.Line, col: d.Column}
 	}
+}
+
+// formatPosition renders a 1-based authored position as "@L:C" (or "@L" when no
+// column was resolved). Zero column is treated as absent -- never "@L:0".
+func formatPosition(line, col int) string {
+	if col > 0 {
+		return fmt.Sprintf("@%d:%d", line, col)
+	}
+	return fmt.Sprintf("@%d", line)
 }

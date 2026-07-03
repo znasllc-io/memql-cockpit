@@ -175,6 +175,41 @@ func bundleSources(bundle string) (string, error) {
 	return b.String(), nil
 }
 
+// bundleFileForLine maps a 1-based line in the concatenated bundle source (the
+// coordinate space AuthoringDiagnostic reports its positions in, #2375) back to
+// the owning file and the 1-based line WITHIN that file. It reconstructs the
+// exact same concatenation bundleSources builds -- files sorted, blank-line
+// ("\n\n") separated -- and tracks each file's start line. ok is false when the
+// bundle is unreadable, empty, or the line falls in a separator gap / out of
+// range (so the caller omits the jump rather than landing on the wrong line).
+func bundleFileForLine(bundle string, blobLine int) (file string, fileLine int, ok bool) {
+	if blobLine < 1 {
+		return "", 0, false
+	}
+	files, err := listBundleFiles(bundle)
+	if err != nil {
+		return "", 0, false
+	}
+	var b strings.Builder
+	for i, f := range files {
+		if i > 0 {
+			b.WriteString("\n\n")
+		}
+		// The file's first char lands on this 1-based line of the blob so far.
+		startLine := 1 + strings.Count(b.String(), "\n")
+		src, rerr := readBundleFile(bundle, f)
+		if rerr != nil {
+			return "", 0, false
+		}
+		b.WriteString(src)
+		endLine := 1 + strings.Count(b.String(), "\n")
+		if blobLine >= startLine && blobLine <= endLine {
+			return f, blobLine - startLine + 1, true
+		}
+	}
+	return "", 0, false
+}
+
 // writeBundleFile saves a bundle file's source to disk.
 func writeBundleFile(bundle, name, content string) error {
 	if err := safeName(bundle); err != nil {
