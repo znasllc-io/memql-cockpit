@@ -61,8 +61,8 @@ type RunResult struct {
 // Runtime is the cockpit's view of the embedded engine automation runtime.
 // It is an interface so the command layer (role gate + audit + version pin)
 // is unit-testable against a fake, and so the real engine-backed
-// implementation can be swapped for the fuller capability surface that
-// lands with I13 (memql#2220) without touching the command code.
+// implementation can be swapped for the fuller capability surface tracked
+// in znasllc-io/memql#2377 (D1) without touching the command code.
 type Runtime interface {
 	// Resolve loads the deployment bundle and resolves the named automation,
 	// proving the embedding without side effects. Returns ErrAutomationNotFound
@@ -80,14 +80,16 @@ type Runtime interface {
 // (memql.New(nil)): bundle resolution and the action/logic/event path run
 // in-process, while DB-backed mutation steps no-op.
 //
-// NOTE (I13, memql#2220): deployEngineCluster (I10 / memql#2224) now resolves
-// + executes through this runtime. Its DB-backed steps (createDeployment /
-// updateDeploymentStatus) and capability actions still need a fully-initialized
-// engine + the cockpit/runner surface, both provided by I13. Until then this
-// runtime proves the embedding (load + resolve + invoke the executor) and runs
-// the automation as far as the bare engine allows: a DB-backed step surfaces an
-// honest "memory engine not initialized" error (isNoEngineDB) rather than a
-// crash, which the deploy command reports as owner-gated. See HandleDeploy.
+// NOTE (znasllc-io/memql#2377, D1): deployEngineCluster (I10 / memql#2224) now
+// resolves + executes through this runtime. Its DB-backed steps (createDeployment
+// / updateDeploymentStatus) and capability actions still need a fully-initialized
+// engine + the cockpit/runner surface. That live-engine-DB work was expected
+// under I13 (memql#2227) but that issue closed without it; it is now tracked in
+// znasllc-io/memql#2377 (D1). Until it lands this runtime proves the embedding
+// (load + resolve + invoke the executor) and runs the automation as far as the
+// bare engine allows: a DB-backed step surfaces an honest "memory engine not
+// initialized" error (isNoEngineDB) rather than a crash, which the deploy command
+// reports as owner-gated. See HandleDeploy.
 type embeddedRuntime struct {
 	logger *slog.Logger
 
