@@ -213,3 +213,25 @@ func TestRunInvocation_DryRunResolved(t *testing.T) {
 		t.Errorf("audit should record dryRun: %+v", rec)
 	}
 }
+
+// D2 (memql#2378): the dry-run ladder. Default stamps dryRun=true into the
+// payload (scripts report); --apply stamps false (scripts perform); an
+// explicit --input dryRun wins; --apply + --dry-run is a usage error.
+func TestStampDryRunLadder(t *testing.T) {
+	inv := invocation{input: map[string]any{}}
+	if err := stampDryRunLadder(&inv); err != nil || inv.input["dryRun"] != true {
+		t.Fatalf("default must stamp dryRun=true, got %v err=%v", inv.input["dryRun"], err)
+	}
+	inv = invocation{apply: true, input: map[string]any{}}
+	if err := stampDryRunLadder(&inv); err != nil || inv.input["dryRun"] != false {
+		t.Fatalf("--apply must stamp dryRun=false, got %v err=%v", inv.input["dryRun"], err)
+	}
+	inv = invocation{apply: true, input: map[string]any{"dryRun": true}}
+	if err := stampDryRunLadder(&inv); err != nil || inv.input["dryRun"] != true {
+		t.Fatalf("explicit --input dryRun must win, got %v err=%v", inv.input["dryRun"], err)
+	}
+	inv = invocation{apply: true, dryRun: true, input: map[string]any{}}
+	if err := stampDryRunLadder(&inv); err == nil {
+		t.Fatal("--apply + --dry-run must be a usage error")
+	}
+}
