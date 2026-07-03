@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/znasllc-io/memql/component/auth"
 	"github.com/znasllc-io/memql/component/automations"
 	"github.com/znasllc-io/memql/component/automations/steps"
 	concept "github.com/znasllc-io/memql/component/database/memory-nodes"
@@ -80,16 +82,15 @@ type Runtime interface {
 // (memql.New(nil)): bundle resolution and the action/logic/event path run
 // in-process, while DB-backed mutation steps no-op.
 //
-// NOTE (znasllc-io/memql#2377, D1): deployEngineCluster (I10 / memql#2224) now
-// resolves + executes through this runtime. Its DB-backed steps (createDeployment
-// / updateDeploymentStatus) and capability actions still need a fully-initialized
-// engine + the cockpit/runner surface. That live-engine-DB work was expected
-// under I13 (memql#2227) but that issue closed without it; it is now tracked in
-// znasllc-io/memql#2377 (D1). Until it lands this runtime proves the embedding
-// (load + resolve + invoke the executor) and runs the automation as far as the
-// bare engine allows: a DB-backed step surfaces an honest "memory engine not
-// initialized" error (isNoEngineDB) rather than a crash, which the deploy command
-// reports as owner-gated. See HandleDeploy.
+// D1 (znasllc-io/memql#2377): when MEMQL_DATABASE_DSN is set the engine boots
+// DB-BACKED (LoadUnifiedConcepts -> MemoryNodesDatabase migrate-on-start ->
+// New(BunDB) -> Init) and the deployment lifecycle mutations
+// (createDeployment / updateDeploymentStatus) persist for real, with the
+// owner identity stamped on the writes. Without the DSN the engine carries no
+// database and a DB-backed step surfaces the honest "memory engine not
+// initialized" error (isNoEngineDB), which the deploy command reports as
+// owner-gated -- see HandleDeploy. Capability actions remain dry-run by
+// default either way (apply-mode plumbing is D2, memql#2378).
 type embeddedRuntime struct {
 	logger *slog.Logger
 
@@ -97,6 +98,12 @@ type embeddedRuntime struct {
 	initErr  error
 	loader   *automations.Loader
 	executor *automations.Executor
+	// dbBacked is true when MEMQL_DATABASE_DSN was set at init and the
+	// engine carries a real database (D1, memql#2377): the deployment
+	// lifecycle mutations (createDeployment / updateDeploymentStatus)
+	// execute for real instead of surfacing "memory engine not
+	// initialized".
+	dbBacked bool
 }
 
 // NewEmbeddedRuntime returns the real engine-backed Runtime.
@@ -115,10 +122,56 @@ func (stderrSink) Write(p []byte) (int, error) { return len(p), nil }
 
 func (e *embeddedRuntime) init() error {
 	e.once.Do(func() {
-		engine, err := memql.New(nil)
-		if err != nil {
-			e.initErr = fmt.Errorf("construct embedded engine: %w", err)
-			return
+		var engine *memql.MemQLEngine
+		var err error
+		// D1 (memql#2377): when MEMQL_DATABASE_DSN is set (the same env the
+		// engine reads everywhere; after `make up` the k3d postgres is the
+		// development target), boot the engine DB-BACKED via the blessed
+		// recipe (LoadUnifiedConcepts -> MemoryNodesDatabase migrate-on-start
+		// -> New(BunDB) -> Init) so the deployment lifecycle mutations
+		// execute for real. Without the DSN the prior no-DB behavior is
+		// unchanged: a DB-backed step surfaces the honest "memory engine not
+		// initialized" error and the deploy command reports it owner-gated.
+		// Env-agnostic by construction -- only the DSN varies per env.
+		if dsn := strings.TrimSpace(os.Getenv("MEMQL_DATABASE_DSN")); dsn != "" {
+			if _, cerr := memql.LoadUnifiedConcepts(nil); cerr != nil {
+				e.initErr = fmt.Errorf("deploy runtime: load unified concepts: %w", cerr)
+				return
+			}
+			mnd, merr := concept.NewMemoryNodesDatabase()
+			if merr != nil {
+				e.initErr = fmt.Errorf("deploy runtime: construct database: %w", merr)
+				return
+			}
+			mnd.Start(context.Background())
+			select {
+			case <-mnd.Ready():
+			case <-time.After(60 * time.Second):
+				e.initErr = fmt.Errorf("deploy runtime: database not ready within 60s (MEMQL_DATABASE_DSN set but unreachable, or migrations stuck)")
+				return
+			}
+			db := mnd.BunDB()
+			if db == nil {
+				e.initErr = fmt.Errorf("deploy runtime: database ready but BunDB is nil")
+				return
+			}
+			engine, err = memql.New(db)
+			if err != nil {
+				e.initErr = fmt.Errorf("construct embedded engine (db-backed): %w", err)
+				return
+			}
+			if ierr := engine.Init(concept.DefaultRegistry()); ierr != nil {
+				e.initErr = fmt.Errorf("deploy runtime: engine init: %w", ierr)
+				return
+			}
+			e.dbBacked = true
+			e.logger.Info("deploy runtime: engine is DB-backed; lifecycle mutations will persist")
+		} else {
+			engine, err = memql.New(nil)
+			if err != nil {
+				e.initErr = fmt.Errorf("construct embedded engine: %w", err)
+				return
+			}
 		}
 		bus := events.NewBus()
 		engine.SetEventBus(bus)
@@ -190,6 +243,14 @@ func (e *embeddedRuntime) Run(ctx context.Context, req RunRequest) (RunResult, e
 	owner := req.Owner
 	if owner == "" {
 		owner = "cockpit"
+	}
+	if e.dbBacked {
+		// The lifecycle mutations resolve their actor from the context.
+		// The deploy command is owner-gated upstream (HandleDeploy
+		// authorize), so stamping the owner identity here is consistent
+		// -- it is what lands on createdBy/triggered records.
+		ctx = auth.ContextWithAccess(ctx, &auth.AccessContext{UserId: owner, Role: auth.RoleOwner})
+		ctx = auth.ContextWithToken(ctx, &auth.TokenInfo{Subject: owner})
 	}
 	execn, execErr := e.executor.ExecuteWithEvent(ctx, auto, owner, ev)
 	res.Executed = true
