@@ -519,7 +519,8 @@ pans the grid). There is no toggle.
 | ↑/↓         | DOMAINS/FILES: move selection; SOURCE: move the hover cursor line |
 | ←/→         | SOURCE: move the hover cursor column                         |
 | H           | SOURCE: Sense hover at the cursor (overlay)                  |
-| Esc         | SOURCE: close the hover overlay                              |
+| C           | FILES/SOURCE: copy (fork) the viewed pack file into a bundle — prompts for a bundle name (existing name reuses it, new name creates it; filename collision auto-suffixes `-N`), then opens the copy in authoring mode (memql#2374) |
+| Esc         | SOURCE: close the hover overlay; copy-to-bundle prompt: cancel |
 | PgUp/PgDn   | SOURCE: scroll the viewport                                  |
 | Ctrl+B      | Switch to authoring mode                                     |
 
@@ -562,7 +563,7 @@ pans the grid). There is no toggle.
 | `sense/`                 | `SenseClient` over the SDK Dispatcher -- editor-side wrappers for MemQL Sense (Tokenize / Diagnose / Complete / Hover). |
 | `config/clusters.go`     | `~/.memql/clusters.yaml` load/save                            |
 | `concepts/`              | Concepts tab (concept picker + row list + generic renderer)   |
-| `dsledit/`               | Editor tab: `view.go` read-only DSL pack browser (domains/files/source) over `memql/sdk/go/pack` (#228) + Sense coloring/hover (#229); `author.go` Ctrl+B authoring mode (editable bundles via `cli/editor`, #230) + Validate/Inject over `memql/sdk/go/authoring` (#231) + owner-gated Ctrl+P Promote / durable activation (#232) + owner-gated Ctrl+D Retire / durable demote (memql#2163); `bundle.go` local `~/.memql/bundles` workspace IO |
+| `dsledit/`               | Editor tab: `view.go` read-only DSL pack browser (domains/files/source) over `memql/sdk/go/pack` (#228) + Sense coloring/hover (#229); `author.go` Ctrl+B authoring mode (editable bundles via `cli/editor`, #230) + Validate/Inject over `memql/sdk/go/authoring` (#231) + owner-gated Ctrl+P Promote / durable activation (#232) + owner-gated Ctrl+D Retire / durable demote (memql#2163) + browse-mode `C` copy-pack-file-to-bundle (fork the viewed source into a bundle, then edit the copy, memql#2374); `bundle.go` local `~/.memql/bundles` workspace IO (incl. `copyFileIntoBundle` auto-suffix collision policy) |
 | `editor/`                | Reusable text editor with Sense integration                   |
 | `settings/`              | Settings tab                                                  |
 | `ui/`                    | Theme, screen, tab bar, layout primitives                     |
