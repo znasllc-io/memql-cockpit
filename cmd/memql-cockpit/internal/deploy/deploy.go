@@ -54,6 +54,7 @@ type invocation struct {
 	role       Role
 	actor      string
 	dryRun     bool
+	apply      bool
 	input      map[string]any
 	topic      string // triggering-event topic for the embedded runtime (deploy path)
 	gate       Gate
@@ -96,6 +97,8 @@ func HandleDeploy(args []string, cockpitVersion string) int {
 			jsonInput, _ = next()
 		case "--dry-run":
 			inv.dryRun = true
+		case "--apply":
+			inv.apply = true
 		case "--help", "-h":
 			printDeployUsage()
 			return 0
@@ -112,6 +115,10 @@ func HandleDeploy(args []string, cockpitVersion string) int {
 		return 2
 	}
 	if err := applyInput(&inv, jsonInput); err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		return 2
+	}
+	if err := stampDryRunLadder(&inv); err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 		return 2
 	}
@@ -206,6 +213,23 @@ func HandleRun(args []string, cockpitVersion string) int {
 // runInvocation is the shared core: version pin → role gate (+audit) →
 // embedded-runtime execute (+audit) → print. It is the single seam the unit
 // tests drive against a fake Runtime + in-memory Auditor.
+
+// stampDryRunLadder applies the D2 (memql#2378) three-rung ladder to a deploy
+// invocation: --dry-run stops at RESOLUTION (nothing executes); the default
+// EXECUTES the automation with every capability script in its own dry-run mode
+// (the payload carries dryRun=true explicitly); --apply flips the payload
+// field so the scripts perform their work. An explicit dryRun in --input wins.
+// One documented switch, dry-run default everywhere.
+func stampDryRunLadder(inv *invocation) error {
+	if inv.apply && inv.dryRun {
+		return fmt.Errorf("--apply and --dry-run are mutually exclusive")
+	}
+	if _, ok := inv.input["dryRun"]; !ok {
+		inv.input["dryRun"] = !inv.apply
+	}
+	return nil
+}
+
 func runInvocation(inv invocation, cockpitVersion string, rt Runtime, auditor *Auditor) int {
 	bundleVersion, err := BundleVersion()
 	if err != nil {
@@ -372,6 +396,7 @@ func printDeployUsage() {
 	fmt.Println("  --actor <id>    Caller identity for the audit trail (or MEMQL_COCKPIT_ACTOR / $USER)")
 	fmt.Println("  --input <json>  Extra JSON-object input merged into the automation input")
 	fmt.Println("  --dry-run       Resolve + preview without executing")
+	fmt.Println("  --apply         Perform the work: sets the payload dryRun=false so every capability script applies instead of reporting (default: scripts run in dry-run mode)")
 	fmt.Println("  --help, -h      Show this help")
 	fmt.Println()
 	fmt.Println("Exit codes: 0 success/invoked · 1 error/denied · 2 usage")
