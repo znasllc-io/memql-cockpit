@@ -86,9 +86,14 @@ func (a *Auditor) Emit(rec AuditRecord) error {
 	if openErr != nil {
 		return fmt.Errorf("open audit log: %w", openErr)
 	}
-	defer f.Close()
 	if _, wErr := f.Write(line); wErr != nil {
+		_ = f.Close()
 		return fmt.Errorf("append audit log: %w", wErr)
+	}
+	// A writable-file Close can surface the flush error -- an audit line
+	// that never reached disk must not report success.
+	if cErr := f.Close(); cErr != nil {
+		return fmt.Errorf("close audit log: %w", cErr)
 	}
 	return nil
 }
