@@ -126,6 +126,10 @@ func HandleDeploy(args []string, cockpitVersion string) int {
 	inv.topic = deployRequestedTopic
 	resolveActorRole(&inv)
 	applyDeployDefaults(&inv) // build the canonical deploy.requested payload
+	if err := resolveStagingDigests(&inv); err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		return 1
+	}
 
 	// Report the runner-surface credential readiness (I17 / memql#2228).
 	// Redacted, never logs secrets. Non-fatal: a dry-run / no-op deploy runs
