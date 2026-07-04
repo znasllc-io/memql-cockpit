@@ -98,6 +98,7 @@ type embeddedRuntime struct {
 	initErr  error
 	loader   *automations.Loader
 	executor *automations.Executor
+	registry *steps.Registry
 	// dbBacked is true when MEMQL_DATABASE_DSN was set at init and the
 	// engine carries a real database (D1, memql#2377): the deployment
 	// lifecycle mutations (createDeployment / updateDeploymentStatus)
@@ -119,6 +120,16 @@ func NewEmbeddedRuntime(logger *slog.Logger) Runtime {
 type stderrSink struct{}
 
 func (stderrSink) Write(p []byte) (int, error) { return len(p), nil }
+
+// stepRegistry lazily builds the shared step registry -- the SAME instance
+// backs the LogicRunner and the automation executor, exactly as app
+// bootstrap wires it.
+func (e *embeddedRuntime) stepRegistry() *steps.Registry {
+	if e.registry == nil {
+		e.registry = steps.NewRegistry()
+	}
+	return e.registry
+}
 
 func (e *embeddedRuntime) init() error {
 	e.once.Do(func() {
@@ -160,6 +171,15 @@ func (e *embeddedRuntime) init() error {
 				e.initErr = fmt.Errorf("construct embedded engine (db-backed): %w", err)
 				return
 			}
+			// The LogicRunner executes multi-step / return-expression logic
+			// bodies in-process (app bootstrap wires it at app/engine.go).
+			// It MUST be set BEFORE Init -- function registration captures
+			// the execution path at load. Without it, a pure logic like the
+			// deploy bundle's deploymentForwardAllowed role gate falls back
+			// to the query-scan path and dies resolving engine-bookkeeping
+			// rows (unable to resolve concept "system.migration") -- found
+			// by the D4 first-live-deploy rehearsal (memql#2380).
+			engine.SetLogicRunner(automations.NewLogicRunner(engine, e.stepRegistry(), e.logger))
 			if ierr := engine.Init(concept.DefaultRegistry()); ierr != nil {
 				e.initErr = fmt.Errorf("deploy runtime: engine init: %w", ierr)
 				return
@@ -184,7 +204,7 @@ func (e *embeddedRuntime) init() error {
 			Logger:       e.logger,
 			Engine:       engine,
 			EventBus:     bus,
-			StepRegistry: steps.NewRegistry(),
+			StepRegistry: e.stepRegistry(),
 		})
 	})
 	return e.initErr
