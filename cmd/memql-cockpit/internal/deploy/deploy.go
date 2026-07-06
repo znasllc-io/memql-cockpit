@@ -333,6 +333,13 @@ func applyDeployDefaults(inv *invocation) {
 	}
 	// deploymentId is the v1:cluster:deployment timeline id; one per invocation
 	// unless the operator pins it (e.g. to append to an existing timeline).
+	// This is a BARE, client-minted slug (dep-<env>-<unix>) -- NOT a canonical
+	// v1:cluster:deployment id, and that is intentional: it is compatible with
+	// the bare-ids client contract (#2438). A client may mint a bare slug and
+	// the engine stores it under the concept (the JoinSpaceAsGuest / content-
+	// addressed-id pattern); the engine namespaces it to
+	// v1:cluster:deployment:<slug> on insert. The client never composes the
+	// canonical form, so this needs no change under the bare-ids cutover.
 	setDefault("deploymentId", fmt.Sprintf("dep-%s-%d", inv.env, time.Now().UTC().Unix()))
 	setDefault("engineNodeTypes", defaultEngineNodeTypes())
 }
