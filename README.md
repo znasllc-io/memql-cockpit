@@ -156,7 +156,8 @@ needed before any keyring access. The load-time mode validator
 ## Module structure
 
 - `cmd/memql-cockpit/` -- binary entry point + per-subcommand internals
-  (`internal/authorize/`, `internal/lint/`, `internal/worker/`).
+  (`internal/deploy/`, `internal/harness/`, `internal/lint/`,
+  `internal/setupproject/`, `internal/worker/`).
 - `cli/` -- TUI primitives (`ui/`, `canvas/`) + product views
   (`agents/`, `auth/`, `client/`, `cluster/`, `config/`,
   `editor/`, `explorer/`, `settings/`).
