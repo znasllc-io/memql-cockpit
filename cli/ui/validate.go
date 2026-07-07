@@ -90,7 +90,7 @@ func IsNameChar(r rune) bool {
 // ValidateDomain checks a cluster domain (e.g. "staging.copresent.ai").
 // Required, fully-qualified (must contain a dot), hostname-shaped, and
 // within MaxHostLen. Returns the normalized (trimmed, lower-cased)
-// domain. The Add/Edit form composes bff.<domain> / identity.<domain>
+// domain. The Add/Edit form composes cockpit.<domain> / identity.<domain>
 // from it, so the shape rules here mirror ValidateHost.
 func ValidateDomain(s string) (string, error) {
 	d := NormalizeName(s)

@@ -702,7 +702,7 @@ func genesisFilePath() string {
 // row to clusters.yaml:
 //
 //	DisplayName = <domain>                  (e.g. local.znas.io)
-//	Endpoint    = https://bff.<domain>      (NGINX LB entry)
+//	Endpoint    = https://cockpit.<domain>      (cockpit-bff gRPC front door)
 //	Issuer      = https://identity.<domain> (OIDC issuer)
 //	ClientId    = cockpit                   (registered cockpit client)
 //
@@ -749,7 +749,7 @@ func (a *App) autoSeedLocalFromGenesis() {
 	seed := config.ClusterConfig{
 		Name:        "local",
 		DisplayName: domain,
-		Endpoint:    "https://bff." + domain,
+		Endpoint:    "https://cockpit." + domain,
 		Issuer:      "https://identity." + domain,
 		ClientId:    "cockpit",
 	}
