@@ -441,13 +441,13 @@ from it by convention on save (`composeFromDomain` in
 `autoSeedLocalFromGenesis` uses for the local row:
 
 ```
-Endpoint = https://bff.<domain>
+Endpoint = https://cockpit.<domain>
 Issuer   = https://identity.<domain>
 ClientId = cockpit
 Name     = slug(<domain>)   (dots -> dashes; the clusters.yaml key)
 ```
 
-The form previews `bff.<domain>` / `identity.<domain>` live as you
+The form previews `cockpit.<domain>` / `identity.<domain>` live as you
 type. `Name` is the immutable config key (preserved across edits so a
 cached token isn't orphaned); the Domain is stored on
 `ClusterConfig.Domain` so Edit round-trips it. Authorization is NOT
@@ -455,7 +455,7 @@ part of the form -- after save the row is `needs-login`, and
 `L:Authorize`/`L:Login` runs OAuth against the composed Issuer +
 ClientId.
 
-Deployments that DON'T follow the `bff.`/`identity.` convention
+Deployments that DON'T follow the `cockpit.`/`identity.` convention
 (local plaintext `host:port`, custom hostnames, a PAT, a different
 client id) are edited directly in `~/.memql/clusters.yaml` -- the form
 is intentionally convention-only. (The previous multi-field form +

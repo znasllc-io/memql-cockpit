@@ -107,7 +107,7 @@ type ClustersView struct {
 // addFormState backs the single-field Add/Edit cluster form. The user
 // types one Domain (e.g. "staging.copresent.ai"); Endpoint / Issuer /
 // ClientId are composed from it by convention on save (see
-// composeFromDomain). Deployments that don't follow the bff./identity.
+// composeFromDomain). Deployments that don't follow the cockpit./identity.
 // convention are edited directly in ~/.memql/clusters.yaml.
 type addFormState struct {
 	domain   string
@@ -137,8 +137,8 @@ func LocalClusterConfig() config.ClusterConfig {
 }
 
 // composeFromDomain builds a full ClusterConfig from a single domain by
-// the bff./identity. convention the local stack ships with (and that
-// autoSeedLocalFromGenesis uses): Endpoint=https://bff.<domain>,
+// the cockpit./identity. convention the local stack ships with (and that
+// autoSeedLocalFromGenesis uses): Endpoint=https://cockpit.<domain>,
 // Issuer=https://identity.<domain>, ClientId="cockpit". The caller has
 // already validated + normalized the domain.
 func composeFromDomain(domain string) config.ClusterConfig {
@@ -146,7 +146,7 @@ func composeFromDomain(domain string) config.ClusterConfig {
 		Name:        ui.DomainToName(domain),
 		DisplayName: domain,
 		Domain:      domain,
-		Endpoint:    "https://bff." + domain,
+		Endpoint:    "https://cockpit." + domain,
 		Issuer:      "https://identity." + domain,
 		ClientId:    "cockpit",
 	}
@@ -154,7 +154,7 @@ func composeFromDomain(domain string) config.ClusterConfig {
 
 // domainFromConfig recovers the domain for the Edit form: the stored
 // Domain when present, else derived from a conventional
-// https://bff.<domain> endpoint, else blank (hand-edited rows that
+// https://cockpit.<domain> endpoint, else blank (hand-edited rows that
 // don't follow the convention just start empty -- retype the domain or
 // keep editing clusters.yaml by hand).
 func domainFromConfig(c config.ClusterConfig) string {
@@ -164,7 +164,7 @@ func domainFromConfig(c config.ClusterConfig) string {
 	ep := strings.TrimSpace(c.Endpoint)
 	ep = strings.TrimPrefix(ep, "https://")
 	ep = strings.TrimPrefix(ep, "http://")
-	ep = strings.TrimPrefix(ep, "bff.")
+	ep = strings.TrimPrefix(ep, "cockpit.")
 	if i := strings.LastIndex(ep, ":"); i >= 0 {
 		ep = ep[:i]
 	}

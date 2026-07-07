@@ -22,7 +22,7 @@ type ClusterConfig struct {
 	DisplayName string `yaml:"display_name,omitempty"` // Human-friendly name; falls back to Name when empty
 	// Domain is the single value the Add/Edit form collects (e.g.
 	// "staging.copresent.ai"). Endpoint / Issuer / ClientId below are
-	// composed from it by convention (bff.<domain> / identity.<domain>
+	// composed from it by convention (cockpit.<domain> / identity.<domain>
 	// / client_id "cockpit"). Stored so the Edit form can round-trip
 	// the domain instead of reverse-engineering it from Endpoint.
 	// Empty for hand-edited / legacy rows that set the URLs directly.

@@ -15,7 +15,7 @@ func TestComposeFromDomain(t *testing.T) {
 		Name:        "staging-copresent-ai",
 		DisplayName: "staging.copresent.ai",
 		Domain:      "staging.copresent.ai",
-		Endpoint:    "https://bff.staging.copresent.ai",
+		Endpoint:    "https://cockpit.staging.copresent.ai",
 		Issuer:      "https://identity.staging.copresent.ai",
 		ClientId:    "cockpit",
 	}
@@ -26,15 +26,15 @@ func TestComposeFromDomain(t *testing.T) {
 
 func TestDomainFromConfig(t *testing.T) {
 	// Stored Domain wins.
-	if got := domainFromConfig(config.ClusterConfig{Domain: "a.b.c", Endpoint: "https://bff.x.y"}); got != "a.b.c" {
+	if got := domainFromConfig(config.ClusterConfig{Domain: "a.b.c", Endpoint: "https://cockpit.x.y"}); got != "a.b.c" {
 		t.Errorf("stored domain not preferred: got %q", got)
 	}
 	// Derive from a conventional endpoint when Domain is absent.
-	if got := domainFromConfig(config.ClusterConfig{Endpoint: "https://bff.staging.copresent.ai"}); got != "staging.copresent.ai" {
+	if got := domainFromConfig(config.ClusterConfig{Endpoint: "https://cockpit.staging.copresent.ai"}); got != "staging.copresent.ai" {
 		t.Errorf("derive-from-endpoint: got %q, want staging.copresent.ai", got)
 	}
 	// Strip a trailing port too.
-	if got := domainFromConfig(config.ClusterConfig{Endpoint: "https://bff.local.znas.io:443"}); got != "local.znas.io" {
+	if got := domainFromConfig(config.ClusterConfig{Endpoint: "https://cockpit.local.znas.io:443"}); got != "local.znas.io" {
 		t.Errorf("derive-with-port: got %q, want local.znas.io", got)
 	}
 }
@@ -66,7 +66,7 @@ func TestAddFormComposesOnEnter(t *testing.T) {
 	if got.Domain != "staging.copresent.ai" {
 		t.Errorf("composed domain = %q, want staging.copresent.ai", got.Domain)
 	}
-	if got.Endpoint != "https://bff.staging.copresent.ai" || got.Issuer != "https://identity.staging.copresent.ai" || got.ClientId != "cockpit" {
+	if got.Endpoint != "https://cockpit.staging.copresent.ai" || got.Issuer != "https://identity.staging.copresent.ai" || got.ClientId != "cockpit" {
 		t.Errorf("composed URLs wrong: %+v", got)
 	}
 }
