@@ -17,8 +17,6 @@ import (
 	"time"
 
 	"github.com/gdamore/tcell/v2"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
 	nodev1 "github.com/znasllc-io/memql/component/node/gen"
@@ -71,6 +69,13 @@ type fakeConceptActor struct {
 	lastDeployID, lastRollbackID            string
 	lastSuggestEnv                          string
 	cuts, deploys, rollbacks                int
+
+	// runner-path recording (#292): C/G/B now fire through the injected
+	// View.DeployRunner (the deployEngineCluster automation path), not the
+	// gRPC actor methods above -- only SuggestNextVersion still uses the
+	// actor.
+	runCalls                     int
+	runEnv, runAction, runTarget string
 }
 
 func (f *fakeConceptActor) CutVersion(_ context.Context, env, bump, version string) (client.ActionResult, error) {
@@ -99,7 +104,12 @@ func newConceptView(t *testing.T, role client.Role, fa *fakeConceptActor) (*View
 	t.Helper()
 	v := NewView(ui.DefaultTheme())
 	v.SetClusterRole(role)
-	v.SetDeployConceptActor(fa)
+	v.SetDeployConceptActor(fa) // still used by SuggestNextVersion (cut preview)
+	v.DeployRunner = func(env, action, targetID string) (string, bool) {
+		fa.runCalls++
+		fa.runEnv, fa.runAction, fa.runTarget = env, action, targetID
+		return "OK: routed " + action, true
+	}
 	redrawCh := make(chan struct{}, 32)
 	v.OnRedraw = func() {
 		select {
@@ -224,51 +234,52 @@ func TestDeployments_CutRoleGate(t *testing.T) {
 	}
 }
 
-func TestDeployments_CutFiresWithEnvAndBump(t *testing.T) {
+func TestDeployments_CutRoutesToRunner(t *testing.T) {
+	// #292: cut fires through the DeployRunner (automation path), NOT the
+	// retired DeployControlService gRPC. The cluster env is carried through.
 	fa := &fakeConceptActor{
-		result: client.ActionResult{OK: true, Message: "cut", AuditEventID: "evt-cut"},
-		sugg:   client.NextVersionSuggestion{CurrentVersion: "2026.6.20", NextPatch: "2026.6.21"},
+		sugg: client.NextVersionSuggestion{CurrentVersion: "2026.6.20", NextPatch: "2026.6.21"},
 	}
 	v, redrawCh := newConceptView(t, client.RoleDeveloper, fa)
-	// A cluster IS one environment (memql-cockpit#226): the cut flow uses
-	// the cluster's resolved env, no picker. Set it, then open cut -> the
-	// modal opens straight on the bump picker.
 	v.SetClusterEnvironment("production")
 	v.HandleEvent(keyRune('C')) // open cut -> bump picker (env already resolved)
-	// bump picker: cutBumps[0]=patch. Enter selects patch -> confirm.
-	v.HandleEvent(keyEnter())
-	// confirm stage: Enter fires CutVersion.
-	v.HandleEvent(keyEnter())
+	v.HandleEvent(keyEnter())   // select patch -> confirm
+	v.HandleEvent(keyEnter())   // confirm -> fire
 
 	line := waitForConceptResult(t, v, redrawCh)
-	if !strings.HasPrefix(line, "SUCCESS:") || !strings.Contains(line, "evt-cut") {
-		t.Errorf("expected cut SUCCESS w/ audit id, got %q", line)
+	if !strings.Contains(line, "routed cut") {
+		t.Errorf("cut should route to the deploy runner; got %q", line)
 	}
-	if fa.cuts != 1 || fa.lastCutEnv != "production" || fa.lastCutBump != "patch" {
-		t.Errorf("CutVersion args wrong: cuts=%d env=%q bump=%q", fa.cuts, fa.lastCutEnv, fa.lastCutBump)
+	if fa.runCalls != 1 || fa.runAction != "cut" || fa.runEnv != "production" {
+		t.Errorf("cut routed wrong: calls=%d action=%q env=%q", fa.runCalls, fa.runAction, fa.runEnv)
 	}
-	// Note: SuggestNextVersion is fired best-effort in a detached
-	// goroutine when the bump picker opens (it only populates a preview
-	// hint), so we don't assert its call synchronously -- doing so races
-	// the cut fire. Its wiring is covered by compiling against the
-	// deployConceptActions interface.
+	if fa.cuts != 0 {
+		t.Errorf("cut must NOT dial the retired DeployControlService (cuts=%d)", fa.cuts)
+	}
 }
 
-func TestDeployments_DeployPendingFires(t *testing.T) {
-	fa := &fakeConceptActor{result: client.ActionResult{OK: true, Message: "shipping"}}
+func TestDeployments_DeployRoutesToRunner(t *testing.T) {
+	// #292: G fires the env-level deployEngineCluster automation via the
+	// runner, carrying the cluster env + the selected deployment id.
+	fa := &fakeConceptActor{}
 	v, redrawCh := newConceptView(t, client.RoleDeveloper, fa)
+	v.SetClusterEnvironment("staging")
 	v.SetDeployments([]DeploymentInfo{{ID: "dep-pending", Version: "9.9.9", Status: "pending"}})
 	v.HandleEvent(keyRune('G')) // deploy the selected pending deployment
 	if !modalOpen(v) {
 		t.Fatal("G should open the deploy-confirm for a pending deployment")
 	}
-	v.HandleEvent(keyEnter()) // confirm -> fire Deploy
+	v.HandleEvent(keyEnter()) // confirm -> fire
 	line := waitForConceptResult(t, v, redrawCh)
-	if !strings.HasPrefix(line, "SUCCESS:") {
-		t.Errorf("expected deploy SUCCESS, got %q", line)
+	if !strings.Contains(line, "routed deploy") {
+		t.Errorf("deploy should route to the runner; got %q", line)
 	}
-	if fa.deploys != 1 || fa.lastDeployID != "dep-pending" {
-		t.Errorf("Deploy args wrong: deploys=%d id=%q", fa.deploys, fa.lastDeployID)
+	if fa.runCalls != 1 || fa.runAction != "deploy" || fa.runEnv != "staging" || fa.runTarget != "dep-pending" {
+		t.Errorf("deploy routed wrong: calls=%d action=%q env=%q target=%q",
+			fa.runCalls, fa.runAction, fa.runEnv, fa.runTarget)
+	}
+	if fa.deploys != 0 {
+		t.Errorf("deploy must NOT dial the retired DeployControlService (deploys=%d)", fa.deploys)
 	}
 }
 
@@ -292,18 +303,19 @@ func TestDeployments_RollbackOwnerOnly(t *testing.T) {
 			t.Errorf("role %q must not open rollback", role)
 		}
 	}
-	fa := &fakeConceptActor{result: client.ActionResult{OK: true, Message: "rolled back", AuditEventID: "evt-rb"}}
+	fa := &fakeConceptActor{}
 	v, redrawCh := newConceptView(t, client.RoleOwner, fa)
+	v.SetClusterEnvironment("staging")
 	v.SetDeployments([]DeploymentInfo{{ID: "dep-succeeded", Version: "3.0.0", Status: "succeeded"}})
 	v.HandleEvent(keyRune('B'))
 	if !modalOpen(v) {
 		t.Fatal("owner B should open rollback confirm for a succeeded deployment")
 	}
-	// Type-to-confirm gate: a wrong phrase must not fire.
+	// Type-to-confirm gate: a wrong phrase must not fire the runner.
 	typeStr(v, "nope")
 	v.HandleEvent(keyEnter())
-	if fa.rollbacks != 0 {
-		t.Fatalf("wrong confirm phrase must not fire rollback (rollbacks=%d)", fa.rollbacks)
+	if fa.runCalls != 0 {
+		t.Fatalf("wrong confirm phrase must not fire rollback (runCalls=%d)", fa.runCalls)
 	}
 	for range "nope" {
 		v.HandleEvent(tcell.NewEventKey(tcell.KeyBackspace, 0, tcell.ModNone))
@@ -311,24 +323,14 @@ func TestDeployments_RollbackOwnerOnly(t *testing.T) {
 	typeStr(v, "rollback")
 	v.HandleEvent(keyEnter())
 	line := waitForConceptResult(t, v, redrawCh)
-	if !strings.Contains(line, "SUCCESS") || !strings.Contains(line, "evt-rb") {
-		t.Errorf("expected rollback SUCCESS w/ audit id, got %q", line)
+	if !strings.Contains(line, "routed rollback") {
+		t.Errorf("rollback should route to the runner; got %q", line)
 	}
-	if fa.rollbacks != 1 || fa.lastRollbackID != "dep-succeeded" {
-		t.Errorf("RollbackDeployment args wrong: rollbacks=%d id=%q", fa.rollbacks, fa.lastRollbackID)
+	if fa.runCalls != 1 || fa.runAction != "rollback" || fa.runTarget != "dep-succeeded" {
+		t.Errorf("rollback routed wrong: calls=%d action=%q target=%q", fa.runCalls, fa.runAction, fa.runTarget)
 	}
-}
-
-func TestDeployments_RollbackPermissionDeniedMapped(t *testing.T) {
-	fa := &fakeConceptActor{err: status.Error(codes.PermissionDenied, "nope")}
-	v, redrawCh := newConceptView(t, client.RoleOwner, fa)
-	v.SetDeployments([]DeploymentInfo{{ID: "dep-x", Version: "1.0.0", Status: "succeeded"}})
-	v.HandleEvent(keyRune('B'))
-	typeStr(v, "rollback")
-	v.HandleEvent(keyEnter())
-	line := waitForConceptResult(t, v, redrawCh)
-	if line != "ERROR: requires owner/admin" {
-		t.Errorf("expected owner/admin mapping, got %q", line)
+	if fa.rollbacks != 0 {
+		t.Errorf("rollback must NOT dial the retired DeployControlService (rollbacks=%d)", fa.rollbacks)
 	}
 }
 
