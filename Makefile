@@ -42,15 +42,18 @@ cockpit:
 # The port-forward is LOCAL access config only. In staging/prod the Cockpit
 # reaches the SAME bff node via the cockpit.<domain> ingress
 # (deploy/k8s/cockpit-front-door.yaml): `memql-cockpit --cluster staging`.
-.PHONY: run forward
+.PHONY: run-local forward
 
 MEMQL_NS ?= memql
 BFF_SVC  ?= bff
 BFF_PORT ?= 50051
 
-## Connect the Cockpit to a local cluster (builds, then auto port-forwards the bff edge)
-run: cockpit
-	@MEMQL_NS=$(MEMQL_NS) BFF_SVC=$(BFF_SVC) BFF_PORT=$(BFF_PORT) bash scripts/run-local.sh $(ARGS)
+## Connect the Cockpit to a LOCAL k3d cluster (builds, then auto port-forwards the bff edge)
+# CRED_STORE=file (default, defined below) avoids macOS Keychain prompts on
+# make-launched dev runs, matching run-cockpit / cockpit-gui-run.
+run-local: cockpit
+	@MEMQL_NS=$(MEMQL_NS) BFF_SVC=$(BFF_SVC) BFF_PORT=$(BFF_PORT) \
+		MEMQL_COCKPIT_CRED_STORE=$(CRED_STORE) bash scripts/run-local.sh $(ARGS)
 
 ## Port-forward only the bff edge to localhost:$(BFF_PORT) (for SDKs / other clients)
 forward:
