@@ -2,26 +2,21 @@ package cluster
 
 // Shared deploy helpers used by the concept-driven Deployments section
 // (deployments.go / deployments_controls.go). These were extracted from
-// the now-removed deployment-v2 "Surface A" files (deploy.go /
-// deploy_controls.go / deploy_grpcstatus.go) when that surface was
+// the now-removed deployment-v2 "Surface A" files when that surface was
 // deleted in the persistent-split overhaul (memql-cockpit#221). The
-// Deployments section's cut/deploy/rollback modal reuses the async-fire
-// outcome formatting, the gRPC PermissionDenied mapping, the bounded
-// action timeout, the colored-token writer, the wrapped-text writer, and
-// the warning-color style -- so they live here, package-scoped, rather
-// than in a file tied to either surface.
+// Deployments section reuses the bounded action timeout (suggest read),
+// the colored-token writer, the wrapped-text writer, and the warning-color
+// style -- so they live here, package-scoped. (The gRPC action-outcome
+// formatting + PermissionDenied mapping went away with #292, when the
+// cut/deploy/rollback controls moved off DeployControlService onto the
+// deployEngineCluster automation runner.)
 
 import (
-	"fmt"
-	"strings"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	"github.com/znasllc-io/memql-cockpit/cli/ui"
-	"github.com/znasllc-io/memql/sdk/go/client"
 )
 
 // deployActionTimeout bounds each SDK write action (cut / deploy /
@@ -82,65 +77,4 @@ func (v *View) drawWrapped(screen *ui.Screen, x, y, w, h int, text string, style
 		r = r[n:]
 		row++
 	}
-}
-
-// formatActionOutcome renders the terminal result line. On a transport
-// error it surfaces the message, mapping a PermissionDenied to the
-// owner/admin hint. On success it shows the ActionResult message plus
-// the AuditEventId so the operator has the audit handle. Returns the
-// line and whether it was a success.
-func formatActionOutcome(res client.ActionResult, err error) (string, bool) {
-	if err != nil {
-		if isPermissionDenied(err) {
-			return "ERROR: requires owner/admin", false
-		}
-		return "ERROR: " + err.Error(), false
-	}
-	if !res.OK {
-		msg := res.Message
-		if msg == "" {
-			msg = "action rejected"
-		}
-		return "ERROR: " + msg, false
-	}
-	msg := res.Message
-	if msg == "" {
-		msg = "ok"
-	}
-	if res.AuditEventID != "" {
-		return fmt.Sprintf("SUCCESS: %s (audit %s)", msg, res.AuditEventID), true
-	}
-	return "SUCCESS: " + msg, true
-}
-
-// permissionDeniedCode is the gRPC code the server returns for a caller
-// whose role doesn't admit a deploy-control action.
-const permissionDeniedCode = codes.PermissionDenied
-
-// isPermissionDenied reports whether err is (or wraps) a gRPC
-// PermissionDenied. The SDK wraps the status error with %w so the gRPC
-// status is still recoverable; we also fall back to a substring match
-// for robustness against any non-status wrapper.
-func isPermissionDenied(err error) bool {
-	if err == nil {
-		return false
-	}
-	if st, ok := grpcStatusFromError(err); ok && st == permissionDeniedCode {
-		return true
-	}
-	return strings.Contains(strings.ToLower(err.Error()), "permissiondenied") ||
-		strings.Contains(err.Error(), "PermissionDenied")
-}
-
-// grpcStatusFromError returns the gRPC status code embedded in err (or
-// any error it wraps), and whether one was found. status.FromError
-// unwraps via the GRPCStatus() / errors.As path.
-func grpcStatusFromError(err error) (codes.Code, bool) {
-	if err == nil {
-		return codes.OK, false
-	}
-	if st, ok := status.FromError(err); ok {
-		return st.Code(), true
-	}
-	return codes.Unknown, false
 }

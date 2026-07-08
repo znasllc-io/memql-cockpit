@@ -1,20 +1,21 @@
 package cluster
 
 // Cut/deploy/rollback modal for the Deployments section (memql-cockpit
-// #207). Concept-driven: it fires the deployment-concept lifecycle
-// wrappers landed in memql#1886 (this is the single deployment surface
-// now -- the older deployment-v2 overlay modal was removed in #221):
+// #207, the single deployment surface since #221).
 //
-//	CutVersion(env, bump, version)  -- create a pending deployment
-//	Deploy(deploymentId)            -- ship a pending deployment
-//	RollbackDeployment(toDeploymentId) -- re-promote a historical digest
-//	SuggestNextVersion(env)         -- propose the next semver (read-only)
+// Deploy fires through the injected DeployRunner -- the blessed
+// deployEngineCluster automation path (the `deploy` subcommand / embedded
+// runner) -- NOT the DeployControlService gRPC, which is identity-only and
+// a bff-role node (including cockpit-bff) never serves (#292). Cut and
+// historical-rollback have no automation equivalent yet and report "not
+// available on the automation path" pending owner-gated retirement
+// (memql#2229). SuggestNextVersion stays a best-effort gRPC read used only
+// to preview a cut's next semver.
 //
 // Role gating (locked matrix, epic #1871): cut + deploy require
 // developer/admin/owner; rollback is owner-only. The key handler in
 // deployments.go only opens the modal for an authorized role, and the
-// server re-checks -- a PermissionDenied surfaces as the owner/admin (or
-// owner-only) hint via formatActionOutcome.
+// deploy subcommand re-gates server-side.
 //
 // Thread-safety: state lives in v.dctrl under v.mu (the same lock that
 // serializes Draw against the per-cluster subscriber goroutine).
@@ -306,28 +307,32 @@ func (v *View) resolveConceptActorLocked() deployConceptActions {
 	return nil
 }
 
-// runConceptAction is the common async-fire wrapper for the concept modal,
-// mirroring runAction. Caller holds v.mu.
-func (v *View) runConceptAction(fn func(ctx context.Context, a deployConceptActions) (client.ActionResult, error)) {
+// runDeployRunnerLocked fires a Deployments control (deploy/cut/rollback)
+// through the injected DeployRunner -- the blessed deployEngineCluster
+// automation path -- instead of the retired DeployControlService gRPC, which
+// a bff-role node (including cockpit-bff) never serves (#292). The runner
+// resolves the env from the cluster (a cluster IS one environment) and the
+// selected deployment's id; it returns the result line + ok. Caller holds
+// v.mu.
+func (v *View) runDeployRunnerLocked(action string) {
 	m := v.dctrl
-	actor := v.resolveConceptActorLocked()
-	if actor == nil {
+	runner := v.DeployRunner
+	if runner == nil {
 		m.stage = dcStageResult
-		m.result = "ERROR: no connected cluster"
+		m.result = "ERROR: deploy runner not wired"
 		m.resultOK = false
 		v.requestRedrawLocked()
 		return
 	}
+	env := v.cutEnvLocked()
+	targetID := m.targetID
 	m.running = true
 	m.stage = dcStageResult
 	m.result = "Working..."
 	v.requestRedrawLocked()
 
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), deployActionTimeout)
-		defer cancel()
-		res, err := fn(ctx, actor)
-		line, ok := formatActionOutcome(res, err)
+		line, ok := runner(env, action, targetID)
 
 		v.mu.Lock()
 		if v.dctrl == m { // modal could have been closed mid-flight
@@ -374,27 +379,15 @@ func (v *View) fireSuggestLocked() {
 }
 
 func (v *View) fireCutLocked() {
-	m := v.dctrl
-	env, bump := m.env, m.bump
-	v.runConceptAction(func(ctx context.Context, a deployConceptActions) (client.ActionResult, error) {
-		// Empty explicit version: the server computes the next semver from
-		// the bump. SuggestNextVersion already previewed it.
-		return a.CutVersion(ctx, env, bump, "")
-	})
+	v.runDeployRunnerLocked("cut")
 }
 
 func (v *View) fireDeployLocked() {
-	id := v.dctrl.targetID
-	v.runConceptAction(func(ctx context.Context, a deployConceptActions) (client.ActionResult, error) {
-		return a.Deploy(ctx, id)
-	})
+	v.runDeployRunnerLocked("deploy")
 }
 
 func (v *View) fireRollbackConceptLocked() {
-	id := v.dctrl.targetID
-	v.runConceptAction(func(ctx context.Context, a deployConceptActions) (client.ActionResult, error) {
-		return a.RollbackDeployment(ctx, id)
-	})
+	v.runDeployRunnerLocked("rollback")
 }
 
 // -----------------------------------------------------------------------------

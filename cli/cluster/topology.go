@@ -157,6 +157,19 @@ type View struct {
 	// so a cluster switch transparently retargets.
 	DeployClient func() *client.DeployControlClient
 
+	// DeployRunner routes the Deployments controls to the blessed
+	// deployEngineCluster automation path (the `deploy` subcommand /
+	// embedded runner) instead of the retired DeployControlService gRPC,
+	// which a bff-role node (including cockpit-bff) does NOT serve. It is
+	// injected from main.go via AppConfig because main.go can import
+	// cmd/.../internal/deploy while cli/** cannot (Go internal visibility).
+	// action ∈ {deploy, cut, rollback}; returns a result line + ok. Only
+	// "deploy" maps to an automation today (env-level forward deploy);
+	// cut / historical-rollback report "not available on the automation
+	// path" pending the owner-gated retirement (memql#2229). See
+	// znasllc-io/memql-cockpit#292.
+	DeployRunner func(env, action, targetID string) (string, bool)
+
 	// OnRedraw, when set, requests a repaint of the topology pane.
 	// Wired to App.postRedraw in app.go so an async deploy action's
 	// result line lands on screen the moment the SDK call returns,

@@ -41,6 +41,12 @@ type AppConfig struct {
 	Cluster config.ClusterConfig
 	Logger  *slog.Logger
 	Version string
+
+	// DeployRunner routes the Deployments controls to the blessed
+	// deployEngineCluster automation path. Built in main.go (which can
+	// import cmd/.../internal/deploy) and threaded to the topology view.
+	// nil disables the controls with a clear message. See #292.
+	DeployRunner func(env, action, targetID string) (string, bool)
 }
 
 // App is the top-level TUI application.
@@ -1358,6 +1364,12 @@ func (a *App) wireCluster() {
 		}
 		return client.NewDeployControlClient(conn)
 	}
+
+	// DeployRunner (znasllc-io/memql-cockpit#292): the Deployments C/G/B
+	// controls fire through the deployEngineCluster automation path, not the
+	// DeployControlService gRPC (identity-only; a bff-role node never serves
+	// it). Injected from main.go via AppConfig; nil disables with a message.
+	a.clustersView.Topology.DeployRunner = a.config.DeployRunner
 
 	// ApplyComposition cuts-from-composition (memql-cockpit#253): cut a new
 	// patch version for env (the DeployControl gate is enforced server-side),

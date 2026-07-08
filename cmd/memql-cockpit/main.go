@@ -17,7 +17,7 @@
 // The built-in "local" cluster is a name slot with no baked-in
 // endpoint. `genesis init` reads IDENTITY_BOOTSTRAP_DOMAIN from the
 // operator's .env and seeds the local row in ~/.memql/clusters.yaml
-// with `https://bff.${DOMAIN}`. The TUI shows "not configured" until
+// with `https://cockpit.${DOMAIN}`. The TUI shows "not configured" until
 // that bootstrap (or an explicit `L:Authorize`) has happened.
 package main
 
@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -49,6 +50,60 @@ import (
 // source of truth (see VERSIONING.md); this constant tracks the
 // VERSION file and is bumped together with it on each release.
 const version = "0.9.0"
+
+// deployRunner routes the Deployments C/G/B controls to the blessed
+// deployEngineCluster automation path (znasllc-io/memql-cockpit#292). It runs
+// THIS binary's `deploy` subcommand for a forward env-level deploy (the only
+// automation in the bundle), capturing its output so nothing corrupts the
+// TUI. Cut / historical-rollback have no automation equivalent and are slated
+// for owner-gated retirement (memql#2229), so they report that honestly
+// instead of dialing the identity-only DeployControlService that a bff-role
+// node (including cockpit-bff) never serves.
+func deployRunner(env, action, targetID string) (string, bool) {
+	switch action {
+	case "deploy":
+		exe, err := os.Executable()
+		if err != nil {
+			return "ERROR: locate cockpit binary: " + err.Error(), false
+		}
+		args := []string{"deploy", "--apply"}
+		if strings.TrimSpace(env) != "" {
+			args = append(args, "--env="+env)
+		}
+		out, runErr := exec.Command(exe, args...).CombinedOutput()
+		s := string(out)
+		line := lastMeaningfulLine(s)
+		// The subcommand exits 0 even when it BLOCKS on a missing engine DB
+		// (the honest owner-gated report). A real success is exit 0 with no
+		// BLOCKED / ERROR marker in the captured output.
+		ok := runErr == nil && !strings.Contains(s, "BLOCKED") && !strings.Contains(s, "ERROR")
+		if line == "" {
+			if runErr != nil {
+				line = "deploy failed: " + runErr.Error()
+			} else {
+				line = "deploy completed (no output)"
+			}
+		}
+		return line, ok
+	case "cut", "rollback":
+		return "not available on the automation deploy path yet (memql#2229) -- " +
+			"use G to deploy the current spec, or `memql-cockpit deploy` / the identity /admin/deployments portal", false
+	default:
+		return "unknown deploy action: " + action, false
+	}
+}
+
+// lastMeaningfulLine returns the last non-empty, trimmed line of s -- the
+// deploy subcommand's final status line -- for surfacing in the TUI result.
+func lastMeaningfulLine(s string) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if t := strings.TrimSpace(lines[i]); t != "" {
+			return t
+		}
+	}
+	return ""
+}
 
 func main() {
 	// Repo-root .env override sits above whatever genesis sealed in,
@@ -158,9 +213,10 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	app := cli.NewApp(cli.AppConfig{
-		Cluster: cluster,
-		Logger:  logger,
-		Version: version,
+		Cluster:      cluster,
+		Logger:       logger,
+		Version:      version,
+		DeployRunner: deployRunner,
 	})
 
 	errCh := make(chan error, 1)
