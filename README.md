@@ -70,7 +70,7 @@ node (the product-agnostic client edge) and launches the Cockpit against it, the
 tears the forward down on exit:
 
 ```bash
-make run                           # build + auto port-forward svc/bff + launch
+make run-local                     # build + auto port-forward svc/bff + launch (guards against a non-local kube-context)
 make forward                       # port-forward the bff edge only (for SDKs / other clients)
 ```
 
