@@ -12,7 +12,7 @@ require (
 	github.com/jezek/xgbutil v0.0.0-20260124183602-9fd151d6a51a
 	github.com/znasllc-io/memql v0.0.0-20260623073124-7c7d1350e667
 	golang.org/x/image v0.43.0
-	golang.org/x/sys v0.46.0
+	golang.org/x/sys v0.47.0
 	golang.org/x/term v0.44.0
 	google.golang.org/grpc v1.82.0
 	google.golang.org/protobuf v1.36.11
