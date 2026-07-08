@@ -36,6 +36,27 @@ all: cockpit
 cockpit:
 	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/memql-cockpit ./cmd/memql-cockpit
 
+# ---------------------------------------------------------------------------
+# Run / connect (local k3d cluster)
+# ---------------------------------------------------------------------------
+# The port-forward is LOCAL access config only. In staging/prod the Cockpit
+# reaches the SAME bff node via the cockpit.<domain> ingress
+# (deploy/k8s/cockpit-front-door.yaml): `memql-cockpit --cluster staging`.
+.PHONY: run forward
+
+MEMQL_NS ?= memql
+BFF_SVC  ?= bff
+BFF_PORT ?= 50051
+
+## Connect the Cockpit to a local cluster (builds, then auto port-forwards the bff edge)
+run: cockpit
+	@MEMQL_NS=$(MEMQL_NS) BFF_SVC=$(BFF_SVC) BFF_PORT=$(BFF_PORT) bash scripts/run-local.sh $(ARGS)
+
+## Port-forward only the bff edge to localhost:$(BFF_PORT) (for SDKs / other clients)
+forward:
+	@echo "port-forward svc/$(BFF_SVC) ($(MEMQL_NS)) -> localhost:$(BFF_PORT) (ctrl-c to stop)"
+	kubectl port-forward -n $(MEMQL_NS) svc/$(BFF_SVC) $(BFF_PORT):$(BFF_PORT)
+
 ## Build Cockpit for macOS Apple Silicon
 cockpit-darwin-arm64:
 	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BIN_DIR)/memql-cockpit-darwin-arm64 ./cmd/memql-cockpit

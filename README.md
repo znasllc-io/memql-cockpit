@@ -64,10 +64,25 @@ genesis envelope — see [docs/deploy-runner.md](docs/deploy-runner.md).
 
 ## Run
 
+Against a **local k3d cluster** (engine brought up with `make up` in the memql
+repo), one command builds and connects — it auto port-forwards the engine `bff`
+node (the product-agnostic client edge) and launches the Cockpit against it, then
+tears the forward down on exit:
+
 ```bash
-./bin/memql-cockpit                # main IDE (multi-tab TUI)
-./bin/memql-cockpit worker run     # run as a per-user worker (HEADLESS; the gui build adds GUI)
-./bin/memql-cockpit-gui worker setup  # one-time GUI worker setup wizard
+make run                           # build + auto port-forward svc/bff + launch
+make forward                       # port-forward the bff edge only (for SDKs / other clients)
+```
+
+The port-forward is **local access config only**. In staging/prod the Cockpit
+reaches the *same* bff node via the `cockpit.<domain>` front-door ingress, so
+there you connect with a named cluster instead — same binary, config-driven:
+
+```bash
+./bin/memql-cockpit --cluster staging   # endpoint from ~/.memql/clusters.yaml
+./bin/memql-cockpit --endpoint <host>   # or an explicit gRPC endpoint
+./bin/memql-cockpit worker run          # run as a per-user worker (HEADLESS; the gui build adds GUI)
+./bin/memql-cockpit-gui worker setup    # one-time GUI worker setup wizard
 ```
 
 Cluster config lives at `~/.memql/clusters.yaml`; worker config at
