@@ -433,15 +433,16 @@ func handleLogoutCmd(args []string) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-// defaultLocalEndpoint is the port-forward target the `local` cluster is
-// reached on (see `make forward`: kubectl port-forward svc/bff 50051). Local is
-// just another clusters.yaml entry -- the ONLY thing that differs from
-// staging/prod is this endpoint (a port-forward vs an ingress). clusters.yaml
-// wins if it sets one; otherwise this default lets `run --cluster local` work
-// out of the box.
-const defaultLocalEndpoint = "localhost:50051"
+// defaultLocalEndpoint is where the `local` cluster is reached. Local is just
+// another clusters.yaml entry with the SAME https://cockpit.<domain> shape as
+// staging/prod -- fronted by the cluster's own ingress (locally the k3s traefik
+// front door at cockpit.local.znas.io with the mkcert `*.local.znas.io`
+// wildcard; in the cloud an nginx/cert-manager ingress). Only the domain +
+// cert/DNS source differ (config, not topology): no port-forward, no special
+// local dial path. clusters.yaml wins if it sets one.
+const defaultLocalEndpoint = "https://cockpit.local.znas.io"
 
-// withLocalDefault fills in the localhost:50051 endpoint for the `local`
+// withLocalDefault fills in the cockpit.local.znas.io endpoint for the `local`
 // cluster when the yaml left it blank.
 func withLocalDefault(c config.ClusterConfig) config.ClusterConfig {
 	if c.Name == "local" && strings.TrimSpace(c.Endpoint) == "" {
@@ -474,7 +475,7 @@ func resolveCluster(clusterName, endpoint string) (config.ClusterConfig, error) 
 	}
 
 	// No --cluster, no --endpoint: fall back to "local" (clusters.yaml wins,
-	// else the localhost:50051 port-forward default).
+	// else the https://cockpit.local.znas.io ingress default).
 	clusters, err := config.LoadClusters()
 	if err == nil {
 		if local, ok := clusters.Get("local"); ok {
