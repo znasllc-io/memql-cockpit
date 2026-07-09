@@ -108,33 +108,33 @@ genesis envelope — see [docs/deploy-runner.md](docs/deploy-runner.md).
 
 **One command for every environment.** `make run` builds the binary and
 connects to the cluster selected in `~/.memql/clusters.yaml`. Local, staging,
-and prod are all just entries there — the experience is identical; the only
-thing that changes per environment is the **endpoint** in the config (a
-port-forward locally, an ingress in staging/prod). Extra flags reach the binary
-via `ARGS=...`.
+and prod are all just entries there, all reached the **same way** —
+`https://cockpit.<domain>` over a TLS ingress. The topology and the dial path
+are identical; only the **config** (domain, cert source, DNS) differs per
+environment ([environment parity](https://github.com/znasllc-io/memql/blob/main/docs/public/operate/environment-parity.md)).
+Extra flags reach the binary via `ARGS=...`.
 
 ```bash
 make run                            # the active clusters.yaml cluster
-make run ARGS="--cluster local"     # the local k3d cluster
-make run ARGS="--cluster staging"   # staging
-make run ARGS="--endpoint host:50051"   # or an explicit endpoint
+make run ARGS="--cluster local"     # local  → https://cockpit.local.znas.io
+make run ARGS="--cluster staging"   # staging → https://cockpit.staging.<domain>
 make run-computeruse                # same, but the computer-use variant
 ```
 
-**Local access.** A local k3d cluster (engine brought up with `make up` in the
-memql repo) has no ingress, so it's reached over a port-forward — the local
-equivalent of the `cockpit.<domain>` ingress that fronts staging/prod. Start it
-in another terminal, then `run` exactly as above:
+**Local, same as the cloud.** Bring the engine up (`make up` in the memql repo)
+and the local cluster serves `https://cockpit.local.znas.io` through its own
+traefik ingress (TLS with the mkcert `*.local.znas.io` wildcard) — the local
+analog of the `cockpit.<domain>` ingress in staging/prod. So `make run
+--cluster local` connects with **no port-forward**, exactly like staging. The
+`local` entry defaults to `https://cockpit.local.znas.io` (needs the mkcert cert
++ a `*.local.znas.io` hosts entry, both already required for
+`identity.local.znas.io`).
 
-```bash
-make forward                        # port-forward svc/bff -> localhost:50051
-make run ARGS="--cluster local"     # connect (local defaults to localhost:50051)
-```
-
-The `local` cluster defaults to `localhost:50051`; override any cluster's
-endpoint/auth in `~/.memql/clusters.yaml` (worker config lives at
-`~/.memql/worker.yaml`). The install scripts under `scripts/install/` register a
-LaunchAgent (macOS) or systemd user service (Linux).
+For low-level gRPC debugging only, `make forward` still port-forwards
+`svc/bff → localhost:50051` — but it is **not** part of the connection path.
+Override any cluster's endpoint/auth in `~/.memql/clusters.yaml`; the install
+scripts under `scripts/install/` register a LaunchAgent (macOS) or systemd user
+service (Linux).
 
 ### Command reference
 
