@@ -1,4 +1,4 @@
-//go:build gui
+//go:build computeruse
 
 package worker
 
@@ -23,7 +23,7 @@ import (
 //
 // Dispatches between two implementations:
 //
-//   - Single-panel TUI (cli/ui + cli/canvas, see wizard_gui.go).
+//   - Single-panel TUI (cli/ui + cli/canvas, see wizard_computeruse.go).
 //     The default path on every interactive terminal session.
 //   - Plain printf, with the same probe logic. Used when stdin or
 //     stdout is not a TTY (CI, install scripts, piped output) so
@@ -62,7 +62,7 @@ func runSetupWizard() error {
 // rendered as scrolling stdout text instead of a tcell single
 // panel.
 func runSetupPrintf() error {
-	fmt.Println("memql-cockpit-gui worker setup")
+	fmt.Println("memql-cockpit-computeruse worker setup")
 	fmt.Println(strings.Repeat("=", 60))
 	fmt.Println()
 
@@ -91,7 +91,7 @@ func runSetupMacOS() error {
 	fmt.Println("BINARY. Running this wizard from Terminal probes whether")
 	fmt.Println("the call SUCCEEDS, which can be true because Terminal")
 	fmt.Println("already has the permission and child processes inherit.")
-	fmt.Println("When the LaunchAgent runs cockpit-gui detached at login,")
+	fmt.Println("When the LaunchAgent runs memql-cockpit-computeruse detached at login,")
 	fmt.Println("the binary needs ITS OWN entry under System Settings ->")
 	fmt.Println("Privacy & Security. The wizard now also reports the per-")
 	fmt.Println("binary status from `tccutil` so you can tell the two")
@@ -109,9 +109,9 @@ func runSetupMacOS() error {
 		fmt.Println()
 		fmt.Println("  Accessibility is DENIED in this process tree.")
 		fmt.Println("  Open System Settings -> Privacy & Security -> Accessibility")
-		fmt.Println("  and approve EITHER memql-cockpit-gui OR your terminal app.")
+		fmt.Println("  and approve EITHER memql-cockpit-computeruse OR your terminal app.")
 		fmt.Println("  If you plan to run as a LaunchAgent later, you must")
-		fmt.Println("  approve the cockpit-gui binary directly.")
+		fmt.Println("  approve the memql-cockpit-computeruse binary directly.")
 		fmt.Println()
 		if !waitForKey("Press Enter after approving (or Ctrl-C to abort)...") {
 			return errors.New("setup cancelled")
@@ -137,9 +137,9 @@ func runSetupMacOS() error {
 		fmt.Println()
 		fmt.Println("  Screen Recording is DENIED in this process tree.")
 		fmt.Println("  Open System Settings -> Privacy & Security -> Screen Recording")
-		fmt.Println("  and approve EITHER memql-cockpit-gui OR your terminal app.")
+		fmt.Println("  and approve EITHER memql-cockpit-computeruse OR your terminal app.")
 		fmt.Println("  If you plan to run as a LaunchAgent later, you must")
-		fmt.Println("  approve the cockpit-gui binary directly.")
+		fmt.Println("  approve the memql-cockpit-computeruse binary directly.")
 		fmt.Println()
 		if !waitForKey("Press Enter after approving (or Ctrl-C to abort)...") {
 			return errors.New("setup cancelled")
@@ -160,17 +160,17 @@ func runSetupMacOS() error {
 	fmt.Printf("  display:   %dx%d\n", width, height)
 	fmt.Printf("  cursor:    (%d,%d)\n", x, y)
 	fmt.Println()
-	fmt.Println("SUCCESS: cockpit-gui worker permissions look good.")
+	fmt.Println("SUCCESS: memql-cockpit-computeruse worker permissions look good.")
 	fmt.Println()
 	fmt.Println("Next steps:")
 	fmt.Println("  1. Configure ~/.memql/worker.yaml (cluster_url + token).")
-	fmt.Println("  2. Run `memql-cockpit-gui worker run` to start serving.")
+	fmt.Println("  2. Run `memql-cockpit-computeruse worker run` to start serving.")
 	fmt.Println()
 	fmt.Println("If you'll run this as a LaunchAgent: install via")
 	fmt.Println("`scripts/install/install-mac.sh` -- it loads the agent and")
 	fmt.Println("the FIRST time the LaunchAgent process tries Accessibility")
 	fmt.Println("or Screen Recording, macOS will prompt you separately for")
-	fmt.Println("the cockpit-gui binary itself (a different TCC entry from")
+	fmt.Println("the memql-cockpit-computeruse binary itself (a different TCC entry from")
 	fmt.Println("Terminal). Approve that prompt to make the agent work at login.")
 	return nil
 }
@@ -252,7 +252,7 @@ func probeAccessibility() (bool, string) {
 // timeout below is defensive; the cgo call itself returns in
 // microseconds.
 //
-// On Linux / Windows builds (gui-tagged but non-darwin) the wrapper
+// On Linux / Windows builds (computeruse-tagged but non-darwin) the wrapper
 // always reports true -- there's no system-level TCC ledger to
 // preflight against; downstream capture failures surface as runtime
 // errors rather than pre-flight denials.
@@ -277,7 +277,7 @@ func probeScreenRecording() (bool, string) {
 			resCh <- result{true, "CGPreflightScreenCaptureAccess returned granted"}
 			return
 		}
-		resCh <- result{false, "CGPreflightScreenCaptureAccess returned denied -- approve cockpit-gui (or its parent Terminal) under System Settings -> Privacy & Security -> Screen Recording"}
+		resCh <- result{false, "CGPreflightScreenCaptureAccess returned denied -- approve memql-cockpit-computeruse (or its parent Terminal) under System Settings -> Privacy & Security -> Screen Recording"}
 	}()
 	select {
 	case r := <-resCh:
@@ -342,7 +342,7 @@ func runSetupLinux() error {
 		fmt.Println("  workerComputer input + screenshot action will return")
 		fmt.Println("  display_server_unsupported.")
 		fmt.Println()
-		fmt.Println("  Action: log into an X11 (Xorg) session to enable GUI")
+		fmt.Println("  Action: log into an X11 (Xorg) session to enable computer-use")
 		fmt.Println("  actions, or register the worker HEADLESS-only (the")
 		fmt.Println("  install-linux.sh installer detects Wayland and does")
 		fmt.Println("  this for you).")

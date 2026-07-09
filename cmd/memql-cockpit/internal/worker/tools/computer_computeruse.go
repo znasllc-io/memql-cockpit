@@ -1,4 +1,4 @@
-//go:build gui
+//go:build computeruse
 
 package tools
 
@@ -17,9 +17,9 @@ import (
 )
 
 // computerActionHandlers is the single source of truth for the
-// GUI-backed workerComputer actions this build supports. The
+// computer-use-backed workerComputer actions this build supports. The
 // dispatcher routes through it AND the capability descriptor
-// (capabilities_gui.go) derives its advertised action list from it,
+// (capabilities_computeruse.go) derives its advertised action list from it,
 // so the two can never drift (memql-cockpit#162).
 //
 // The `capabilities` and `wait` actions are absent -- they are
@@ -27,7 +27,7 @@ import (
 // consulted (capabilities.go / wait.go).
 //
 // window_list / window_focus (memql-cockpit#167) are real on macOS
-// (CGWindowList) and Linux/X11 (EWMH); on Wayland and other gui
+// (CGWindowList) and Linux/X11 (EWMH); on Wayland and other computeruse
 // platforms their handlers return a structured
 // unsupported_on_platform failure -- consumers should read the
 // descriptor's displayServer field alongside the action list.
@@ -50,12 +50,12 @@ var computerActionHandlers = map[string]func(map[string]any) (*memqlv1.Success, 
 
 // dispatchComputer routes workerComputer.<action> to the matching
 // RobotGo-backed implementation. The default-build sibling
-// (computer.go, //go:build !gui) returns Unimplemented.
+// (computer.go, //go:build !computeruse) returns Unimplemented.
 //
-// Handlers run on the cockpit-gui process; macOS TCC permissions
+// Handlers run on the memql-cockpit-computeruse process; macOS TCC permissions
 // (Accessibility for input, Screen Recording for screenshot) are
 // required and probed at startup -- see worker.PermissionStatus
-// and `memql-cockpit-gui worker setup` for the operator wizard.
+// and `memql-cockpit-computeruse worker setup` for the operator wizard.
 func (d *Dispatcher) dispatchComputer(ctx context.Context, action string, args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	_ = ctx
 	if handler, ok := computerActionHandlers[action]; ok {
@@ -235,7 +235,7 @@ func guiCursorPosition(_ map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 // gate's strict-mode region exemption (memql-cockpit#131). The
 // dispatcher calls it just before gating a workerComputer.mouse_click
 // so an in-region click can skip the per-action approval modal.
-// Always Known=true on the GUI build; the headless stub returns false.
+// Always Known=true on the computer-use build; the headless stub returns false.
 func cursorLocation() (x, y int, known bool) {
 	x, y = robotgo.Location()
 	return x, y, true
@@ -746,7 +746,7 @@ func guiDisplayInfo(_ map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	}, fmt.Sprintf("%dx%d, %d display(s)", width, height, len(displays)), 0), nil
 }
 
-// guiWindowList / guiWindowFocus live in window_gui.go with their
+// guiWindowList / guiWindowFocus live in window_computeruse.go with their
 // platform backends in window_gui_{darwin,linux,other}.go
 // (memql-cockpit#167).
 

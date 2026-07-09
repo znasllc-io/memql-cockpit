@@ -180,12 +180,12 @@ func cockpitBuildTag() string {
 	if buildTagOverride != "" {
 		return buildTagOverride
 	}
-	return "nogui"
+	return "headless"
 }
 
-// buildTagOverride is set at link/init time by the gui-tagged
-// platform layer to "gui". The default build leaves it empty so
-// cockpitBuildTag() reports "nogui".
+// buildTagOverride is set at link/init time by the computeruse-tagged
+// platform layer to "computeruse". The default build leaves it empty so
+// cockpitBuildTag() reports "headless".
 var buildTagOverride string
 
 // probePermissions performs the platform-specific permissions

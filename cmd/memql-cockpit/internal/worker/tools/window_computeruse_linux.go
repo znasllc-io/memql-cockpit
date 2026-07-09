@@ -1,4 +1,4 @@
-//go:build gui && linux
+//go:build computeruse && linux
 
 package tools
 

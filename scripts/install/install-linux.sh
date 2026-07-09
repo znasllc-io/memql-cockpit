@@ -24,8 +24,8 @@ Required:
 
 Options:
     --name <name>             Worker name (default: hostname -s)
-    --gui                     Install the GUI variant. Wayland only
-                              registers HEADLESS; X11 enables GUI.
+    --computeruse                     Install the computer-use variant. Wayland only
+                              registers HEADLESS; X11 enables the COMPUTERUSE capability.
     --user-local              Install under \$HOME/.memql/bin instead of
                               /usr/local/bin. Use when sudo isn't
                               available (CI, restricted environments).
@@ -54,7 +54,7 @@ function parse_args() {
             --token)         TOKEN="$2"; shift 2 ;;
             --cluster)       CLUSTER_URL="$2"; shift 2 ;;
             --name)          NAME="$2"; shift 2 ;;
-            --gui)           FLAVOUR="gui"; shift ;;
+            --computeruse)           FLAVOUR="computeruse"; shift ;;
             --user-local)    INSTALL_MODE="user-local"; shift ;;
             --download-base) DOWNLOAD_BASE="$2"; shift 2 ;;
             --force)         FORCE="yes"; shift ;;
@@ -84,8 +84,8 @@ function install_binary() {
     binary="$(binary_name_for "$FLAVOUR")"
     local url="${DOWNLOAD_BASE}/${binary}"
     local friendly_name
-    if [[ "$FLAVOUR" == "gui" ]]; then
-        friendly_name="memql-cockpit-gui"
+    if [[ "$FLAVOUR" == "computeruse" ]]; then
+        friendly_name="memql-cockpit-computeruse"
     else
         friendly_name="memql-cockpit"
     fi
@@ -96,11 +96,11 @@ function install_binary() {
 function write_config() {
     local path="${HOME}/.memql/worker.yaml"
     local capabilities="HEADLESS"
-    if [[ "$FLAVOUR" == "gui" ]]; then
+    if [[ "$FLAVOUR" == "computeruse" ]]; then
         if [[ -n "${WAYLAND_DISPLAY:-}" && -z "${DISPLAY:-}" ]]; then
-            echo "INFO: Wayland detected; registering HEADLESS only (X11 required for GUI)"
+            echo "INFO: Wayland detected; registering HEADLESS only (X11 required for COMPUTERUSE)"
         else
-            capabilities="HEADLESS,GUI"
+            capabilities="HEADLESS,COMPUTERUSE"
         fi
     fi
 
@@ -113,7 +113,7 @@ labels:
   arch: $(detect_arch)
 concurrency:
   HEADLESS: 8
-  GUI: 1
+  COMPUTERUSE: 1
 state_dir: ${HOME}/.memql/state
 log_level: info
 capabilities:

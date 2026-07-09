@@ -12,7 +12,7 @@ import (
 // have one or both as pipes, which is the signal to use the printf
 // fallback.
 //
-// Lives in a tag-free file because both the gui-tagged TCC wizard
+// Lives in a tag-free file because both the computeruse-tagged TCC wizard
 // and the (always-built) pair wizard use it.
 func isInteractiveTTY() bool {
 	return term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd()))

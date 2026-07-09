@@ -8,8 +8,8 @@ import (
 // These tests cover the build-agnostic window helpers (window.go):
 // the wire shape window_list emits and the windowId argument
 // parsing window_focus does. They run on the headless CI build AND
-// the local gui-tagged build -- the platform listers themselves are
-// exercised by the gui-tagged smoke test (window_gui_darwin_test.go).
+// the local computeruse-tagged build -- the platform listers themselves are
+// exercised by the computeruse-tagged smoke test (window_gui_darwin_test.go).
 
 func TestWindowListPayload_WireShape(t *testing.T) {
 	wins := []WindowInfo{

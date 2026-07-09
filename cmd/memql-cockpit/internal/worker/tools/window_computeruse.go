@@ -1,4 +1,4 @@
-//go:build gui
+//go:build computeruse
 
 package tools
 
@@ -15,9 +15,9 @@ import (
 //	listWindows() ([]WindowInfo, *memqlv1.Failure)
 //	focusWindow(id uint64) (app, method string, fail *memqlv1.Failure)
 //
-// implemented by window_gui_darwin.go (CGWindowList + app
-// activation), window_gui_linux.go (EWMH over X11; structured
-// unsupported error on Wayland), and window_gui_other.go (structured
+// implemented by window_computeruse_darwin.go (CGWindowList + app
+// activation), window_computeruse_linux.go (EWMH over X11; structured
+// unsupported error on Wayland), and window_computeruse_other.go (structured
 // unsupported error elsewhere).
 
 // guiWindowList enumerates on-screen top-level windows.

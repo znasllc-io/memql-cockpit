@@ -177,9 +177,9 @@ func getTestWindow(t *testing.T) time.Duration {
 //
 // Shared scaffolding for the per-build-tag variants
 // (memql-cockpit#171): the headless build asserts Known=false (its
-// cursorLocation stub), the gui build asserts the live-cursor path
+// cursorLocation stub), the computeruse build asserts the live-cursor path
 // (Known=true). The gate denies, so the per-action handler never
-// runs and no real input is ever driven; on the gui build
+// runs and no real input is ever driven; on the computeruse build
 // cursorLocation() only reads robotgo.Location().
 func mouseClickAllowsAtCursor(t *testing.T) consent.CursorPoint {
 	t.Helper()

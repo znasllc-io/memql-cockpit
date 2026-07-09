@@ -1,4 +1,4 @@
-//go:build linux && gui
+//go:build linux && computeruse
 
 package worker
 
@@ -19,7 +19,7 @@ import (
 // structured `display_server_unsupported` instead of an opaque
 // RobotGo error.
 //
-// Linux-only, GUI-only. On every other platform / build
+// Linux-only, computeruse-only. On every other platform / build
 // configuration the hook stays nil and the dispatcher skips the
 // check.
 func init() {

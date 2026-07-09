@@ -1,6 +1,6 @@
 // Package tools holds the cockpit-side tool implementations the
 // worker dispatches against. Headless tools (workerHost.*) are
-// always built. GUI tools (workerComputer.*) live behind a build
+// always built. computer-use tools (workerComputer.*) live behind a build
 // tag and reduce to "Unimplemented" on the default build.
 package tools
 
@@ -134,7 +134,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, dispatch *memqlv1.ToolDispatc
 		// (memql-cockpit#131). mouse_click carries no coordinates of
 		// its own -- positioning happens via a preceding mouse_move
 		// -- so the region check reads where the cursor actually is
-		// at dispatch time. cursorLocation() is GUI-build-backed;
+		// at dispatch time. cursorLocation() is computer-use-build-backed;
 		// the headless stub returns Known=false, which AllowsAt
 		// treats as out-of-region (falls through to the gate).
 		var dec consent.Decision
@@ -167,7 +167,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, dispatch *memqlv1.ToolDispatc
 		// `capabilities` is build-agnostic introspection
 		// (memql-cockpit#162): route it BEFORE the per-build
 		// dispatchComputer so the headless build answers honestly
-		// (guiAvailable=false, actions=[]) instead of rejecting
+		// (computerUseAvailable=false, actions=[]) instead of rejecting
 		// with gui_unavailable. It is the one workerComputer action
 		// that must work on every build variant.
 		//
@@ -178,7 +178,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, dispatch *memqlv1.ToolDispatc
 		// short-circuits with a structured remediation hint instead
 		// of letting RobotGo fail or panic downstream.
 		// `wait` (memql-cockpit#166) is the second build-agnostic
-		// action: a bounded sleep that needs no GUI backend and no
+		// action: a bounded sleep that needs no computer-use backend and no
 		// platform permission, so it routes alongside `capabilities`,
 		// before the per-build router AND before the preflights.
 		if action == computerCapabilitiesAction {

@@ -1,11 +1,11 @@
-//go:build gui
+//go:build computeruse
 
 package tools
 
 import "testing"
 
-// TestDispatcher_MouseClickRoutesThroughAllowsAt_GUI is the gui half
-// of the build-tag split from memql-cockpit#171. On the gui build
+// TestDispatcher_MouseClickRoutesThroughAllowsAt_GUI is the computeruse half
+// of the build-tag split from memql-cockpit#171. On the computeruse build
 // cursorLocation() reads the live cursor via robotgo.Location() and
 // always reports Known=true, so the dispatcher must hand a known
 // position to AllowsAt for the strict-mode region exemption
@@ -17,6 +17,6 @@ import "testing"
 func TestDispatcher_MouseClickRoutesThroughAllowsAt_GUI(t *testing.T) {
 	cursor := mouseClickAllowsAtCursor(t)
 	if !cursor.Known {
-		t.Errorf("gui build must resolve the live cursor (Known=true); got %+v", cursor)
+		t.Errorf("computeruse build must resolve the live cursor (Known=true); got %+v", cursor)
 	}
 }

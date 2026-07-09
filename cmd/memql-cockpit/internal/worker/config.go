@@ -46,8 +46,8 @@ func Defaults() Config {
 			"hostname": hostname,
 		},
 		Concurrency: map[string]uint32{
-			"HEADLESS": 8,
-			"GUI":      1,
+			"HEADLESS":    8,
+			"COMPUTERUSE": 1,
 		},
 		Capabilities: []string{"HEADLESS"},
 	}
@@ -83,7 +83,7 @@ func LoadFile(path string) (Config, error) {
 		cfg.Name = hostname
 	}
 	if cfg.Concurrency == nil {
-		cfg.Concurrency = map[string]uint32{"HEADLESS": 8, "GUI": 1}
+		cfg.Concurrency = map[string]uint32{"HEADLESS": 8, "COMPUTERUSE": 1}
 	}
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "info"

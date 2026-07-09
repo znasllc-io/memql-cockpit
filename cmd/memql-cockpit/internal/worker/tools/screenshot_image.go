@@ -1,5 +1,5 @@
 // Screenshot image helpers (memql-cockpit#163). No build tag: pure
-// image-processing code extracted from the gui-tagged handler so CI
+// image-processing code extracted from the computeruse-tagged handler so CI
 // can compile and test it headlessly.
 
 package tools

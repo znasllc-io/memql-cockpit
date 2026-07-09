@@ -121,12 +121,12 @@ jobs:
         working-directory: memql-cockpit
         run: go vet ./...
 
-  # Compiles + vets the gui-tagged code (RobotGo etc.) on both supported
-  # platforms. Build + vet ONLY: `go test -tags gui` is deliberately omitted —
-  # CI runners are headless and the gui tests drive a real cursor/display
+  # Compiles + vets the computeruse-tagged code (RobotGo etc.) on both supported
+  # platforms. Build + vet ONLY: `go test -tags computeruse` is deliberately omitted —
+  # CI runners are headless and the computeruse tests drive a real cursor/display
   # (see #171). Keep the job name short; it appears in branch protection.
-  build-gui:
-    name: build-gui
+  build-computeruse:
+    name: build-computeruse
     strategy:
       fail-fast: false
       matrix:
@@ -157,9 +157,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libxtst-dev libxinerama-dev libxkbcommon-dev libxkbcommon-x11-dev libpng-dev libx11-dev libxi-dev
-      - name: go build (gui)
+      - name: go build (computeruse)
         working-directory: memql-cockpit
-        run: CGO_ENABLED=1 go build -tags gui ./...
-      - name: go vet (gui)
+        run: CGO_ENABLED=1 go build -tags computeruse ./...
+      - name: go vet (computeruse)
         working-directory: memql-cockpit
-        run: CGO_ENABLED=1 go vet -tags gui ./...
+        run: CGO_ENABLED=1 go vet -tags computeruse ./...

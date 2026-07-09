@@ -139,16 +139,16 @@ func RunPairWizard(opts PairOptions) error {
 	}
 	fmt.Printf("Wrote %s.\n", DefaultConfigPath())
 
-	// TCC pre-flight (gui builds only). On the headless build,
+	// TCC pre-flight (computeruse builds only). On the headless build,
 	// runSetupWizard is a no-op-with-print; we skip it entirely so
-	// the user doesn't see a confusing "no GUI required" splash.
-	if isInteractiveTTY() && BuildHasGUI() {
+	// the user doesn't see a confusing "no computer-use required" splash.
+	if isInteractiveTTY() && BuildHasComputerUse() {
 		fmt.Println()
 		fmt.Println("Running computer-use permissions check...")
 		if err := runSetupWizard(); err != nil {
 			// runSetupWizard writes its own diagnostics; the wizard
 			// continues into running the worker either way. A
-			// non-zero exit from setup is treated as "GUI tools may
+			// non-zero exit from setup is treated as "computer-use tools may
 			// be unavailable; HEADLESS still works."
 			logger.Warn("permissions wizard reported issues; proceeding HEADLESS-only", "error", err)
 		}
@@ -302,7 +302,7 @@ func offerLaunchAgentInstall(logger *slog.Logger) {
 	fmt.Println()
 	fmt.Println("Auto-start installed. The worker will run after every login.")
 	fmt.Println("If macOS prompts you for Accessibility / Screen Recording on the next login,")
-	fmt.Println("approve the cockpit-gui binary -- the LaunchAgent process is a separate TCC")
+	fmt.Println("approve the memql-cockpit-computeruse binary -- the LaunchAgent process is a separate TCC")
 	fmt.Println("entry from this Terminal session.")
 }
 

@@ -51,9 +51,9 @@ function detect_arch() {
 }
 
 # Pick the appropriate cockpit binary name for the requested
-# headless / gui flavour and the detected platform.
+# headless / computeruse flavour and the detected platform.
 function binary_name_for() {
-    local flavour="$1"  # "headless" or "gui"
+    local flavour="$1"  # "headless" or "computeruse"
     local os arch
     os="$(detect_os)"
     arch="$(detect_arch)"
@@ -61,8 +61,8 @@ function binary_name_for() {
         headless)
             echo "memql-cockpit-${os}-${arch}"
             ;;
-        gui)
-            echo "memql-cockpit-gui-${os}-${arch}"
+        computeruse)
+            echo "memql-cockpit-computeruse-${os}-${arch}"
             ;;
         *)
             echo "ERROR: unknown flavour $flavour" >&2
@@ -148,7 +148,7 @@ function require_sudo() {
 #
 #   INSTALL_BINARY_DEST     -- full path to the downloaded binary
 #   INSTALL_BINARY_FRIENDLY -- full path to the friendly symlink
-#                              (memql-cockpit / memql-cockpit-gui).
+#                              (memql-cockpit / memql-cockpit-computeruse).
 #
 # In system mode the install path is created via `sudo install
 # -m 0755 ...` so the destination is root-owned and the worker
@@ -219,7 +219,7 @@ labels:
   arch: $(detect_arch)
 concurrency:
   HEADLESS: 8
-  GUI: 1
+  COMPUTERUSE: 1
 state_dir: ${STATE_DIR_DEFAULT}
 log_level: info
 capabilities:

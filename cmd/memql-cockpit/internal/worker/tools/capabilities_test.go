@@ -1,4 +1,4 @@
-//go:build !gui
+//go:build !computeruse
 
 package tools
 
@@ -21,22 +21,22 @@ func fakeEnv(vars map[string]string) func(string) string {
 }
 
 func TestComputeCapabilities_Headless(t *testing.T) {
-	// This test file is !gui, so it always exercises the headless
-	// variant: guiAvailable=false, empty actions, displayServer
+	// This test file is !computeruse, so it always exercises the headless
+	// variant: computerUseAvailable=false, empty actions, displayServer
 	// "none" regardless of what the host env claims.
 	desc := computeCapabilities("linux", fakeEnv(map[string]string{
 		"DISPLAY":         ":0",
 		"WAYLAND_DISPLAY": "wayland-0",
 	}))
-	if desc.GUIAvailable {
-		t.Error("headless build must report guiAvailable=false")
+	if desc.ComputerUseAvailable {
+		t.Error("headless build must report computerUseAvailable=false")
 	}
 	if desc.DisplayServer != "none" {
 		t.Errorf("headless build must report displayServer=none regardless of env; got %q", desc.DisplayServer)
 	}
 	// Actions means "dispatchable actions" (memql-cockpit#166): the
 	// build-agnostic `wait` works headless, so it IS advertised even
-	// with guiAvailable=false. No GUI-backed action may appear.
+	// with computerUseAvailable=false. No computer-use-backed action may appear.
 	if len(desc.Actions) != 1 || desc.Actions[0] != "wait" {
 		t.Errorf(`headless build must advertise exactly ["wait"]; got %v`, desc.Actions)
 	}
@@ -117,8 +117,8 @@ func TestDispatcher_CapabilitiesWorksHeadless(t *testing.T) {
 	if err := json.Unmarshal(success.GetResultJson(), &desc); err != nil {
 		t.Fatalf("result is not valid descriptor JSON: %v (raw: %s)", err, success.GetResultJson())
 	}
-	if desc.GUIAvailable {
-		t.Error("headless dispatch must report guiAvailable=false")
+	if desc.ComputerUseAvailable {
+		t.Error("headless dispatch must report computerUseAvailable=false")
 	}
 	if len(desc.Actions) != 1 || desc.Actions[0] != "wait" {
 		t.Errorf(`headless dispatch must report actions=["wait"]; got %v`, desc.Actions)
@@ -175,7 +175,7 @@ func TestDispatcher_CapabilitiesGatedAsObserve(t *testing.T) {
 // TestDispatcher_OtherComputerActionsStillGuiUnavailable pins the
 // headless build's pre-existing behavior for every NON-capabilities
 // workerComputer action: gui_unavailable, not a silent success.
-// window_list / window_focus are real on the gui build since
+// window_list / window_focus are real on the computeruse build since
 // memql-cockpit#167 but must stay gui_unavailable here.
 func TestDispatcher_OtherComputerActionsStillGuiUnavailable(t *testing.T) {
 	d := NewDispatcher(quietLogger(), DefaultPolicy(), nil)

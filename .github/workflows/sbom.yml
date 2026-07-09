@@ -20,7 +20,7 @@ permissions:
 # workflow so the supply-chain story is uniform.
 #
 # memql-cockpit ships two binary variants from one module (headless
-# default + `gui` build tag). The SBOM produced here covers the
+# default + `computeruse` build tag). The SBOM produced here covers the
 # module-level dependency graph; per-binary SBOMs that reflect the
 # build-tagged subset are a separate exercise tracked in #65 (TBD).
 

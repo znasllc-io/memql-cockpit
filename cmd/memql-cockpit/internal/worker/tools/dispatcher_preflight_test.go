@@ -99,11 +99,11 @@ func TestDispatcher_AccessibilityPreflightLeavesScreenshotAlone(t *testing.T) {
 
 // TestDispatcher_AccessibilityPreflightTrueAdmits pins the admit
 // path: a hook that reports trusted lets input actions through to
-// the per-build router. Headless-only -- on the gui build an
+// the per-build router. Headless-only -- on the computeruse build an
 // admitted mouse_move would drive the real cursor.
 func TestDispatcher_AccessibilityPreflightTrueAdmits(t *testing.T) {
-	if buildHasGUI {
-		t.Skip("admit path would drive real input on the gui build; covered headless")
+	if buildHasComputerUse {
+		t.Skip("admit path would drive real input on the computeruse build; covered headless")
 	}
 	calls := 0
 	setPreflightHooks(t, func() bool { calls++; return true }, nil, nil)
@@ -119,7 +119,7 @@ func TestDispatcher_AccessibilityPreflightTrueAdmits(t *testing.T) {
 }
 
 // TestDispatcher_DisplayServerPreflightBlocksWayland: on a Wayland
-// session (linux && gui wires the hook to the #162 detection) every
+// session (linux && computeruse wires the hook to the #162 detection) every
 // input AND screenshot action fails with a structured
 // display_server_unsupported pointing at an X11/XWayland session,
 // instead of an opaque RobotGo failure.
@@ -166,8 +166,8 @@ func TestDispatcher_DisplayServerPreflightBlocksNone(t *testing.T) {
 // per-build router. Headless-only for the same reason as the
 // Accessibility admit test.
 func TestDispatcher_DisplayServerPreflightX11Admits(t *testing.T) {
-	if buildHasGUI {
-		t.Skip("admit path would drive real input on the gui build; covered headless")
+	if buildHasComputerUse {
+		t.Skip("admit path would drive real input on the computeruse build; covered headless")
 	}
 	setPreflightHooks(t, nil, nil, func() string { return "x11" })
 	d := NewDispatcher(quietLogger(), DefaultPolicy(), nil)
