@@ -106,50 +106,42 @@ genesis envelope — see [docs/deploy-runner.md](docs/deploy-runner.md).
 
 ## Run
 
-The `make run*` family builds the binary and launches the Cockpit; the
-members differ only in **where/how** they connect. Extra flags reach the
-binary via `ARGS=...` (e.g. `make run ARGS="--cluster staging"`).
-
-Against your **active cluster** — the current entry in
-`~/.memql/clusters.yaml`, or an explicit `--endpoint`:
-
-```bash
-make run                            # headless, active clusters.yaml cluster
-make run ARGS="--cluster staging"   # pick a named cluster from clusters.yaml
-make run-computeruse                # same connection, but the computer-use variant
-```
-
-Against a **local k3d cluster** (engine brought up with `make up` in the memql
-repo), one command builds and connects — it auto port-forwards the engine `bff`
-node (the product-agnostic client edge) and launches the Cockpit against it, then
-tears the forward down on exit:
+**One command for every environment.** `make run` builds the binary and
+connects to the cluster selected in `~/.memql/clusters.yaml`. Local, staging,
+and prod are all just entries there — the experience is identical; the only
+thing that changes per environment is the **endpoint** in the config (a
+port-forward locally, an ingress in staging/prod). Extra flags reach the binary
+via `ARGS=...`.
 
 ```bash
-make run-local                     # build + auto port-forward svc/bff + launch (guards against a non-local kube-context)
-make forward                       # port-forward the bff edge only (for SDKs / other clients)
+make run                            # the active clusters.yaml cluster
+make run ARGS="--cluster local"     # the local k3d cluster
+make run ARGS="--cluster staging"   # staging
+make run ARGS="--endpoint host:50051"   # or an explicit endpoint
+make run-computeruse                # same, but the computer-use variant
 ```
 
-The port-forward is **local access config only**. In staging/prod the Cockpit
-reaches the *same* bff node via the `cockpit.<domain>` front-door ingress, so
-there you connect with a named cluster instead — same binary, config-driven:
+**Local access.** A local k3d cluster (engine brought up with `make up` in the
+memql repo) has no ingress, so it's reached over a port-forward — the local
+equivalent of the `cockpit.<domain>` ingress that fronts staging/prod. Start it
+in another terminal, then `run` exactly as above:
 
 ```bash
-./bin/memql-cockpit --cluster staging          # endpoint from ~/.memql/clusters.yaml
-./bin/memql-cockpit --endpoint <host>          # or an explicit gRPC endpoint
-./bin/memql-cockpit worker run                 # run as a per-user worker (HEADLESS; the computer-use build adds COMPUTERUSE)
-./bin/memql-cockpit-computeruse worker setup   # one-time computer-use worker setup wizard
+make forward                        # port-forward svc/bff -> localhost:50051
+make run ARGS="--cluster local"     # connect (local defaults to localhost:50051)
 ```
 
-Cluster config lives at `~/.memql/clusters.yaml`; worker config at
-`~/.memql/worker.yaml`. The install scripts under `scripts/install/`
-register a LaunchAgent (macOS) or systemd user service (Linux).
+The `local` cluster defaults to `localhost:50051`; override any cluster's
+endpoint/auth in `~/.memql/clusters.yaml` (worker config lives at
+`~/.memql/worker.yaml`). The install scripts under `scripts/install/` register a
+LaunchAgent (macOS) or systemd user service (Linux).
 
 ### Command reference
 
 Every target is a thin wrapper over the binary or a helper script; the
 `make help` output is auto-generated from the same comments. The knobs
 in the third column are Make variables — pass them inline, e.g.
-`make run-local BFF_PORT=50051 CRED_STORE=keyring`.
+`make run CRED_STORE=keyring` or `make forward BFF_PORT=50051`.
 
 | Target | Purpose | Key ARGS / env | Example |
 |---|---|---|---|
@@ -157,11 +149,11 @@ in the third column are Make variables — pass them inline, e.g.
 | `make cockpit-computeruse` | Build the computer-use binary → `bin/memql-cockpit-computeruse` (CGO + RobotGo) | — | `make cockpit-computeruse` |
 | `make cockpit-all-platforms` | Cross-build headless for darwin/linux × arm64/amd64 | — | `make cockpit-all-platforms` |
 | `make cockpit-computeruse-all-platforms` | Cross-build the computer-use variant for all platforms | — | `make cockpit-computeruse-all-platforms` |
-| `make run` | Build + run headless against the active `clusters.yaml` cluster | `ARGS`, `CRED_STORE` | `make run ARGS="--cluster staging"` |
-| `make run-computeruse` | Build + run the computer-use variant against the active cluster | `ARGS`, `CRED_STORE` | `make run-computeruse` |
-| `make run-local` | Build + run against a **local k3d** cluster, auto port-forwarding `svc/bff` (guards the kube-context) | `ARGS`, `CRED_STORE`, `MEMQL_NS`, `BFF_SVC`, `BFF_PORT`, `MEMQL_ALLOW_CONTEXT` | `make run-local BFF_PORT=50051` |
-| `make forward` | Port-forward `svc/bff` only — no launch (for SDKs / other clients) | `MEMQL_NS`, `BFF_SVC`, `BFF_PORT` | `make forward BFF_PORT=50051` |
+| `make run` | Build + run against a `clusters.yaml` cluster (any environment) | `ARGS`, `CRED_STORE` | `make run ARGS="--cluster local"` |
+| `make run-computeruse` | Same as `run`, but the computer-use variant | `ARGS`, `CRED_STORE` | `make run-computeruse ARGS="--cluster staging"` |
+| `make forward` | Port-forward the local k3d `svc/bff` → `localhost:50051` (local access for `run`) | `MEMQL_NS`, `BFF_SVC`, `BFF_PORT` | `make forward BFF_PORT=50051` |
 | `make dist` | Package versioned `tar.gz` + `SHA256SUMS` into `dist/` (headless, all platforms) | — | `make dist` |
+| `make release` | Recommend the next version from commits; `ARGS="--cut"` to tag + release | `ARGS` | `make release ARGS="--cut"` |
 
 The knobs:
 
@@ -174,12 +166,7 @@ The knobs:
   default is unchanged (auto-probe → Keychain). See
   [Credential storage](#credential-storage).
 - **`MEMQL_NS` / `BFF_SVC` / `BFF_PORT`** — namespace / Service / local
-  port for the `run-local` + `forward` port-forward. Defaults: `memql` /
-  `bff` / `50051`.
-- **`MEMQL_ALLOW_CONTEXT`** — set to `1` to skip `run-local`'s guard that
-  the active kube-context is a local (`k3d-…`) cluster. Staging/prod use
-  the *same* `memql` namespace + `bff` Service, so the guard exists to
-  stop `run-local` silently forwarding to a remote cluster.
+  port for `make forward`. Defaults: `memql` / `bff` / `50051`.
 
 ### Computer use
 
