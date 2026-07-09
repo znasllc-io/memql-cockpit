@@ -107,28 +107,13 @@ function install_binary() {
 
 function write_config() {
     local path="${HOME}/.memql/worker.yaml"
-    write_worker_yaml "$path" "$CLUSTER_URL" "$TOKEN" "$NAME" "$FORCE"
+    # The computer-use variant additionally advertises COMPUTERUSE.
+    # macOS has no Wayland gate, so the flavour alone decides the set.
+    local capabilities="HEADLESS"
     if [[ "$FLAVOUR" == "computeruse" ]]; then
-        # Ensure the COMPUTERUSE capability is advertised.
-        cat > "$path" << YAML
-cluster_url: ${CLUSTER_URL}
-token: ${TOKEN}
-name: ${NAME}
-labels:
-  os: darwin
-  arch: $(detect_arch)
-concurrency:
-  HEADLESS: 8
-  COMPUTERUSE: 1
-state_dir: ${HOME}/.memql/state
-log_level: info
-capabilities:
-  - HEADLESS
-  - COMPUTERUSE
-YAML
-        chmod 600 "$path"
+        capabilities="HEADLESS,COMPUTERUSE"
     fi
-    echo "INFO: wrote $path"
+    write_worker_yaml "$path" "$CLUSTER_URL" "$TOKEN" "$NAME" "$FORCE" "$capabilities"
 }
 
 function install_launch_agent() {

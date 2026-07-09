@@ -95,6 +95,11 @@ function install_binary() {
 
 function write_config() {
     local path="${HOME}/.memql/worker.yaml"
+    # The computer-use variant advertises COMPUTERUSE, but only on X11:
+    # RobotGo can't drive Wayland, so a Wayland session downgrades to
+    # HEADLESS-only. This platform-specific decision stays here; the
+    # shared renderer (write_worker_yaml) only emits what it is handed
+    # and honors --force.
     local capabilities="HEADLESS"
     if [[ "$FLAVOUR" == "computeruse" ]]; then
         if [[ -n "${WAYLAND_DISPLAY:-}" && -z "${DISPLAY:-}" ]]; then
@@ -103,24 +108,7 @@ function write_config() {
             capabilities="HEADLESS,COMPUTERUSE"
         fi
     fi
-
-    cat > "$path" << YAML
-cluster_url: ${CLUSTER_URL}
-token: ${TOKEN}
-name: ${NAME}
-labels:
-  os: linux
-  arch: $(detect_arch)
-concurrency:
-  HEADLESS: 8
-  COMPUTERUSE: 1
-state_dir: ${HOME}/.memql/state
-log_level: info
-capabilities:
-$(echo "$capabilities" | tr ',' '\n' | sed 's/^/  - /')
-YAML
-    chmod 600 "$path"
-    echo "INFO: wrote $path (capabilities: $capabilities)"
+    write_worker_yaml "$path" "$CLUSTER_URL" "$TOKEN" "$NAME" "$FORCE" "$capabilities"
 }
 
 function install_systemd_unit() {
@@ -160,15 +148,15 @@ StandardOutput=append:${HOME}/.memql/state/worker.log
 StandardError=append:${HOME}/.memql/state/worker.log
 
 # Environment file for the worker token + cluster URL. Marked with
-# leading `-` so systemd doesn't fail if the file is missing; the
+# leading '-' so systemd doesn't fail if the file is missing; the
 # worker also reads MEMQL_WORKER_TOKEN from ~/.memql/worker.yaml.
 # Use this file (chmod 0600) instead of inline Environment= so
-# the token is NOT visible in `systemctl show` output.
+# the token is NOT visible in 'systemctl show' output.
 EnvironmentFile=-${env_file}
 
 # Hardening directives. The headless worker doesn't need write
 # access to the system tree or other users' home dirs; tighten
-# accordingly. The GUI build (computer_use_embodied) needs a
+# accordingly. The computer-use build (build tag computeruse) needs a
 # more permissive ProtectHome to drive the user's desktop, but
 # the headless install path here is the default.
 ProtectSystem=strict

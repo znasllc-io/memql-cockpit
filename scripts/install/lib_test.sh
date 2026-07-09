@@ -3,14 +3,15 @@
 # scripts/install/lib_test.sh
 # ============================
 #
-# Smoke tests for lib.sh's mode helpers. Runs the pure-logic
-# functions (install_mode_dir, install_mode validation) and a
-# user-local dry run. The /usr/local/bin path can't be exercised
-# in CI without elevated privileges, so the system-mode path is
-# checked via the require_sudo failure mode + the help text.
+# Smoke tests for lib.sh's pure-logic helpers: install_mode_dir,
+# require_sudo's failure mode, binary_name_for (headless + computeruse
+# flavours), and write_worker_yaml (fresh write, 0600 mode, capability
+# list, and its --force clobber guard). The /usr/local/bin system path
+# can't be exercised in CI without elevated privileges, so the
+# system-mode path is checked via the require_sudo failure mode.
 #
 # Run: bash scripts/install/lib_test.sh
-# Used by .github/workflows/install-scripts-lint.yml (when wired).
+# Wired into CI by .github/workflows/install-scripts-lint.yml.
 
 set -uo pipefail
 
@@ -65,22 +66,93 @@ fi
 if [[ $EUID -eq 0 ]]; then
     echo "INFO: running as root -- skipping require_sudo failure-mode tests"
 else
-    # Force sudo to fail by clobbering PATH so `sudo` is unreachable
-    # AND command -v sudo returns non-zero. Run in a subshell so the
-    # PATH munging doesn't bleed.
-    (
+    # Force sudo to be unreachable by clearing PATH inside a subshell
+    # (so `command -v sudo` and sudo itself both fail). Running the
+    # subshell as the `if` condition checks its status directly.
+    if (
+        # shellcheck disable=SC2123  # clearing PATH is the point of this probe
         PATH=""
-        if require_sudo 2>/dev/null; then
-            echo "FAIL: require_sudo passed with PATH cleared (expected fail)"
-            exit 1
-        fi
-        echo "PASS: require_sudo fails when sudo unreachable"
-    )
-    if [[ $? -ne 0 ]]; then
-        FAIL=$((FAIL + 1))
+        require_sudo
+    ) >/dev/null 2>&1; then
+        fail "require_sudo passed with PATH cleared (expected fail)"
     else
-        PASS=$((PASS + 1))
+        pass "require_sudo fails when sudo unreachable"
     fi
+fi
+
+# ---------------------------------------------------------------
+# binary_name_for
+# ---------------------------------------------------------------
+
+_os="$(detect_os)"
+_arch="$(detect_arch)"
+
+expect_eq "binary_name_for headless" \
+    "$(binary_name_for headless)" "memql-cockpit-${_os}-${_arch}"
+expect_eq "binary_name_for computeruse" \
+    "$(binary_name_for computeruse)" "memql-cockpit-computeruse-${_os}-${_arch}"
+
+# Unknown flavour prints to stderr + non-zero.
+if binary_name_for bogus >/dev/null 2>&1; then
+    fail "binary_name_for bogus accepted; should have errored"
+else
+    pass "binary_name_for bogus rejected"
+fi
+
+# ---------------------------------------------------------------
+# write_worker_yaml
+# ---------------------------------------------------------------
+
+_tmp="$(mktemp -d)"
+trap 'rm -rf "$_tmp"' EXIT
+_wy="${_tmp}/worker.yaml"
+
+# file_mode prints an octal permission string portably (GNU + BSD stat).
+function file_mode() {
+    stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null
+}
+
+# Fresh write with default capabilities (HEADLESS only).
+if write_worker_yaml "$_wy" "https://c.example" "mql_wkr_abc" "host1" "no" >/dev/null 2>&1; then
+    pass "write_worker_yaml fresh write succeeds"
+else
+    fail "write_worker_yaml fresh write should succeed"
+fi
+
+expect_eq "write_worker_yaml renders mode 0600" "$(file_mode "$_wy")" "600"
+
+if grep -qx '  - HEADLESS' "$_wy"; then
+    pass "write_worker_yaml default lists HEADLESS capability"
+else
+    fail "write_worker_yaml default should list HEADLESS capability"
+fi
+
+# COMPUTERUSE appears in the concurrency block, so match the capability
+# LIST line exactly (whole line) rather than a substring.
+if grep -qx '  - COMPUTERUSE' "$_wy"; then
+    fail "write_worker_yaml default must not list COMPUTERUSE capability"
+else
+    pass "write_worker_yaml default omits COMPUTERUSE capability"
+fi
+
+# Refuses to clobber an existing file without force.
+if write_worker_yaml "$_wy" "https://c.example" "mql_wkr_abc" "host1" "no" >/dev/null 2>&1; then
+    fail "write_worker_yaml clobbered an existing file without --force"
+else
+    pass "write_worker_yaml refuses to clobber without --force"
+fi
+
+# Overwrites with force=yes and the computer-use capability set.
+if write_worker_yaml "$_wy" "https://c.example" "mql_wkr_abc" "host1" "yes" "HEADLESS,COMPUTERUSE" >/dev/null 2>&1; then
+    pass "write_worker_yaml overwrites with --force"
+else
+    fail "write_worker_yaml should overwrite with --force"
+fi
+
+if grep -qx '  - HEADLESS' "$_wy" && grep -qx '  - COMPUTERUSE' "$_wy"; then
+    pass "write_worker_yaml computeruse lists HEADLESS + COMPUTERUSE"
+else
+    fail "write_worker_yaml computeruse should list HEADLESS + COMPUTERUSE"
 fi
 
 # ---------------------------------------------------------------

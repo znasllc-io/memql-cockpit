@@ -21,7 +21,7 @@ body:
       label: Build variant
       options:
         - headless (default)
-        - GUI (CGO + RobotGo)
+        - computer-use (CGO + RobotGo)
         - worker
     validations:
       required: true

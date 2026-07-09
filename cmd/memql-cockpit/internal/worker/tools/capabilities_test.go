@@ -90,7 +90,7 @@ func TestDetectDisplayServer(t *testing.T) {
 
 // TestDispatcher_CapabilitiesWorksHeadless is the core #162
 // contract: workerComputer.capabilities must answer on the headless
-// build instead of returning gui_unavailable -- it's the one action
+// build instead of returning computeruse_unavailable -- it's the one action
 // that must never fail.
 func TestDispatcher_CapabilitiesWorksHeadless(t *testing.T) {
 	gate := &fakeGate{decision: consent.Decision{Allowed: true, Reason: "consent granted"}}
@@ -174,9 +174,9 @@ func TestDispatcher_CapabilitiesGatedAsObserve(t *testing.T) {
 
 // TestDispatcher_OtherComputerActionsStillGuiUnavailable pins the
 // headless build's pre-existing behavior for every NON-capabilities
-// workerComputer action: gui_unavailable, not a silent success.
+// workerComputer action: computeruse_unavailable, not a silent success.
 // window_list / window_focus are real on the computeruse build since
-// memql-cockpit#167 but must stay gui_unavailable here.
+// memql-cockpit#167 but must stay computeruse_unavailable here.
 func TestDispatcher_OtherComputerActionsStillGuiUnavailable(t *testing.T) {
 	d := NewDispatcher(quietLogger(), DefaultPolicy(), nil)
 	for _, action := range []string{"screenshot", "mouse_click", "mouse_down", "mouse_up", "key_hold", "display_info", "window_list", "window_focus"} {
@@ -187,8 +187,8 @@ func TestDispatcher_OtherComputerActionsStillGuiUnavailable(t *testing.T) {
 			CallId:   "caps-3-" + action,
 		}
 		_, failure := d.Dispatch(context.Background(), dispatch)
-		if failure == nil || failure.GetErrorCode() != "gui_unavailable" {
-			t.Errorf("headless workerComputer.%s should be gui_unavailable; got %+v", action, failure)
+		if failure == nil || failure.GetErrorCode() != "computeruse_unavailable" {
+			t.Errorf("headless workerComputer.%s should be computeruse_unavailable; got %+v", action, failure)
 		}
 	}
 }

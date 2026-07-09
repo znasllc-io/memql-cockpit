@@ -168,7 +168,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, dispatch *memqlv1.ToolDispatc
 		// (memql-cockpit#162): route it BEFORE the per-build
 		// dispatchComputer so the headless build answers honestly
 		// (computerUseAvailable=false, actions=[]) instead of rejecting
-		// with gui_unavailable. It is the one workerComputer action
+		// with computeruse_unavailable. It is the one workerComputer action
 		// that must work on every build variant.
 		//
 		// Every other workerComputer action runs the per-call

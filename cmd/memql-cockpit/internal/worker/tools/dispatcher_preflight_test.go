@@ -113,8 +113,8 @@ func TestDispatcher_AccessibilityPreflightTrueAdmits(t *testing.T) {
 	if calls != 1 {
 		t.Errorf("Accessibility hook should be consulted exactly once; got %d", calls)
 	}
-	if failure == nil || failure.GetErrorCode() != "gui_unavailable" {
-		t.Errorf("admitted headless mouse_move should reach the router (gui_unavailable); got %+v", failure)
+	if failure == nil || failure.GetErrorCode() != "computeruse_unavailable" {
+		t.Errorf("admitted headless mouse_move should reach the router (computeruse_unavailable); got %+v", failure)
 	}
 }
 
@@ -173,8 +173,8 @@ func TestDispatcher_DisplayServerPreflightX11Admits(t *testing.T) {
 	d := NewDispatcher(quietLogger(), DefaultPolicy(), nil)
 
 	_, failure := dispatchComputerAction(t, d, "mouse_move")
-	if failure == nil || failure.GetErrorCode() != "gui_unavailable" {
-		t.Errorf("admitted headless mouse_move should reach the router (gui_unavailable); got %+v", failure)
+	if failure == nil || failure.GetErrorCode() != "computeruse_unavailable" {
+		t.Errorf("admitted headless mouse_move should reach the router (computeruse_unavailable); got %+v", failure)
 	}
 }
 

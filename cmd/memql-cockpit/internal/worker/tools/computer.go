@@ -15,7 +15,7 @@ import (
 func (d *Dispatcher) dispatchComputer(_ context.Context, action string, _ map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
 	_ = action
 	return nil, &memqlv1.Failure{
-		ErrorCode:    "gui_unavailable",
+		ErrorCode:    "computeruse_unavailable",
 		ErrorMessage: "this cockpit binary was built without the computeruse tag; install memql-cockpit-computeruse to enable workerComputer.* actions",
 	}
 }

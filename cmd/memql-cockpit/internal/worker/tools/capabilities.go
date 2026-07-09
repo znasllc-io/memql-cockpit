@@ -20,7 +20,7 @@ const capabilitySchemaVersion = 1
 // works on EVERY build variant. The dispatcher routes it before the
 // per-build dispatchComputer so a headless binary answers honestly
 // (computerUseAvailable=false, actions=[]) instead of returning
-// gui_unavailable. It's the agent runtime's introspection path:
+// computeruse_unavailable. It's the agent runtime's introspection path:
 // "what can this worker actually do?" must never itself fail.
 const computerCapabilitiesAction = "capabilities"
 
@@ -164,7 +164,7 @@ func CapabilityDescriptorJSON() (string, error) {
 // runComputerCapabilities serves workerComputer.capabilities on
 // every build variant. Routed by the dispatcher BEFORE the per-build
 // dispatchComputer so the headless build answers instead of
-// rejecting with gui_unavailable.
+// rejecting with computeruse_unavailable.
 func runComputerCapabilities() (*memqlv1.Success, *memqlv1.Failure) {
 	desc := ComputeCapabilities()
 	preview := fmt.Sprintf("platform=%s displayServer=%s computerUseAvailable=%t actions=%d displays=%d",
