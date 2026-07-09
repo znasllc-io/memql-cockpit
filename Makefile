@@ -83,27 +83,26 @@ cockpit-computeruse-all-platforms: cockpit-computeruse-darwin-arm64 cockpit-comp
 # ---------------------------------------------------------------------------
 ##@ Run
 # ---------------------------------------------------------------------------
-# The RUN family, distinct by WHERE/HOW they connect:
-#   run             -> your active ~/.memql/clusters.yaml cluster (or --endpoint)
-#   run-local       -> a LOCAL k3d cluster, auto port-forwarding svc/bff
-#   run-computeruse -> like `run`, but the computer-use variant
-#   forward         -> port-forward svc/bff only (no launch; for SDKs/other clients)
-# Extra flags reach the binary via ARGS=..., e.g. `make run ARGS="--cluster staging"`.
+# ONE command for every environment. `run` connects to the cluster selected in
+# ~/.memql/clusters.yaml; pass --cluster <name> (local / staging / prod) or
+# --endpoint <addr> via ARGS. Same experience everywhere -- only the
+# clusters.yaml config differs. `local` is reached over a port-forward
+# (`make forward`, endpoint localhost:$(BFF_PORT)); staging/prod over the
+# cockpit.<domain> ingress. That endpoint is the ONLY thing that changes.
+#   make run                            # active clusters.yaml cluster
+#   make run ARGS="--cluster local"     # local k3d (run `make forward` first)
+#   make run ARGS="--cluster staging"   # staging (ingress endpoint from clusters.yaml)
 
-.PHONY: run run-local run-computeruse forward
+.PHONY: run run-computeruse forward
 
-run: cockpit ## Build + run headless Cockpit against the active clusters.yaml cluster
+run: cockpit ## Build + run the Cockpit against a clusters.yaml cluster (ARGS="--cluster local|staging|...")
 	MEMQL_COCKPIT_CRED_STORE=$(CRED_STORE) ./$(BIN_DIR)/memql-cockpit $(ARGS)
 
-run-local: cockpit ## Build + run against a LOCAL k3d cluster (auto port-forwards svc/bff; guards non-k3d contexts)
-	@MEMQL_NS=$(MEMQL_NS) BFF_SVC=$(BFF_SVC) BFF_PORT=$(BFF_PORT) \
-		MEMQL_COCKPIT_CRED_STORE=$(CRED_STORE) bash scripts/run-local.sh $(ARGS)
-
-run-computeruse: cockpit-computeruse ## Build + run the computer-use variant against the active clusters.yaml cluster
+run-computeruse: cockpit-computeruse ## Same as `run`, but the computer-use variant
 	MEMQL_COCKPIT_CRED_STORE=$(CRED_STORE) ./$(BIN_DIR)/memql-cockpit-computeruse $(ARGS)
 
-forward: ## Port-forward svc/bff to localhost:$(BFF_PORT) only (no launch; ctrl-c to stop)
-	@echo "port-forward svc/$(BFF_SVC) ($(MEMQL_NS)) -> localhost:$(BFF_PORT) (ctrl-c to stop)"
+forward: ## Port-forward the local k3d svc/bff to localhost:$(BFF_PORT) (local access for `make run --cluster local`)
+	@echo "kube-context: $$(kubectl config current-context 2>/dev/null) | port-forward svc/$(BFF_SVC) ($(MEMQL_NS)) -> localhost:$(BFF_PORT) (ctrl-c to stop)"
 	kubectl port-forward -n $(MEMQL_NS) svc/$(BFF_SVC) $(BFF_PORT):$(BFF_PORT)
 
 # ---------------------------------------------------------------------------

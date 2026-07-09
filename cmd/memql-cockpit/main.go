@@ -433,6 +433,23 @@ func handleLogoutCmd(args []string) {
 // Helpers
 // ---------------------------------------------------------------------------
 
+// defaultLocalEndpoint is the port-forward target the `local` cluster is
+// reached on (see `make forward`: kubectl port-forward svc/bff 50051). Local is
+// just another clusters.yaml entry -- the ONLY thing that differs from
+// staging/prod is this endpoint (a port-forward vs an ingress). clusters.yaml
+// wins if it sets one; otherwise this default lets `run --cluster local` work
+// out of the box.
+const defaultLocalEndpoint = "localhost:50051"
+
+// withLocalDefault fills in the localhost:50051 endpoint for the `local`
+// cluster when the yaml left it blank.
+func withLocalDefault(c config.ClusterConfig) config.ClusterConfig {
+	if c.Name == "local" && strings.TrimSpace(c.Endpoint) == "" {
+		c.Endpoint = defaultLocalEndpoint
+	}
+	return c
+}
+
 func resolveCluster(clusterName, endpoint string) (config.ClusterConfig, error) {
 	if endpoint != "" {
 		return config.ClusterConfig{
@@ -446,24 +463,25 @@ func resolveCluster(clusterName, endpoint string) (config.ClusterConfig, error) 
 		if err != nil {
 			return config.ClusterConfig{}, fmt.Errorf("load clusters config: %w", err)
 		}
-		c, ok := clusters.Get(clusterName)
-		if !ok {
-			return config.ClusterConfig{}, fmt.Errorf("cluster %q not found in ~/.memql/clusters.yaml -- launch the TUI and press A to add one, or L on the row to authorize it", clusterName)
+		if c, ok := clusters.Get(clusterName); ok {
+			return withLocalDefault(c), nil
 		}
-		return c, nil
+		// `local` is a permanent default even without a clusters.yaml entry.
+		if clusterName == "local" {
+			return config.ClusterConfig{Name: "local", Endpoint: defaultLocalEndpoint}, nil
+		}
+		return config.ClusterConfig{}, fmt.Errorf("cluster %q not found in ~/.memql/clusters.yaml -- launch the TUI and press A to add one, or L on the row to authorize it", clusterName)
 	}
 
-	// No --cluster, no --endpoint: fall back to whatever clusters.yaml
-	// says about "local" (typically seeded by `genesis init`). If the
-	// yaml has nothing for local, return the empty default so the TUI
-	// can surface the "needs-auth" state instead of dialing thin air.
+	// No --cluster, no --endpoint: fall back to "local" (clusters.yaml wins,
+	// else the localhost:50051 port-forward default).
 	clusters, err := config.LoadClusters()
 	if err == nil {
 		if local, ok := clusters.Get("local"); ok {
-			return local, nil
+			return withLocalDefault(local), nil
 		}
 	}
-	return config.ClusterConfig{Name: "local"}, nil
+	return config.ClusterConfig{Name: "local", Endpoint: defaultLocalEndpoint}, nil
 }
 
 func printUsage() {
