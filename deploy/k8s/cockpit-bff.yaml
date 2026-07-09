@@ -1,9 +1,15 @@
-# cockpit-bff -- the memQL Cockpit's own backend-for-frontend node.
+# cockpit-bff -- the memQL Cockpit's backend-for-frontend node.
 #
 # Per-client BFF (znasllc-io/memql-cockpit#288): the engine stays
 # client-agnostic and each client owns its BFF edge. This is the Cockpit's,
-# fronted at cockpit.<domain> (see cockpit-front-door.yaml). It is the engine
-# `bff` role (product-neutral) built from this repo's cockpit-bff/ module.
+# fronted at cockpit.<domain> (see cockpit-front-door.yaml).
+#
+# Platform consolidation (znasllc-io/memql#2472, Decision 5): this is now the
+# engine's PRODUCT-AGNOSTIC bff image itself (acrmemql.azurecr.io/memql-bff) run
+# under a distinct name -- i.e. the Cockpit's instance of the multi-bff model
+# (a `bff-<client>`). The bespoke cockpit-bff/ Go module + its build workflow
+# are deleted; there is nothing product-specific to compile, so the Cockpit
+# just runs the same bff image the engine ships (no DSL bundle mounted).
 #
 # COEXISTENCE DESIGN (locked #288): a cluster may already run the PRODUCT bff
 # (e.g. memql-bff-copresent as service `bff`). cockpit-bff is a DISTINCT
@@ -57,9 +63,10 @@ spec:
       terminationGracePeriodSeconds: 45
       containers:
         - name: cockpit-bff
-          # Built by .github/workflows/build-cockpit-bff-image.yml (OIDC -> ACR).
+          # The engine's product-agnostic bff image (built by memql's
+          # build-engine-images.yml, OIDC -> ACR). Pinned per environment.
           # Pin @sha256 per environment via an overlay for staging/prod.
-          image: acrmemql.azurecr.io/cockpit-bff:1.0.0
+          image: acrmemql.azurecr.io/memql-bff:0.9.9
           lifecycle:
             preStop:
               exec:
