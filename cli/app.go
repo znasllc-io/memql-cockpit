@@ -192,8 +192,8 @@ func NewApp(cfg AppConfig) *App {
 //     can cancel out, in which case Run returns without entering
 //     the IDE.
 //  2. Launch splash -- numbered options to pick the entry mode.
-//     '1' = operating console (multi-tab IDE), '2' = run-local
-//     placeholder, 'Q' = quit.
+//     '1' = operating console (multi-tab IDE), '2' = set up local
+//     cluster (placeholder wizard), 'Q' = quit.
 //  3. Operating console -- the multi-tab IDE. Connection
 //     goroutines start here, not before, so the wizard / splash
 //     run on a quiet screen.
