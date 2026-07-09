@@ -138,6 +138,19 @@ dist-checksums: ## Write a SHA256SUMS manifest over the packaged archives in dis
 		&& echo "  wrote $(DIST_DIR)/memql-cockpit-$(VERSION)-SHA256SUMS"
 
 # ---------------------------------------------------------------------------
+##@ Release
+# ---------------------------------------------------------------------------
+# Tag-driven: `make release` recommends the next semver from the commits since
+# the last tag (conventional-commit prefixes, no AI). Add ARGS="--cut" to bump
+# VERSION + main.go, tag vX.Y.Z, push, and create the GitHub Release (which
+# triggers release.yml to build + upload the per-platform binaries).
+
+.PHONY: release
+
+release: ## Recommend the next version from commits; ARGS="--cut" to tag + release (see --help)
+	@bash scripts/release/cut-release.sh $(ARGS)
+
+# ---------------------------------------------------------------------------
 ##@ Test
 # ---------------------------------------------------------------------------
 

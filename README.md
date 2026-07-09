@@ -260,6 +260,28 @@ on disk -- it carries the endpoint / OIDC issuer / optional PAT
 needed before any keyring access. The load-time mode validator
 (0600 enforced) catches drift on that file too.
 
+## Releasing
+
+Releases are **tag-driven**: cutting a `vX.Y.Z` tag + GitHub Release triggers
+`.github/workflows/release.yml`, which cross-builds and uploads the per-platform
+binaries (`darwin`/`linux` × `arm64`/`amd64`) + `SHA256SUMS`.
+
+`make release` recommends the next version from the commits since the last tag —
+**no AI**, just conventional-commit prefixes (`feat!:`/`BREAKING CHANGE` → major,
+`feat:` → minor, everything else → patch):
+
+```bash
+make release                          # recommend only (safe): shows the next version + why
+make release ARGS="--cut"             # cut the recommended version (asks to confirm)
+make release ARGS="--bump=minor --cut"       # force a bump level
+make release ARGS="--version=1.2.3 --cut"    # force an explicit version
+make release ARGS="--cut --yes"       # non-interactive
+```
+
+Cutting bumps `VERSION` + the `main.go` version constant, commits `release:
+vX.Y.Z`, tags, pushes, and opens the GitHub Release. See
+`scripts/release/cut-release.sh --help`.
+
 ## Module structure
 
 - `cmd/memql-cockpit/` -- binary entry point + per-subcommand internals
