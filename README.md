@@ -38,6 +38,33 @@ memQL Cockpit is the terminal-native IDE and operations console for [memQL](http
 
 ---
 
+## Install
+
+Grab the latest release — the **headless** build, macOS + Linux (arm64/amd64),
+no Windows:
+
+```bash
+# one-liner (detects OS/arch, checksum-verified)
+curl -fsSL https://raw.githubusercontent.com/znasllc-io/memql-cockpit/main/install.sh | sh
+
+# pin a version, or an install dir
+curl -fsSL https://raw.githubusercontent.com/znasllc-io/memql-cockpit/main/install.sh | MEMQL_COCKPIT_VERSION=v0.10.0 sh
+curl -fsSL https://raw.githubusercontent.com/znasllc-io/memql-cockpit/main/install.sh | BIN_DIR=/usr/local/bin sh
+```
+
+Or, if you have Go (builds from source):
+
+```bash
+go install github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit@latest      # or @vX.Y.Z
+```
+
+Both give you the headless build. The **computer-use** variant (screenshot /
+mouse / keyboard) needs native tooling and is built from source — `make
+cockpit-computeruse`, or `go install -tags computeruse
+github.com/znasllc-io/memql-cockpit/cmd/memql-cockpit@latest` (see
+[docs/computer-use.md](docs/computer-use.md)). Releases are cut with
+[`make release`](#releasing).
+
 ## Build
 
 The Cockpit ships in two build variants:
