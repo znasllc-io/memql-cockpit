@@ -24,8 +24,8 @@ Required:
 
 Options:
     --name <name>             Worker name (default: hostname -s)
-    --gui                     Install the GUI variant. Wayland only
-                              registers HEADLESS; X11 enables GUI.
+    --computeruse                     Install the computer-use variant. Wayland only
+                              registers HEADLESS; X11 enables the COMPUTERUSE capability.
     --user-local              Install under \$HOME/.memql/bin instead of
                               /usr/local/bin. Use when sudo isn't
                               available (CI, restricted environments).
@@ -54,7 +54,7 @@ function parse_args() {
             --token)         TOKEN="$2"; shift 2 ;;
             --cluster)       CLUSTER_URL="$2"; shift 2 ;;
             --name)          NAME="$2"; shift 2 ;;
-            --gui)           FLAVOUR="gui"; shift ;;
+            --computeruse)           FLAVOUR="computeruse"; shift ;;
             --user-local)    INSTALL_MODE="user-local"; shift ;;
             --download-base) DOWNLOAD_BASE="$2"; shift 2 ;;
             --force)         FORCE="yes"; shift ;;
@@ -84,8 +84,8 @@ function install_binary() {
     binary="$(binary_name_for "$FLAVOUR")"
     local url="${DOWNLOAD_BASE}/${binary}"
     local friendly_name
-    if [[ "$FLAVOUR" == "gui" ]]; then
-        friendly_name="memql-cockpit-gui"
+    if [[ "$FLAVOUR" == "computeruse" ]]; then
+        friendly_name="memql-cockpit-computeruse"
     else
         friendly_name="memql-cockpit"
     fi
@@ -95,32 +95,20 @@ function install_binary() {
 
 function write_config() {
     local path="${HOME}/.memql/worker.yaml"
+    # The computer-use variant advertises COMPUTERUSE, but only on X11:
+    # RobotGo can't drive Wayland, so a Wayland session downgrades to
+    # HEADLESS-only. This platform-specific decision stays here; the
+    # shared renderer (write_worker_yaml) only emits what it is handed
+    # and honors --force.
     local capabilities="HEADLESS"
-    if [[ "$FLAVOUR" == "gui" ]]; then
+    if [[ "$FLAVOUR" == "computeruse" ]]; then
         if [[ -n "${WAYLAND_DISPLAY:-}" && -z "${DISPLAY:-}" ]]; then
-            echo "INFO: Wayland detected; registering HEADLESS only (X11 required for GUI)"
+            echo "INFO: Wayland detected; registering HEADLESS only (X11 required for COMPUTERUSE)"
         else
-            capabilities="HEADLESS,GUI"
+            capabilities="HEADLESS,COMPUTERUSE"
         fi
     fi
-
-    cat > "$path" << YAML
-cluster_url: ${CLUSTER_URL}
-token: ${TOKEN}
-name: ${NAME}
-labels:
-  os: linux
-  arch: $(detect_arch)
-concurrency:
-  HEADLESS: 8
-  GUI: 1
-state_dir: ${HOME}/.memql/state
-log_level: info
-capabilities:
-$(echo "$capabilities" | tr ',' '\n' | sed 's/^/  - /')
-YAML
-    chmod 600 "$path"
-    echo "INFO: wrote $path (capabilities: $capabilities)"
+    write_worker_yaml "$path" "$CLUSTER_URL" "$TOKEN" "$NAME" "$FORCE" "$capabilities"
 }
 
 function install_systemd_unit() {
@@ -160,15 +148,15 @@ StandardOutput=append:${HOME}/.memql/state/worker.log
 StandardError=append:${HOME}/.memql/state/worker.log
 
 # Environment file for the worker token + cluster URL. Marked with
-# leading `-` so systemd doesn't fail if the file is missing; the
+# leading '-' so systemd doesn't fail if the file is missing; the
 # worker also reads MEMQL_WORKER_TOKEN from ~/.memql/worker.yaml.
 # Use this file (chmod 0600) instead of inline Environment= so
-# the token is NOT visible in `systemctl show` output.
+# the token is NOT visible in 'systemctl show' output.
 EnvironmentFile=-${env_file}
 
 # Hardening directives. The headless worker doesn't need write
 # access to the system tree or other users' home dirs; tighten
-# accordingly. The GUI build (computer_use_embodied) needs a
+# accordingly. The computer-use build (build tag computeruse) needs a
 # more permissive ProtectHome to drive the user's desktop, but
 # the headless install path here is the default.
 ProtectSystem=strict

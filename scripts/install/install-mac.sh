@@ -15,7 +15,7 @@
 #   --token <token>     Worker token (mql_wkr_<...>). Required.
 #   --cluster <url>     Cluster URL. Required.
 #   --name <name>       Worker name (default: hostname).
-#   --gui               Install the GUI variant (memql-cockpit-gui).
+#   --computeruse               Install the computer-use variant (memql-cockpit-computeruse).
 #   --download-base <u> Base URL for binary downloads.
 #   --force             Overwrite existing worker.yaml.
 #   --no-service        Skip LaunchAgent installation.
@@ -37,7 +37,7 @@ Required:
 
 Options:
     --name <name>             Worker name (default: hostname)
-    --gui                     Install the GUI variant (memql-cockpit-gui)
+    --computeruse                     Install the computer-use variant (memql-cockpit-computeruse)
     --user-local              Install under \$HOME/.memql/bin instead of
                               /usr/local/bin. Use when sudo isn't
                               available (CI, restricted environments).
@@ -66,7 +66,7 @@ function parse_args() {
             --token)         TOKEN="$2"; shift 2 ;;
             --cluster)       CLUSTER_URL="$2"; shift 2 ;;
             --name)          NAME="$2"; shift 2 ;;
-            --gui)           FLAVOUR="gui"; shift ;;
+            --computeruse)           FLAVOUR="computeruse"; shift ;;
             --user-local)    INSTALL_MODE="user-local"; shift ;;
             --download-base) DOWNLOAD_BASE="$2"; shift 2 ;;
             --force)         FORCE="yes"; shift ;;
@@ -96,8 +96,8 @@ function install_binary() {
     binary="$(binary_name_for "$FLAVOUR")"
     local url="${DOWNLOAD_BASE}/${binary}"
     local friendly_name
-    if [[ "$FLAVOUR" == "gui" ]]; then
-        friendly_name="memql-cockpit-gui"
+    if [[ "$FLAVOUR" == "computeruse" ]]; then
+        friendly_name="memql-cockpit-computeruse"
     else
         friendly_name="memql-cockpit"
     fi
@@ -107,28 +107,13 @@ function install_binary() {
 
 function write_config() {
     local path="${HOME}/.memql/worker.yaml"
-    write_worker_yaml "$path" "$CLUSTER_URL" "$TOKEN" "$NAME" "$FORCE"
-    if [[ "$FLAVOUR" == "gui" ]]; then
-        # Ensure GUI capability is advertised.
-        cat > "$path" << YAML
-cluster_url: ${CLUSTER_URL}
-token: ${TOKEN}
-name: ${NAME}
-labels:
-  os: darwin
-  arch: $(detect_arch)
-concurrency:
-  HEADLESS: 8
-  GUI: 1
-state_dir: ${HOME}/.memql/state
-log_level: info
-capabilities:
-  - HEADLESS
-  - GUI
-YAML
-        chmod 600 "$path"
+    # The computer-use variant additionally advertises COMPUTERUSE.
+    # macOS has no Wayland gate, so the flavour alone decides the set.
+    local capabilities="HEADLESS"
+    if [[ "$FLAVOUR" == "computeruse" ]]; then
+        capabilities="HEADLESS,COMPUTERUSE"
     fi
-    echo "INFO: wrote $path"
+    write_worker_yaml "$path" "$CLUSTER_URL" "$TOKEN" "$NAME" "$FORCE" "$capabilities"
 }
 
 function install_launch_agent() {

@@ -31,8 +31,8 @@ memQL Cockpit is the terminal-native IDE and operations console for [memQL](http
 
 - **Multi-tab TUI** — DevOps, Concepts, Editor, Settings — all in one terminal; the unified Concepts tab consumes `@displayCard` hints to render rows nicely per concept
 - **DSL editor + linter** — write `.memql` files with structured validation
-- **Worker modes** — per-user workers bring computer use into the platform: `HEADLESS` (shell / fs / http tools) on every build, `GUI` on the gui variant
-- **GUI variant** — opt-in CGO build with screenshot, mouse, keyboard, and window control via RobotGo; see [docs/computer-use.md](docs/computer-use.md)
+- **Worker modes** — per-user workers bring computer use into the platform: `HEADLESS` (shell / fs / http tools) on every build, `COMPUTERUSE` on the computer-use variant
+- **Computer-use variant** — opt-in CGO build (`-tags computeruse`) with screenshot, mouse, keyboard, and window control via RobotGo; see [docs/computer-use.md](docs/computer-use.md)
 - **Service install** — register as a LaunchAgent (macOS) or systemd user service (Linux)
 - **gRPC client** — talks to memQL cluster nodes; no engine embedded
 
@@ -40,14 +40,29 @@ memQL Cockpit is the terminal-native IDE and operations console for [memQL](http
 
 ## Build
 
+The Cockpit ships in two build variants:
+
+- **headless** (default) — pure Go, `CGO_ENABLED=0`; ships everywhere.
+  The worker exposes the `HEADLESS` tool surface (shell / fs / http).
+- **computer-use** (`-tags computeruse`, CGO + RobotGo) — adds the
+  `workerComputer.*` control surface (screenshot / mouse / keyboard /
+  window) and registers the `COMPUTERUSE` capability. Here "computer-use"
+  is a machine-control surface, **not** a graphical UI. It needs native
+  tooling (macOS Xcode CLT; Linux `gcc` + X11 dev headers), is built
+  per-host, and is deliberately **not** shipped in `dist`. See
+  [docs/computer-use.md](docs/computer-use.md).
+
 ```bash
-make cockpit          # headless variant (default, ships everywhere)
-make cockpit-gui      # GUI variant with screenshot/mouse/keyboard
-                      # (requires CGO + RobotGo deps -- see Makefile)
-make cockpit-all-platforms       # cross-compile to darwin/linux x arm64/amd64
-make cockpit-gui-all-platforms   # GUI variant, all platforms
-make dist             # versioned tar.gz archives + SHA256SUMS -> dist/
+make cockpit                            # headless variant (default, ships everywhere)
+make cockpit-computeruse                # computer-use variant (CGO + RobotGo; adds workerComputer.*)
+make cockpit-all-platforms              # cross-compile headless -> darwin/linux x arm64/amd64
+make cockpit-computeruse-all-platforms  # computer-use variant, all platforms
+make dist                               # versioned tar.gz archives + SHA256SUMS -> dist/ (headless only)
 ```
+
+A full, auto-generated target list (with the `ARGS=` / `CRED_STORE=`
+knobs) is always one `make help` away; the [Command reference](#command-reference)
+below summarizes the day-to-day set.
 
 Output lands under `bin/`. Check the build's version with
 `./bin/memql-cockpit --version` (or `make version`). See
@@ -64,6 +79,19 @@ genesis envelope — see [docs/deploy-runner.md](docs/deploy-runner.md).
 
 ## Run
 
+The `make run*` family builds the binary and launches the Cockpit; the
+members differ only in **where/how** they connect. Extra flags reach the
+binary via `ARGS=...` (e.g. `make run ARGS="--cluster staging"`).
+
+Against your **active cluster** — the current entry in
+`~/.memql/clusters.yaml`, or an explicit `--endpoint`:
+
+```bash
+make run                            # headless, active clusters.yaml cluster
+make run ARGS="--cluster staging"   # pick a named cluster from clusters.yaml
+make run-computeruse                # same connection, but the computer-use variant
+```
+
 Against a **local k3d cluster** (engine brought up with `make up` in the memql
 repo), one command builds and connects — it auto port-forwards the engine `bff`
 node (the product-agnostic client edge) and launches the Cockpit against it, then
@@ -79,15 +107,52 @@ reaches the *same* bff node via the `cockpit.<domain>` front-door ingress, so
 there you connect with a named cluster instead — same binary, config-driven:
 
 ```bash
-./bin/memql-cockpit --cluster staging   # endpoint from ~/.memql/clusters.yaml
-./bin/memql-cockpit --endpoint <host>   # or an explicit gRPC endpoint
-./bin/memql-cockpit worker run          # run as a per-user worker (HEADLESS; the gui build adds GUI)
-./bin/memql-cockpit-gui worker setup    # one-time GUI worker setup wizard
+./bin/memql-cockpit --cluster staging          # endpoint from ~/.memql/clusters.yaml
+./bin/memql-cockpit --endpoint <host>          # or an explicit gRPC endpoint
+./bin/memql-cockpit worker run                 # run as a per-user worker (HEADLESS; the computer-use build adds COMPUTERUSE)
+./bin/memql-cockpit-computeruse worker setup   # one-time computer-use worker setup wizard
 ```
 
 Cluster config lives at `~/.memql/clusters.yaml`; worker config at
 `~/.memql/worker.yaml`. The install scripts under `scripts/install/`
 register a LaunchAgent (macOS) or systemd user service (Linux).
+
+### Command reference
+
+Every target is a thin wrapper over the binary or a helper script; the
+`make help` output is auto-generated from the same comments. The knobs
+in the third column are Make variables — pass them inline, e.g.
+`make run-local BFF_PORT=50051 CRED_STORE=keyring`.
+
+| Target | Purpose | Key ARGS / env | Example |
+|---|---|---|---|
+| `make cockpit` | Build the headless binary → `bin/memql-cockpit` | — | `make cockpit` |
+| `make cockpit-computeruse` | Build the computer-use binary → `bin/memql-cockpit-computeruse` (CGO + RobotGo) | — | `make cockpit-computeruse` |
+| `make cockpit-all-platforms` | Cross-build headless for darwin/linux × arm64/amd64 | — | `make cockpit-all-platforms` |
+| `make cockpit-computeruse-all-platforms` | Cross-build the computer-use variant for all platforms | — | `make cockpit-computeruse-all-platforms` |
+| `make run` | Build + run headless against the active `clusters.yaml` cluster | `ARGS`, `CRED_STORE` | `make run ARGS="--cluster staging"` |
+| `make run-computeruse` | Build + run the computer-use variant against the active cluster | `ARGS`, `CRED_STORE` | `make run-computeruse` |
+| `make run-local` | Build + run against a **local k3d** cluster, auto port-forwarding `svc/bff` (guards the kube-context) | `ARGS`, `CRED_STORE`, `MEMQL_NS`, `BFF_SVC`, `BFF_PORT`, `MEMQL_ALLOW_CONTEXT` | `make run-local BFF_PORT=50051` |
+| `make forward` | Port-forward `svc/bff` only — no launch (for SDKs / other clients) | `MEMQL_NS`, `BFF_SVC`, `BFF_PORT` | `make forward BFF_PORT=50051` |
+| `make dist` | Package versioned `tar.gz` + `SHA256SUMS` into `dist/` (headless, all platforms) | — | `make dist` |
+
+The knobs:
+
+- **`ARGS`** — extra flags forwarded verbatim to the cockpit binary
+  (e.g. `--cluster <name>`, `--endpoint <host>`, `worker run`).
+- **`CRED_STORE`** — credential backend for `make`-launched runs:
+  `file` (default; tokens in `~/.memql/`, mode 0600) or `keyring`. Make
+  defaults to `file` because a locally-built, unsigned binary makes the
+  macOS Keychain re-prompt on every rebuild; the shipped binary's own
+  default is unchanged (auto-probe → Keychain). See
+  [Credential storage](#credential-storage).
+- **`MEMQL_NS` / `BFF_SVC` / `BFF_PORT`** — namespace / Service / local
+  port for the `run-local` + `forward` port-forward. Defaults: `memql` /
+  `bff` / `50051`.
+- **`MEMQL_ALLOW_CONTEXT`** — set to `1` to skip `run-local`'s guard that
+  the active kube-context is a local (`k3d-…`) cluster. Staging/prod use
+  the *same* `memql` namespace + `bff` Service, so the guard exists to
+  stop `run-local` silently forwarding to a remote cluster.
 
 ### Computer use
 
@@ -98,8 +163,8 @@ architecture, the full 16-action vocabulary, the coordinate model,
 the capability descriptor, the platform support matrix, permission
 setup, and troubleshooting. The short version:
 
-- **macOS** -- the GUI worker needs two TCC grants for the
-  `memql-cockpit-gui` binary under System Settings -> Privacy &
+- **macOS** -- the computer-use worker needs two TCC grants for the
+  `memql-cockpit-computeruse` binary under System Settings -> Privacy &
   Security: **Accessibility** (mouse + keyboard) and **Screen
   Recording** (screenshots). `worker setup` probes both; the worker
   re-checks them on every dispatch, so a mid-session revocation
@@ -109,8 +174,8 @@ setup, and troubleshooting. The short version:
   display) input + screenshot actions return
   `display_server_unsupported` -- register HEADLESS-only there
   (`install-linux.sh` detects Wayland and does this automatically).
-  Building the GUI variant needs `gcc` plus the X11 dev packages
-  listed in [docs/computer-use.md](docs/computer-use.md).
+  Building the computer-use variant needs `gcc` plus the X11 dev
+  packages listed in [docs/computer-use.md](docs/computer-use.md).
 
 ### Computer-use consent gate
 

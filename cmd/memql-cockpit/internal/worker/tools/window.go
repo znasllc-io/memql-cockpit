@@ -9,7 +9,7 @@ import (
 )
 
 // WindowInfo is one enumerated top-level window, in the shape the
-// platform listers (window_gui_darwin.go / window_gui_linux.go)
+// platform listers (window_computeruse_darwin.go / window_computeruse_linux.go)
 // produce and windowListPayload serializes.
 //
 // Coordinate contract: X/Y/Width/Height are in LOGICAL coordinates --

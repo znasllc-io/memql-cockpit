@@ -1,4 +1,4 @@
-//go:build gui
+//go:build computeruse
 
 package worker
 
@@ -235,7 +235,7 @@ func (w *wizard) kickoffProbe(step stepId) {
 			if st.granted {
 				st.detail = "Both permissions granted in this process tree."
 			} else {
-				st.detail = "One or more permissions are denied. The worker can still register HEADLESS-only; GUI tools will return gui_unavailable."
+				st.detail = "One or more permissions are denied. The worker can still register HEADLESS-only; computer-use tools will return gui_unavailable."
 			}
 		}
 
@@ -605,8 +605,8 @@ func (w *wizard) bodyText() []string {
 			return []string{"On Linux the wizard checks the display server first -- RobotGo requires X11, so a Wayland or display-less session FAILS here and input actions return display_server_unsupported at dispatch time. On X11 it then probes XTEST mouse movement."}
 		}
 		return []string{
-			"macOS grants Accessibility per BINARY. Running this wizard from Terminal probes whether the underlying CGEvent post succeeds, which can be true because Terminal already has the grant and the cockpit-gui inherits.",
-			"When the LaunchAgent runs cockpit-gui detached at login, it needs its OWN entry under System Settings -> Privacy & Security -> Accessibility. Approve it there to make the agent work without a logged-in shell.",
+			"macOS grants Accessibility per BINARY. Running this wizard from Terminal probes whether the underlying CGEvent post succeeds, which can be true because Terminal already has the grant and the memql-cockpit-computeruse inherits.",
+			"When the LaunchAgent runs memql-cockpit-computeruse detached at login, it needs its OWN entry under System Settings -> Privacy & Security -> Accessibility. Approve it there to make the agent work without a logged-in shell.",
 			"Press R to re-probe, O to open System Settings, Enter to continue.",
 		}
 	case stepScreenRecording:
@@ -614,7 +614,7 @@ func (w *wizard) bodyText() []string {
 			return []string{"On Linux the screen-grab requires an X11 session (Wayland FAILS with display_server_unsupported); on X11 the grab uses the X11 SHM extension."}
 		}
 		return []string{
-			"Screen Recording is a separate macOS TCC entry from Accessibility. Same inheritance rules apply -- a probe that succeeds via Terminal does NOT mean cockpit-gui itself is approved.",
+			"Screen Recording is a separate macOS TCC entry from Accessibility. Same inheritance rules apply -- a probe that succeeds via Terminal does NOT mean memql-cockpit-computeruse itself is approved.",
 			"Press R to re-probe, O to open System Settings, Enter to continue.",
 		}
 	case stepValidate:
@@ -628,7 +628,7 @@ func (w *wizard) bodyText() []string {
 		if st.granted && sr.granted {
 			lines = append(lines,
 				"Both Accessibility and Screen Recording are granted in this process tree.",
-				"Configure ~/.memql/worker.yaml with cluster_url + token, then run: memql-cockpit-gui worker run",
+				"Configure ~/.memql/worker.yaml with cluster_url + token, then run: memql-cockpit-computeruse worker run",
 			)
 		} else {
 			lines = append(lines, "Some permissions are denied; the worker can still register HEADLESS-only.")

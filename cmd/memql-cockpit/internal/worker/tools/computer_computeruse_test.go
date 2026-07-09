@@ -1,4 +1,4 @@
-//go:build gui
+//go:build computeruse
 
 package tools
 
@@ -143,7 +143,7 @@ func TestGuiMouseDownUp_RejectBadButton(t *testing.T) {
 }
 
 // Live multi-display tests (memql-cockpit#165). These exercise the
-// RobotGo-backed enumeration so they only run on gui-tagged builds
+// RobotGo-backed enumeration so they only run on computeruse-tagged builds
 // with a reachable display; the geometry/bounds logic itself is
 // covered headlessly in coords_test.go.
 

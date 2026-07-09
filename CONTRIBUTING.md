@@ -27,9 +27,9 @@ See the [README](README.md) for build and run instructions. The cockpit depends 
 - One logical change per commit; commit messages explain *why*, not just *what*
 - Match the surrounding TUI patterns in `cli/ui/`
 
-## GUI variant
+## Computer-use variant
 
-The GUI build (`make cockpit-gui`) requires CGO + RobotGo (X11 deps on Linux, native frameworks on macOS). Most contributions only need the headless build (`make cockpit`); GUI-specific changes should be tested on both supported platforms.
+The computer-use build (`make cockpit-computeruse`) requires CGO + RobotGo (X11 deps on Linux, native frameworks on macOS). Most contributions only need the headless build (`make cockpit`); computer-use-specific changes should be tested on both supported platforms.
 
 ## License
 

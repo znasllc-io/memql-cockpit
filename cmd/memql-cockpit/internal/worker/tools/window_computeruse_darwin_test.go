@@ -1,4 +1,4 @@
-//go:build gui && darwin
+//go:build computeruse && darwin
 
 package tools
 

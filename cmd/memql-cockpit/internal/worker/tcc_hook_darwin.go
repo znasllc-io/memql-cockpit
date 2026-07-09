@@ -1,4 +1,4 @@
-//go:build darwin && gui
+//go:build darwin && computeruse
 
 package worker
 
@@ -18,7 +18,7 @@ import (
 // structured failure with a remediation hint instead of a raw
 // RobotGo error or panic.
 //
-// macOS-only, GUI-only. On every other platform / build
+// macOS-only, computeruse-only. On every other platform / build
 // configuration the hooks stay nil and the dispatcher skips the
 // checks.
 func init() {

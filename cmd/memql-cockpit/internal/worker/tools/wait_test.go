@@ -12,7 +12,7 @@ import (
 
 // Untagged test file: workerComputer.wait is build-agnostic
 // (memql-cockpit#166), so these run identically on the headless and
-// gui builds -- a sleep drives no real input.
+// computeruse builds -- a sleep drives no real input.
 
 // TestDispatcher_WaitWorksOnEveryBuild is the routing contract: wait
 // dispatches successfully on every build variant (the headless

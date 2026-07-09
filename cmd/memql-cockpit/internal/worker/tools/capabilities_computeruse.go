@@ -1,4 +1,4 @@
-//go:build gui
+//go:build computeruse
 
 package tools
 
@@ -8,13 +8,13 @@ import (
 	"github.com/go-vgo/robotgo"
 )
 
-// buildHasGUI reports whether this binary was built with the gui
-// tag. True here: the gui-tagged build carries the RobotGo backend.
-const buildHasGUI = true
+// buildHasComputerUse reports whether this binary was built with the computeruse
+// tag. True here: the computeruse-tagged build carries the RobotGo backend.
+const buildHasComputerUse = true
 
 // supportedComputerActions derives the advertised action list from
 // computerActionHandlers -- the exact routing table dispatchComputer
-// uses (computer_gui.go) -- so the descriptor can never drift from
+// uses (computer_computeruse.go) -- so the descriptor can never drift from
 // what the router actually serves. Sorted for a stable wire shape.
 //
 // window_list / window_focus are advertised since memql-cockpit#167
@@ -37,7 +37,7 @@ func supportedComputerActions() []string {
 // (quartz / x11), so a non-positive probe result -- e.g. Xinerama
 // missing on a single-headed X server -- is floored at 1: a display
 // server implies at least one display. Mirrors the
-// enumerateDisplays fallback in computer_gui.go.
+// enumerateDisplays fallback in computer_computeruse.go.
 func displayCount() int {
 	n := robotgo.DisplaysNum()
 	if n < 1 {

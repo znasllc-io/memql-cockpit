@@ -3,9 +3,13 @@
 # scripts/install/lib.sh
 # ======================
 #
-# Shared function library for the worker install scripts. Mirrors
-# scripts/dev/lib.sh -- function-based, sourced by the OS-specific
-# drivers under scripts/install/install-{mac,linux}.sh.
+# Shared function library for the worker install scripts --
+# function-based helpers sourced by the OS-specific drivers
+# install-mac.sh and install-linux.sh. write_worker_yaml (below) is
+# the single renderer for ~/.memql/worker.yaml, so the config layout
+# can never drift between the two platforms. The pure-logic helpers
+# are exercised by lib_test.sh, wired into CI via
+# .github/workflows/install-scripts-lint.yml.
 
 set -uo pipefail
 
@@ -20,7 +24,6 @@ set -uo pipefail
 readonly INSTALL_PREFIX_SYSTEM="/usr/local/bin"
 readonly INSTALL_PREFIX_USER="${HOME}/.memql/bin"
 
-readonly CONFIG_DIR_DEFAULT="${HOME}/.memql"
 readonly STATE_DIR_DEFAULT="${HOME}/.memql/state"
 
 # Detect host os ("darwin" or "linux") and arch ("amd64" or "arm64").
@@ -51,9 +54,9 @@ function detect_arch() {
 }
 
 # Pick the appropriate cockpit binary name for the requested
-# headless / gui flavour and the detected platform.
+# headless / computeruse flavour and the detected platform.
 function binary_name_for() {
-    local flavour="$1"  # "headless" or "gui"
+    local flavour="$1"  # "headless" or "computeruse"
     local os arch
     os="$(detect_os)"
     arch="$(detect_arch)"
@@ -61,8 +64,8 @@ function binary_name_for() {
         headless)
             echo "memql-cockpit-${os}-${arch}"
             ;;
-        gui)
-            echo "memql-cockpit-gui-${os}-${arch}"
+        computeruse)
+            echo "memql-cockpit-computeruse-${os}-${arch}"
             ;;
         *)
             echo "ERROR: unknown flavour $flavour" >&2
@@ -148,7 +151,7 @@ function require_sudo() {
 #
 #   INSTALL_BINARY_DEST     -- full path to the downloaded binary
 #   INSTALL_BINARY_FRIENDLY -- full path to the friendly symlink
-#                              (memql-cockpit / memql-cockpit-gui).
+#                              (memql-cockpit / memql-cockpit-computeruse).
 #
 # In system mode the install path is created via `sudo install
 # -m 0755 ...` so the destination is root-owned and the worker
@@ -197,16 +200,35 @@ function install_binary_with_mode() {
     esac
 }
 
-# Render ~/.memql/worker.yaml from supplied args. Refuses to clobber
-# an existing file unless --force.
+# write_worker_yaml renders ~/.memql/worker.yaml from the supplied
+# args. It is the SINGLE source of truth for the worker.yaml layout:
+# both install-mac.sh and install-linux.sh call it, so the config can
+# never drift between platforms. Refuses to clobber an existing file
+# unless force == "yes" (the installers' --force flag).
+#
+# Args:
+#   $1 path          -- destination file (usually ~/.memql/worker.yaml)
+#   $2 cluster_url   -- cluster edge URL
+#   $3 token         -- worker token (mql_wkr_...)
+#   $4 name          -- worker name
+#   $5 force         -- "yes" to overwrite an existing file (default "no")
+#   $6 capabilities  -- comma-separated capability list to advertise
+#                       (default "HEADLESS"; pass "HEADLESS,COMPUTERUSE"
+#                       for the computer-use variant). The Wayland
+#                       downgrade decision stays in install-linux.sh --
+#                       this helper only renders what it is handed.
+#
+# The concurrency block (HEADLESS: 8, COMPUTERUSE: 1) is fixed and
+# platform-agnostic; os/arch labels come from detect_os/detect_arch.
 function write_worker_yaml() {
     local path="$1"
     local cluster_url="$2"
     local token="$3"
     local name="$4"
     local force="${5:-no}"
+    local capabilities="${6:-HEADLESS}"
     if [[ -e "$path" && "$force" != "yes" ]]; then
-        echo "ERROR: $path already exists; pass --force to overwrite"
+        echo "ERROR: $path already exists; pass --force to overwrite" >&2
         return 1
     fi
     mkdir -p "$(dirname "$path")"
@@ -219,11 +241,12 @@ labels:
   arch: $(detect_arch)
 concurrency:
   HEADLESS: 8
-  GUI: 1
+  COMPUTERUSE: 1
 state_dir: ${STATE_DIR_DEFAULT}
 log_level: info
 capabilities:
-  - HEADLESS
+$(echo "$capabilities" | tr ',' '\n' | sed 's/^/  - /')
 YAML
     chmod 600 "$path"
+    echo "INFO: wrote $path (capabilities: ${capabilities})"
 }

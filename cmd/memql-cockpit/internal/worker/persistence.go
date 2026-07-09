@@ -37,7 +37,7 @@ func WriteWorkerYAML(path, clusterURL, token, name string) error {
 			"arch":     runtime.GOARCH,
 			"hostname": hostname,
 		},
-		Concurrency:  map[string]uint32{"HEADLESS": 8, "GUI": 1},
+		Concurrency:  map[string]uint32{"HEADLESS": 8, "COMPUTERUSE": 1},
 		StateDir:     defaultStateDir(),
 		LogLevel:     "info",
 		Capabilities: capabilitiesForBuildTag(),
@@ -58,8 +58,8 @@ func WriteWorkerYAML(path, clusterURL, token, name string) error {
 }
 
 // capabilitiesForBuildTag returns the capabilities the running
-// cockpit binary can advertise. The gui-tagged sibling
-// (capabilities_gui.go) overrides to include "GUI"; the default
+// cockpit binary can advertise. The computeruse-tagged sibling
+// (capabilities_computeruse.go) overrides to include "COMPUTERUSE"; the default
 // build is HEADLESS-only.
 func capabilitiesForBuildTag() []string {
 	return capabilitiesForBuildTagImpl()

@@ -36,7 +36,7 @@ memql-cockpit#126.)
 ### 2. Single-panel wizard
 
 Used for focused, time-bounded flows like
-`memql-cockpit-gui worker setup`. Same `Header` chrome ("memQL
+`memql-cockpit-computeruse worker setup`. Same `Header` chrome ("memQL
 Cockpit" branding on the left, contextual hint on the right, dark
 band shared with the bottom hint bar). The tab bar is replaced with
 a context-specific hint footer ("Enter:Continue R:Re-probe ..."), and
@@ -70,8 +70,8 @@ import only `cli/ui` and `cli/canvas` -- not `cli/app`, not
 `cli/cluster`, not other tab-specific packages. This keeps the
 multi-tab IDE and the wizards independently buildable. Examples:
 
-- `cmd/memql-cockpit/internal/worker/wizard_gui.go` -- worker setup
-  wizard, single-panel layout (build tag `gui`).
+- `cmd/memql-cockpit/internal/worker/wizard_computeruse.go` -- worker setup
+  wizard, single-panel layout (build tag `computeruse`).
 - Future: `cmd/memql-cockpit/internal/onboarding/` -- first-launch
   flow, single-panel layout, optionally chained.
 

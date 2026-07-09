@@ -11,7 +11,7 @@ import (
 // mouse + keyboard events). Returns true when the calling process is
 // trusted (AXIsProcessTrusted), false otherwise.
 //
-// Set at init time by the worker package's darwin && gui build
+// Set at init time by the worker package's darwin && computeruse build
 // (cmd/memql-cockpit/internal/worker/tcc_hook_darwin.go) and nil on
 // every other platform / build configuration -- nil means "the
 // platform doesn't gate this; proceed". Same injection rationale as
@@ -21,13 +21,13 @@ var AccessibilityPreflightHook func() bool
 
 // DisplayServerPreflightHook reports the display server the host
 // session exposes ("x11" / "wayland" / "none"). Set at init time by
-// the worker package's linux && gui build
+// the worker package's linux && computeruse build
 // (cmd/memql-cockpit/internal/worker/display_preflight_linux.go) --
 // RobotGo drives X11 only, so any non-x11 answer means input +
 // screenshot actions cannot work and must fail with a structured
 // `display_server_unsupported` instead of an opaque RobotGo error.
 // Nil on every other platform / build configuration: macOS always
-// has Quartz, and the headless build rejects GUI actions before any
+// has Quartz, and the headless build rejects computer-use actions before any
 // display question arises.
 var DisplayServerPreflightHook func() string
 
@@ -90,7 +90,7 @@ func preflightComputerAction(action string) *memqlv1.Failure {
 		return failure("permission_denied", fmt.Sprintf(
 			"workerComputer.%s requires the Accessibility permission, which is not "+
 				"granted for this binary. Open System Settings -> Privacy & Security -> "+
-				"Accessibility, enable memql-cockpit-gui, then retry.", action))
+				"Accessibility, enable memql-cockpit-computeruse, then retry.", action))
 	}
 
 	// macOS Screen Recording gate: same TCC pattern, screenshot only.
@@ -98,7 +98,7 @@ func preflightComputerAction(action string) *memqlv1.Failure {
 		return failure("permission_denied",
 			"Screen Recording permission is not granted for this binary. "+
 				"Open System Settings -> Privacy & Security -> Screen Recording, "+
-				"enable memql-cockpit-gui, then re-run.")
+				"enable memql-cockpit-computeruse, then re-run.")
 	}
 
 	return nil

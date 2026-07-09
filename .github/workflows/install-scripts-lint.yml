@@ -1,0 +1,46 @@
+name: install-scripts-lint
+
+# Lints + smoke-tests the worker install scripts under scripts/install/.
+# These are pure shell (no Go), so this lane is independent of the memql
+# sibling checkout the build/test lanes need.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'scripts/install/**'
+      - '.github/workflows/install-scripts-lint.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/install/**'
+      - '.github/workflows/install-scripts-lint.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: shellcheck + lib_test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout memql-cockpit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: bash -n (syntax check)
+        run: |
+          for f in scripts/install/*.sh; do
+            echo "bash -n $f"
+            bash -n "$f"
+          done
+
+      # shellcheck ships on the GitHub-hosted ubuntu runners. -x follows the
+      # `source lib.sh` so the sourced helpers are analysed too; --source-path
+      # points it at the install dir so the source= directives resolve.
+      - name: shellcheck
+        run: |
+          shellcheck --version
+          shellcheck -x --source-path=scripts/install scripts/install/*.sh
+
+      - name: lib_test.sh (helper smoke tests)
+        run: bash scripts/install/lib_test.sh

@@ -19,7 +19,7 @@ const (
 )
 
 // runComputerWait serves workerComputer.wait on EVERY build variant
-// -- like `capabilities` it needs no GUI backend, so the dispatcher
+// -- like `capabilities` it needs no computer-use backend, so the dispatcher
 // routes it before the per-build router AND before the platform
 // preflights (a pure sleep needs neither Accessibility nor a display
 // server). Untagged file: both builds share this one implementation.

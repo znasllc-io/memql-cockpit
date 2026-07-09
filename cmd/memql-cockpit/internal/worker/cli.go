@@ -23,7 +23,7 @@ import (
 //	memql-cockpit worker pair <code>       Redeem a pairing code, write yaml, run worker
 //	memql-cockpit worker                   Open the pairing wizard (paste a code)
 //	memql-cockpit worker run [flags]       Run the worker (assumes worker.yaml already written)
-//	memql-cockpit worker setup             Re-run TCC permissions check (gui builds)
+//	memql-cockpit worker setup             Re-run TCC permissions check (computeruse builds)
 //	memql-cockpit worker config            Print effective config
 //
 // `pair` is the primary entry: it walks the user from "I have an
@@ -357,7 +357,7 @@ func printUsage() {
 	fmt.Println("  memql-cockpit worker               Same flow with a paste prompt (no code arg).")
 	fmt.Println("  memql-cockpit worker run           Run an already-configured worker (used by")
 	fmt.Println("                                     LaunchAgent / scripts).")
-	fmt.Println("  memql-cockpit worker setup         Re-run TCC permissions check (GUI builds only).")
+	fmt.Println("  memql-cockpit worker setup         Re-run TCC permissions check (computeruse builds only).")
 	fmt.Println("  memql-cockpit worker config        Print the effective config.")
 	fmt.Println("  memql-cockpit worker consent <op>  Manage the per-call consent gate (grant/revoke/status/watch).")
 	fmt.Println("")

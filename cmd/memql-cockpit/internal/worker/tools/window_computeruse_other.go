@@ -1,4 +1,4 @@
-//go:build gui && !darwin && !linux
+//go:build computeruse && !darwin && !linux
 
 package tools
 
@@ -10,8 +10,8 @@ import (
 )
 
 // Window enumeration / activation ships for macOS (CGWindowList) and
-// Linux/X11 (EWMH) only -- see window_gui_darwin.go /
-// window_gui_linux.go. Other gui-tagged platforms get the structured
+// Linux/X11 (EWMH) only -- see window_computeruse_darwin.go /
+// window_computeruse_linux.go. Other computeruse-tagged platforms get the structured
 // unsupported error; the actions are still routed (and therefore
 // advertised by the capability descriptor) so the error is honest
 // and actionable rather than unknown_action.
