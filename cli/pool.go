@@ -642,10 +642,16 @@ func (e *connEntry) dialOnce(ctx context.Context) error {
 
 	sm := client.NewSubscriptionManager(conn.Dispatcher())
 	subCtx := context.Background()
-	subId, events, err := sm.Subscribe(subCtx,
-		client.SubscriptionKindGraphEvents,
-		"node.created.v1:cluster:node",
-	)
+	// Graph subscriptions are structured (concept + actions) since
+	// memql#2460 -- the free-text Subscribe(GraphEvents, "node.created.
+	// v1:cluster:node") form is now rejected server-side, which used to
+	// surface as a non-auth dial error that spun the connect loop
+	// forever ("Connecting..." / retrying). Subscribe to node.created on
+	// v1:cluster:node via the structured API.
+	subId, events, err := sm.SubscribeGraph(subCtx, client.GraphSubscribeOptions{
+		Concept: "v1:cluster:node",
+		Actions: []client.GraphAction{client.GraphActionCreated},
+	})
 	if err != nil {
 		conn.Close()
 		return err
