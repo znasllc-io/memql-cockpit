@@ -1,0 +1,21 @@
+# The memql commit every CI lane checks out as the ../memql sibling.
+#
+# This file is the SINGLE source of truth for that pin. Workflows must not
+# name a ref themselves -- they reach the sibling through
+# .github/actions/checkout-memql, which reads this file. The guard job in
+# ci.yml fails if any workflow checks out znasllc-io/memql directly.
+#
+# WHY PINNED. memql is being split into ~29 nested modules (memql#3228). No
+# static cockpit go.mod is green both before and after a given module lands
+# (see the truth table in go.mod), and there is no atomic cross-repo merge.
+# Pinning buys the window: cockpit keeps building against a known memql while
+# that module lands, then ONE cockpit PR moves this pin and adds that module's
+# require + replace in the same commit.
+#
+# TO BUMP: change the sha below, add the newly-landed module's `require` and
+# `replace` to go.mod, and run `go mod tidy` -- all in one commit.
+#
+# Currently pinned to memql main after the wire (memql#3240) and base
+# (memql#3241) tiers landed -- 22 nested modules. The engine, platform and
+# server tiers (memql#3242..#3244) each get their own bump.
+3b913f3791a9d1063fbbbf5143d327f1b758de2e

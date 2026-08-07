@@ -21,17 +21,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout memql-cockpit
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: memql-cockpit
-      - name: Checkout memql (sibling for replace directive)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Checkout memql (sibling for the ../memql replace directive, pinned)
+        # Pinned via .github/memql-pin -- see that file and go.mod. memql is
+        # mid module-split (memql#3228) and an unpinned main breaks cockpit the
+        # moment any nested go.mod lands.
+        uses: ./memql-cockpit/.github/actions/checkout-memql
         with:
-          repository: znasllc-io/memql
-          path: memql
-          # See ci.yml: Dependabot's restricted token can't read the private
-          # sibling repo; MEMQL_SIBLING_TOKEN (Dependabot secret) covers that,
-          # with a fallback to the default token on normal runs.
+          # Dependabot's restricted token can't read the sibling repo;
+          # MEMQL_SIBLING_TOKEN (Dependabot secret) covers that, with a
+          # fallback to the default token on normal runs.
           token: ${{ secrets.MEMQL_SIBLING_TOKEN || github.token }}
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:

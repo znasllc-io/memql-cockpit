@@ -533,7 +533,10 @@ func (v *View) requestHover(line, col int) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		// Sense positions are 1-indexed (line + column).
-		h, err := sc.Hover(ctx, src, sense.Position{Line: line + 1, Column: col + 1})
+		// memql#2760 added a filePath argument supplying the ambient domain
+		// that disambiguates colliding bare construct names. "" is accepted
+		// and costs only that tie-break, restoring pre-#2760 behaviour.
+		h, err := sc.Hover(ctx, src, sense.Position{Line: line + 1, Column: col + 1}, "")
 		if err != nil {
 			v.status(fmt.Sprintf("hover: %v", err))
 			return
