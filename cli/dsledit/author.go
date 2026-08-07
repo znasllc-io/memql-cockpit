@@ -998,7 +998,12 @@ func (a *authoring) requestHover(src string, line, col, anchorX, anchorY int) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	h, err := sc.Hover(ctx, src, sense.Position{Line: line + 1, Column: col + 1})
+	// memql#2760 added a filePath argument that supplies the ambient domain
+	// disambiguating a bare construct name whose trailing segment collides
+	// across namespaces. "" is accepted and costs only that tie-break, so it
+	// restores the exact pre-#2760 behaviour; threading the real editor path
+	// through is a separate improvement.
+	h, err := sc.Hover(ctx, src, sense.Position{Line: line + 1, Column: col + 1}, "")
 	if err != nil {
 		a.status(fmt.Sprintf("hover: %v", err))
 		return

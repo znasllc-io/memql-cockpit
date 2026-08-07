@@ -22,15 +22,15 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           path: memql-cockpit
-      - name: Checkout memql (sibling for replace directive)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Checkout memql (sibling for the ../memql replace directive, pinned)
+        # Pinned via .github/memql-pin -- see that file and go.mod. memql is
+        # mid module-split (memql#3228) and an unpinned main breaks cockpit the
+        # moment any nested go.mod lands.
+        uses: ./memql-cockpit/.github/actions/checkout-memql
         with:
-          repository: znasllc-io/memql
-          path: memql
-          # Dependabot runs use a restricted token that can't read other private
-          # repos, so the sibling checkout fails there. MEMQL_SIBLING_TOKEN is a
-          # fine-grained PAT (contents:read on znasllc-io/memql) added as a
-          # Dependabot secret; it falls back to the default token on normal runs.
+          # Dependabot's restricted token can't read the sibling repo;
+          # MEMQL_SIBLING_TOKEN (Dependabot secret) covers that, with a
+          # fallback to the default token on normal runs.
           token: ${{ secrets.MEMQL_SIBLING_TOKEN || github.token }}
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
@@ -49,15 +49,15 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           path: memql-cockpit
-      - name: Checkout memql (sibling for replace directive)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Checkout memql (sibling for the ../memql replace directive, pinned)
+        # Pinned via .github/memql-pin -- see that file and go.mod. memql is
+        # mid module-split (memql#3228) and an unpinned main breaks cockpit the
+        # moment any nested go.mod lands.
+        uses: ./memql-cockpit/.github/actions/checkout-memql
         with:
-          repository: znasllc-io/memql
-          path: memql
-          # Dependabot runs use a restricted token that can't read other private
-          # repos, so the sibling checkout fails there. MEMQL_SIBLING_TOKEN is a
-          # fine-grained PAT (contents:read on znasllc-io/memql) added as a
-          # Dependabot secret; it falls back to the default token on normal runs.
+          # Dependabot's restricted token can't read the sibling repo;
+          # MEMQL_SIBLING_TOKEN (Dependabot secret) covers that, with a
+          # fallback to the default token on normal runs.
           token: ${{ secrets.MEMQL_SIBLING_TOKEN || github.token }}
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
@@ -102,15 +102,15 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           path: memql-cockpit
-      - name: Checkout memql (sibling for replace directive)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Checkout memql (sibling for the ../memql replace directive, pinned)
+        # Pinned via .github/memql-pin -- see that file and go.mod. memql is
+        # mid module-split (memql#3228) and an unpinned main breaks cockpit the
+        # moment any nested go.mod lands.
+        uses: ./memql-cockpit/.github/actions/checkout-memql
         with:
-          repository: znasllc-io/memql
-          path: memql
-          # Dependabot runs use a restricted token that can't read other private
-          # repos, so the sibling checkout fails there. MEMQL_SIBLING_TOKEN is a
-          # fine-grained PAT (contents:read on znasllc-io/memql) added as a
-          # Dependabot secret; it falls back to the default token on normal runs.
+          # Dependabot's restricted token can't read the sibling repo;
+          # MEMQL_SIBLING_TOKEN (Dependabot secret) covers that, with a
+          # fallback to the default token on normal runs.
           token: ${{ secrets.MEMQL_SIBLING_TOKEN || github.token }}
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
@@ -137,15 +137,15 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           path: memql-cockpit
-      - name: Checkout memql (sibling for replace directive)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Checkout memql (sibling for the ../memql replace directive, pinned)
+        # Pinned via .github/memql-pin -- see that file and go.mod. memql is
+        # mid module-split (memql#3228) and an unpinned main breaks cockpit the
+        # moment any nested go.mod lands.
+        uses: ./memql-cockpit/.github/actions/checkout-memql
         with:
-          repository: znasllc-io/memql
-          path: memql
-          # Dependabot runs use a restricted token that can't read other private
-          # repos, so the sibling checkout fails there. MEMQL_SIBLING_TOKEN is a
-          # fine-grained PAT (contents:read on znasllc-io/memql) added as a
-          # Dependabot secret; it falls back to the default token on normal runs.
+          # Dependabot's restricted token can't read the sibling repo;
+          # MEMQL_SIBLING_TOKEN (Dependabot secret) covers that, with a
+          # fallback to the default token on normal runs.
           token: ${{ secrets.MEMQL_SIBLING_TOKEN || github.token }}
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
@@ -163,3 +163,47 @@ jobs:
       - name: go vet (computeruse)
         working-directory: memql-cockpit
         run: CGO_ENABLED=1 go vet -tags computeruse ./...
+
+  # The memql sibling pin must have exactly ONE source of truth.
+  #
+  # memql is mid module-split (memql#3228). No static cockpit go.mod is green
+  # both before and after a given memql module lands (truth table in go.mod),
+  # so every lane has to build against a PINNED memql. A lane that still checks
+  # out an unpinned main does not fail today -- it fails on whichever future day
+  # a nested go.mod lands, in whichever lane was missed. Converting that into an
+  # immediate, obvious failure is what this job is for.
+  #
+  # Needs no sibling checkout and no Go: it reads this repo's own files.
+  memql-pin-guard:
+    name: memql-pin-guard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout memql-cockpit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          path: memql-cockpit
+      - name: Every memql checkout goes through the pinned composite action
+        working-directory: memql-cockpit
+        run: |
+          set -euo pipefail
+          # Anchored at line start so this job's own pattern, which appears
+          # mid-line inside a shell assignment, does not match itself.
+          bad="$(grep -rlnE '^[[:space:]]*repository:[[:space:]]*znasllc-io/memql' .github/workflows/ || true)"
+          if [ -n "$bad" ]; then
+            echo "These workflows check out the memql sibling directly rather than"
+            echo "through .github/actions/checkout-memql, so they are NOT covered"
+            echo "by the .github/memql-pin single source of truth:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "all memql checkouts go through the composite action"
+      - name: The pin is a resolvable full commit sha
+        working-directory: memql-cockpit
+        run: |
+          set -euo pipefail
+          sha="$(grep -vE '^[[:space:]]*(#|$)' .github/memql-pin | head -1 | tr -d '[:space:]')"
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo ".github/memql-pin must hold a full 40-character commit sha, got '${sha}'"
+            exit 1
+          fi
+          echo "pin ok: $sha"
