@@ -11,6 +11,12 @@ require (
 	github.com/jezek/xgb v1.3.1
 	github.com/jezek/xgbutil v0.0.0-20260124183602-9fd151d6a51a
 	github.com/znasllc-io/memql v0.0.0-20260623073124-7c7d1350e667
+	github.com/znasllc-io/memql/component/architecture v0.0.0
+	github.com/znasllc-io/memql/component/auth v0.0.0
+	github.com/znasllc-io/memql/component/events v0.0.0
+	github.com/znasllc-io/memql/component/grpc/gen v0.0.0
+	github.com/znasllc-io/memql/component/node/gen v0.0.0
+	github.com/znasllc-io/memql/component/secret v0.0.0
 	golang.org/x/image v0.44.0
 	golang.org/x/sys v0.47.0
 	golang.org/x/term v0.45.0
@@ -83,6 +89,16 @@ require (
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	github.com/zeozeozeo/gomplerate v0.0.0-20250404113140-0fbb236df825 // indirect
+	github.com/znasllc-io/memql/component/bus v0.0.0 // indirect
+	github.com/znasllc-io/memql/component/bus/gen v0.0.0 // indirect
+	github.com/znasllc-io/memql/component/config v0.0.0 // indirect
+	github.com/znasllc-io/memql/component/language/annotations v0.0.0 // indirect
+	github.com/znasllc-io/memql/component/language/ast v0.0.0 // indirect
+	github.com/znasllc-io/memql/component/language/dslclause v0.0.0 // indirect
+	github.com/znasllc-io/memql/component/metrics v0.0.0 // indirect
+	github.com/znasllc-io/memql/component/provenance v0.0.0 // indirect
+	github.com/znasllc-io/memql/component/safety v0.0.0 // indirect
+	github.com/znasllc-io/memql/core v0.0.0 // indirect
 	go.opentelemetry.io/otel v1.44.0 // indirect
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
 	go.yaml.in/yaml/v4 v4.0.0-rc.2 // indirect
@@ -155,8 +171,46 @@ require (
 // mapping for those is decided by those tasks, so it is not guessed here.
 replace github.com/znasllc-io/memql => ../memql
 
+replace github.com/znasllc-io/memql/component/architecture => ../memql/component/architecture
+
+replace github.com/znasllc-io/memql/component/auth => ../memql/component/auth
+
+replace github.com/znasllc-io/memql/component/bus => ../memql/component/bus
+
+replace github.com/znasllc-io/memql/component/bus/gen => ../memql/component/bus/gen
+
+replace github.com/znasllc-io/memql/component/config => ../memql/component/config
+
+replace github.com/znasllc-io/memql/component/events => ../memql/component/events
+
+replace github.com/znasllc-io/memql/component/fileprocessor => ../memql/component/fileprocessor
+
 replace github.com/znasllc-io/memql/component/grpc/gen => ../memql/component/grpc/gen
+
+replace github.com/znasllc-io/memql/component/healing => ../memql/component/healing
+
+replace github.com/znasllc-io/memql/component/language/annotations => ../memql/component/language/annotations
+
+replace github.com/znasllc-io/memql/component/language/ast => ../memql/component/language/ast
+
+replace github.com/znasllc-io/memql/component/language/dslclause => ../memql/component/language/dslclause
+
+replace github.com/znasllc-io/memql/component/metadata => ../memql/component/metadata
+
+replace github.com/znasllc-io/memql/component/metrics => ../memql/component/metrics
 
 replace github.com/znasllc-io/memql/component/node/gen => ../memql/component/node/gen
 
-replace github.com/znasllc-io/memql/component/bus/gen => ../memql/component/bus/gen
+replace github.com/znasllc-io/memql/component/observe => ../memql/component/observe
+
+replace github.com/znasllc-io/memql/component/planner => ../memql/component/planner
+
+replace github.com/znasllc-io/memql/component/polyphon => ../memql/component/polyphon
+
+replace github.com/znasllc-io/memql/component/provenance => ../memql/component/provenance
+
+replace github.com/znasllc-io/memql/component/safety => ../memql/component/safety
+
+replace github.com/znasllc-io/memql/component/secret => ../memql/component/secret
+
+replace github.com/znasllc-io/memql/core => ../memql/core
