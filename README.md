@@ -30,7 +30,7 @@ memQL Cockpit is the terminal-native IDE and operations console for [memQL](http
 ## Features
 
 - **Multi-tab TUI** — DevOps, Concepts, Editor, Settings — all in one terminal; the unified Concepts tab consumes `@displayCard` hints to render rows nicely per concept
-- **DSL editor + linter** — write `.memql` files with structured validation
+- **DSL editor + linter** — write `.memql` files with structured validation (powered by MemQL Sense; for editing outside the Cockpit, the [MemQL VS Code extension](https://github.com/znasllc-io/memql/blob/main/docs/public/language/vscode.md) is a second consumer of the same Sense brain, over an offline language server)
 - **Worker modes** — per-user workers bring computer use into the platform: `HEADLESS` (shell / fs / http tools) on every build, `COMPUTERUSE` on the computer-use variant
 - **Computer-use variant** — opt-in CGO build (`-tags computeruse`) with screenshot, mouse, keyboard, and window control via RobotGo; see [docs/computer-use.md](docs/computer-use.md)
 - **Service install** — register as a LaunchAgent (macOS) or systemd user service (Linux)
