@@ -71,6 +71,57 @@ func TestAddFormComposesOnEnter(t *testing.T) {
 	}
 }
 
+// TestAddFormCarriesLocalToggle drives the Local toggle the way the TUI
+// does -- type a domain, ↓ onto the toggle, Space to flip it -- and
+// asserts the saved config carries Local. The flag is what the memQL
+// VS Code extension reads out of the shared clusters.yaml to gate its
+// non-local write confirmation (znasllc-io/memql#3313).
+func TestAddFormCarriesLocalToggle(t *testing.T) {
+	v := NewClustersView(ui.DefaultTheme())
+	var got config.ClusterConfig
+	v.OnAdd = func(c config.ClusterConfig) { got = c }
+
+	v.showAddForm = true
+	v.addForm = addFormState{}
+
+	for _, r := range "dev.example.com" {
+		v.HandleEvent(tcell.NewEventKey(tcell.KeyRune, r, tcell.ModNone))
+	}
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyDown, 0, tcell.ModNone))
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyRune, ' ', tcell.ModNone))
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+
+	if !got.Local {
+		t.Errorf("Local not set on the saved config: %+v", got)
+	}
+	// The toggle must not swallow into the field behind it: a Space
+	// landing in the domain would have failed validation instead.
+	if got.Domain != "dev.example.com" {
+		t.Errorf("domain = %q, want dev.example.com", got.Domain)
+	}
+}
+
+// TestEditFormPrefillsLocal: re-opening the form for an existing cluster
+// shows its current Local value, so saving an unrelated edit does not
+// silently clear the flag.
+func TestEditFormPrefillsLocal(t *testing.T) {
+	s := formStateFromConfig(config.ClusterConfig{Name: "dev", Domain: "dev.example.com", Local: true})
+	if !s.local {
+		t.Fatal("edit form did not pre-populate the Local toggle")
+	}
+
+	v := NewClustersView(ui.DefaultTheme())
+	var got config.ClusterConfig
+	v.OnSave = func(c config.ClusterConfig) { got = c }
+	v.showAddForm = true
+	v.addForm = s
+	v.HandleEvent(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+
+	if !got.Local {
+		t.Errorf("saving an untouched edit form cleared Local: %+v", got)
+	}
+}
+
 // TestAddFormRejectsBareLabel: a non-FQDN keeps the form open with an
 // error instead of saving.
 func TestAddFormRejectsBareLabel(t *testing.T) {
