@@ -104,20 +104,34 @@ type ClustersView struct {
 	OnEntryState func(clusterName string) (state string, attempt int, nextTryAt string, ok bool)
 }
 
-// addFormState backs the single-field Add/Edit cluster form. The user
-// types one Domain (e.g. "staging.copresent.ai"); Endpoint / Issuer /
-// ClientId are composed from it by convention on save (see
-// composeFromDomain). Deployments that don't follow the cockpit./identity.
-// convention are edited directly in ~/.memql/clusters.yaml.
+// addFormState backs the Add/Edit cluster form. The user types one
+// Domain (e.g. "staging.copresent.ai"); Endpoint / Issuer / ClientId
+// are composed from it by convention on save (see composeFromDomain).
+// Deployments that don't follow the cockpit./identity. convention are
+// edited directly in ~/.memql/clusters.yaml.
 type addFormState struct {
-	domain   string
+	domain string
+	// local is the Local toggle -- "this cluster runs on my machine".
+	// Persisted to clusters.yaml as `local:`, where the memQL VS Code
+	// extension reads it to gate its non-local write confirmation
+	// (znasllc-io/memql#3313).
+	local    bool
 	editMode bool   // true when re-opening the form for an existing cluster
 	editName string // original (immutable) cluster name when editMode is true
+	// cursor is the focused field: formFieldDomain or formFieldLocal.
+	cursor int
 	// formError is set by Enter-handling when validation fails. Cleared
 	// on the next keystroke so the hint disappears once the user
 	// acknowledges it and continues editing.
 	formError string
 }
+
+// Focusable fields in the Add/Edit form, in render order.
+const (
+	formFieldDomain = iota
+	formFieldLocal
+	formFieldCount
+)
 
 // defaultLocalClusterConfig is the seed used when no user override
 // exists in clusters.yaml. The name slot is always "local"; the
@@ -176,6 +190,7 @@ func domainFromConfig(c config.ClusterConfig) string {
 func formStateFromConfig(c config.ClusterConfig) addFormState {
 	return addFormState{
 		domain:   domainFromConfig(c),
+		local:    c.Local,
 		editMode: true,
 		editName: c.Name,
 	}
@@ -642,25 +657,42 @@ func (v *ClustersView) drawAddForm(screen *ui.Screen, x, y, maxW int, bounds ui.
 		y += 2
 	}
 
-	// The single field: Domain. Endpoint / Issuer / ClientId are
-	// composed from it on save (see composeFromDomain).
-	screen.DrawText(x+1, y, 10, "Domain", v.Theme.AccentStyle())
+	// Field 1: Domain. Endpoint / Issuer / ClientId are composed from
+	// it on save (see composeFromDomain).
+	domainFocused := v.addForm.cursor == formFieldDomain
+	screen.DrawText(x+1, y, 10, "Domain", v.formLabelStyle(domainFocused))
 	fieldX := x + 12
 	fieldW := min(maxW-13, 28)
 	if fieldW < 3 {
 		return
 	}
-	fieldStyle := tcell.StyleDefault.Foreground(v.Theme.FG).Background(tcell.NewRGBColor(50, 55, 65))
-	screen.FillRect(fieldX, y, fieldW, 1, fieldStyle)
 	caretStyle := tcell.StyleDefault.Background(v.Theme.FG)
+	fieldStyle := v.formFieldStyle(domainFocused)
+	screen.FillRect(fieldX, y, fieldW, 1, fieldStyle)
 	if v.addForm.domain == "" {
 		screen.DrawText(fieldX+1, y, fieldW-2, "example.copresent.ai", fieldStyle.Foreground(v.Theme.Subtle))
-		screen.SetCell(fieldX+1, y, ' ', caretStyle)
+		if domainFocused {
+			screen.SetCell(fieldX+1, y, ' ', caretStyle)
+		}
 	} else {
 		// Horizontal scroll so a long domain keeps its end + caret on
 		// screen (memql-cockpit#193).
-		ui.DrawInputValue(screen, fieldX, y, fieldW, v.addForm.domain, true, fieldStyle, caretStyle)
+		ui.DrawInputValue(screen, fieldX, y, fieldW, v.addForm.domain, domainFocused, fieldStyle, caretStyle)
 	}
+	y += 2
+
+	// Field 2: Local -- a toggle, not free text. Rendered in the same
+	// "[x] on" / "[ ] off" shape ui.Form uses for FieldToggle so the
+	// two form surfaces read alike.
+	localFocused := v.addForm.cursor == formFieldLocal
+	screen.DrawText(x+1, y, 10, "Local", v.formLabelStyle(localFocused))
+	localStyle := v.formFieldStyle(localFocused)
+	screen.FillRect(fieldX, y, fieldW, 1, localStyle)
+	toggle := "[ ] off"
+	if v.addForm.local {
+		toggle = "[x] on"
+	}
+	screen.DrawText(fieldX+1, y, fieldW-2, toggle, localStyle)
 	y += 2
 
 	// Inline validation error (if any). Wrapped via ui.WrapText so a
@@ -675,7 +707,27 @@ func (v *ClustersView) drawAddForm(screen *ui.Screen, x, y, maxW int, bounds ui.
 	}
 
 	subtle := v.Theme.SubtleStyle()
+	screen.DrawText(x, y, maxW, "↑/↓:Field      Space:Toggle", subtle)
+	y++
 	screen.DrawText(x, y, maxW, "Enter:Save       Esc:Cancel", subtle)
+}
+
+// formLabelStyle / formFieldStyle paint an Add/Edit form row focused or
+// not, matching ui.Form's convention (accent label + lighter input box
+// on the focused row).
+func (v *ClustersView) formLabelStyle(focused bool) tcell.Style {
+	if focused {
+		return v.Theme.AccentStyle()
+	}
+	return v.Theme.BaseStyle()
+}
+
+func (v *ClustersView) formFieldStyle(focused bool) tcell.Style {
+	bg := tcell.NewRGBColor(35, 38, 45)
+	if focused {
+		bg = tcell.NewRGBColor(50, 55, 65)
+	}
+	return tcell.StyleDefault.Foreground(v.Theme.FG).Background(bg)
 }
 
 // HandleEvent routes events based on focus and state.
@@ -894,9 +946,23 @@ func (v *ClustersView) handleAddFormEvent(ev *tcell.EventKey) bool {
 	case tcell.KeyEscape:
 		v.showAddForm = false
 		return true
-	// Single-field form: Tab/↑/↓ have nothing to navigate to. Swallow
-	// them so they don't leak to pane navigation while the form is open.
-	case tcell.KeyTab, tcell.KeyUp, tcell.KeyDown:
+	// ↑/↓ move between Domain and Local. Tab is swallowed rather than
+	// used for navigation -- HandleEvent reserves it for pane focus and
+	// deliberately eats it while a form is open.
+	case tcell.KeyUp, tcell.KeyDown:
+		v.addForm.formError = ""
+		v.addForm.cursor = (v.addForm.cursor + 1) % formFieldCount
+		return true
+	case tcell.KeyTab:
+		return true
+	case tcell.KeyLeft, tcell.KeyRight:
+		// Arrows cycle a toggle, matching ui.Form's FieldToggle
+		// bindings. Text fields have no mid-string caret, so there is
+		// nothing else for them to do.
+		if v.addForm.cursor == formFieldLocal {
+			v.addForm.formError = ""
+			v.addForm.local = !v.addForm.local
+		}
 		return true
 	case tcell.KeyEnter:
 		domain, err := ui.ValidateDomain(v.addForm.domain)
@@ -905,6 +971,7 @@ func (v *ClustersView) handleAddFormEvent(ev *tcell.EventKey) bool {
 			return true
 		}
 		c := composeFromDomain(domain)
+		c.Local = v.addForm.local
 		var fire func()
 		if v.addForm.editMode {
 			// Keep the original config key immutable so a saved token /
@@ -928,6 +995,9 @@ func (v *ClustersView) handleAddFormEvent(ev *tcell.EventKey) bool {
 		return true
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
 		v.addForm.formError = ""
+		if v.addForm.cursor != formFieldDomain {
+			return true
+		}
 		if r := []rune(v.addForm.domain); len(r) > 0 {
 			v.addForm.domain = string(r[:len(r)-1])
 		}
@@ -935,6 +1005,14 @@ func (v *ClustersView) handleAddFormEvent(ev *tcell.EventKey) bool {
 	case tcell.KeyRune:
 		v.addForm.formError = ""
 		r := ev.Rune()
+		if v.addForm.cursor == formFieldLocal {
+			// Space flips the toggle; every other rune is swallowed so
+			// stray typing can't leak into the domain field behind it.
+			if r == ' ' {
+				v.addForm.local = !v.addForm.local
+			}
+			return true
+		}
 		// Domains are a subset of the host charset; lower-case on the way
 		// in so the stored value matches the server's normalized form.
 		if r >= 'A' && r <= 'Z' {

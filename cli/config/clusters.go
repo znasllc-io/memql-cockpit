@@ -36,6 +36,14 @@ type ClusterConfig struct {
 	// flow -- the token IS the credential. Generate one at
 	// /me/tokens on the identity binary.
 	PAT string `yaml:"pat,omitempty"`
+	// Local marks a cluster as running on the operator's own machine.
+	// clusters.yaml is SHARED with the memQL VS Code extension, which
+	// gates its "you are about to run a mutation against a non-local
+	// cluster" confirmation on this flag. The cockpit does not act on
+	// the value itself; it models it so both tools agree on what a
+	// cluster is and a cockpit-written entry carries the field instead
+	// of silently omitting it (znasllc-io/memql#3313).
+	Local bool `yaml:"local,omitempty"`
 }
 
 // Display returns DisplayName if set, otherwise Name. Use this for
