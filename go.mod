@@ -2,7 +2,7 @@ module github.com/znasllc-io/memql-cockpit
 
 go 1.26.1
 
-toolchain go1.26.5
+toolchain go1.26.6
 
 require (
 	github.com/99designs/keyring v1.2.2
