@@ -44,6 +44,26 @@ type ClusterConfig struct {
 	// cluster is and a cockpit-written entry carries the field instead
 	// of silently omitting it (znasllc-io/memql#3313).
 	Local bool `yaml:"local,omitempty"`
+	// Version is the release that cluster is believed to be running
+	// ("v0.18.0"). The memQL VS Code plugin owns the value: it records the
+	// version at install and refreshes it opportunistically, because no
+	// installed cluster can state its own release -- ServerHello.version is
+	// the literal "v1" (the wire protocol) and the engine's release stamp
+	// only reaches clusters cut after znasllc-io/memql#3998.
+	//
+	// The cockpit does not act on the value; it models the key for the same
+	// reason it models Local. SaveClusters marshals this struct over the
+	// file, so a key that is not a field here is DROPPED on the cockpit's
+	// next write -- asserted by TestClusterVersionFieldRoundTrip below. A
+	// plugin-recorded version silently vanishing the first time an operator
+	// edits a cluster in the cockpit is exactly the failure this field
+	// prevents (znasllc-io/memql#3994).
+	//
+	// Unlike Local there is no absent-versus-false rule to negotiate: a
+	// string has no third state, omitempty drops only "", and neither tool
+	// writes an empty version. Contract:
+	// memql/docs/public/operate/cluster-version-record.md.
+	Version string `yaml:"version,omitempty"`
 }
 
 // Display returns DisplayName if set, otherwise Name. Use this for
