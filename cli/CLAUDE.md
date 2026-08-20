@@ -328,10 +328,10 @@ the same pane, not a replacement.
 ## Connection Pool
 
 **Env parity (non-negotiable):** every cluster is reached the SAME way --
-`https://cockpit.<domain>` over a TLS gRPC ingress -- whether it is local,
+`https://api.<domain>` over a TLS gRPC ingress -- whether it is local,
 staging, or prod. There is NO local special-casing in the dial path: `local` is
-just a registry entry whose endpoint defaults to `https://cockpit.local.znas.io`
-(fronted by the local k3s traefik + mkcert wildcard, the analog of the cloud
+just a registry entry whose endpoint defaults to `https://api.memql.localhost`
+(fronted by the local k3s traefik + mkcert `*.memql.localhost` wildcard, the analog of the cloud
 nginx ingress). `pool.go` passes `ClusterConfig.Endpoint` straight to the SDK
 with no local/remote branch. A `kubectl port-forward` is a debugging tool, never
 a connection model -- do not reintroduce a local-only endpoint. See the standard:

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -117,6 +118,20 @@ func (f *ClustersFile) Get(name string) (ClusterConfig, bool) {
 		}
 	}
 	return ClusterConfig{}, false
+}
+
+// DefaultLocalEndpoint is where the `local` cluster is reached when
+// clusters.yaml left the endpoint blank (memql#4133). The engine overlay
+// advertises https://api.<domain>; locally that is api.memql.localhost.
+const DefaultLocalEndpoint = "https://api.memql.localhost"
+
+// WithLocalDefault fills in DefaultLocalEndpoint for the `local` cluster
+// when the yaml left it blank. Other names and explicit endpoints pass through.
+func WithLocalDefault(c ClusterConfig) ClusterConfig {
+	if c.Name == "local" && strings.TrimSpace(c.Endpoint) == "" {
+		c.Endpoint = DefaultLocalEndpoint
+	}
+	return c
 }
 
 // ConfigDir returns the memql config directory (~/.memql/).

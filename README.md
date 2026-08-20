@@ -109,26 +109,26 @@ genesis envelope — see [docs/deploy-runner.md](docs/deploy-runner.md).
 **One command for every environment.** `make run` builds the binary and
 connects to the cluster selected in `~/.memql/clusters.yaml`. Local, staging,
 and prod are all just entries there, all reached the **same way** —
-`https://cockpit.<domain>` over a TLS ingress. The topology and the dial path
+`https://api.<domain>` over a TLS ingress. The topology and the dial path
 are identical; only the **config** (domain, cert source, DNS) differs per
 environment ([environment parity](https://github.com/znasllc-io/memql/blob/main/docs/public/operate/environment-parity.md)).
 Extra flags reach the binary via `ARGS=...`.
 
 ```bash
 make run                            # the active clusters.yaml cluster
-make run ARGS="--cluster local"     # local  → https://cockpit.local.znas.io
-make run ARGS="--cluster staging"   # staging → https://cockpit.staging.<domain>
+make run ARGS="--cluster local"     # local  → https://api.memql.localhost
+make run ARGS="--cluster staging"   # staging → https://api.staging.<domain>
 make run-computeruse                # same, but the computer-use variant
 ```
 
 **Local, same as the cloud.** Bring the engine up (`make up` in the memql repo)
-and the local cluster serves `https://cockpit.local.znas.io` through its own
-traefik ingress (TLS with the mkcert `*.local.znas.io` wildcard) — the local
-analog of the `cockpit.<domain>` ingress in staging/prod. So `make run
+and the local cluster serves `https://api.memql.localhost` through its own
+traefik ingress (TLS with the mkcert `*.memql.localhost` wildcard) — the local
+analog of the `api.<domain>` ingress in staging/prod. So `make run
 --cluster local` connects with **no port-forward**, exactly like staging. The
-`local` entry defaults to `https://cockpit.local.znas.io` (needs the mkcert cert
-+ a `*.local.znas.io` hosts entry, both already required for
-`identity.local.znas.io`).
+`local` entry defaults to `https://api.memql.localhost` (needs the mkcert cert
++ a `*.memql.localhost` hosts entry, both already required for
+`identity.memql.localhost` and `https://portal.memql.localhost`).
 
 For low-level gRPC debugging only, `make forward` still port-forwards
 `svc/bff → localhost:50051` — but it is **not** part of the connection path.
