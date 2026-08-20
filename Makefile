@@ -86,11 +86,11 @@ cockpit-computeruse-all-platforms: cockpit-computeruse-darwin-arm64 cockpit-comp
 # ONE command for every environment. `run` connects to the cluster selected in
 # ~/.memql/clusters.yaml; pass --cluster <name> (local / staging / prod) or
 # --endpoint <addr> via ARGS. Same experience everywhere -- only the
-# clusters.yaml config differs. `local` is reached over a port-forward
-# (`make forward`, endpoint localhost:$(BFF_PORT)); staging/prod over the
-# cockpit.<domain> ingress. That endpoint is the ONLY thing that changes.
+# clusters.yaml config differs. `local` defaults to the engine overlay
+# front door (https://api.memql.localhost); staging/prod over the
+# api.<domain> ingress. That endpoint is the ONLY thing that changes.
 #   make run                            # active clusters.yaml cluster
-#   make run ARGS="--cluster local"     # local k3d (run `make forward` first)
+#   make run ARGS="--cluster local"     # local k3d (https://api.memql.localhost)
 #   make run ARGS="--cluster staging"   # staging (ingress endpoint from clusters.yaml)
 
 .PHONY: run run-computeruse forward

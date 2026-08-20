@@ -14,11 +14,10 @@
 //	memql-cockpit logout <cluster>                  Remove cached credentials
 //	memql-cockpit --version                         Print version
 //
-// The built-in "local" cluster is a name slot with no baked-in
-// endpoint. `genesis init` reads IDENTITY_BOOTSTRAP_DOMAIN from the
-// operator's .env and seeds the local row in ~/.memql/clusters.yaml
-// with `https://cockpit.${DOMAIN}`. The TUI shows "not configured" until
-// that bootstrap (or an explicit `L:Authorize`) has happened.
+// The built-in "local" cluster falls back to config.DefaultLocalEndpoint
+// (https://api.memql.localhost, memql#4133) when clusters.yaml has no
+// row or left the endpoint blank. `genesis init` can still seed the
+// row from IDENTITY_BOOTSTRAP_DOMAIN; clusters.yaml wins when set.
 package main
 
 import (
@@ -433,24 +432,6 @@ func handleLogoutCmd(args []string) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-// defaultLocalEndpoint is where the `local` cluster is reached. Local is just
-// another clusters.yaml entry with the SAME https://cockpit.<domain> shape as
-// staging/prod -- fronted by the cluster's own ingress (locally the k3s traefik
-// front door at cockpit.local.znas.io with the mkcert `*.local.znas.io`
-// wildcard; in the cloud an nginx/cert-manager ingress). Only the domain +
-// cert/DNS source differ (config, not topology): no port-forward, no special
-// local dial path. clusters.yaml wins if it sets one.
-const defaultLocalEndpoint = "https://cockpit.local.znas.io"
-
-// withLocalDefault fills in the cockpit.local.znas.io endpoint for the `local`
-// cluster when the yaml left it blank.
-func withLocalDefault(c config.ClusterConfig) config.ClusterConfig {
-	if c.Name == "local" && strings.TrimSpace(c.Endpoint) == "" {
-		c.Endpoint = defaultLocalEndpoint
-	}
-	return c
-}
-
 func resolveCluster(clusterName, endpoint string) (config.ClusterConfig, error) {
 	if endpoint != "" {
 		return config.ClusterConfig{
@@ -465,24 +446,24 @@ func resolveCluster(clusterName, endpoint string) (config.ClusterConfig, error) 
 			return config.ClusterConfig{}, fmt.Errorf("load clusters config: %w", err)
 		}
 		if c, ok := clusters.Get(clusterName); ok {
-			return withLocalDefault(c), nil
+			return config.WithLocalDefault(c), nil
 		}
 		// `local` is a permanent default even without a clusters.yaml entry.
 		if clusterName == "local" {
-			return config.ClusterConfig{Name: "local", Endpoint: defaultLocalEndpoint}, nil
+			return config.ClusterConfig{Name: "local", Endpoint: config.DefaultLocalEndpoint}, nil
 		}
 		return config.ClusterConfig{}, fmt.Errorf("cluster %q not found in ~/.memql/clusters.yaml -- launch the TUI and press A to add one, or L on the row to authorize it", clusterName)
 	}
 
 	// No --cluster, no --endpoint: fall back to "local" (clusters.yaml wins,
-	// else the https://cockpit.local.znas.io ingress default).
+	// else the https://api.memql.localhost ingress default).
 	clusters, err := config.LoadClusters()
 	if err == nil {
 		if local, ok := clusters.Get("local"); ok {
-			return withLocalDefault(local), nil
+			return config.WithLocalDefault(local), nil
 		}
 	}
-	return config.ClusterConfig{Name: "local", Endpoint: defaultLocalEndpoint}, nil
+	return config.ClusterConfig{Name: "local", Endpoint: config.DefaultLocalEndpoint}, nil
 }
 
 func printUsage() {
