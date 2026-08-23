@@ -72,8 +72,10 @@ multi-tab IDE and the wizards independently buildable. Examples:
 
 - `cmd/memql-cockpit/internal/worker/wizard_computeruse.go` -- worker setup
   wizard, single-panel layout (build tag `computeruse`).
-- Future: `cmd/memql-cockpit/internal/onboarding/` -- first-launch
-  flow, single-panel layout, optionally chained.
+- `cli/splash/` -- the launch splash, the first surface a user sees. This is
+  the first-launch flow this section once listed as a future
+  `cmd/memql-cockpit/internal/onboarding/`; it shipped under `cli/` instead,
+  chained after any pre-flight wizard in `cli/wizard/`.
 
 The rule of thumb: if it lives under `cli/` it's part of the
 multi-tab IDE; if it lives under `cmd/memql-cockpit/internal/` it's a
@@ -293,13 +295,10 @@ closures in `wireCluster` (`OnDeploymentsShown` / `OnSelectDeployment`
 `deploymentsRefreshLoop`, and parses rows in `app.go`
 (`parseDeployments` / `parseDeploymentNodes`).
 
-> The earlier **deployment-v2 surface** (an always-on STAGING/PROD
-> Argo/Rollouts status strip + a `D`-key DeployStaging/Promote/Rollback
-> modal; files `cluster/deploy.go` / `deploy_controls.go` /
-> `deploy_grpcstatus.go` plus `app.go`'s `refreshDeployStatus` poll) was
-> removed in memql-cockpit#221 when the persistent split landed. The
-> concept-driven Deployments section above is the single deployment
-> surface now.
+> The earlier deployment-v2 surface (an always-on STAGING/PROD status strip
+> plus a `D`-key modal) was removed in memql-cockpit#221 when the persistent
+> split landed. **The concept-driven Deployments section above is the single
+> deployment surface.**
 
 ### Architecture navigator (the `X` toggle)
 
@@ -570,13 +569,20 @@ pans the grid). There is no toggle.
 | `cluster/architecture.go`| `ArchView`: drill-down navigator over `topology.model.json`   |
 | `cluster/metrics_fetcher.go` | `QueryClientMetricsFetcher`: codeMetric overlay fetch      |
 | _gRPC client_            | Lives in `memql/sdk/go/client/` -- `Connection`, `Dispatcher`, `QueryClient`, `SubscriptionManager`. Cockpit imports the SDK rather than reimplementing the wire layer. |
-| `sense/`                 | `SenseClient` over the SDK Dispatcher -- editor-side wrappers for MemQL Sense (Tokenize / Diagnose / Complete / Hover). |
+| _MemQL Sense_            | No cockpit wrapper package. `cli/editor/`, `cli/dsledit/` and `app.go` consume `memql/sdk/go/sense` directly (Tokenize / Diagnose / Complete / Hover). |
 | `config/clusters.go`     | `~/.memql/clusters.yaml` load/save                            |
 | `concepts/`              | Concepts tab (concept picker + row list + generic renderer)   |
 | `dsledit/`               | Editor tab: `view.go` read-only DSL pack browser (domains/files/source) over `memql/sdk/go/pack` (#228) + Sense coloring/hover (#229); `author.go` Ctrl+B authoring mode (editable bundles via `cli/editor`, #230) + Validate/Inject over `memql/sdk/go/authoring` (#231) + owner-gated Ctrl+P Promote / durable activation (#232) + owner-gated Ctrl+D Retire / durable demote (memql#2163) + browse-mode `C` copy-pack-file-to-bundle (fork the viewed source into a bundle, then edit the copy, memql#2374); `bundle.go` local `~/.memql/bundles` workspace IO (incl. `copyFileIntoBundle` auto-suffix collision policy) |
 | `editor/`                | Reusable text editor with Sense integration                   |
 | `settings/`              | Settings tab                                                  |
 | `ui/`                    | Theme, screen, tab bar, layout primitives                     |
+| `canvas/`                | Pixel framebuffer: `Canvas` + `Renderer`, circles/lines, 4x5 bitmap font. Paint into a Canvas, then `Renderer.DrawCanvas` projects it into a `Rect` |
+| `auth/`                  | Authentication against memQL's identity service -- an RFC 6749 authorization-code shape where identity replaces `/authorize` with an email-driven `/login` + magic link |
+| `splash/`                | Launch splash: the first surface on start, single-panel with numbered options. **Launch-only** -- once the user picks, the main TUI owns the session; there is no "return to splash" |
+| `wizard/`                | Launch-time single-panel wizards: `config/` (Configuration screen over the memql env-var registry), `genesis/` (first-launch envelope), `runlocal/` ("Set up local cluster", with a running/not-running branch) |
+| `healing/`               | Self-healing healed-pack flow (memql#2144, E4.6): list healed overrides for a base construct and drive validate-proposed-patch (accept -> versioned overlay override the engine's two-tier resolver prefers; reject -> recorded rejection) |
+| `dockerprobe/`           | Enumerates the local docker containers belonging to a cluster; backs the runlocal wizard's "already running" branch |
+| `crash/`                 | Panic recovery + crash reports -- renders a friendly message in the affected pane (or restores the terminal and prints one), hands the user an error code, writes a structured log. **Route screen-touching goroutines' recovery through here** |
 
 ---
 
@@ -813,11 +819,31 @@ bug.
 
 ---
 
+## Subcommand surfaces (`cmd/memql-cockpit/internal/`)
+
+Not part of the multi-tab IDE. Each is a focused entry point that imports only
+`cli/ui` + `cli/canvas` when it needs a TUI at all (the rule of thumb at the top
+of this file).
+
+| Package | Subcommand | What |
+|---|---|---|
+| `worker/` | `worker run`, `worker setup`, `worker config` | The operator's machine as a MemQL worker. `wizard_computeruse.go` is the single-panel setup wizard (build tag `computeruse`); dials go through `memql/sdk/go/worker.Dial`, and only the worker-protocol lifecycle (Register / Heartbeat / ToolResult) stays here |
+| `deploy/` | `deploy`, `run` | Control-plane surface for the DevOps DSL deployment bundle (memql#2212). Embeds the engine automation runtime in-process and runs a named automation from OUTSIDE the target cluster |
+| `harness/` | `harness trace <planId>` | One-shot fetch + print of a harness plan's execution timeline, over the engine's `harnessTrace` builtin (memql-cockpit#142) |
+| `lint/` | `lint <path>` | Author-facing surface of the DSL validator: drives the same `dslimports.Load` + downstream-validation path the engine runs at boot, on demand |
+| `setupproject/` | `setup project` | Stamps a new product workspace from the memql-project template at a pinned ref, resets it to fresh git history, then drives the interactive fill-in (memql#2448) |
+
+`worker config` and `--version` are the printf surfaces -- single-shot dumps
+that pipe well, deliberately not TUI.
+
+---
+
 ## SDK-only rule
 
 Every wire call from `cli/**` goes through `memql/sdk/go/` --
 `client/` for queries / mutations / subscriptions, `sense/` for
-editor language intelligence, and `worker/` once #117 lands.
+editor language intelligence, and `worker/` for worker dials (memql#117,
+landed -- `cmd/memql-cockpit/internal/worker/connect.go` uses it).
 
 What that means concretely:
 
