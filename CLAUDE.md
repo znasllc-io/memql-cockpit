@@ -68,10 +68,14 @@ resolves against a **pinned commit**.
   `replace`, and run `go mod tidy` — **all in one commit**. The truth table for
   which combinations fail (and how) is in `go.mod`'s own comment block; read it
   before guessing.
-- **The 2026-08 blocker is gone.** The slim-down deleted every
-  `component/genesis` importer (the TUI wizards and the embedded deploy
-  runtime), so the pin can advance past the engine's genesis removal
-  (`36c19108`) whenever a bump is next needed — follow the discipline above.
+- **The 2026-08 blocker is gone, and the pin has moved past it.** The
+  slim-down deleted every `component/genesis` importer (the TUI wizards and
+  the embedded deploy runtime), and the local-apps bump then advanced the pin
+  across the genesis removal (`36c19108`) and the engine / platform / server
+  tiers in one commit. Two modules cockpit already imported —
+  `component/identity` and `component/memql` — grew their own `go.mod` in that
+  window and are now direct `require`s; the rest of the `replace` block is the
+  transitive closure `go mod tidy` demanded, not a hand-picked list.
 
 ### Consequence: local build failures that are not your fault
 
@@ -99,7 +103,9 @@ memql-cockpit/
 │   ├── worker/             The worker: pair / run / setup / config /
 │   │                       consent; LaunchAgent + service glue; tools/
 │   │                       (shell, fs, http; computeruse adds screenshot /
-│   │                       mouse / keyboard / window via RobotGo)
+│   │                       mouse / keyboard / window via RobotGo);
+│   │                       apps/ (local-app detection) + appsession/
+│   │                       (the app-session runner) -- see Local apps
 │   ├── lint/               `memql lint` — author-facing DSL validator
 │   └── setupproject/       `memql setup project` — stamps a memql-project
 │                           workspace (stdin prompts when flags are absent)
@@ -108,7 +114,8 @@ memql-cockpit/
 │                           one-liner. install.sh at the root is the plain
 │                           binary installer from GitHub releases
 ├── deploy/systemd/         memql-worker.service template (user systemd)
-├── docs/                   computer-use.md; docs/superpowers/specs/ designs
+├── docs/                   computer-use.md, local-apps.md;
+│                           docs/superpowers/specs/ designs
 └── .github/memql-pin       THE pin. Single source of truth
 ```
 
@@ -126,6 +133,49 @@ Two builds, **one installed command name** (`memql`):
 carries it to the cluster. Dev cross-builds emit suffixed artifacts in `bin/`
 (`memql-darwin-arm64`, `memql-computeruse`, ...) but an installed machine has
 exactly one `memql`.
+
+## Local apps as execution surfaces
+
+The worker can delegate a planner Task to an app the user **already pays
+for** -- Claude Code or Codex -- running on this machine, with MemQL's tools
+reachable from inside it over MCP. The engine half is memql#4358; the
+canonical record is the engine's
+`docs/public/operate/local-apps.md`. `docs/local-apps.md` here covers the
+machine side.
+
+- **`internal/worker/apps`** detects `claude` / `codex` on PATH, their
+  versions and their auth state, and the worker reports the inventory on
+  `Register` and **every** `Heartbeat`. The engine derives `app:<id>` routing
+  labels from it and has no other way to learn any of it.
+- **`internal/worker/appsession`** runs the sessions:
+  `AppSessionStart / Chunk / Control / End`, kinds `run` / `open` / `attach`,
+  plus the MCP config writer, the Library pull/push, and the platform launch
+  paths.
+
+Four rules here are load-bearing, and each is the kind that fails silently:
+
+1. **`signed_in=false` beats a guess.** A routing label needs `allowed` AND
+   `signed_in`, so the router cannot pick a machine that would then refuse.
+   Every probe reports false when it cannot tell -- including on macOS, where
+   Claude Code's token is in the Keychain and the worker must not read it (a
+   LaunchAgent raising a Keychain prompt is the same hazard the credential
+   store already avoids).
+2. **`apps_present` is always true on the beat.** proto3 cannot distinguish an
+   empty repeated field from an absent one; `false` means "this build does not
+   report apps", which is wrong for a machine that just uninstalled one.
+3. **`apps.allow` in `policy.yaml` is default-deny.** An app session does what
+   `workerHost.exec` does. An app present but unlisted is reported with
+   `allowed=false` rather than omitted -- the portal can then say "present,
+   blocked" instead of rendering it identically to "not installed".
+4. **The MCP config file is deleted on every exit path.** The per-run bearer
+   **cannot be revoked** (the engine's verify path is JWKS-only and DB-free),
+   so deletion is the security control, not housekeeping. A `defer` is not
+   enough: every write is recorded in a ledger under the state dir, and
+   `appsession.Sweep` clears what a SIGKILL left behind at the next start.
+
+`usage.known=false` when the app reported nothing, and `exit_code` passes
+through unnormalised -- the engine records the first as billing "unknown" and
+reads the second as a failed run.
 
 ## Worker + auth notes
 

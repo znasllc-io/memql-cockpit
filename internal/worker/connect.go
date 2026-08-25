@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -178,6 +179,32 @@ func buildHeartbeat(active uint32, perCap map[string]uint32, inventory []apps.In
 	}
 }
 
+// SendAppSessionChunk emits one piece of app-session output.
+//
+// seq is assigned by the session and passed through unchanged, including
+// on a retry: the engine drops out-of-order and duplicate chunks rather
+// than appending them, so renumbering a resend would open a gap in the
+// transcript that no later reader could detect.
+func (c *Connection) SendAppSessionChunk(sessionID, stream string, data []byte, seq uint64) error {
+	return c.conn.Send(&memqlv1.WorkerClientMessage{
+		Payload: &memqlv1.WorkerClientMessage_AppSessionChunk{
+			AppSessionChunk: &memqlv1.AppSessionChunk{
+				SessionId: sessionID,
+				Stream:    stream,
+				Data:      data,
+				Seq:       seq,
+			},
+		},
+	})
+}
+
+// SendAppSessionEnd closes an app session on the wire.
+func (c *Connection) SendAppSessionEnd(end *memqlv1.AppSessionEnd) error {
+	return c.conn.Send(&memqlv1.WorkerClientMessage{
+		Payload: &memqlv1.WorkerClientMessage_AppSessionEnd{AppSessionEnd: end},
+	})
+}
+
 // SendToolResult emits a ToolResult envelope.
 func (c *Connection) SendToolResult(callId string, success *memqlv1.Success, failure *memqlv1.Failure) error {
 	res := &memqlv1.ToolResult{CallId: callId}
@@ -199,7 +226,33 @@ func (c *Connection) Close() {
 	c.conn.Close()
 }
 
-func cockpitVersion() string { return "0.9.0" }
+// SetVersion tells the worker which version to register as.
+//
+// The binary's version is stamped at build time into `main.version` by
+// `-ldflags -X`, and this package cannot read that -- so main hands it
+// over at startup. Without this the worker registered a SECOND,
+// hand-maintained constant, which had already drifted a minor version
+// behind the one `memql --version` printed.
+//
+// That drift is the same defect TestVersionIsSettableByLdflags exists to
+// prevent, one layer further out: the number the cluster stores for a
+// machine, shows on /machines, and reads when deciding whether a cockpit
+// is new enough to drive an app. A plausible-but-wrong version there is
+// invisible in exactly the way a plausible-but-wrong version in
+// `--version` was.
+func SetVersion(v string) {
+	if strings.TrimSpace(v) == "" {
+		return
+	}
+	cockpitVersionValue = v
+}
+
+// cockpitVersionValue defaults to the VERSION file's contents so a build
+// that never calls SetVersion -- a test, or `go run` -- reports something
+// truthful rather than empty.
+var cockpitVersionValue = "0.10.0"
+
+func cockpitVersion() string { return cockpitVersionValue }
 func cockpitBuildTag() string {
 	if buildTagOverride != "" {
 		return buildTagOverride

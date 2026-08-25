@@ -13,6 +13,7 @@ import (
 
 	"github.com/znasllc-io/memql-cockpit/internal/config"
 	"github.com/znasllc-io/memql-cockpit/internal/crash"
+	"github.com/znasllc-io/memql-cockpit/internal/worker/appsession"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/consent"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/tools"
 )
@@ -262,12 +263,32 @@ func handleRun(args []string) {
 		}
 	}
 
+	// App sessions (memql-cockpit#347..#350). The manager sweeps any MCP
+	// configuration a previous cockpit process left behind as it is
+	// constructed -- a SIGKILLed worker leaves a bearer on disk, and the
+	// service manager restarts it without anything else noticing.
+	sessions := appsession.NewManager(appsession.Options{
+		Logger:     logger,
+		StateDir:   cfg.StateDir,
+		ClusterURL: cfg.ClusterURL,
+		Allowed: func(appID string) bool {
+			for _, allowed := range policy.AppsAllow() {
+				if strings.EqualFold(strings.TrimSpace(allowed), appID) {
+					return true
+				}
+			}
+			return false
+		},
+		CheckWorkspace: policy.CheckPath,
+	})
+
 	runner, err := NewRunner(Options{
-		Logger:  logger,
-		Config:  cfg,
-		Tools:   dispatcher,
-		Apps:    NewAppInventory(policy),
-		Metrics: metrics,
+		Logger:   logger,
+		Config:   cfg,
+		Tools:    dispatcher,
+		Apps:     NewAppInventory(policy),
+		Sessions: sessions,
+		Metrics:  metrics,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
@@ -288,6 +309,11 @@ func handleRun(args []string) {
 				}
 			default:
 				logger.Info("worker shutting down", "signal", sig.String())
+				// Cancel live app sessions before the stream goes, so
+				// each reports its own end and each MCP configuration
+				// file is deleted. A shutdown that just exits leaves an
+				// agent running and a bearer on disk.
+				sessions.StopAll("the cockpit is shutting down")
 				cancel()
 				return
 			}

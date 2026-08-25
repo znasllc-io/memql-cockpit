@@ -59,6 +59,13 @@ import (
 var version = "0.10.0"
 
 func main() {
+	// The worker registers this version with the cluster, and this
+	// package owns the symbol -ldflags stamps. Handing it over here is
+	// what keeps the machine's recorded version the one it was built
+	// from rather than a second constant somebody has to remember to
+	// bump (memql-cockpit#346's registration row is read by /machines).
+	worker.SetVersion(version)
+
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(2)

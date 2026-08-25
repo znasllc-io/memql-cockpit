@@ -200,3 +200,39 @@ func TestRootInstallerMigratesTheService(t *testing.T) {
 			"a KeepAlive restart in that gap execs a path that no longer exists")
 	}
 }
+
+// TestWorkerRegistersTheStampedVersion is TestVersionIsSettableByLdflags
+// one layer out.
+//
+// The worker reports a version to the cluster on Register, and that is
+// what /machines shows and what the engine reads when deciding whether a
+// cockpit is new enough to drive an app. It used to be a SECOND
+// hand-maintained constant in internal/worker, and it had already drifted
+// a minor version behind the one `memql --version` printed -- invisible,
+// because the number was always plausible.
+//
+// Asserted against the source for the same reason as its sibling above:
+// the failure is a missing wire-up, and a source check names it.
+func TestWorkerRegistersTheStampedVersion(t *testing.T) {
+	mainBody := readRepoFile(t, filepath.Join("cmd", "memql", "main.go"))
+	if !strings.Contains(mainBody, "worker.SetVersion(version)") {
+		t.Error("main does not hand the stamped version to the worker; " +
+			"the cluster would record whatever internal/worker hard-codes")
+	}
+
+	connect := readRepoFile(t, filepath.Join("internal", "worker", "connect.go"))
+	if strings.Contains(connect, `func cockpitVersion() string { return "`) {
+		t.Error("internal/worker hard-codes its own version again -- " +
+			"that is the second source of truth this test exists to prevent")
+	}
+
+	// The fallback, for a build that never calls SetVersion, must still
+	// match the VERSION file rather than rot on its own schedule.
+	wantVersion := strings.TrimSpace(readRepoFile(t, "VERSION"))
+	if !strings.Contains(connect, `cockpitVersionValue = "`+wantVersion+`"`) {
+		t.Errorf("internal/worker's fallback version does not match VERSION (%s)", wantVersion)
+	}
+	if !strings.Contains(mainBody, `var version = "`+wantVersion+`"`) {
+		t.Errorf("main.go's version does not match VERSION (%s)", wantVersion)
+	}
+}
