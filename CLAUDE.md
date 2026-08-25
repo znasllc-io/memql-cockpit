@@ -1,28 +1,34 @@
-# memQL Cockpit
+# MemQL Cockpit
 
-**Type:** Terminal-native IDE and operations console for MemQL
-**Binary:** `memql-cockpit` (built from `cmd/memql-cockpit/`)
-**Display name:** "memQL Cockpit" -- shown in the header chrome and Settings
-**Language:** Go (tcell TUI)
+**Type:** Fleet worker runtime + cluster CLI for MemQL
+**Binary:** `memql` (built from `cmd/memql/`)
+**Display name:** "MemQL Cockpit"
+**Language:** Go
 
-The Cockpit is the terminal sibling of the MemQL Portal: it manages clusters,
-explores concepts, browses and authors MemQL, drives deployments, and runs as a
-**worker** on the operator's own machine. The engine lives in a separate repo
-(`github.com/znasllc-io/memql`) and is consumed as a **pinned sibling checkout**
--- see "The memql pin" below, which is the single most surprising thing about
-this repository.
+The Cockpit is the machine-side half of the MemQL fleet: it enrolls a machine
+against a cluster and runs as that machine's **worker** (headless shell / fs /
+http tools everywhere; mouse + keyboard + screenshot on the computer-use
+build). The TUI it once carried is gone (2026-08-25 slim-down — spec in
+`docs/superpowers/specs/2026-08-25-cockpit-slim-rename-design.md`); the portal
+and the VS Code extension own every interactive surface now. The engine lives
+in a separate repo (`github.com/znasllc-io/memql`) and is consumed as a
+**pinned sibling checkout** — see "The memql pin" below, which is the single
+most surprising thing about this repository.
+
+**The command name is `memql`, and the collision is deliberate:** the engine
+repo also builds a `bin/memql`, but it ships only inside container images and
+runs in pods. This CLI is what gets installed on operator machines — different
+distribution channels, no PATH overlap. Do not "fix" this.
 
 ---
 
 ## Quick Start
 
 ```bash
-make cockpit             # build the headless binary -> bin/memql-cockpit
-make cockpit-computeruse # the computer-use variant (CGO + RobotGo)
+make cockpit             # build the headless binary -> bin/memql
+make cockpit-computeruse # the computer-use variant (CGO + RobotGo) -> bin/memql-computeruse
 make run                 # build + run against a clusters.yaml cluster
-                         #   ARGS="--cluster local|staging|..."
-make forward             # port-forward the local k3d svc/bff for `--cluster local`
-
+                         #   ARGS="cluster list" etc.
 make test                # go test ./...
 make lint                # fmt + vet
 make tidy                # go mod tidy
@@ -33,7 +39,7 @@ make release             # recommend the next version; ARGS="--cut" tags + relea
 ```
 
 `./...` really does mean everything here. **This is a single Go module** with no
-`go.work` and no nested modules -- the opposite of the memql repo, where a bare
+`go.work` and no nested modules — the opposite of the memql repo, where a bare
 `go test ./...` silently misses the engine. Do not import that repo's caution
 into this one.
 
@@ -41,10 +47,10 @@ into this one.
 
 ## The memql pin (read this before touching `go.mod`)
 
-Cockpit consumes ~21 memql packages through **`replace` directives pointing at a
-sibling checkout at `../memql`**. Local builds therefore resolve against
-whatever your memql working copy happens to be; CI resolves against a **pinned
-commit**.
+Cockpit consumes the engine's wire-tier packages through **`replace`
+directives pointing at a sibling checkout at `../memql`**. Local builds
+therefore resolve against whatever your memql working copy happens to be; CI
+resolves against a **pinned commit**.
 
 - **The pin lives in exactly one file: `.github/memql-pin`.** Every workflow
   reaches the sibling through `.github/actions/checkout-memql`, which reads it.
@@ -58,25 +64,21 @@ commit**.
   (memql#3228). No static cockpit `go.mod` is green both before and after a
   given module lands, and there is no atomic cross-repo merge. The pin buys the
   window.
-- **To bump:** change the sha, add the newly-landed module's `require` **and**
-  `replace`, and run `go mod tidy` -- **all in one commit**. The truth table for
+- **To bump:** change the sha, add any newly-landed module's `require` **and**
+  `replace`, and run `go mod tidy` — **all in one commit**. The truth table for
   which combinations fail (and how) is in `go.mod`'s own comment block; read it
   before guessing.
+- **The 2026-08 blocker is gone.** The slim-down deleted every
+  `component/genesis` importer (the TUI wizards and the embedded deploy
+  runtime), so the pin can advance past the engine's genesis removal
+  (`36c19108`) whenever a bump is next needed — follow the discipline above.
 
 ### Consequence: local build failures that are not your fault
 
 If `go build ./...` here reports `updates to go.mod needed`, the usual cause is
-that your `../memql` checkout has moved past the pin, not that this repo is
-broken. Check `.github/memql-pin` against your memql sibling before debugging.
-
-> **Known pin-bump blocker (as of 2026-08-23).** Six files import
-> `memql/component/genesis` -- `cli/app.go`, `cmd/memql-cockpit/main.go`,
-> `cli/wizard/{genesis,config,runlocal}` -- and memql **deleted that package**
-> on 2026-08-16 (`36c19108`, `feat(config)!: delete the genesis envelope`). The
-> pin (`3b913f37`, 2026-08-07) predates the removal, which is the only reason
-> CI is green. Bumping the pin past that commit requires porting the
-> sealed-envelope wizards onto whatever replaced it (`component/envregistry` +
-> the recovery-key flow) in the same PR.
+that your `../memql` checkout has moved past (or lags) the pin. Check
+`.github/memql-pin` against your memql sibling before debugging; a detached
+checkout of the pinned sha is the reference state.
 
 ---
 
@@ -84,106 +86,77 @@ broken. Check `.github/memql-pin` against your memql sibling before debugging.
 
 ```
 memql-cockpit/
-├── cli/                    The multi-tab IDE. See cli/CLAUDE.md -- the
-│   │                       authoritative spec for every TUI surface
-│   ├── ui/  canvas/        TUI primitives: Screen, Theme, Header, layout;
-│   │                       and the pixel framebuffer. ALL surfaces use these
-│   ├── cluster/            DevOps tab: cluster manager, topology, deployments
-│   ├── concepts/           Concepts tab: generic row browser
-│   ├── dsledit/ editor/    Editor tab: pack browser + bundle authoring
-│   ├── settings/           Settings tab
-│   ├── auth/               Identity-service auth (magic-link + PKCE-ish code grant)
-│   ├── splash/             Launch splash -- the first surface on start
-│   ├── wizard/             Launch-time single-panel wizards:
-│   │                         config/    Configuration screen (env-var registry)
-│   │                         genesis/   First-launch envelope wizard
-│   │                         runlocal/  "Set up local cluster"
-│   ├── healing/            Self-healing healed-pack review flow (memql#2144)
-│   ├── dockerprobe/        Enumerates local docker containers for a cluster
-│   ├── crash/              Panic recovery + crash reports (see below)
-│   └── config/             ~/.memql/clusters.yaml load/save
-├── cmd/memql-cockpit/      Binary entry point + focused subcommands:
-│   └── internal/
-│       ├── worker/         `worker run` -- the operator's machine as a worker
-│       ├── deploy/         `deploy` / `run` -- DevOps DSL deployment bundle
-│       ├── harness/        `harness trace <planId>` -- plan timeline dump
-│       ├── lint/           `lint <path>` -- author-facing DSL validator
-│       └── setupproject/   `setup project` -- stamps a memql-project workspace
-├── docs/                   computer-use.md, deploy-runner.md
-├── deploy/  scripts/  assets/
+├── cmd/memql/              Binary entry point: dispatch, cluster add/list/
+│                           remove, login/logout, creds; variant consts
+├── internal/
+│   ├── auth/               Identity-service auth: browser code grant with
+│   │                       loopback callback; RFC 8628 device flow fallback
+│   │                       (device.go) for SSH / headless machines
+│   ├── config/             ~/.memql/clusters.yaml registry, credential
+│   │                       stores (keyring / file), identity discovery
+│   │                       (/.well-known/memql-config.json client)
+│   ├── crash/              Panic recovery + redacted crash reports
+│   ├── worker/             The worker: pair / run / setup / config /
+│   │                       consent; LaunchAgent + service glue; tools/
+│   │                       (shell, fs, http; computeruse adds screenshot /
+│   │                       mouse / keyboard / window via RobotGo)
+│   ├── lint/               `memql lint` — author-facing DSL validator
+│   └── setupproject/       `memql setup project` — stamps a memql-project
+│                           workspace (stdin prompts when flags are absent)
+├── scripts/install/        Worker-machine installers (mac / linux): binary +
+│                           service + worker.yaml; the portal composes the
+│                           one-liner. install.sh at the root is the plain
+│                           binary installer from GitHub releases
+├── deploy/systemd/         memql-worker.service template (user systemd)
+├── docs/                   computer-use.md; docs/superpowers/specs/ designs
 └── .github/memql-pin       THE pin. Single source of truth
 ```
 
----
+## Build variants
 
-## Build tags
+Two builds, **one installed command name** (`memql`):
 
-| Tag | What it adds | Constraint |
-|---|---|---|
-| _(none)_ | Headless build. The default, and what `make cockpit` produces | `CGO_ENABLED=0`, cross-compiles to every platform |
-| `computeruse` | Wraps RobotGo for screenshot + mouse + keyboard, adding the `workerComputer.*` tool surface | **`CGO_ENABLED=1` required**; needs X11 dev headers on Linux |
+- **headless** (default, CGO off) — ships from GitHub releases; shell / fs /
+  http worker tools.
+- **computeruse** (`-tags computeruse`, CGO + RobotGo) — adds the
+  workerComputer.* surface; built per-host (macOS Xcode CLT; Linux gcc +
+  libxtst-dev / libxinerama-dev / libxkbcommon-dev / libpng-dev).
 
-CI builds and vets both. A change that compiles headless can still break the
-computer-use lane -- that lane is not optional.
+`memql --version` prints the variant; the worker's capability registration
+carries it to the cluster. Dev cross-builds emit suffixed artifacts in `bin/`
+(`memql-darwin-arm64`, `memql-computeruse`, ...) but an installed machine has
+exactly one `memql`.
 
----
+## Worker + auth notes
 
-## Two rules that reviewers enforce
+- **Enrollment:** `memql cluster add <domain>` fetches
+  `https://identity.<domain>/.well-known/memql-config.json` (falling back to
+  the api./identity. convention when discovery is unreachable), registers the
+  cluster and signs in. On a box with no browser (`DISPLAY` unset on linux, or
+  the launch fails), sign-in falls back to the RFC 8628 device flow against
+  `/device/code` + `/oauth/token`.
+- **Services:** macOS LaunchAgent label `com.znasllc.memql-worker`; Linux
+  user-systemd `memql-worker.service`. Installers retire the pre-rename
+  `memql-cockpit-worker` agent/unit and binaries in place.
+- **Credential stores:** OS keyring preferred, file fallback
+  (`~/.memql/credentials/`, 0600). `MEMQL_COCKPIT_CRED_STORE` forces one.
+  The keyring service name stays `com.znasllc.memql-cockpit` on purpose —
+  renaming it would strand every existing entry for zero user-visible gain.
+  The worker's own run path deliberately never resolves the keyring (a
+  LaunchAgent must not trigger Keychain prompts); it keeps the lazy file
+  default.
+- **worker.yaml** (`~/.memql/worker.yaml`) carries cluster URL, worker token,
+  name, capabilities. `memql worker config` prints the effective config.
 
-Both are stated in full in [cli/CLAUDE.md](cli/CLAUDE.md); they are repeated
-here because they bind code outside `cli/` too.
+## Testing
 
-1. **Canonical-TUI rule.** Every interactive surface goes through `cli/ui` +
-   `cli/canvas`. `fmt.Println` interactive flows in new subcommands are a
-   regression. Non-interactive single-shot output (`cluster list`, `--version`)
-   stays printf, and every TUI surface MUST detect a non-TTY and fall back to
-   printf so CI and install scripts don't choke on escape codes.
-2. **SDK-only rule.** Every wire call goes through `memql/sdk/go/` --
-   `client/` for queries/mutations/subscriptions, `sense/` for language
-   intelligence, `worker/` for worker dials. No direct `grpc.NewClient`, no
-   `memqlv1` imports, no raw DSL strings. **If you can't express something
-   through the SDK, the SDK needs to grow** -- open an issue on memql, add the
-   typed method there, come back.
+`go test ./...` is the whole suite (single module). The installer shell
+library has its own tests: `bash scripts/install/lib_test.sh`.
 
----
+## Releases
 
-## CI
-
-`ci.yml` runs six jobs: `build` (headless), `test` (`go test -count=1
--timeout=300s ./...`), `gofmt -l`, `vet`, `build-computeruse` (CGO + X11
-headers), and `memql-pin-guard`. Separate workflows cover CodeQL, gitleaks,
-govulncheck, SBOM, OpenSSF Scorecard and install-script lint.
-
-Every Go lane checks out the pinned memql sibling first, so a lane that fails
-only on the pin bump is telling you about the engine, not about your diff.
-
----
-
-## Crash reports
-
-`cli/crash` turns "panic on the goroutine holding the terminal" into a rendered
-message in the affected pane (or a restored terminal plus a printed message),
-an error code for the user, and a structured log to hand to support. When you
-add a goroutine that can touch the screen, route its recovery through this
-package rather than letting the panic escape.
-
----
-
-## Documentation
-
-- [cli/CLAUDE.md](cli/CLAUDE.md) -- **the TUI spec.** Tab order, layout bands,
-  every pane's keys, list-pane conventions, the layout-edge glyph rule, the
-  connection pool and the single-live-connection invariant. Read it before
-  changing any surface under `cli/`.
-- [docs/computer-use.md](docs/computer-use.md) -- the computer-use worker build.
-- [docs/deploy-runner.md](docs/deploy-runner.md) -- the deploy runner.
-- [VERSIONING.md](VERSIONING.md) -- version + release policy.
-- The engine, DSL and wire contract live in the **memql** repo; its root
-  `CLAUDE.md` is the reference for anything server-side.
-
----
-
-## Documentation Style
-
-No emojis. Use `[ ]` / `[x]` checkboxes and "SUCCESS:" / "ERROR:" / "WARNING:" /
-"INFO:" text indicators. Applies to docs, CLI output and all user-facing text.
+Tag-driven: `make release` recommends the next semver; `ARGS="--cut"` bumps
+VERSION + `cmd/memql/main.go`, tags, and publishes the GitHub Release, which
+`release.yml` fills with per-platform raw binaries (`memql-<os>-<arch>`),
+tar.gz archives (`memql-<version>-<os>-<arch>.tar.gz`) and a SHA256SUMS
+manifest — the names `install.sh` and `scripts/install/` download.

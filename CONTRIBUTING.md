@@ -2,7 +2,7 @@
 
 Thanks for your interest in contributing.
 
-memQL Cockpit is pre-1.0 and tracks memQL core. The TUI layout, worker contract, and DSL linter are still evolving, so the best contributions today are small, focused, and discussed before they land.
+memQL Cockpit is pre-1.0 and tracks memQL core. The worker contract and DSL linter are still evolving, so the best contributions today are small, focused, and discussed before they land.
 
 ## Before you write code
 
@@ -17,7 +17,7 @@ See the [README](README.md) for build and run instructions. The cockpit depends 
 ```
 ~/projects/
 ├── memql/
-└── memql-cockpit/
+└── memql/
 ```
 
 ## Code style
@@ -25,7 +25,7 @@ See the [README](README.md) for build and run instructions. The cockpit depends 
 - Go code must be `gofmt`-clean and pass `go vet ./...`
 - Run `go test ./...` locally before opening a PR
 - One logical change per commit; commit messages explain *why*, not just *what*
-- Match the surrounding TUI patterns in `cli/ui/`
+- Match the surrounding patterns of the package you are editing
 
 ## Computer-use variant
 
