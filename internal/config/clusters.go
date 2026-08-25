@@ -65,6 +65,38 @@ type ClusterConfig struct {
 	// writes an empty version. Contract:
 	// memql/docs/public/operate/cluster-version-record.md.
 	Version string `yaml:"version,omitempty"`
+
+	// Extra carries every key in the entry this Go version does not
+	// model, so a cockpit read-modify-write hands them back unchanged
+	// (memql-cockpit#333).
+	//
+	// WHY THIS EXISTS AT ALL. clusters.yaml is SHARED with the memQL VS
+	// Code extension, which writes through the yaml Document API and so
+	// preserves keys it does not know. The cockpit marshals a struct, and
+	// yaml.v3 drops what the struct does not name. Without this field the
+	// contract is "every shared key must be modelled in BOTH tools, in
+	// lockstep, forever" -- and the failure when that slips is invisible:
+	// an operator edits a cluster here and loses a setting they configured
+	// in the editor, with no error on either side. `local` and `version`
+	// are the two that already had to be added retroactively for exactly
+	// that reason; the ones above are the evidence, not the exception.
+	//
+	// The two tools stay symmetric now: both preserve, neither deletes.
+	//
+	// THE COST, PAID DELIBERATELY: a map field makes ClusterConfig
+	// non-comparable, so `a == b` no longer compiles. That is a feature
+	// rather than a wart -- struct equality on a config row was always
+	// comparing the modelled subset and silently ignoring the rest, which
+	// is the same blind spot in a different costume. Use reflect.DeepEqual
+	// where a whole-value comparison is genuinely wanted. The sites the
+	// issue named (cli/cluster/cluster_form_test.go) went out with the
+	// 2026-08-25 slim-down, so there was nothing left to migrate.
+	//
+	// A key here must NOT duplicate one of the fields above: yaml.v3
+	// errors on a marshal whose inline map collides with a modelled key.
+	// Unmarshal cannot produce that -- it routes a known key to its field
+	// -- so it only arises if something constructs Extra by hand.
+	Extra map[string]any `yaml:",inline"`
 }
 
 // Display returns DisplayName if set, otherwise Name. Use this for
@@ -86,6 +118,12 @@ func (c ClusterConfig) Display() string {
 type ClustersFile struct {
 	Clusters        []ClusterConfig `yaml:"clusters"`
 	SelectedCluster string          `yaml:"selected_cluster,omitempty"`
+
+	// Extra is ClusterConfig.Extra's twin for the TOP level of the file.
+	// The same tool writes both levels, so a preserved `local:` inside an
+	// entry beside a dropped top-level key would be a half-kept promise
+	// (memql-cockpit#333).
+	Extra map[string]any `yaml:",inline"`
 }
 
 // NeedsAuth reports whether the cluster lacks enough credentials to
