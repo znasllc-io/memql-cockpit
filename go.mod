@@ -6,22 +6,15 @@ toolchain go1.26.6
 
 require (
 	github.com/99designs/keyring v1.2.2
-	github.com/gdamore/tcell/v2 v2.13.10
 	github.com/go-vgo/robotgo v1.0.2
 	github.com/jezek/xgb v1.3.1
 	github.com/jezek/xgbutil v0.0.0-20260124183602-9fd151d6a51a
 	github.com/znasllc-io/memql v0.0.0-20260623073124-7c7d1350e667
-	github.com/znasllc-io/memql/component/architecture v0.0.0
-	github.com/znasllc-io/memql/component/auth v0.0.0
-	github.com/znasllc-io/memql/component/events v0.0.0
 	github.com/znasllc-io/memql/component/grpc/gen v0.0.0
-	github.com/znasllc-io/memql/component/node/gen v0.0.0
-	github.com/znasllc-io/memql/component/secret v0.0.0
-	golang.org/x/image v0.44.0
+	golang.org/x/image v0.45.0
 	golang.org/x/sys v0.47.0
 	golang.org/x/term v0.45.0
-	google.golang.org/grpc v1.83.0
-	google.golang.org/protobuf v1.36.11
+	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -38,7 +31,6 @@ require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/dvsekhvalnov/jose2go v1.7.0 // indirect
 	github.com/ebitengine/purego v0.10.0 // indirect
-	github.com/gdamore/encoding v1.0.1 // indirect
 	github.com/gen2brain/shm v0.2.1 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/godbus/dbus v0.0.0-20190726142602-4481cbc300e2 // indirect
@@ -49,7 +41,6 @@ require (
 	github.com/invopop/jsonschema v0.14.0 // indirect
 	github.com/jinzhu/inflection v1.0.0 // indirect
 	github.com/lib/pq v1.12.3 // indirect
-	github.com/lucasb-eyer/go-colorful v1.3.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20260324052639-156f7da3f749 // indirect
 	github.com/mtibben/percent v0.2.1 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
@@ -62,8 +53,6 @@ require (
 	github.com/prometheus/common v0.70.1 // indirect
 	github.com/prometheus/procfs v0.21.1 // indirect
 	github.com/puzpuzpuz/xsync/v3 v3.5.1 // indirect
-	github.com/rivo/uniseg v0.4.7 // indirect
-	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/santhosh-tekuri/jsonschema/v5 v5.3.1 // indirect
 	github.com/sashabaranov/go-openai v1.41.2 // indirect
 	github.com/shirou/gopsutil/v4 v4.26.2 // indirect
@@ -89,15 +78,18 @@ require (
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	github.com/zeozeozeo/gomplerate v0.0.0-20250404113140-0fbb236df825 // indirect
+	github.com/znasllc-io/memql/component/auth v0.0.0 // indirect
 	github.com/znasllc-io/memql/component/bus v0.0.0 // indirect
 	github.com/znasllc-io/memql/component/bus/gen v0.0.0 // indirect
 	github.com/znasllc-io/memql/component/config v0.0.0 // indirect
+	github.com/znasllc-io/memql/component/events v0.0.0 // indirect
 	github.com/znasllc-io/memql/component/language/annotations v0.0.0 // indirect
 	github.com/znasllc-io/memql/component/language/ast v0.0.0 // indirect
 	github.com/znasllc-io/memql/component/language/dslclause v0.0.0 // indirect
 	github.com/znasllc-io/memql/component/metrics v0.0.0 // indirect
 	github.com/znasllc-io/memql/component/provenance v0.0.0 // indirect
 	github.com/znasllc-io/memql/component/safety v0.0.0 // indirect
+	github.com/znasllc-io/memql/component/secret v0.0.0 // indirect
 	github.com/znasllc-io/memql/core v0.0.0 // indirect
 	go.opentelemetry.io/otel v1.44.0 // indirect
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
@@ -106,8 +98,9 @@ require (
 	golang.org/x/exp v0.0.0-20260603202125-055de637280b // indirect
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/text v0.40.0 // indirect
+	golang.org/x/text v0.41.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
+	google.golang.org/grpc v1.83.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	mellium.im/sasl v0.3.2 // indirect
 )
@@ -171,8 +164,6 @@ require (
 // mapping for those is decided by those tasks, so it is not guessed here.
 replace github.com/znasllc-io/memql => ../memql
 
-replace github.com/znasllc-io/memql/component/architecture => ../memql/component/architecture
-
 replace github.com/znasllc-io/memql/component/auth => ../memql/component/auth
 
 replace github.com/znasllc-io/memql/component/bus => ../memql/component/bus
@@ -183,11 +174,7 @@ replace github.com/znasllc-io/memql/component/config => ../memql/component/confi
 
 replace github.com/znasllc-io/memql/component/events => ../memql/component/events
 
-replace github.com/znasllc-io/memql/component/fileprocessor => ../memql/component/fileprocessor
-
 replace github.com/znasllc-io/memql/component/grpc/gen => ../memql/component/grpc/gen
-
-replace github.com/znasllc-io/memql/component/healing => ../memql/component/healing
 
 replace github.com/znasllc-io/memql/component/language/annotations => ../memql/component/language/annotations
 
@@ -195,17 +182,7 @@ replace github.com/znasllc-io/memql/component/language/ast => ../memql/component
 
 replace github.com/znasllc-io/memql/component/language/dslclause => ../memql/component/language/dslclause
 
-replace github.com/znasllc-io/memql/component/metadata => ../memql/component/metadata
-
 replace github.com/znasllc-io/memql/component/metrics => ../memql/component/metrics
-
-replace github.com/znasllc-io/memql/component/node/gen => ../memql/component/node/gen
-
-replace github.com/znasllc-io/memql/component/observe => ../memql/component/observe
-
-replace github.com/znasllc-io/memql/component/planner => ../memql/component/planner
-
-replace github.com/znasllc-io/memql/component/polyphon => ../memql/component/polyphon
 
 replace github.com/znasllc-io/memql/component/provenance => ../memql/component/provenance
 

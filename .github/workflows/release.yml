@@ -36,7 +36,7 @@ jobs:
           # fallback to the default token on normal runs.
           token: ${{ secrets.MEMQL_SIBLING_TOKEN || github.token }}
       - name: Set up Go
-        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: memql-cockpit/go.mod
 
@@ -55,10 +55,10 @@ jobs:
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
           gh release upload "$TAG" \
-            bin/memql-cockpit-darwin-arm64 \
-            bin/memql-cockpit-darwin-amd64 \
-            bin/memql-cockpit-linux-amd64 \
-            bin/memql-cockpit-linux-arm64 \
+            bin/memql-darwin-arm64 \
+            bin/memql-darwin-amd64 \
+            bin/memql-linux-amd64 \
+            bin/memql-linux-arm64 \
             --clobber
 
       - name: Upload distributable archives + SHA256SUMS to the release

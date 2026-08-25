@@ -4,35 +4,35 @@ This document is the contract reference for the cockpit's computer-use
 surface (`workerComputer.*`): the dispatch architecture, the action
 vocabulary, the coordinate model, the capability descriptor, platform
 support, permission setup, and troubleshooting. It documents what
-shipped in the computer-use v2 epic (memql-cockpit#161).
+shipped in the computer-use v2 epic (memql#161).
 
 The surface lives in the **computer-use build variant** — the
-`memql-cockpit-computeruse` binary, built with `-tags computeruse`
+`memql` binary, built with `-tags computeruse`
 (CGO + RobotGo). Build it with `make cockpit-computeruse`, or install it
 on a worker host with the OS installers' `--computeruse` flag
 (`scripts/install/install-mac.sh --computeruse` /
 `scripts/install/install-linux.sh --computeruse`). The default headless
-`memql-cockpit` binary exposes only `capabilities` + `wait`; every other
+`memql` binary exposes only `capabilities` + `wait`; every other
 action returns `gui_unavailable`.
 
 > **Migration note — the computer-use binary was renamed.** The build
 > variant was renamed `gui` → `computeruse`: the binary
-> `memql-cockpit-gui` → **`memql-cockpit-computeruse`**, the build tag
+> `memql-gui` → **`memql`**, the build tag
 > `-tags gui` → `-tags computeruse`, and the advertised capability
 > `GUI` → `COMPUTERUSE`. macOS TCC grants are keyed to the binary's
 > identity, so after upgrading you **must re-grant Accessibility and
-> Screen Recording to `memql-cockpit-computeruse`** under System
+> Screen Recording to `memql`** under System
 > Settings → Privacy & Security, then **re-run
-> `memql-cockpit-computeruse worker setup`** to reprobe. The old
-> `memql-cockpit-gui` entries in those TCC panes are stale and can be
+> `memql worker setup`** to reprobe. The old
+> `memql-gui` entries in those TCC panes are stale and can be
 > removed. (The `gui_unavailable` error code is intentionally
 > **unchanged** — it remains a stable wire value.)
 
 Source-of-truth code paths (this repo unless noted):
 
-- Dispatcher + consent + preflight: `cmd/memql-cockpit/internal/worker/tools/dispatcher.go`, `preflight.go`, `cmd/memql-cockpit/worker/consent/consent.go`
-- Action handlers: `cmd/memql-cockpit/internal/worker/tools/computer_computeruse.go`, `window_computeruse_{darwin,linux,other}.go`, `wait.go`, `capabilities.go`
-- Coordinate model: `cmd/memql-cockpit/internal/worker/tools/coords.go` (the package comment is the canonical contract)
+- Dispatcher + consent + preflight: `cmd/memql/internal/worker/tools/dispatcher.go`, `preflight.go`, `cmd/memql/worker/consent/consent.go`
+- Action handlers: `cmd/memql/internal/worker/tools/computer_computeruse.go`, `window_computeruse_{darwin,linux,other}.go`, `wait.go`, `capabilities.go`
+- Coordinate model: `cmd/memql/internal/worker/tools/coords.go` (the package comment is the canonical contract)
 - Server-side scope policy: `integrations/agent/worker/scope.go` (memql repo)
 - Descriptor validation: `component/worker/capability_descriptor.go` (memql repo)
 
@@ -86,8 +86,8 @@ RobotGo error.
 
 | Build | Tag | workerComputer surface |
 |---|---|---|
-| `memql-cockpit` (headless, default) | none | `capabilities` + `wait` only; every other action returns `gui_unavailable`. Registers capability `HEADLESS`. |
-| `memql-cockpit-computeruse` | `computeruse` (CGO + RobotGo) | Full 16-action vocabulary. Registers `HEADLESS` + `COMPUTERUSE`. |
+| `memql` (headless, default) | none | `capabilities` + `wait` only; every other action returns `gui_unavailable`. Registers capability `HEADLESS`. |
+| `memql` | `computeruse` (CGO + RobotGo) | Full 16-action vocabulary. Registers `HEADLESS` + `COMPUTERUSE`. |
 
 The computer-use action table (`computerActionHandlers` in
 `computer_computeruse.go`) is the single source of truth: the dispatcher
@@ -245,7 +245,7 @@ as multiple waits so each stays cancellable and audit-visible. Result
 ## Coordinate model
 
 Canonical contract: the package comment in
-`cmd/memql-cockpit/internal/worker/tools/coords.go`.
+`cmd/memql/internal/worker/tools/coords.go`.
 
 Model/tool coordinates are ALWAYS in the coordinate space of the most
 recently emitted screenshot image: `(0,0)..(emittedWidth-1,
@@ -300,7 +300,7 @@ landing somewhere undefined.
 ## Capability descriptor
 
 The worker's structured self-description of its computer-use surface
-(memql-cockpit#162). Shape (`schemaVersion` 1):
+(memql#162). Shape (`schemaVersion` 1):
 
 ```json
 {
@@ -326,7 +326,7 @@ The worker's structured self-description of its computer-use surface
   `["wait"]`, not `[]`. The meta `capabilities` action is
   deliberately NOT listed (it is the introspection channel itself and
   is unconditionally available).
-- `displays`: attached display count at call time (memql-cockpit#165);
+- `displays`: attached display count at call time (memql#165);
   0 on headless builds and when no RobotGo-drivable display server is
   reachable, at least 1 otherwise. Additive field -- schemaVersion
   stays 1; the memql server tolerates unknown JSON fields.
@@ -413,7 +413,7 @@ Windows and other platforms: no computer-use backend; `window_list`/
 
 ### macOS (TCC)
 
-Two grants for the `memql-cockpit-computeruse` binary under System
+Two grants for the `memql` binary under System
 Settings -> Privacy & Security:
 
 - **Accessibility** -- gates synthetic mouse + keyboard events
@@ -431,7 +431,7 @@ TCC grants are per signed-binary identity, and a command-line binary
 launched from Terminal INHERITS Terminal's grants. That means a probe
 can succeed from your shell while the same binary, launched detached
 as a LaunchAgent at login, is denied -- the LaunchAgent needs the
-`memql-cockpit-computeruse` binary's OWN entry in System Settings. The
+`memql` binary's OWN entry in System Settings. The
 setup wizard reports both the active probe result and the per-binary
 `tccutil check` status (macOS 14.4+) so you can tell the cases apart.
 
@@ -450,11 +450,11 @@ setup wizard reports both the active probe result and the per-binary
 
 ### The `worker setup` wizard
 
-`memql-cockpit-computeruse worker setup` is the interactive permissions
-preflight. On an interactive terminal it renders a single-panel TUI
-(three steps on macOS: Accessibility -> Screen Recording -> Validate;
-`R` re-probes, `O` opens the right System Settings pane); without a
-TTY it falls back to plain printf output with the same probe logic.
+`memql worker setup` is the permissions preflight: plain sequential
+output (three steps on macOS: Accessibility -> Screen Recording ->
+Validate), pausing for approval where a grant is missing. Pass
+`--non-interactive` to report-and-fail instead of pausing -- for
+scripted installs and CI.
 
 The wizard probes the ACTUAL gated operations, using the same
 detection the dispatcher enforces so its verdict cannot disagree with
@@ -470,12 +470,12 @@ runtime gating:
 A denied step does not block: the worker can still register
 HEADLESS-only, and computer-use calls fail with structured errors. The
 headless binary's `worker setup` just prints guidance to install
-`memql-cockpit-computeruse`.
+`memql`.
 
 ## Consent gate (operator side)
 
 Every `workerHost`/`workerComputer` dispatch passes a per-host consent
-gate before anything runs (memql-cockpit#64). Without an active
+gate before anything runs (memql#64). Without an active
 operator-granted window the call fails with `consent_required` -- this
 includes `capabilities` and `wait`.
 
@@ -483,10 +483,10 @@ The worker exposes a local control socket (`~/.memql/worker.sock`,
 mode 0600; override with `MEMQL_WORKER_CONSENT_SOCKET`):
 
 ```bash
-memql-cockpit worker consent grant --window=1h [--strict]  # open a window
-memql-cockpit worker consent revoke                        # close immediately
-memql-cockpit worker consent status                        # show current state
-memql-cockpit worker consent watch                         # live event tail
+memql worker consent grant --window=1h [--strict]  # open a window
+memql worker consent revoke                        # close immediately
+memql worker consent status                        # show current state
+memql worker consent watch                         # live event tail
 ```
 
 - A second `grant` overwrites the active window (most recent decision
@@ -494,16 +494,16 @@ memql-cockpit worker consent watch                         # live event tail
 - **Strict mode** (`--strict`): flags the window for per-call
   Allow/Deny approval on the high-risk subset (`key_type`, `key_hold`,
   `mouse_click`, `mouse_down`, `mouse_up`). Interactive Allow/Deny
-  enforcement previously lived in the Workers tab (memql-cockpit#64,
+  enforcement previously lived in the Workers tab (memql#64,
   #130) -- an in-TUI approval modal + region picker -- but was removed
-  with that tab in memql-cockpit#216; worker consent is now managed via
+  with that tab in memql#216; worker consent is now managed via
   the `worker consent` subcommands. Other interact
   actions (`exec`, `fs_write`, `mouse_move`, `key_combo`, ...) stay
   admitted by the standing window.
-- Close the active window immediately with `memql-cockpit worker
+- Close the active window immediately with `memql worker
   consent revoke` (this also cancels any pending approvals). The
   previous global `Ctrl+E` cockpit kill switch went away with the
-  Workers tab (memql-cockpit#216).
+  Workers tab (memql#216).
 
 This gate is cockpit-side and operator-facing. It is independent of
 the memql-side gates (per-task Plan approval, user kill-switch
@@ -514,11 +514,11 @@ worker.
 
 | Error code | Cause | Fix |
 |---|---|---|
-| `consent_required` | No active consent window on the worker host (or the window expired). | On the worker host: `memql-cockpit worker consent grant --window=<duration>`. |
-| `permission_denied` | macOS TCC grant missing or revoked: Accessibility (input actions) or Screen Recording (screenshot). Checked per call, so mid-session revocation surfaces immediately. | System Settings -> Privacy & Security -> Accessibility / Screen Recording: enable `memql-cockpit-computeruse` (the binary itself, not just Terminal, for LaunchAgent use). Re-run `memql-cockpit-computeruse worker setup` to verify. |
+| `consent_required` | No active consent window on the worker host (or the window expired). | On the worker host: `memql worker consent grant --window=<duration>`. |
+| `permission_denied` | macOS TCC grant missing or revoked: Accessibility (input actions) or Screen Recording (screenshot). Checked per call, so mid-session revocation surfaces immediately. | System Settings -> Privacy & Security -> Accessibility / Screen Recording: enable `memql` (the binary itself, not just Terminal, for LaunchAgent use). Re-run `memql worker setup` to verify. |
 | `display_server_unsupported` | Linux session is Wayland (`WAYLAND_DISPLAY`/`XDG_SESSION_TYPE` -- wins even when `DISPLAY` is set) or has no display server at all; RobotGo drives X11 only. | Log into an X11 (Xorg) session, or register the worker HEADLESS-only (`install-linux.sh` does this automatically on Wayland). |
 | `out_of_bounds` | Coordinates outside the emitted screenshot rect, or the mapped logical point falls in a gap between displays (union-of-rects validation). The message names the valid rect(s). | Take a fresh default-policy `screenshot` of the target display and derive coordinates from THAT image; pass the same `display` arg on the mouse action. Don't target dead zones between monitors. |
-| `gui_unavailable` | The connected worker is the headless build; only `capabilities` + `wait` exist there. (Error code retained for wire stability across the `gui` → `computeruse` rename.) | Install/run `memql-cockpit-computeruse` on the host (`make cockpit-computeruse`), then `worker setup` + `worker run`. Check `capabilities` first: `computerUseAvailable: false` means this build. |
+| `gui_unavailable` | The connected worker is the headless build; only `capabilities` + `wait` exist there. (Error code retained for wire stability across the `gui` → `computeruse` rename.) | Install/run `memql` on the host (`make cockpit-computeruse`), then `worker setup` + `worker run`. Check `capabilities` first: `computerUseAvailable: false` means this build. |
 | `window_not_found` | The `windowId` is not in the current enumeration -- window ids change as windows open/close. | Re-run `window_list` and use a fresh id. |
 | `unsupported_on_platform` | `window_list`/`window_focus` on Wayland or a platform without a backend (no portable Wayland window-enumeration API exists). | Use an X11 session (Linux) or macOS; check the descriptor's `displayServer` before calling. |
 | `unknown_action` (memql side) | The action is not in the memql scope table (`scope.go`) -- deny-by-default for unclassified actions. | Verify the action name; if it is a newly added cockpit action, the memql-side classification must land first (see "Evolving the contract"). |
@@ -527,9 +527,9 @@ worker.
 ## Evolving the contract
 
 Adding a `workerComputer` action is a three-repo lockstep
-(memql-cockpit -> memql -> bff), in that order so nothing is exposed
+(memql -> memql -> bff), in that order so nothing is exposed
 to agents before every gate knows about it. Reference: epic
-memql-cockpit#161 (the v2 wave) for worked examples.
+memql#161 (the v2 wave) for worked examples.
 
 1. **Cockpit (this repo)** -- implement and gate:
    - Handler in `computerActionHandlers` (`computer_computeruse.go`) for

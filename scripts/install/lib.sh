@@ -62,10 +62,10 @@ function binary_name_for() {
     arch="$(detect_arch)"
     case "$flavour" in
         headless)
-            echo "memql-cockpit-${os}-${arch}"
+            echo "memql-${os}-${arch}"
             ;;
         computeruse)
-            echo "memql-cockpit-computeruse-${os}-${arch}"
+            echo "memql-computeruse-${os}-${arch}"
             ;;
         *)
             echo "ERROR: unknown flavour $flavour" >&2
@@ -151,7 +151,7 @@ function require_sudo() {
 #
 #   INSTALL_BINARY_DEST     -- full path to the downloaded binary
 #   INSTALL_BINARY_FRIENDLY -- full path to the friendly symlink
-#                              (memql-cockpit / memql-cockpit-computeruse).
+#                              (memql / memql-computeruse).
 #
 # In system mode the install path is created via `sudo install
 # -m 0755 ...` so the destination is root-owned and the worker
@@ -196,6 +196,17 @@ function install_binary_with_mode() {
         *)
             echo "ERROR: unknown install mode '$mode'" >&2
             return 1
+            ;;
+    esac
+
+    # Migrate: drop the pre-rename binaries/symlinks beside the new one
+    # (znasllc-io/memql#4553). Harmless when absent.
+    case "$mode" in
+        system)
+            sudo rm -f "$dest_dir/memql-cockpit" "$dest_dir/memql-cockpit-computeruse" 2>/dev/null || true
+            ;;
+        *)
+            rm -f "$dest_dir/memql-cockpit" "$dest_dir/memql-cockpit-computeruse" 2>/dev/null || true
             ;;
     esac
 }

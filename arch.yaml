@@ -2,16 +2,18 @@
 # Schema: memql/component/architecture/extract/archyaml.go
 
 service: memql-cockpit
-display_name: "memQL Cockpit"
+display_name: "MemQL Cockpit"
 description: |
-  Terminal-native IDE and operations console. Multi-tab TUI built on
-  tcell, with cluster topology, MemQL explorer, agents directory,
-  and the architecture navigator that consumes the model emitted by
-  memql-arch.
+  The fleet worker runtime and cluster CLI, installed as the `memql`
+  command on operator machines. Runs headless (shell / fs / http
+  tools) everywhere and computer-use (screenshot / mouse / keyboard /
+  window via RobotGo) on the opt-in CGO build; enrolls machines
+  against a cluster (discovery + OAuth, device-code fallback) and
+  runs as a LaunchAgent / user-systemd service.
 
 depends_on:
   - memql
 
 entrypoints:
   - func: "main.main"
-    label: "TUI launch"
+    label: "memql CLI"

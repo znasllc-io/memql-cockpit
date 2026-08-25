@@ -30,13 +30,13 @@ has been removed. Versions are plain semver, pinned to tags.
 ## How the Cockpit reports its version
 
 ```
-$ memql-cockpit --version
-memql-cockpit 0.9.0
+$ memql --version
+memql 0.9.0
 ```
 
 The same string is sent on the worker-protocol `Register` handshake
 (`cockpitVersion()` in
-`cmd/memql-cockpit/internal/worker/connect.go`) so the hub can see
+`cmd/memql/internal/worker/connect.go`) so the hub can see
 which Cockpit a worker is running.
 
 ## Baseline: 0.9.0

@@ -3,7 +3,7 @@
 # scripts/install/install-linux.sh
 # =================================
 #
-# Install memql-cockpit-worker on Linux. Downloads the appropriate
+# Install memql-worker on Linux. Downloads the appropriate
 # binary, drops a user-systemd service, and (optionally) generates
 # a worker.yaml from a token supplied on the command line.
 
@@ -12,7 +12,7 @@ set -euo pipefail
 # shellcheck source=lib.sh
 source "$(dirname "$0")/lib.sh"
 
-readonly DEFAULT_DOWNLOAD_BASE="https://app.copresent.ai/admin/workers/install"
+readonly DEFAULT_DOWNLOAD_BASE="https://github.com/znasllc-io/memql-cockpit/releases/latest/download"
 
 function show_help() {
     cat << EOF
@@ -85,9 +85,9 @@ function install_binary() {
     local url="${DOWNLOAD_BASE}/${binary}"
     local friendly_name
     if [[ "$FLAVOUR" == "computeruse" ]]; then
-        friendly_name="memql-cockpit-computeruse"
+        friendly_name="memql-computeruse"
     else
-        friendly_name="memql-cockpit"
+        friendly_name="memql"
     fi
     install_binary_with_mode "$INSTALL_MODE" "$url" "$binary" "$friendly_name"
     INSTALLED_BINARY="$INSTALL_BINARY_FRIENDLY"
@@ -122,7 +122,15 @@ function install_systemd_unit() {
     fi
     local unit_dir="${HOME}/.config/systemd/user"
     mkdir -p "$unit_dir"
-    local unit="${unit_dir}/memql-cockpit-worker.service"
+    # Migrate: retire the pre-rename unit so an upgraded machine never
+    # runs two workers (znasllc-io/memql#4553).
+    if [[ -f "$unit_dir/memql-cockpit-worker.service" ]]; then
+        systemctl --user disable --now memql-cockpit-worker.service >/dev/null 2>&1 || true
+        rm -f "$unit_dir/memql-cockpit-worker.service"
+        systemctl --user daemon-reload >/dev/null 2>&1 || true
+        echo "INFO: removed legacy memql-cockpit-worker.service unit"
+    fi
+    local unit="${unit_dir}/memql-worker.service"
     local env_file="${HOME}/.memql/worker.env"
     # Create the env file as 0600 even when empty so an operator
     # who later wants to inject MEMQL_WORKER_TOKEN via the env-file
@@ -179,9 +187,9 @@ WantedBy=default.target
 UNIT
     echo "INFO: wrote $unit"
     systemctl --user daemon-reload
-    systemctl --user enable memql-cockpit-worker.service
-    systemctl --user restart memql-cockpit-worker.service
-    echo "INFO: enabled and started memql-cockpit-worker.service"
+    systemctl --user enable memql-worker.service
+    systemctl --user restart memql-worker.service
+    echo "INFO: enabled and started memql-worker.service"
 }
 
 function main() {
@@ -194,7 +202,7 @@ function main() {
     cat << EOF
 
 ================================================================
-SUCCESS: memql-cockpit-worker installed.
+SUCCESS: memql-worker installed.
 
 Binary:    ${INSTALLED_BINARY}
 Config:    ${HOME}/.memql/worker.yaml
@@ -202,11 +210,11 @@ Logs:      ${HOME}/.memql/state/worker.log
 
 To check the status:
 
-  systemctl --user status memql-cockpit-worker.service
+  systemctl --user status memql-worker.service
 
 To stop it:
 
-  systemctl --user stop memql-cockpit-worker.service
+  systemctl --user stop memql-worker.service
 ================================================================
 EOF
 }

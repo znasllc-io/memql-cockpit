@@ -44,19 +44,19 @@ CRED_STORE ?= file
 all: cockpit  ## Build memQL Cockpit (host platform, headless) -- default
 
 cockpit: ## Build memQL Cockpit (host platform, headless)
-	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/memql-cockpit ./cmd/memql-cockpit
+	$(GO) build $(GOFLAGS) -o $(BIN_DIR)/memql ./cmd/memql
 
 cockpit-darwin-arm64: ## Cross-build headless for macOS Apple Silicon
-	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BIN_DIR)/memql-cockpit-darwin-arm64 ./cmd/memql-cockpit
+	GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BIN_DIR)/memql-darwin-arm64 ./cmd/memql
 
 cockpit-darwin-amd64: ## Cross-build headless for macOS Intel
-	GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BIN_DIR)/memql-cockpit-darwin-amd64 ./cmd/memql-cockpit
+	GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BIN_DIR)/memql-darwin-amd64 ./cmd/memql
 
 cockpit-linux-amd64: ## Cross-build headless for Linux x86_64
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BIN_DIR)/memql-cockpit-linux-amd64 ./cmd/memql-cockpit
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BIN_DIR)/memql-linux-amd64 ./cmd/memql
 
 cockpit-linux-arm64: ## Cross-build headless for Linux aarch64
-	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BIN_DIR)/memql-cockpit-linux-arm64 ./cmd/memql-cockpit
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 $(GO) build $(GOFLAGS) -o $(BIN_DIR)/memql-linux-arm64 ./cmd/memql
 
 cockpit-all-platforms: cockpit-darwin-arm64 cockpit-darwin-amd64 cockpit-linux-amd64 cockpit-linux-arm64  ## Cross-build headless for all platforms
 
@@ -64,19 +64,19 @@ cockpit-all-platforms: cockpit-darwin-arm64 cockpit-darwin-amd64 cockpit-linux-a
 # RobotGo). Requires native tooling: macOS Xcode CLT; Linux gcc + libxtst-dev /
 # libxinerama-dev / libxkbcommon-dev / libpng-dev. Built per-host (not in dist).
 cockpit-computeruse: ## Build the computer-use variant (CGO + RobotGo; adds workerComputer.*)
-	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags computeruse -o $(BIN_DIR)/memql-cockpit-computeruse ./cmd/memql-cockpit
+	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags computeruse -o $(BIN_DIR)/memql-computeruse ./cmd/memql
 
 cockpit-computeruse-darwin-arm64: ## Computer-use cross-build for macOS Apple Silicon
-	GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags computeruse -o $(BIN_DIR)/memql-cockpit-computeruse-darwin-arm64 ./cmd/memql-cockpit
+	GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags computeruse -o $(BIN_DIR)/memql-computeruse-darwin-arm64 ./cmd/memql
 
 cockpit-computeruse-darwin-amd64: ## Computer-use cross-build for macOS Intel
-	GOOS=darwin GOARCH=amd64 CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags computeruse -o $(BIN_DIR)/memql-cockpit-computeruse-darwin-amd64 ./cmd/memql-cockpit
+	GOOS=darwin GOARCH=amd64 CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags computeruse -o $(BIN_DIR)/memql-computeruse-darwin-amd64 ./cmd/memql
 
 cockpit-computeruse-linux-amd64: ## Computer-use cross-build for Linux x86_64
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags computeruse -o $(BIN_DIR)/memql-cockpit-computeruse-linux-amd64 ./cmd/memql-cockpit
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags computeruse -o $(BIN_DIR)/memql-computeruse-linux-amd64 ./cmd/memql
 
 cockpit-computeruse-linux-arm64: ## Computer-use cross-build for Linux aarch64
-	GOOS=linux GOARCH=arm64 CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags computeruse -o $(BIN_DIR)/memql-cockpit-computeruse-linux-arm64 ./cmd/memql-cockpit
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags computeruse -o $(BIN_DIR)/memql-computeruse-linux-arm64 ./cmd/memql
 
 cockpit-computeruse-all-platforms: cockpit-computeruse-darwin-arm64 cockpit-computeruse-darwin-amd64 cockpit-computeruse-linux-amd64 cockpit-computeruse-linux-arm64  ## Computer-use cross-build for all platforms
 
@@ -96,10 +96,10 @@ cockpit-computeruse-all-platforms: cockpit-computeruse-darwin-arm64 cockpit-comp
 .PHONY: run run-computeruse forward
 
 run: cockpit ## Build + run the Cockpit against a clusters.yaml cluster (ARGS="--cluster local|staging|...")
-	MEMQL_COCKPIT_CRED_STORE=$(CRED_STORE) ./$(BIN_DIR)/memql-cockpit $(ARGS)
+	MEMQL_COCKPIT_CRED_STORE=$(CRED_STORE) ./$(BIN_DIR)/memql $(ARGS)
 
 run-computeruse: cockpit-computeruse ## Same as `run`, but the computer-use variant
-	MEMQL_COCKPIT_CRED_STORE=$(CRED_STORE) ./$(BIN_DIR)/memql-cockpit-computeruse $(ARGS)
+	MEMQL_COCKPIT_CRED_STORE=$(CRED_STORE) ./$(BIN_DIR)/memql-computeruse $(ARGS)
 
 forward: ## Port-forward the local k3d svc/bff to localhost:$(BFF_PORT) (local access for `make run --cluster local`)
 	@echo "kube-context: $$(kubectl config current-context 2>/dev/null) | port-forward svc/$(BFF_SVC) ($(MEMQL_NS)) -> localhost:$(BFF_PORT) (ctrl-c to stop)"
@@ -109,7 +109,7 @@ forward: ## Port-forward the local k3d svc/bff to localhost:$(BFF_PORT) (local a
 ##@ Distribution
 # ---------------------------------------------------------------------------
 # `make dist` produces the distributable artifacts operators + CI install: a
-# versioned tar.gz per platform (binary renamed to plain `memql-cockpit` +
+# versioned tar.gz per platform (binary renamed to plain `memql` +
 # LICENSE + README) plus a SHA256SUMS manifest. Headless only -- the computeruse
 # variant needs CGO + native tooling and is built per-host, so it is not shipped.
 
@@ -123,18 +123,18 @@ dist: cockpit-all-platforms ## Package versioned tar.gz archives + SHA256SUMS in
 	@for triple in $(DIST_PLATFORMS); do \
 		stage="$(DIST_DIR)/stage-$$triple"; \
 		mkdir -p "$$stage"; \
-		cp "$(BIN_DIR)/memql-cockpit-$$triple" "$$stage/memql-cockpit"; \
+		cp "$(BIN_DIR)/memql-$$triple" "$$stage/memql"; \
 		cp LICENSE README.md "$$stage/" 2>/dev/null || true; \
-		tar -czf "$(DIST_DIR)/memql-cockpit-$(VERSION)-$$triple.tar.gz" -C "$$stage" .; \
+		tar -czf "$(DIST_DIR)/memql-$(VERSION)-$$triple.tar.gz" -C "$$stage" .; \
 		rm -rf "$$stage"; \
-		echo "  packaged $(DIST_DIR)/memql-cockpit-$(VERSION)-$$triple.tar.gz"; \
+		echo "  packaged $(DIST_DIR)/memql-$(VERSION)-$$triple.tar.gz"; \
 	done
 	@$(MAKE) --no-print-directory dist-checksums
 
 dist-checksums: ## Write a SHA256SUMS manifest over the packaged archives in dist/
 	@cd $(DIST_DIR) && { command -v sha256sum >/dev/null 2>&1 && sha256sum *.tar.gz || shasum -a 256 *.tar.gz; } \
-		> memql-cockpit-$(VERSION)-SHA256SUMS \
-		&& echo "  wrote $(DIST_DIR)/memql-cockpit-$(VERSION)-SHA256SUMS"
+		> memql-$(VERSION)-SHA256SUMS \
+		&& echo "  wrote $(DIST_DIR)/memql-$(VERSION)-SHA256SUMS"
 
 # ---------------------------------------------------------------------------
 ##@ Release

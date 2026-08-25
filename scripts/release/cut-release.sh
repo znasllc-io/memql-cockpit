@@ -25,7 +25,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 VERSION_FILE="$REPO_ROOT/VERSION"
-MAIN_GO="$REPO_ROOT/cmd/memql-cockpit/main.go"
+MAIN_GO="$REPO_ROOT/cmd/memql/main.go"
 
 #=============================================================================
 # FUNCTIONS
