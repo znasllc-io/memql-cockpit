@@ -156,6 +156,47 @@ else
 fi
 
 # ---------------------------------------------------------------
+# install.sh restates lib.sh's names -- they must agree
+# ---------------------------------------------------------------
+#
+# The root install.sh is fetched ALONE by `curl | sh` and has no lib.sh to
+# source, so it carries its own copy of the migration names. A rename
+# applied to one file and not the other produces an installer that retires
+# a service nobody registered, or registers one nothing will find -- both
+# silent. Reading the literals out of the script is what makes the
+# duplication safe.
+
+_install_sh="$(dirname "$0")/../../install.sh"
+
+function install_sh_value() {
+    local key="$1"
+    grep -E "^${key}=" "$_install_sh" | head -1 | sed -E "s/^${key}=\"?([^\"]*)\"?.*/\\1/"
+}
+
+if [[ -f "$_install_sh" ]]; then
+    expect_eq "install.sh installs the same command name" \
+        "$(install_sh_value BINARY)" "$INSTALLED_COMMAND"
+    expect_eq "install.sh SERVICE_LABEL_DARWIN" \
+        "$(install_sh_value SERVICE_LABEL_DARWIN)" "com.znasllc.memql-worker"
+    expect_eq "install.sh SERVICE_LABEL_LINUX" \
+        "$(install_sh_value SERVICE_LABEL_LINUX)" "memql-worker"
+    expect_eq "install.sh LEGACY_LABEL_DARWIN" \
+        "$(install_sh_value LEGACY_LABEL_DARWIN)" "com.znasllc.memql-cockpit-worker"
+    expect_eq "install.sh LEGACY_LABEL_LINUX" \
+        "$(install_sh_value LEGACY_LABEL_LINUX)" "memql-cockpit-worker"
+
+    # The new label must not BE the old one -- a migration that renames
+    # nothing would satisfy every other assertion here.
+    if [[ "$(install_sh_value SERVICE_LABEL_DARWIN)" == "$(install_sh_value LEGACY_LABEL_DARWIN)" ]]; then
+        fail "install.sh's darwin service label equals the legacy one; it migrates nothing"
+    else
+        pass "install.sh darwin service label differs from the legacy label"
+    fi
+else
+    fail "install.sh not found at $_install_sh"
+fi
+
+# ---------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------
 

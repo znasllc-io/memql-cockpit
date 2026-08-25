@@ -10,11 +10,29 @@ set -eu
 #   curl -fsSL .../install.sh | BIN_DIR=/usr/local/bin sh
 #
 # The computer-use variant (screenshot/mouse/keyboard) needs native tooling and
-# is built from source -- see the README (`make cockpit-computeruse` or
-# `go install -tags computeruse ...`). This installer fetches the headless build.
+# is built from source -- see the README (`make memql-computeruse` or
+# `go install -tags computeruse ...`). It installs under the SAME name; this
+# installer fetches the headless build.
+#
+# UPGRADING FROM A memql-cockpit INSTALL. This script deletes the pre-rename
+# binaries AND retires the pre-rename service, in that order. Deleting the
+# binary alone is not a migration: the LaunchAgent / systemd unit is
+# KeepAlive/Restart=always, so it would go on trying to exec a path that no
+# longer exists, and the operator sees a machine that simply went offline.
+#
+# The names below must agree with scripts/install/lib.sh, which owns the same
+# set for the token-driven installers. They are DUPLICATED because this script
+# is fetched alone by `curl | sh` and has no lib.sh to source; the duplication
+# is held honest by scripts/install/lib_test.sh, which reads both files.
 
 REPO="znasllc-io/memql-cockpit"
 BINARY="memql"
+
+LEGACY_BINARIES="memql-cockpit memql-cockpit-computeruse"
+LEGACY_LABEL_DARWIN="com.znasllc.memql-cockpit-worker"
+LEGACY_LABEL_LINUX="memql-cockpit-worker"
+SERVICE_LABEL_DARWIN="com.znasllc.memql-worker"
+SERVICE_LABEL_LINUX="memql-worker"
 
 log() { printf '%s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -50,6 +68,115 @@ verify_checksum() {
     # $1=dir $2=asset $3=sumsfile
     ( cd "$1" && grep " $2\$" "$3" | \
         if command -v sha256sum >/dev/null 2>&1; then sha256sum -c -; else shasum -a 256 -c -; fi ) >/dev/null 2>&1
+}
+
+# migrate_service moves a running worker from the pre-rename service name to
+# the current one.
+#
+# It re-registers ONLY where a legacy service was actually installed. A machine
+# that never ran the worker as a service must not acquire one by upgrading --
+# an installer that starts a background service nobody asked for is a surprise
+# it has no business springing.
+migrate_service() {
+    os="$1"; bin="$2"
+    case "$os" in
+        darwin) migrate_launch_agent "$bin" ;;
+        linux)  migrate_systemd_unit "$bin" ;;
+    esac
+}
+
+migrate_launch_agent() {
+    bin="$1"
+    plist="${HOME}/Library/LaunchAgents/${LEGACY_LABEL_DARWIN}.plist"
+    [ -f "$plist" ] || return 0
+
+    log "==> migrating the ${LEGACY_LABEL_DARWIN} LaunchAgent to ${SERVICE_LABEL_DARWIN}"
+    launchctl unload "$plist" >/dev/null 2>&1 || true
+    rm -f "$plist"
+
+    new_plist="${HOME}/Library/LaunchAgents/${SERVICE_LABEL_DARWIN}.plist"
+    cat > "$new_plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${SERVICE_LABEL_DARWIN}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${bin}</string>
+        <string>worker</string>
+        <string>run</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${HOME}/.memql/state/worker.log</string>
+    <key>StandardErrorPath</key>
+    <string>${HOME}/.memql/state/worker.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>${HOME}</string>
+    </dict>
+</dict>
+</plist>
+PLIST
+    chmod 644 "$new_plist"
+    launchctl load "$new_plist" >/dev/null 2>&1 || \
+        log "    (could not load ${SERVICE_LABEL_DARWIN}; run: launchctl load ${new_plist})"
+    log "    worker service is now ${SERVICE_LABEL_DARWIN}"
+}
+
+migrate_systemd_unit() {
+    bin="$1"
+    unit_dir="${HOME}/.config/systemd/user"
+    legacy_unit="${unit_dir}/${LEGACY_LABEL_LINUX}.service"
+    [ -f "$legacy_unit" ] || return 0
+
+    log "==> migrating the ${LEGACY_LABEL_LINUX} systemd unit to ${SERVICE_LABEL_LINUX}"
+    systemctl --user disable --now "${LEGACY_LABEL_LINUX}.service" >/dev/null 2>&1 || true
+    rm -f "$legacy_unit"
+
+    new_unit="${unit_dir}/${SERVICE_LABEL_LINUX}.service"
+    mkdir -p "$unit_dir"
+    cat > "$new_unit" <<UNIT
+[Unit]
+Description=MemQL Cockpit Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${bin} worker run
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:${HOME}/.memql/state/worker.log
+StandardError=append:${HOME}/.memql/state/worker.log
+
+[Install]
+WantedBy=default.target
+UNIT
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    systemctl --user enable --now "${SERVICE_LABEL_LINUX}.service" >/dev/null 2>&1 || \
+        log "    (could not start ${SERVICE_LABEL_LINUX}; run: systemctl --user enable --now ${SERVICE_LABEL_LINUX}.service)"
+    log "    worker service is now ${SERVICE_LABEL_LINUX}"
+}
+
+# remove_legacy_binaries deletes the pre-rename binaries from ONE directory --
+# the one just installed into. Scoped there on purpose: a $PATH-wide sweep
+# would delete binaries this installer never placed.
+remove_legacy_binaries() {
+    dir="$1"
+    for name in $LEGACY_BINARIES; do
+        if [ -e "${dir}/${name}" ] || [ -L "${dir}/${name}" ]; then
+            rm -f "${dir}/${name}" 2>/dev/null \
+                && log "    removed ${dir}/${name}" \
+                || log "    NOTE: could not remove ${dir}/${name} -- delete it by hand"
+        fi
+    done
 }
 
 main() {
@@ -92,8 +219,12 @@ main() {
         cp "${tmp}/${BINARY}" "${bindir}/${BINARY}" && chmod 0755 "${bindir}/${BINARY}"
     fi
 
-    # Migrate: drop the pre-rename binaries if this machine had them.
-    rm -f "${bindir}/memql-cockpit" "${bindir}/memql-cockpit-computeruse" 2>/dev/null || true
+    # Migration, AFTER a successful install: an interrupted download must not
+    # leave a machine with neither the old binary nor the new one. The service
+    # is re-registered BEFORE the old binary is deleted, so a KeepAlive restart
+    # in the gap finds something to exec.
+    migrate_service "$os" "${bindir}/${BINARY}"
+    remove_legacy_binaries "$bindir"
 
     log ""
     log "installed ${BINARY} ${tag} -> ${bindir}/${BINARY}"

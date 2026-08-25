@@ -26,6 +26,12 @@ readonly INSTALL_PREFIX_USER="${HOME}/.memql/bin"
 
 readonly STATE_DIR_DEFAULT="${HOME}/.memql/state"
 
+# The installed command. ONE name for both build variants (design D4,
+# znasllc-io/memql-cockpit#352): the download artifact carries the variant,
+# the installed file never does. `memql --version` is what answers "which
+# build is this", which only works because the path cannot.
+readonly INSTALLED_COMMAND="memql"
+
 # Detect host os ("darwin" or "linux") and arch ("amd64" or "arm64").
 function detect_os() {
     local raw

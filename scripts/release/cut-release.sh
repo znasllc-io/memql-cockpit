@@ -3,7 +3,7 @@ set -euo pipefail
 
 # cut-release.sh -- recommend the next semver from the commits since the last
 # tag (conventional-commit prefixes; NO AI), then optionally cut a tag-driven
-# release. Cutting bumps the VERSION file + the main.go `version` constant,
+# release. Cutting bumps the VERSION file + the main.go `version` var,
 # commits, tags vX.Y.Z, pushes, and creates a GitHub Release -- which triggers
 # .github/workflows/release.yml to build + upload the per-platform binaries.
 #
@@ -114,7 +114,15 @@ function perform_cut() {
     fi
     log "==> bumping VERSION + main.go to $next"
     echo "$next" > "$VERSION_FILE"
-    perl -pi -e "s/^const version = \".*\"/const version = \"$next\"/" "$MAIN_GO"
+    # `var`, not `const`: -ldflags -X can only set a var, so that is what
+    # main.go declares. Matching the wrong keyword substitutes NOTHING and
+    # the cut proceeds with a stale version compiled in -- which is why
+    # the result is VERIFIED below rather than assumed.
+    perl -pi -e "s/^var version = \".*\"/var version = \"$next\"/" "$MAIN_GO"
+    if ! grep -q "^var version = \"$next\"$" "$MAIN_GO"; then
+        err "failed to bump the version in $MAIN_GO (expected: var version = \"$next\")"
+        exit 1
+    fi
     git -C "$REPO_ROOT" add "$VERSION_FILE" "$MAIN_GO"
     git -C "$REPO_ROOT" commit -q -m "release: $tag"
     git -C "$REPO_ROOT" tag -a "$tag" -m "$tag"
