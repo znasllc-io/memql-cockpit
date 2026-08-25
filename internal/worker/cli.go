@@ -266,6 +266,7 @@ func handleRun(args []string) {
 		Logger:  logger,
 		Config:  cfg,
 		Tools:   dispatcher,
+		Apps:    NewAppInventory(policy),
 		Metrics: metrics,
 	})
 	if err != nil {

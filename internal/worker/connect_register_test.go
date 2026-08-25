@@ -37,7 +37,7 @@ func TestBuildRegister_CarriesValidCapabilityDescriptor(t *testing.T) {
 		Name:         "test-worker",
 		Capabilities: []string{"HEADLESS"},
 		Concurrency:  map[string]uint32{"HEADLESS": 1},
-	})
+	}, nil)
 
 	raw := register.GetCapabilityDescriptorJson()
 	if raw == "" {

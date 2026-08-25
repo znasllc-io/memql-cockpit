@@ -11,6 +11,8 @@ import (
 	"time"
 
 	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
+
+	"github.com/znasllc-io/memql-cockpit/internal/worker/apps"
 )
 
 // Runner owns the worker's main loop: reconnect-with-backoff, the
@@ -20,6 +22,7 @@ type Runner struct {
 	logger    *slog.Logger
 	cfg       Config
 	tools     ToolDispatcher
+	apps      AppInventory
 	heartbeat time.Duration
 	metrics   *Metrics
 
@@ -42,6 +45,7 @@ type Options struct {
 	Logger    *slog.Logger
 	Config    Config
 	Tools     ToolDispatcher
+	Apps      AppInventory
 	Heartbeat time.Duration
 	Metrics   *Metrics
 }
@@ -63,6 +67,7 @@ func NewRunner(opts Options) (*Runner, error) {
 		logger:    opts.Logger,
 		cfg:       opts.Config,
 		tools:     opts.Tools,
+		apps:      opts.Apps,
 		heartbeat: hb,
 		metrics:   opts.Metrics,
 		closed:    make(chan struct{}),
@@ -85,7 +90,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			return err
 		}
 
-		conn, err := Connect(ctx, r.cfg, r.logger)
+		conn, err := Connect(ctx, r.cfg, r.inventory(ctx), r.logger)
 		if err != nil {
 			if r.metrics != nil {
 				r.metrics.RecordReconnect()
@@ -164,11 +169,27 @@ func (r *Runner) heartbeatLoop(ctx context.Context, conn *Connection) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if err := conn.SendHeartbeat(0, nil); err != nil {
+			// The inventory is re-taken on every beat rather than
+			// captured at connect. The engine applies an inventory
+			// change to its live registry immediately and persists it
+			// outside the 60s lastSeenAt throttle precisely because it
+			// is a routing change -- so signing into Claude Code makes
+			// this machine selectable on the NEXT BEAT, not the next
+			// reconnect. Sending a snapshot would give that back.
+			if err := conn.SendHeartbeat(0, nil, r.inventory(ctx)); err != nil {
 				return
 			}
 		}
 	}
+}
+
+// inventory takes the current local app inventory, or nil when this
+// build reports none.
+func (r *Runner) inventory(ctx context.Context) []apps.Info {
+	if r == nil || r.apps == nil {
+		return nil
+	}
+	return r.apps.Apps(ctx)
 }
 
 func (r *Runner) handleMessage(ctx context.Context, conn *Connection, msg *memqlv1.WorkerServerMessage) error {

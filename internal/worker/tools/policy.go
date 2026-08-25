@@ -25,6 +25,7 @@ type Policy struct {
 	shell      ShellPolicy
 	fs         FSPolicy
 	http       HTTPPolicy
+	apps       AppsPolicy
 	configPath string
 }
 
@@ -58,6 +59,31 @@ type FSPolicy struct {
 	Deny          []string `yaml:"deny"`
 }
 
+// AppsPolicy controls which local apps this machine will let the engine
+// drive (memql-cockpit#346).
+//
+//	apps:
+//	  allow:
+//	    - claude-code
+//	    - codex
+//
+// DEFAULT-DENY, and deliberately so. An app session does exactly what
+// workerHost.exec does -- edits files and runs commands on somebody's own
+// computer -- so it gets the same posture the rest of this file has:
+// nothing runs until the machine's owner says which app may. An empty
+// allow list is the state of every machine that has not been configured,
+// including every machine upgrading into this feature, and it must not
+// mean "all".
+//
+// An app that is present but not listed is still REPORTED, with
+// allowed=false. That is what makes the portal able to say
+// "present, blocked" instead of rendering it identically to "not
+// installed" -- one of those an operator can fix, the other sends them
+// looking for the wrong problem.
+type AppsPolicy struct {
+	Allow []string `yaml:"allow"`
+}
+
 // HTTPPolicy controls workerHost.http_fetch.
 type HTTPPolicy struct {
 	AllowURLs       []string `yaml:"allow_urls"`
@@ -72,6 +98,7 @@ type rawPolicy struct {
 	Shell ShellPolicy `yaml:"shell"`
 	FS    FSPolicy    `yaml:"fs"`
 	HTTP  HTTPPolicy  `yaml:"http"`
+	Apps  AppsPolicy  `yaml:"apps"`
 }
 
 // DefaultPolicy returns the baseline allow/deny lists shipped with
@@ -203,6 +230,10 @@ func (p *Policy) reload() error {
 	if raw.HTTP.BlockPrivateNet {
 		p.http.BlockPrivateNet = true
 	}
+	// Apps merge the same way shell/fs allow lists do, so SIGHUP adds an
+	// app without a worker restart. There is no baseline to merge onto:
+	// DefaultPolicy leaves this empty, which is the default-deny above.
+	p.apps.Allow = mergeUnique(p.apps.Allow, raw.Apps.Allow)
 	return nil
 }
 
@@ -321,6 +352,25 @@ func (p *Policy) MaxRedirects() int {
 		return 5
 	}
 	return p.http.MaxRedirects
+}
+
+// AppsAllow returns a copy of the allowed app ids.
+//
+// The copy matters: the worker calls this on every heartbeat and hands
+// the result to the detector, and a shared slice would race a SIGHUP
+// reload mid-beat.
+func (p *Policy) AppsAllow() []string {
+	if p == nil {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if len(p.apps.Allow) == 0 {
+		return nil
+	}
+	out := make([]string, len(p.apps.Allow))
+	copy(out, p.apps.Allow)
+	return out
 }
 
 // ShellLimits exposes the rlimit + privilege-drop knobs to the

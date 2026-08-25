@@ -14,6 +14,7 @@ import (
 	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 	sdkworker "github.com/znasllc-io/memql/sdk/go/worker"
 
+	"github.com/znasllc-io/memql-cockpit/internal/worker/apps"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/tools"
 )
 
@@ -36,7 +37,7 @@ type Connection struct {
 // sends the worker-protocol Register handshake. Returns the live
 // connection and the registration metadata pulled from the
 // RegisterAck.
-func Connect(ctx context.Context, cfg Config, logger *slog.Logger) (*Connection, error) {
+func Connect(ctx context.Context, cfg Config, inventory []apps.Info, logger *slog.Logger) (*Connection, error) {
 	endpoint, useTLS, err := sdkworker.ParseClusterURL(cfg.ClusterURL)
 	if err != nil {
 		return nil, err
@@ -57,7 +58,7 @@ func Connect(ctx context.Context, cfg Config, logger *slog.Logger) (*Connection,
 		logger: logger,
 	}
 
-	if err := c.register(ctx, cfg); err != nil {
+	if err := c.register(ctx, cfg, inventory); err != nil {
 		c.Close()
 		return nil, err
 	}
@@ -69,7 +70,7 @@ func Connect(ctx context.Context, cfg Config, logger *slog.Logger) (*Connection,
 // shape -- in particular that capability_descriptor_json always
 // satisfies the server-side validation rules (memql#1331: raw size,
 // schemaVersion, action-name pattern) -- without a live stream.
-func buildRegister(cfg Config) *memqlv1.Register {
+func buildRegister(cfg Config, inventory []apps.Info) *memqlv1.Register {
 	hostname, _ := os.Hostname()
 	register := &memqlv1.Register{
 		Name:         cfg.Name,
@@ -84,6 +85,11 @@ func buildRegister(cfg Config) *memqlv1.Register {
 		Permissions: probePermissions(),
 		Version:     cockpitVersion(),
 		BuildTag:    cockpitBuildTag(),
+		// Local apps (memql-cockpit#346). The engine derives `app:<id>`
+		// routing labels from entries that are BOTH allowed and signed
+		// in, and has no other way to learn any of this -- it cannot
+		// dial this machine.
+		Apps: appsToProto(inventory),
 	}
 	// Capability descriptor (memql-cockpit#166): the same JSON the
 	// workerComputer.capabilities action returns, sent up front so
@@ -98,8 +104,8 @@ func buildRegister(cfg Config) *memqlv1.Register {
 }
 
 // register sends the Register message and waits for the RegisterAck.
-func (c *Connection) register(ctx context.Context, cfg Config) error {
-	register := buildRegister(cfg)
+func (c *Connection) register(ctx context.Context, cfg Config, inventory []apps.Info) error {
+	register := buildRegister(cfg, inventory)
 	if err := c.conn.Send(&memqlv1.WorkerClientMessage{
 		Payload: &memqlv1.WorkerClientMessage_Register{Register: register},
 	}); err != nil {
@@ -141,17 +147,35 @@ func (c *Connection) Recv() (*memqlv1.WorkerServerMessage, error) {
 	return c.conn.Recv()
 }
 
-// SendHeartbeat emits a Heartbeat envelope.
-func (c *Connection) SendHeartbeat(active uint32, perCap map[string]uint32) error {
+// SendHeartbeat emits a Heartbeat envelope carrying the current app
+// inventory.
+//
+// apps_present is ALWAYS true here, and that is load-bearing. proto3
+// cannot tell an empty repeated field from an absent one, so the engine
+// reads apps_present=false as "this build does not report apps" and
+// leaves the stored inventory alone -- correct for an older cockpit, and
+// wrong for this one on a machine that just uninstalled its last app.
+// Once a build supports the field, every beat asserts the full truth,
+// including "none".
+func (c *Connection) SendHeartbeat(active uint32, perCap map[string]uint32, inventory []apps.Info) error {
 	return c.conn.Send(&memqlv1.WorkerClientMessage{
 		Payload: &memqlv1.WorkerClientMessage_Heartbeat{
-			Heartbeat: &memqlv1.Heartbeat{
-				Ts:                       timestamppb.Now(),
-				ActiveCallsTotal:         active,
-				ActiveCallsPerCapability: perCap,
-			},
+			Heartbeat: buildHeartbeat(active, perCap, inventory),
 		},
 	})
+}
+
+// buildHeartbeat assembles the Heartbeat message. Pulled out of
+// SendHeartbeat for the same reason buildRegister is pulled out of
+// register: the wire shape is assertable without a live stream.
+func buildHeartbeat(active uint32, perCap map[string]uint32, inventory []apps.Info) *memqlv1.Heartbeat {
+	return &memqlv1.Heartbeat{
+		Ts:                       timestamppb.Now(),
+		ActiveCallsTotal:         active,
+		ActiveCallsPerCapability: perCap,
+		Apps:                     appsToProto(inventory),
+		AppsPresent:              true,
+	}
 }
 
 // SendToolResult emits a ToolResult envelope.
