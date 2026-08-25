@@ -322,12 +322,16 @@ var setupNonInteractive bool
 
 func handleSetup(args []string) {
 	fs := flag.NewFlagSet("worker setup", flag.ExitOnError)
-	nonInteractive := fs.Bool("non-interactive", false, "never prompt; report missing permissions and exit nonzero")
+	nonInteractive := fs.Bool("non-interactive", false, "never prompt; report what is missing and exit 4 (not granted) or 5 (probe failed)")
 	_ = fs.Parse(args)
 	setupNonInteractive = *nonInteractive
 	if err := runSetupWizard(); err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-		os.Exit(1)
+		// The wizard's own code, not a flat 1: an install script reading
+		// `$?` has to be able to tell "a permission has not been granted"
+		// (exit 4, the operator has an action) from "the probe itself
+		// failed" (exit 5). See setup_exit.go.
+		os.Exit(SetupExitCode(err))
 	}
 }
 
