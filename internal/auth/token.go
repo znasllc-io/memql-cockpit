@@ -105,7 +105,7 @@ func ensureValidToken(ctx context.Context, cluster config.ClusterConfig, logger 
 
 	// No refresh token, or refresh terminally rejected. Open the
 	// browser and ask for a fresh login.
-	result, err := Login(ctx, cluster.Issuer, cluster.ClientId)
+	result, err := InteractiveLogin(ctx, cluster.Issuer, cluster.ClientId)
 	if err != nil {
 		return "", fmt.Errorf("login: %w", err)
 	}

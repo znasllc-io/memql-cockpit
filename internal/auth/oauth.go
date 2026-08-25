@@ -119,7 +119,7 @@ func Login(ctx context.Context, issuer, clientId string) (*LoginResult, error) {
 	}()
 
 	if err := openBrowser(authURL); err != nil {
-		return nil, fmt.Errorf("open browser: %w (URL: %s)", err, authURL)
+		return nil, fmt.Errorf("%w: %v (URL: %s)", ErrNoBrowser, err, authURL)
 	}
 
 	select {
