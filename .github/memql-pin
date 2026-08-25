@@ -15,7 +15,16 @@
 # TO BUMP: change the sha below, add the newly-landed module's `require` and
 # `replace` to go.mod, and run `go mod tidy` -- all in one commit.
 #
-# Currently pinned to memql main after the wire (memql#3240) and base
-# (memql#3241) tiers landed -- 22 nested modules. The engine, platform and
-# server tiers (memql#3242..#3244) each get their own bump.
-3b913f3791a9d1063fbbbf5143d327f1b758de2e
+# Currently pinned to memql main after the local-apps engine half landed
+# (memql#4358) -- the wire tier now carries AppInfo on Register/Heartbeat and
+# the AppSessionStart/Chunk/Control/End envelopes, which memql-cockpit#346..#350
+# implement. This bump crosses the engine, platform and server tiers
+# (memql#3242..#3244) in one step: the split reached 49 nested modules, and the
+# ones cockpit actually resolves -- component/identity and component/memql --
+# gained their own go.mod in that window, so their require + replace land here
+# in the same commit as the sha, per the discipline above.
+#
+# It also crosses the engine's genesis removal (36c19108). That was the
+# standing blocker on this pin and it is gone: the 2026-08-25 slim-down deleted
+# every component/genesis importer in this repo.
+0314f78eb04d8df57b3d27db3f7b1cd04dcee723
