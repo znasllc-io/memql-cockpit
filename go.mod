@@ -11,10 +11,10 @@ require (
 	github.com/jezek/xgbutil v0.0.0-20260124183602-9fd151d6a51a
 	github.com/znasllc-io/memql v0.0.0-20260623073124-7c7d1350e667
 	github.com/znasllc-io/memql/component/grpc/gen v0.0.0
-	golang.org/x/image v0.44.0
+	golang.org/x/image v0.45.0
 	golang.org/x/sys v0.47.0
 	golang.org/x/term v0.45.0
-	google.golang.org/protobuf v1.36.11
+	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -98,7 +98,7 @@ require (
 	golang.org/x/exp v0.0.0-20260603202125-055de637280b // indirect
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/text v0.40.0 // indirect
+	golang.org/x/text v0.41.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 	google.golang.org/grpc v1.83.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
@@ -164,7 +164,6 @@ require (
 // mapping for those is decided by those tasks, so it is not guessed here.
 replace github.com/znasllc-io/memql => ../memql
 
-
 replace github.com/znasllc-io/memql/component/auth => ../memql/component/auth
 
 replace github.com/znasllc-io/memql/component/bus => ../memql/component/bus
@@ -175,9 +174,7 @@ replace github.com/znasllc-io/memql/component/config => ../memql/component/confi
 
 replace github.com/znasllc-io/memql/component/events => ../memql/component/events
 
-
 replace github.com/znasllc-io/memql/component/grpc/gen => ../memql/component/grpc/gen
-
 
 replace github.com/znasllc-io/memql/component/language/annotations => ../memql/component/language/annotations
 
@@ -185,12 +182,7 @@ replace github.com/znasllc-io/memql/component/language/ast => ../memql/component
 
 replace github.com/znasllc-io/memql/component/language/dslclause => ../memql/component/language/dslclause
 
-
 replace github.com/znasllc-io/memql/component/metrics => ../memql/component/metrics
-
-
-
-
 
 replace github.com/znasllc-io/memql/component/provenance => ../memql/component/provenance
 
