@@ -77,8 +77,8 @@ func dispatchHandleCommand(args []string) {
 // handlePair is the front-door wizard entry. The cockpit MUST
 // have an authorized cluster before pair runs -- the identity URL
 // is read from ~/.memql/clusters.yaml's selected cluster, NOT
-// from a flag or interactive prompt. Run `memql-cockpit authorize
-// <url>` first.
+// from a flag or interactive prompt. Run `memql cluster add
+// <domain>` first.
 //
 // With a code argument, the wizard skips the paste step. With none,
 // it opens to a paste prompt. The advanced --identity / --token
