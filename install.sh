@@ -14,7 +14,7 @@ set -eu
 # `go install -tags computeruse ...`). This installer fetches the headless build.
 
 REPO="znasllc-io/memql-cockpit"
-BINARY="memql-cockpit"
+BINARY="memql"
 
 log() { printf '%s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -78,7 +78,7 @@ main() {
         tar -xzf "${tmp}/${asset}" -C "$tmp"
         [ -f "${tmp}/${BINARY}" ] || die "archive did not contain ${BINARY}"
     else
-        # Legacy format: a raw per-platform binary (memql-cockpit-<os>-<arch>).
+        # Legacy format: a raw per-platform binary (memql-<os>-<arch>).
         legacy="${BINARY}-${os}-${arch}"
         log "    (no tar.gz; trying legacy raw binary ${legacy})"
         curl -fsSL --proto '=https' "${base}/${legacy}" -o "${tmp}/${BINARY}" \
@@ -91,6 +91,9 @@ main() {
     if ! install -m 0755 "${tmp}/${BINARY}" "${bindir}/${BINARY}" 2>/dev/null; then
         cp "${tmp}/${BINARY}" "${bindir}/${BINARY}" && chmod 0755 "${bindir}/${BINARY}"
     fi
+
+    # Migrate: drop the pre-rename binaries if this machine had them.
+    rm -f "${bindir}/memql-cockpit" "${bindir}/memql-cockpit-computeruse" 2>/dev/null || true
 
     log ""
     log "installed ${BINARY} ${tag} -> ${bindir}/${BINARY}"

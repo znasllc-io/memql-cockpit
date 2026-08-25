@@ -1,7 +1,7 @@
-# deploy/systemd/memql-cockpit-worker.service
+# deploy/systemd/memql-worker.service
 # ============================================
 #
-# Template user-systemd unit for memql-cockpit-worker on Linux.
+# Template user-systemd unit for memql-worker on Linux.
 # scripts/install/install-linux.sh copies this to
 # ~/.config/systemd/user/ with the binary path filled in.
 #

@@ -10,7 +10,12 @@ import (
 	"path/filepath"
 )
 
-const launchAgentLabel = "com.znasllc.memql-cockpit-worker"
+const launchAgentLabel = "com.znasllc.memql-worker"
+
+// legacyLaunchAgentLabel is the pre-rename label. Install and
+// Uninstall both retire it so a machine upgraded in place never runs
+// two workers (znasllc-io/memql#4553).
+const legacyLaunchAgentLabel = "com.znasllc.memql-cockpit-worker"
 
 // InstallLaunchAgent drops a per-user LaunchAgent plist and loads
 // it. Subsequent reboots auto-start the worker without the user
@@ -46,6 +51,12 @@ func InstallLaunchAgent(binaryPath string) error {
 		return fmt.Errorf("launch agent: plist dir: %w", err)
 	}
 	plistPath := filepath.Join(plistDir, launchAgentLabel+".plist")
+
+	// Retire the legacy agent before loading the new one.
+	if legacy := filepath.Join(plistDir, legacyLaunchAgentLabel+".plist"); fileExists(legacy) {
+		_ = exec.Command("launchctl", "unload", legacy).Run()
+		_ = os.Remove(legacy)
+	}
 
 	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -99,9 +110,19 @@ func UninstallLaunchAgent() error {
 		return fmt.Errorf("launch agent: home dir: %w", err)
 	}
 	plistPath := filepath.Join(home, "Library", "LaunchAgents", launchAgentLabel+".plist")
+	if legacy := filepath.Join(home, "Library", "LaunchAgents", legacyLaunchAgentLabel+".plist"); fileExists(legacy) {
+		_ = exec.Command("launchctl", "unload", legacy).Run()
+		_ = os.Remove(legacy)
+	}
 	if _, err := os.Stat(plistPath); errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	_ = exec.Command("launchctl", "unload", plistPath).Run()
 	return os.Remove(plistPath)
+}
+
+// fileExists reports whether path exists (any type).
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }

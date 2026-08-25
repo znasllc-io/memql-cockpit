@@ -3,7 +3,7 @@
 # scripts/install/install-mac.sh
 # ===============================
 #
-# Install memql-cockpit-worker on macOS. Downloads the appropriate
+# Install memql-worker on macOS. Downloads the appropriate
 # binary, drops a LaunchAgent at ~/Library/LaunchAgents/, and
 # (optionally) generates a worker.yaml from a token supplied on the
 # command line.
@@ -15,7 +15,7 @@
 #   --token <token>     Worker token (mql_wkr_<...>). Required.
 #   --cluster <url>     Cluster URL. Required.
 #   --name <name>       Worker name (default: hostname).
-#   --computeruse               Install the computer-use variant (memql-cockpit-computeruse).
+#   --computeruse               Install the computer-use variant (memql-computeruse).
 #   --download-base <u> Base URL for binary downloads.
 #   --force             Overwrite existing worker.yaml.
 #   --no-service        Skip LaunchAgent installation.
@@ -25,7 +25,7 @@ set -euo pipefail
 # shellcheck source=lib.sh
 source "$(dirname "$0")/lib.sh"
 
-readonly DEFAULT_DOWNLOAD_BASE="https://app.copresent.ai/admin/workers/install"
+readonly DEFAULT_DOWNLOAD_BASE="https://github.com/znasllc-io/memql-cockpit/releases/latest/download"
 
 function show_help() {
     cat << EOF
@@ -37,7 +37,7 @@ Required:
 
 Options:
     --name <name>             Worker name (default: hostname)
-    --computeruse                     Install the computer-use variant (memql-cockpit-computeruse)
+    --computeruse                     Install the computer-use variant (memql-computeruse)
     --user-local              Install under \$HOME/.memql/bin instead of
                               /usr/local/bin. Use when sudo isn't
                               available (CI, restricted environments).
@@ -97,9 +97,9 @@ function install_binary() {
     local url="${DOWNLOAD_BASE}/${binary}"
     local friendly_name
     if [[ "$FLAVOUR" == "computeruse" ]]; then
-        friendly_name="memql-cockpit-computeruse"
+        friendly_name="memql-computeruse"
     else
-        friendly_name="memql-cockpit"
+        friendly_name="memql"
     fi
     install_binary_with_mode "$INSTALL_MODE" "$url" "$binary" "$friendly_name"
     INSTALLED_BINARY="$INSTALL_BINARY_FRIENDLY"
@@ -122,15 +122,23 @@ function install_launch_agent() {
         return 0
     fi
     local plist_dir="${HOME}/Library/LaunchAgents"
-    local plist="${plist_dir}/com.znasllc.memql-cockpit-worker.plist"
+    local plist="${plist_dir}/com.znasllc.memql-worker.plist"
     mkdir -p "$plist_dir"
+    # Migrate: retire the pre-rename LaunchAgent so an upgraded machine
+    # never runs two workers (znasllc-io/memql#4553).
+    local legacy="${plist_dir}/com.znasllc.memql-cockpit-worker.plist"
+    if [[ -f "$legacy" ]]; then
+        launchctl unload "$legacy" >/dev/null 2>&1 || true
+        rm -f "$legacy"
+        echo "INFO: removed legacy com.znasllc.memql-cockpit-worker LaunchAgent"
+    fi
     cat > "$plist" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.znasllc.memql-cockpit-worker</string>
+    <string>com.znasllc.memql-worker</string>
     <key>ProgramArguments</key>
     <array>
         <string>${INSTALLED_BINARY}</string>
@@ -157,7 +165,7 @@ PLIST
     echo "INFO: wrote $plist"
     launchctl unload "$plist" >/dev/null 2>&1 || true
     launchctl load "$plist"
-    echo "INFO: launched memql-cockpit-worker LaunchAgent"
+    echo "INFO: launched memql-worker LaunchAgent"
 }
 
 function main() {
@@ -169,7 +177,7 @@ function main() {
     cat << EOF
 
 ================================================================
-SUCCESS: memql-cockpit-worker installed.
+SUCCESS: memql-worker installed.
 
 Binary:    ${INSTALLED_BINARY}
 Config:    ${HOME}/.memql/worker.yaml
@@ -178,11 +186,11 @@ Logs:      ${HOME}/.memql/state/worker.log
 The worker is running as a LaunchAgent and will reconnect on
 boot. To check the status:
 
-  launchctl list | grep memql-cockpit-worker
+  launchctl list | grep memql-worker
 
 To stop it:
 
-  launchctl unload ~/Library/LaunchAgents/com.znasllc.memql-cockpit-worker.plist
+  launchctl unload ~/Library/LaunchAgents/com.znasllc.memql-worker.plist
 ================================================================
 EOF
 }
