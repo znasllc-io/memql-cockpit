@@ -11,6 +11,8 @@ require (
 	github.com/jezek/xgbutil v0.0.0-20260124183602-9fd151d6a51a
 	github.com/znasllc-io/memql v0.0.0-20260623073124-7c7d1350e667
 	github.com/znasllc-io/memql/component/grpc/gen v0.0.0
+	github.com/znasllc-io/memql/component/identity v0.0.0
+	github.com/znasllc-io/memql/component/memql v0.0.0
 	golang.org/x/image v0.45.0
 	golang.org/x/sys v0.47.0
 	golang.org/x/term v0.45.0
@@ -20,7 +22,7 @@ require (
 
 require (
 	github.com/99designs/go-keychain v0.0.0-20191008050251-8e49817e8af4 // indirect
-	github.com/anthropics/anthropic-sdk-go v1.61.0 // indirect
+	github.com/anthropics/anthropic-sdk-go v1.63.1 // indirect
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/buger/jsonparser v1.1.2 // indirect
@@ -54,7 +56,7 @@ require (
 	github.com/prometheus/procfs v0.21.1 // indirect
 	github.com/puzpuzpuz/xsync/v3 v3.5.1 // indirect
 	github.com/santhosh-tekuri/jsonschema/v5 v5.3.1 // indirect
-	github.com/sashabaranov/go-openai v1.41.2 // indirect
+	github.com/sashabaranov/go-openai v1.42.0 // indirect
 	github.com/shirou/gopsutil/v4 v4.26.2 // indirect
 	github.com/standard-webhooks/standard-webhooks/libraries v0.0.1 // indirect
 	github.com/stretchr/objx v0.5.0 // indirect
@@ -78,11 +80,17 @@ require (
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	github.com/zeozeozeo/gomplerate v0.0.0-20250404113140-0fbb236df825 // indirect
+	github.com/znasllc-io/memql/component/actions v0.0.0 // indirect
 	github.com/znasllc-io/memql/component/auth v0.0.0 // indirect
 	github.com/znasllc-io/memql/component/bus v0.0.0 // indirect
 	github.com/znasllc-io/memql/component/bus/gen v0.0.0 // indirect
 	github.com/znasllc-io/memql/component/config v0.0.0 // indirect
+	github.com/znasllc-io/memql/component/database v0.0.0 // indirect
+	github.com/znasllc-io/memql/component/envregistry v0.0.0 // indirect
 	github.com/znasllc-io/memql/component/events v0.0.0 // indirect
+	github.com/znasllc-io/memql/component/frontdoor v0.0.0 // indirect
+	github.com/znasllc-io/memql/component/harness v0.0.0 // indirect
+	github.com/znasllc-io/memql/component/language v0.0.0 // indirect
 	github.com/znasllc-io/memql/component/language/annotations v0.0.0 // indirect
 	github.com/znasllc-io/memql/component/language/ast v0.0.0 // indirect
 	github.com/znasllc-io/memql/component/language/dslclause v0.0.0 // indirect
@@ -91,17 +99,18 @@ require (
 	github.com/znasllc-io/memql/component/safety v0.0.0 // indirect
 	github.com/znasllc-io/memql/component/secret v0.0.0 // indirect
 	github.com/znasllc-io/memql/core v0.0.0 // indirect
+	github.com/znasllc-io/memql/docs v0.0.0 // indirect
+	github.com/znasllc-io/memql/dsl v0.0.0 // indirect
 	go.opentelemetry.io/otel v1.44.0 // indirect
 	go.opentelemetry.io/otel/trace v1.44.0 // indirect
 	go.yaml.in/yaml/v4 v4.0.0-rc.2 // indirect
-	golang.org/x/crypto v0.54.0 // indirect
+	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/exp v0.0.0-20260603202125-055de637280b // indirect
-	golang.org/x/net v0.57.0 // indirect
+	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 	google.golang.org/grpc v1.83.0 // indirect
-	gopkg.in/yaml.v2 v2.4.0 // indirect
 	mellium.im/sasl v0.3.2 // indirect
 )
 
@@ -157,12 +166,19 @@ require (
 //     memql across eight tasks and the catch-up lands as one unreviewable
 //     change. The per-tier pin bump keeps that safety at task granularity.
 //
-// The set below covers the root module plus the `wire` tier, which lands next
-// (memql#3240) and whose paths are fixed by docs/ci-design.md. The wire entries
-// are inert until that go.mod exists (row 1 above). Later tiers' entries land
-// with their own pin-bump PR (memql#3241..#3244) -- the tier-to-directory
-// mapping for those is decided by those tasks, so it is not guessed here.
+// The set below is not hand-picked: it is the CLOSURE of what cockpit's own
+// imports pull in, converged by running `go mod tidy` and adding whatever
+// module the failure named until it went green. Two of the entries are direct
+// (component/grpc/gen for the wire types, and component/identity +
+// component/memql, which gained their own go.mod between the 2026-08-07 pin
+// and this one); the rest are transitive and carry `// indirect` on their
+// require. Do not prune a replace here because the path looks unrelated to a
+// CLI -- component/identity/workerpairing reaches component/memql, which
+// reaches actions / database / envregistry / frontdoor / language / harness,
+// and dropping any one of them puts row 2 of the truth table back.
 replace github.com/znasllc-io/memql => ../memql
+
+replace github.com/znasllc-io/memql/component/actions => ../memql/component/actions
 
 replace github.com/znasllc-io/memql/component/auth => ../memql/component/auth
 
@@ -172,15 +188,29 @@ replace github.com/znasllc-io/memql/component/bus/gen => ../memql/component/bus/
 
 replace github.com/znasllc-io/memql/component/config => ../memql/component/config
 
+replace github.com/znasllc-io/memql/component/database => ../memql/component/database
+
+replace github.com/znasllc-io/memql/component/envregistry => ../memql/component/envregistry
+
 replace github.com/znasllc-io/memql/component/events => ../memql/component/events
 
+replace github.com/znasllc-io/memql/component/frontdoor => ../memql/component/frontdoor
+
 replace github.com/znasllc-io/memql/component/grpc/gen => ../memql/component/grpc/gen
+
+replace github.com/znasllc-io/memql/component/harness => ../memql/component/harness
+
+replace github.com/znasllc-io/memql/component/identity => ../memql/component/identity
+
+replace github.com/znasllc-io/memql/component/language => ../memql/component/language
 
 replace github.com/znasllc-io/memql/component/language/annotations => ../memql/component/language/annotations
 
 replace github.com/znasllc-io/memql/component/language/ast => ../memql/component/language/ast
 
 replace github.com/znasllc-io/memql/component/language/dslclause => ../memql/component/language/dslclause
+
+replace github.com/znasllc-io/memql/component/memql => ../memql/component/memql
 
 replace github.com/znasllc-io/memql/component/metrics => ../memql/component/metrics
 
@@ -191,3 +221,7 @@ replace github.com/znasllc-io/memql/component/safety => ../memql/component/safet
 replace github.com/znasllc-io/memql/component/secret => ../memql/component/secret
 
 replace github.com/znasllc-io/memql/core => ../memql/core
+
+replace github.com/znasllc-io/memql/docs => ../memql/docs
+
+replace github.com/znasllc-io/memql/dsl => ../memql/dsl

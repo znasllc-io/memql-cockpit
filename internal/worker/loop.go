@@ -11,6 +11,9 @@ import (
 	"time"
 
 	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
+
+	"github.com/znasllc-io/memql-cockpit/internal/worker/apps"
+	"github.com/znasllc-io/memql-cockpit/internal/worker/appsession"
 )
 
 // Runner owns the worker's main loop: reconnect-with-backoff, the
@@ -20,6 +23,8 @@ type Runner struct {
 	logger    *slog.Logger
 	cfg       Config
 	tools     ToolDispatcher
+	apps      AppInventory
+	sessions  *appsession.Manager
 	heartbeat time.Duration
 	metrics   *Metrics
 
@@ -42,6 +47,8 @@ type Options struct {
 	Logger    *slog.Logger
 	Config    Config
 	Tools     ToolDispatcher
+	Apps      AppInventory
+	Sessions  *appsession.Manager
 	Heartbeat time.Duration
 	Metrics   *Metrics
 }
@@ -63,6 +70,8 @@ func NewRunner(opts Options) (*Runner, error) {
 		logger:    opts.Logger,
 		cfg:       opts.Config,
 		tools:     opts.Tools,
+		apps:      opts.Apps,
+		sessions:  opts.Sessions,
 		heartbeat: hb,
 		metrics:   opts.Metrics,
 		closed:    make(chan struct{}),
@@ -85,7 +94,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			return err
 		}
 
-		conn, err := Connect(ctx, r.cfg, r.logger)
+		conn, err := Connect(ctx, r.cfg, r.inventory(ctx), r.logger)
 		if err != nil {
 			if r.metrics != nil {
 				r.metrics.RecordReconnect()
@@ -145,6 +154,15 @@ func (r *Runner) runStream(ctx context.Context, conn *Connection) error {
 	for {
 		msg, err := conn.Recv()
 		if err != nil {
+			// A disconnect ends every live app session with a named
+			// error. The stream is the only channel back to the caller,
+			// so a session that outlived it has nowhere to report and
+			// nobody waiting -- and the process it is supervising would
+			// keep working on somebody's machine with nothing watching
+			// it, which is precisely what cancel exists to prevent.
+			if r.sessions != nil {
+				r.sessions.StopAll("the worker's stream to the cluster was lost")
+			}
 			r.active.Wait()
 			return err
 		}
@@ -164,11 +182,27 @@ func (r *Runner) heartbeatLoop(ctx context.Context, conn *Connection) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if err := conn.SendHeartbeat(0, nil); err != nil {
+			// The inventory is re-taken on every beat rather than
+			// captured at connect. The engine applies an inventory
+			// change to its live registry immediately and persists it
+			// outside the 60s lastSeenAt throttle precisely because it
+			// is a routing change -- so signing into Claude Code makes
+			// this machine selectable on the NEXT BEAT, not the next
+			// reconnect. Sending a snapshot would give that back.
+			if err := conn.SendHeartbeat(0, nil, r.inventory(ctx)); err != nil {
 				return
 			}
 		}
 	}
+}
+
+// inventory takes the current local app inventory, or nil when this
+// build reports none.
+func (r *Runner) inventory(ctx context.Context) []apps.Info {
+	if r == nil || r.apps == nil {
+		return nil
+	}
+	return r.apps.Apps(ctx)
 }
 
 func (r *Runner) handleMessage(ctx context.Context, conn *Connection, msg *memqlv1.WorkerServerMessage) error {
@@ -187,8 +221,26 @@ func (r *Runner) handleMessage(ctx context.Context, conn *Connection, msg *memql
 			"call_id", payload.ToolCancel.GetCallId(),
 			"reason", payload.ToolCancel.GetReason(),
 		)
+	case *memqlv1.WorkerServerMessage_AppSessionStart:
+		if r.sessions == nil {
+			r.logger.Warn("app session start received but this build runs no sessions",
+				"session_id", payload.AppSessionStart.GetSessionId())
+			break
+		}
+		r.sessions.Start(ctx, conn, payload.AppSessionStart)
+	case *memqlv1.WorkerServerMessage_AppSessionControl:
+		if r.sessions != nil {
+			r.sessions.Control(payload.AppSessionControl)
+		}
 	case *memqlv1.WorkerServerMessage_Drain:
 		r.logger.Info("worker received drain; will exit after in-flight calls finish")
+		// App sessions are not tool calls and are not in r.active: a
+		// session can run for an hour, and draining is not a reason to
+		// abandon one silently. Cancel them by name so each reports its
+		// own end before the stream goes.
+		if r.sessions != nil {
+			r.sessions.StopAll("the cluster asked this worker to drain")
+		}
 		r.active.Wait()
 		return fmt.Errorf("server requested drain")
 	case *memqlv1.WorkerServerMessage_RotationResponse:

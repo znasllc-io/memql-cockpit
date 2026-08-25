@@ -40,11 +40,18 @@ func TestClustersFileGet(t *testing.T) {
 // a cockpit load/save cycle rather than being dropped on the floor
 // (znasllc-io/memql#3313).
 //
-// The other half of the contract is the extension's: it writes through
-// the yaml Document API precisely because the cockpit's plain struct
-// marshal, asserted below, does NOT preserve keys it does not model.
-// That is why the cockpit has to model `local` explicitly instead of
-// relying on the round trip to carry it.
+// This test used to close by asserting that an UNKNOWN key did not
+// survive, and told whoever fixed that to come back and change it. That
+// is memql-cockpit#333, now done: ClusterConfig.Extra is a
+// `yaml:",inline"` catch-all, so the cockpit preserves what it does not
+// model and the two tools are finally symmetric -- the extension's
+// Document API and the cockpit's struct marshal both hand unknown keys
+// back unchanged. The assertion below is inverted to match.
+//
+// `local` still gets its own modelled field rather than riding in Extra,
+// and should keep it: the cockpit WRITES this key on its own (a
+// cockpit-created entry has to carry it), and preservation only covers
+// keys some other tool put there first.
 func TestClusterLocalFieldRoundTrip(t *testing.T) {
 	// A file as the extension writes it: `local: true` plus a key this
 	// Go version does not know about.
@@ -98,12 +105,160 @@ selected_cluster: staging
 		t.Errorf("Local=false should be omitted, got:\n%s", quiet)
 	}
 
-	// The documented limitation, asserted so it cannot drift silently:
-	// a struct round trip drops any key the cockpit does not model. If
-	// this ever starts passing through unknown keys, revisit the note
-	// above (and the extension's reason for using the Document API).
-	if strings.Contains(string(saved), "future_key") {
-		t.Error("unknown keys now survive the struct round trip -- update the shared-file note")
+	// The former limitation, now inverted (memql-cockpit#333): a key the
+	// cockpit does not model rides through the struct round trip on
+	// ClusterConfig.Extra, value intact.
+	if !strings.Contains(string(saved), "future_key: kept-by-the-extension") {
+		t.Errorf("an unmodelled key was dropped on the cockpit's round trip:\n%s", saved)
+	}
+	if got := reloaded.Clusters[0].Extra["future_key"]; got != "kept-by-the-extension" {
+		t.Errorf("future_key reloaded as %#v, want %q", got, "kept-by-the-extension")
+	}
+}
+
+// TestUnknownKeysSurviveRoundTrip is memql-cockpit#333's acceptance
+// criterion on its own terms: a read-modify-write through the cockpit
+// preserves every key it does not model, at BOTH levels of the file, and
+// does not invent any.
+//
+// The scenario is the real one. clusters.yaml is shared with the memQL VS
+// Code extension, which ships on its own cadence and adds per-cluster
+// state the engine-side design already anticipates more of. Before this,
+// each such key silently vanished the first time an operator touched a
+// cluster in the cockpit -- no error, no log line, just a setting gone.
+func TestUnknownKeysSurviveRoundTrip(t *testing.T) {
+	// A file with unmodelled keys at both levels, of three shapes: a
+	// scalar, a nested map, and a list. A catch-all that only carried
+	// scalars would still quietly flatten the other two.
+	const onDisk = `clusters:
+    - name: staging
+      endpoint: https://cockpit.staging.example.com
+      local: true
+      version: v0.18.0
+      future_scalar: kept
+      future_map:
+        nested: value
+        depth: 2
+      future_list:
+        - one
+        - two
+selected_cluster: staging
+future_top_level: also-kept
+`
+
+	var loaded ClustersFile
+	if err := yaml.Unmarshal([]byte(onDisk), &loaded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// Modify something the way the cockpit would, so this is a genuine
+	// read-MODIFY-write rather than a byte-for-byte copy.
+	loaded.SelectedCluster = "local"
+
+	saved, err := yaml.Marshal(&loaded)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var reloaded ClustersFile
+	if err := yaml.Unmarshal(saved, &reloaded); err != nil {
+		t.Fatalf("re-unmarshal: %v", err)
+	}
+
+	if len(reloaded.Clusters) != 1 {
+		t.Fatalf("clusters = %d, want 1", len(reloaded.Clusters))
+	}
+	c := reloaded.Clusters[0]
+
+	// The modelled fields still land on their fields, not in the map --
+	// a catch-all that swallowed known keys would break both tools.
+	if c.Name != "staging" || !c.Local || c.Version != "v0.18.0" {
+		t.Errorf("modelled fields did not survive: %+v", c)
+	}
+	for _, known := range []string{"name", "endpoint", "local", "version"} {
+		if _, stolen := c.Extra[known]; stolen {
+			t.Errorf("modelled key %q was captured into Extra", known)
+		}
+	}
+
+	if got := c.Extra["future_scalar"]; got != "kept" {
+		t.Errorf("future_scalar = %#v, want %q", got, "kept")
+	}
+	nested, ok := c.Extra["future_map"].(map[string]any)
+	if !ok {
+		t.Fatalf("future_map reloaded as %T, want a map", c.Extra["future_map"])
+	}
+	if nested["nested"] != "value" || nested["depth"] != 2 {
+		t.Errorf("future_map = %#v, want nested:value depth:2", nested)
+	}
+	list, ok := c.Extra["future_list"].([]any)
+	if !ok {
+		t.Fatalf("future_list reloaded as %T, want a list", c.Extra["future_list"])
+	}
+	if len(list) != 2 || list[0] != "one" || list[1] != "two" {
+		t.Errorf("future_list = %#v, want [one two]", list)
+	}
+
+	if got := reloaded.Extra["future_top_level"]; got != "also-kept" {
+		t.Errorf("top-level future_top_level = %#v, want %q", got, "also-kept")
+	}
+	if reloaded.SelectedCluster != "local" {
+		t.Errorf("the modification itself was lost: selected_cluster = %q", reloaded.SelectedCluster)
+	}
+
+	// A cluster with nothing unmodelled must not grow an empty mapping
+	// or a `extra: {}` key. Every entry in every operator's file is in
+	// this state, so a save that dirtied all of them would be worse than
+	// the bug this fixes.
+	quiet, err := yaml.Marshal(&ClustersFile{
+		Clusters: []ClusterConfig{{Name: "prod", Endpoint: "https://cockpit.example.com"}},
+	})
+	if err != nil {
+		t.Fatalf("marshal quiet: %v", err)
+	}
+	if strings.Contains(string(quiet), "extra") || strings.Contains(string(quiet), "{}") {
+		t.Errorf("an empty Extra leaked into the wire form:\n%s", quiet)
+	}
+}
+
+// TestUnknownKeysStableAcrossRepeatedSaves guards the shape of the fix
+// rather than its presence. Go map iteration is randomised, so an inline
+// catch-all that emitted its keys in map order would rewrite the file
+// differently on every save -- which turns `memql cluster remove` into a
+// diff across every untouched entry, and makes the file useless to keep
+// in version control or to diff after an incident.
+//
+// yaml.v3 sorts inline-map keys; this pins that so an encoder change
+// cannot silently take it away.
+func TestUnknownKeysStableAcrossRepeatedSaves(t *testing.T) {
+	const onDisk = `clusters:
+    - name: staging
+      endpoint: https://cockpit.staging.example.com
+      zulu: 1
+      alpha: 2
+      mike: 3
+      bravo: 4
+`
+	var loaded ClustersFile
+	if err := yaml.Unmarshal([]byte(onDisk), &loaded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	first, err := yaml.Marshal(&loaded)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for i := range 20 {
+		var round ClustersFile
+		if err := yaml.Unmarshal(first, &round); err != nil {
+			t.Fatalf("re-unmarshal %d: %v", i, err)
+		}
+		again, err := yaml.Marshal(&round)
+		if err != nil {
+			t.Fatalf("re-marshal %d: %v", i, err)
+		}
+		if string(again) != string(first) {
+			t.Fatalf("save %d differs from save 0:\n--- first ---\n%s\n--- again ---\n%s", i, first, again)
+		}
 	}
 }
 
