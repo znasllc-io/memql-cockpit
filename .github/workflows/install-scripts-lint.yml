@@ -1,19 +1,29 @@
 name: install-scripts-lint
 
-# Lints + smoke-tests the worker install scripts under scripts/install/.
-# These are pure shell (no Go), so this lane is independent of the memql
-# sibling checkout the build/test lanes need.
+# Lints + smoke-tests the install scripts: the token-driven worker
+# installers under scripts/install/, and the root install.sh that
+# `curl | sh` fetches. These are pure shell (no Go), so this lane is
+# independent of the memql sibling checkout the build/test lanes need.
+#
+# The root install.sh is IN SCOPE because the rename gave it real logic --
+# it migrates the pre-rename service and removes the pre-rename binaries --
+# and because it RESTATES four names lib.sh owns (it is fetched alone by
+# `curl | sh` and has nothing to source). lib_test.sh reads both files to
+# check they agree, and that assertion is inert if this lane does not run
+# when install.sh alone changes.
 
 on:
   pull_request:
     branches: [main]
     paths:
       - 'scripts/install/**'
+      - 'install.sh'
       - '.github/workflows/install-scripts-lint.yml'
   push:
     branches: [main]
     paths:
       - 'scripts/install/**'
+      - 'install.sh'
       - '.github/workflows/install-scripts-lint.yml'
 
 permissions:
@@ -33,6 +43,11 @@ jobs:
             echo "bash -n $f"
             bash -n "$f"
           done
+          # install.sh declares /bin/sh, not bash -- check it with the
+          # shell it names, or the check passes on bashisms the real
+          # interpreter would refuse.
+          echo "sh -n install.sh"
+          sh -n install.sh
 
       # shellcheck ships on the GitHub-hosted ubuntu runners. -x follows the
       # `source lib.sh` so the sourced helpers are analysed too; --source-path
@@ -41,6 +56,8 @@ jobs:
         run: |
           shellcheck --version
           shellcheck -x --source-path=scripts/install scripts/install/*.sh
+          # POSIX sh dialect, matching install.sh's own shebang.
+          shellcheck -s sh install.sh
 
       - name: lib_test.sh (helper smoke tests)
         run: bash scripts/install/lib_test.sh

@@ -88,9 +88,9 @@ _os="$(detect_os)"
 _arch="$(detect_arch)"
 
 expect_eq "binary_name_for headless" \
-    "$(binary_name_for headless)" "memql-${_os}-${_arch}"
+    "$(binary_name_for headless)" "${INSTALLED_COMMAND}-${_os}-${_arch}"
 expect_eq "binary_name_for computeruse" \
-    "$(binary_name_for computeruse)" "memql-computeruse-${_os}-${_arch}"
+    "$(binary_name_for computeruse)" "${INSTALLED_COMMAND}-computeruse-${_os}-${_arch}"
 
 # Unknown flavour prints to stderr + non-zero.
 if binary_name_for bogus >/dev/null 2>&1; then

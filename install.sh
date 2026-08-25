@@ -172,9 +172,14 @@ remove_legacy_binaries() {
     dir="$1"
     for name in $LEGACY_BINARIES; do
         if [ -e "${dir}/${name}" ] || [ -L "${dir}/${name}" ]; then
-            rm -f "${dir}/${name}" 2>/dev/null \
-                && log "    removed ${dir}/${name}" \
-                || log "    NOTE: could not remove ${dir}/${name} -- delete it by hand"
+            # if/else rather than `A && B || C`: with the && || form, a
+            # failing log() would run the NOTE branch after a successful
+            # removal (SC2015).
+            if rm -f "${dir}/${name}" 2>/dev/null; then
+                log "    removed ${dir}/${name}"
+            else
+                log "    NOTE: could not remove ${dir}/${name} -- delete it by hand"
+            fi
         fi
     done
 }

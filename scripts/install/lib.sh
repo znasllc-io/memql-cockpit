@@ -59,8 +59,15 @@ function detect_arch() {
     esac
 }
 
-# Pick the appropriate cockpit binary name for the requested
-# headless / computeruse flavour and the detected platform.
+# Pick the DOWNLOAD artifact name for the requested headless /
+# computeruse flavour and the detected platform.
+#
+# The artifact carries the variant AND the platform; the installed file is
+# always plain $INSTALLED_COMMAND. Both names derive from that one
+# constant, so a rename cannot move the download without moving the
+# install. These strings must also agree with the Makefile's dist targets
+# and release.yml's upload list -- TestReleaseArtifactNamesAgree holds
+# those three together.
 function binary_name_for() {
     local flavour="$1"  # "headless" or "computeruse"
     local os arch
@@ -68,10 +75,10 @@ function binary_name_for() {
     arch="$(detect_arch)"
     case "$flavour" in
         headless)
-            echo "memql-${os}-${arch}"
+            echo "${INSTALLED_COMMAND}-${os}-${arch}"
             ;;
         computeruse)
-            echo "memql-computeruse-${os}-${arch}"
+            echo "${INSTALLED_COMMAND}-computeruse-${os}-${arch}"
             ;;
         *)
             echo "ERROR: unknown flavour $flavour" >&2
