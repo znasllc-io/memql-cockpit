@@ -4,7 +4,6 @@ package worker
 
 import (
 	"bufio"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -106,13 +105,13 @@ func runSetupMacOS() error {
 		fmt.Println("  approve the memql binary directly.")
 		fmt.Println()
 		if !waitForKey("Press Enter after approving (or Ctrl-C to abort)...") {
-			return errors.New("setup cancelled")
+			return setupPrereq("setup cancelled before the grant was confirmed")
 		}
 		// Re-probe after approval.
 		accessOK, accessDetail = probeAccessibility()
 		fmt.Printf("  re-probe: %s\n", accessDetail)
 		if !accessOK {
-			return errors.New("Accessibility still denied after approval -- restart the binary or check System Settings")
+			return setupPrereq("Accessibility still denied after approval -- restart the binary or check System Settings")
 		}
 	}
 	fmt.Println("  Accessibility preflight: PASS")
@@ -134,12 +133,12 @@ func runSetupMacOS() error {
 		fmt.Println("  approve the memql binary directly.")
 		fmt.Println()
 		if !waitForKey("Press Enter after approving (or Ctrl-C to abort)...") {
-			return errors.New("setup cancelled")
+			return setupPrereq("setup cancelled before the grant was confirmed")
 		}
 		srOK, srDetail = probeScreenRecording()
 		fmt.Printf("  re-probe: %s\n", srDetail)
 		if !srOK {
-			return errors.New("Screen Recording still denied after approval -- macOS sometimes requires a binary restart; re-run setup")
+			return setupPrereq("Screen Recording still denied after approval -- macOS sometimes requires a binary restart; re-run setup")
 		}
 	}
 	fmt.Println("  Screen Recording preflight: PASS")
@@ -338,10 +337,14 @@ func runSetupLinux() error {
 		fmt.Println("  actions, or register the worker HEADLESS-only (the")
 		fmt.Println("  install-linux.sh installer detects Wayland and does")
 		fmt.Println("  this for you).")
-		return nil
+		// A machine fact the operator has to change, reported as a
+		// prerequisite rather than swallowed as success: an installer
+		// reading exit 0 here registers a computer-use worker that
+		// cannot move a mouse.
+		return setupPrereq("wayland session: RobotGo drives X11 only")
 	default:
 		fmt.Printf("  Display server preflight: FAIL (%s)\n", server)
-		return errors.New("setup: no display server detected (DISPLAY unset); X11 unreachable")
+		return setupPrereq("no display server detected (DISPLAY unset); X11 unreachable")
 	}
 	fmt.Println()
 
@@ -354,24 +357,24 @@ func runSetupLinux() error {
 	robotgo.Move(startX, startY)
 	if midX == startX && midY == startY {
 		fmt.Println("  Input probe: FAIL")
-		return fmt.Errorf("X11: cursor MoveRelative did not move; check XTEST + DISPLAY auth (Xauth/cookie)")
+		return setupPrereq("X11: cursor MoveRelative did not move; check XTEST + DISPLAY auth (Xauth/cookie)")
 	}
 	fmt.Println("  Input probe: PASS (cursor moved + restored)")
 	tmp, err := os.CreateTemp("", "worker-setup-probe-*.png")
 	if err != nil {
-		return fmt.Errorf("temp file: %w", err)
+		return setupFailed("temp file: %v", err)
 	}
 	tmpPath := tmp.Name()
 	_ = tmp.Close()
 	defer os.Remove(tmpPath)
 	if err := robotgo.SaveCapture(tmpPath, 0, 0, 16, 16); err != nil {
 		fmt.Println("  Screenshot probe: FAIL")
-		return fmt.Errorf("X11 screenshot probe: %w", err)
+		return setupPrereq("X11 screenshot probe: %v", err)
 	}
 	stat, err := os.Stat(tmpPath)
 	if err != nil || stat.Size() < 200 {
 		fmt.Println("  Screenshot probe: FAIL")
-		return fmt.Errorf("X11 screenshot suspiciously small (%d bytes)", stat.Size())
+		return setupPrereq("X11 screenshot suspiciously small (%d bytes)", stat.Size())
 	}
 	fmt.Printf("  Screenshot probe: PASS (%d bytes)\n", stat.Size())
 	fmt.Println()

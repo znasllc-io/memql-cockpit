@@ -39,9 +39,24 @@ import (
 )
 
 // version is the cockpit's semantic version. The git tag is the
-// source of truth (see VERSIONING.md); this constant tracks the
-// VERSION file and is bumped together with it on each release.
-const version = "0.10.0"
+// source of truth (see VERSIONING.md); this tracks the VERSION file and
+// is bumped with it by scripts/release/cut-release.sh.
+//
+// IT MUST BE A `var`, NOT A `const`. The Makefile stamps the real tag in
+// with `-ldflags -X main.version=$(VERSION)`, and -X silently does
+// NOTHING to a const: no error, no warning, just a binary reporting the
+// source string. Measured on this tree -- built with
+// `-X main.version=STAMPED-9.9.9`, a const build printed `memql 0.10.0`.
+//
+// So every release artifact carried the hard-coded constant rather than
+// the tag it was cut from, which is the opposite of what VERSIONING.md
+// promises ("the tag is the source of truth"). It is invisible because
+// the number printed is always plausible.
+//
+// buildVariant next door stays a `const` on purpose: it is chosen by a
+// build tag, not stamped, so there is nothing for -X to set.
+// TestVersionIsSettableByLdflags guards the difference.
+var version = "0.10.0"
 
 func main() {
 	if len(os.Args) < 2 {

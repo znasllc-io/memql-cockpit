@@ -27,8 +27,8 @@ distribution channels, no PATH overlap. Do not "fix" this.
 ```bash
 make cockpit             # build the headless binary -> bin/memql
 make cockpit-computeruse # the computer-use variant (CGO + RobotGo) -> bin/memql-computeruse
-make run                 # build + run against a clusters.yaml cluster
-                         #   ARGS="cluster list" etc.
+make worker              # build + run the worker (ARGS="--log-level=debug")
+make clusters            # build + list the registered clusters
 make test                # go test ./...
 make lint                # fmt + vet
 make tidy                # go mod tidy

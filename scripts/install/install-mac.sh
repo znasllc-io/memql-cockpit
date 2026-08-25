@@ -95,13 +95,13 @@ function install_binary() {
     local binary
     binary="$(binary_name_for "$FLAVOUR")"
     local url="${DOWNLOAD_BASE}/${binary}"
-    local friendly_name
-    if [[ "$FLAVOUR" == "computeruse" ]]; then
-        friendly_name="memql-computeruse"
-    else
-        friendly_name="memql"
-    fi
-    install_binary_with_mode "$INSTALL_MODE" "$url" "$binary" "$friendly_name"
+    # ONE installed command for BOTH variants (design D4). The DOWNLOAD
+    # artifact carries the variant (memql-computeruse-<os>-<arch>); the
+    # installed file never does. Installing the computer-use build as
+    # `memql-computeruse` would reinstate the second command name D4
+    # retires -- and it is the name the docs, the service unit's
+    # ExecStart, and `memql --version`'s variant line all assume.
+    install_binary_with_mode "$INSTALL_MODE" "$url" "$binary" "$INSTALLED_COMMAND"
     INSTALLED_BINARY="$INSTALL_BINARY_FRIENDLY"
 }
 
