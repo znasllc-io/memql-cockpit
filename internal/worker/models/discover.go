@@ -2,6 +2,7 @@ package models
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"sort"
@@ -151,7 +152,56 @@ func (d *Discoverer) Probe(ctx context.Context, req Request) Inventory {
 		}
 		return inv.Models[i].Runtime < inv.Models[j].Runtime
 	})
+	inv.Models, inv.ProbeNotes = resolveDuplicates(inv.Models, inv.ProbeNotes)
 	return inv
+}
+
+// resolveDuplicates keeps ONE entry per model id.
+//
+// A model id is a label KEY -- `model:<id>` -- so two runtimes offering
+// the same id cannot both be advertised: the second silently overwrites
+// the first's attributes, and Find would then hand a call to whichever
+// entry sorted first. The machine would be telling the cluster one
+// context window and serving from a runtime with another, and nothing
+// anywhere would report a conflict.
+//
+// A DECLARED runtime wins over the native Ollama probe. The operator went
+// out of their way to write that entry down, and it is the documented way
+// to correct what the probe inferred -- declaring a model against Ollama's
+// own /v1 surface with structured_output: true is how you overrule the
+// `tools` heuristic. If the auto-discovered entry shadowed it, that escape
+// hatch would quietly not work.
+func resolveDuplicates(in []Info, notes []string) ([]Info, []string) {
+	out := make([]Info, 0, len(in))
+	for i := 0; i < len(in); {
+		j := i
+		for j < len(in) && in[j].ID == in[i].ID {
+			j++
+		}
+		group := in[i:j]
+		i = j
+		if len(group) == 1 {
+			out = append(out, group[0])
+			continue
+		}
+		pick := 0
+		for k, m := range group {
+			if m.Kind == KindOpenAICompatible {
+				pick = k
+				break
+			}
+		}
+		out = append(out, group[pick])
+		for k, m := range group {
+			if k == pick {
+				continue
+			}
+			notes = append(notes, fmt.Sprintf(
+				"model %s is offered by both %s and %s; serving it from %s, because a model id can be advertised once",
+				m.ID, group[pick].Runtime, m.Runtime, group[pick].Runtime))
+		}
+	}
+	return out, notes
 }
 
 // ollamaBaseURL resolves where to look for Ollama.

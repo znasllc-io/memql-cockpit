@@ -349,3 +349,58 @@ func TestProbe_StableOrder(t *testing.T) {
 		t.Errorf("order = %v, want sorted by id", first)
 	}
 }
+
+// TestProbe_DuplicateIdAcrossRuntimes.
+//
+// A model id is a label KEY. Two runtimes offering the same id cannot both
+// be advertised -- the second overwrites the first's attributes, and Find
+// would hand the call to whichever sorted first, so the machine would tell
+// the cluster one context window and serve from a runtime with another.
+//
+// The DECLARED entry wins, and that direction is what makes the documented
+// escape hatch work: declaring a model against Ollama's own /v1 surface
+// with structured_output: true is how an operator overrules the `tools`
+// heuristic, and an auto-discovered entry shadowing it would leave them
+// editing a file that changes nothing.
+func TestProbe_DuplicateIdAcrossRuntimes(t *testing.T) {
+	ollama, _ := ollamaStub(t, []string{"llama3.1:8b"}, map[string]string{
+		// The probe finds no tools capability, so it claims no
+		// structured output -- exactly the case the escape hatch exists
+		// for.
+		"llama3.1:8b": `{"capabilities":["completion"],"model_info":{"llama.context_length":8192}}`,
+	})
+	declared := openAIStub(t, []string{"llama3.1:8b"})
+
+	inv := discovererFor(ollama.URL, nil).Probe(context.Background(), Request{
+		Allow: []string{"llama3.1:8b"},
+		Runtimes: []DeclaredRuntime{{
+			Name:    "ollama-openai",
+			BaseURL: declared.URL,
+			Models:  []DeclaredModel{{ID: "llama3.1:8b", ContextWindow: 131072, StructuredOutput: true, MaxConcurrent: 1}},
+		}},
+	})
+
+	if len(inv.Models) != 1 {
+		t.Fatalf("a model id must be reported once, got %+v", inv.Models)
+	}
+	got := inv.Models[0]
+	if got.Kind != KindOpenAICompatible || got.Runtime != "ollama-openai" {
+		t.Fatalf("the declared entry must win: %+v", got)
+	}
+	if !got.StructuredOutput || got.ContextWindow != 131072 {
+		t.Errorf("the operator's stated attributes must survive: %+v", got.Attributes)
+	}
+
+	// What is advertised and what would serve the call must be the same
+	// entry -- that is the whole point.
+	if want := "ctx=131072,structured=1,max=1"; inv.Labels()["model:llama3.1:8b"] != want {
+		t.Errorf("label = %q, want %q", inv.Labels()["model:llama3.1:8b"], want)
+	}
+	served, ok := inv.Find("llama3.1:8b")
+	if !ok || served.Runtime != got.Runtime {
+		t.Errorf("Find resolved %+v, which is not the entry the label describes", served)
+	}
+	if !strings.Contains(strings.Join(inv.ProbeNotes, " "), "offered by both") {
+		t.Errorf("the shadowed entry must be reported, not silently dropped: %v", inv.ProbeNotes)
+	}
+}

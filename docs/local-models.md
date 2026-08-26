@@ -137,6 +137,12 @@ report **`tools`** — which covers the operational class (`llama3.1:8b`,
 OpenAI-compatible runtime pointed at Ollama's own `/v1` surface with
 `structured_output: true`. Your machine, your claim.
 
+That escape hatch relies on one rule worth knowing: **a model id can be
+advertised once**, because the id is the label key. When the native probe and
+a declared runtime both offer the same id, the **declared** entry wins and
+`memql worker models` says which one was shadowed. If it went the other way,
+the file you just edited would change nothing.
+
 `max_concurrent` is the one attribute that is **never** left absent: the engine
 reads a missing ceiling as *unlimited*. `OLLAMA_NUM_PARALLEL` sets it; silence
 gets 1.
