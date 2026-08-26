@@ -10,6 +10,8 @@ import (
 	"sync"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/znasllc-io/memql-cockpit/internal/worker/models"
 )
 
 // Policy controls allow/deny decisions for the cockpit's headless
@@ -26,6 +28,7 @@ type Policy struct {
 	fs         FSPolicy
 	http       HTTPPolicy
 	apps       AppsPolicy
+	models     ModelsPolicy
 	configPath string
 }
 
@@ -84,6 +87,40 @@ type AppsPolicy struct {
 	Allow []string `yaml:"allow"`
 }
 
+// ModelsPolicy controls which local models this machine will serve, and
+// which OpenAI-compatible runtimes it knows about (memql-cockpit#359).
+//
+//	models:
+//	  allow:
+//	    - llama3.1:8b
+//	    - nomic-embed-text
+//	  runtimes:
+//	    - name: lmstudio
+//	      base_url: http://127.0.0.1:1234/v1
+//	      models:
+//	        - id: qwen2.5-7b-instruct
+//	          context_window: 32768
+//	          structured_output: true
+//
+// DEFAULT-DENY, for the reason apps.allow is. Serving a model call spends
+// this machine's own GPU on somebody else's prompt, so nothing is offered
+// until the machine's owner says which model may be. An empty allow list
+// is the state of every machine upgrading into this feature, and it must
+// not mean "all".
+//
+// A model that is present but unlisted is still REPORTED, blocked --
+// which is what lets the portal say "present, blocked" rather than
+// rendering it identically to "not installed".
+//
+// The runtime declaration types live in the models package rather than
+// here: they are the shape discovery consumes, and the yaml tags belong
+// with the struct that carries the fields. models imports nothing from
+// this repo, so the direction stays acyclic.
+type ModelsPolicy struct {
+	Allow    []string                 `yaml:"allow"`
+	Runtimes []models.DeclaredRuntime `yaml:"runtimes"`
+}
+
 // HTTPPolicy controls workerHost.http_fetch.
 type HTTPPolicy struct {
 	AllowURLs       []string `yaml:"allow_urls"`
@@ -95,10 +132,11 @@ type HTTPPolicy struct {
 
 // rawPolicy is the YAML-unmarshal target.
 type rawPolicy struct {
-	Shell ShellPolicy `yaml:"shell"`
-	FS    FSPolicy    `yaml:"fs"`
-	HTTP  HTTPPolicy  `yaml:"http"`
-	Apps  AppsPolicy  `yaml:"apps"`
+	Shell  ShellPolicy  `yaml:"shell"`
+	FS     FSPolicy     `yaml:"fs"`
+	HTTP   HTTPPolicy   `yaml:"http"`
+	Apps   AppsPolicy   `yaml:"apps"`
+	Models ModelsPolicy `yaml:"models"`
 }
 
 // DefaultPolicy returns the baseline allow/deny lists shipped with
@@ -234,6 +272,16 @@ func (p *Policy) reload() error {
 	// app without a worker restart. There is no baseline to merge onto:
 	// DefaultPolicy leaves this empty, which is the default-deny above.
 	p.apps.Allow = mergeUnique(p.apps.Allow, raw.Apps.Allow)
+	// models.allow merges the way apps.allow does, so SIGHUP makes a
+	// newly pulled model offerable without a worker restart.
+	p.models.Allow = mergeUnique(p.models.Allow, raw.Models.Allow)
+	// Runtimes REPLACE rather than merge, and the asymmetry is
+	// deliberate: an allow entry is a bare name, where a runtime is a
+	// record with a base URL, a key variable and a model list. Merging
+	// two records that share a name produces a hybrid neither the
+	// operator nor this code intended -- an endpoint moved to a new port
+	// would keep answering on the old one until a restart.
+	p.models.Runtimes = raw.Models.Runtimes
 	return nil
 }
 
@@ -370,6 +418,46 @@ func (p *Policy) AppsAllow() []string {
 	}
 	out := make([]string, len(p.apps.Allow))
 	copy(out, p.apps.Allow)
+	return out
+}
+
+// ModelsAllow returns a copy of the allowed model ids. Empty is
+// default-deny, not "all".
+func (p *Policy) ModelsAllow() []string {
+	if p == nil {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if len(p.models.Allow) == 0 {
+		return nil
+	}
+	out := make([]string, len(p.models.Allow))
+	copy(out, p.models.Allow)
+	return out
+}
+
+// ModelRuntimes returns a copy of the declared OpenAI-compatible
+// runtimes. The nested model slices are copied too: a caller that
+// appended to one would be editing the live policy under the lock this
+// method just released.
+func (p *Policy) ModelRuntimes() []models.DeclaredRuntime {
+	if p == nil {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if len(p.models.Runtimes) == 0 {
+		return nil
+	}
+	out := make([]models.DeclaredRuntime, len(p.models.Runtimes))
+	for i, rt := range p.models.Runtimes {
+		out[i] = rt
+		if len(rt.Models) > 0 {
+			out[i].Models = make([]models.DeclaredModel, len(rt.Models))
+			copy(out[i].Models, rt.Models)
+		}
+	}
 	return out
 }
 

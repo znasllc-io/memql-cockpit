@@ -16,6 +16,7 @@ import (
 	sdkworker "github.com/znasllc-io/memql/sdk/go/worker"
 
 	"github.com/znasllc-io/memql-cockpit/internal/worker/apps"
+	"github.com/znasllc-io/memql-cockpit/internal/worker/models"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/tools"
 )
 
@@ -32,13 +33,20 @@ type Connection struct {
 	RegistrationId string
 	OwnerUserId    string
 	RegisteredAt   time.Time
+
+	// ModelFingerprint is the advertised model label set this connection
+	// registered with. The runner compares a later discovery against it
+	// to decide whether re-advertising is worth a reconnect -- which is
+	// the only way to re-advertise, because the engine's stream handler
+	// accepts Register exactly once, at the handshake.
+	ModelFingerprint string
 }
 
 // Connect dials the cluster (via the SDK), opens the stream, and
 // sends the worker-protocol Register handshake. Returns the live
 // connection and the registration metadata pulled from the
 // RegisterAck.
-func Connect(ctx context.Context, cfg Config, inventory []apps.Info, logger *slog.Logger) (*Connection, error) {
+func Connect(ctx context.Context, cfg Config, inventory []apps.Info, modelInv models.Inventory, logger *slog.Logger) (*Connection, error) {
 	endpoint, useTLS, err := sdkworker.ParseClusterURL(cfg.ClusterURL)
 	if err != nil {
 		return nil, err
@@ -59,7 +67,7 @@ func Connect(ctx context.Context, cfg Config, inventory []apps.Info, logger *slo
 		logger: logger,
 	}
 
-	if err := c.register(ctx, cfg, inventory); err != nil {
+	if err := c.register(ctx, cfg, inventory, modelInv); err != nil {
 		c.Close()
 		return nil, err
 	}
@@ -71,13 +79,20 @@ func Connect(ctx context.Context, cfg Config, inventory []apps.Info, logger *slo
 // shape -- in particular that capability_descriptor_json always
 // satisfies the server-side validation rules (memql#1331: raw size,
 // schemaVersion, action-name pattern) -- without a live stream.
-func buildRegister(cfg Config, inventory []apps.Info) *memqlv1.Register {
+func buildRegister(cfg Config, inventory []apps.Info, modelInv models.Inventory) *memqlv1.Register {
 	hostname, _ := os.Hostname()
+	// Local models (memql-cockpit#361). They ride the EXISTING
+	// registration mechanism -- `model:<id>` and `runtime:<kind>` labels
+	// plus the MODEL capability -- because the engine derives its routing
+	// from labels and a second channel would be a second thing to
+	// disagree with the first. A machine that offers none contributes
+	// nothing here: no capability, no labels, no concurrency entry.
+	modelReg := modelRegistrationFor(modelInv)
 	register := &memqlv1.Register{
 		Name:         cfg.Name,
-		Capabilities: cfg.Capabilities,
-		Labels:       cfg.Labels,
-		Concurrency:  cfg.Concurrency,
+		Capabilities: withModelCapability(cfg.Capabilities, modelReg.Capability),
+		Labels:       mergeModelLabels(cfg.Labels, modelReg.Labels),
+		Concurrency:  withModelConcurrency(cfg.Concurrency, modelReg.Capability, modelReg.Concurrency),
 		Platform: &memqlv1.PlatformInfo{
 			Os:       runtime.GOOS,
 			Arch:     runtime.GOARCH,
@@ -105,8 +120,9 @@ func buildRegister(cfg Config, inventory []apps.Info) *memqlv1.Register {
 }
 
 // register sends the Register message and waits for the RegisterAck.
-func (c *Connection) register(ctx context.Context, cfg Config, inventory []apps.Info) error {
-	register := buildRegister(cfg, inventory)
+func (c *Connection) register(ctx context.Context, cfg Config, inventory []apps.Info, modelInv models.Inventory) error {
+	register := buildRegister(cfg, inventory, modelInv)
+	c.ModelFingerprint = advertisedFingerprint(modelInv.Labels())
 	if err := c.conn.Send(&memqlv1.WorkerClientMessage{
 		Payload: &memqlv1.WorkerClientMessage_Register{Register: register},
 	}); err != nil {
@@ -133,6 +149,7 @@ func (c *Connection) register(ctx context.Context, cfg Config, inventory []apps.
 		c.logger.Info("worker registered with cluster",
 			"registration_id", c.RegistrationId,
 			"owner_user_id", c.OwnerUserId,
+			"models_offered", len(modelInv.Advertised()),
 		)
 	}
 	return nil
@@ -202,6 +219,32 @@ func (c *Connection) SendAppSessionChunk(sessionID, stream string, data []byte, 
 func (c *Connection) SendAppSessionEnd(end *memqlv1.AppSessionEnd) error {
 	return c.conn.Send(&memqlv1.WorkerClientMessage{
 		Payload: &memqlv1.WorkerClientMessage_AppSessionEnd{AppSessionEnd: end},
+	})
+}
+
+// SendModelCallDelta emits one piece of generated output.
+//
+// seq is assigned by the call and passed through unchanged. The engine
+// drops out-of-order and duplicate deltas rather than appending them, so
+// a renumbering here would open a gap in the generation that no later
+// reader could detect.
+func (c *Connection) SendModelCallDelta(requestID string, seq uint64, content string, keepalive bool) error {
+	return c.conn.Send(&memqlv1.WorkerClientMessage{
+		Payload: &memqlv1.WorkerClientMessage_ModelCallDelta{
+			ModelCallDelta: &memqlv1.ModelCallDelta{
+				RequestId: requestID,
+				Seq:       seq,
+				Content:   content,
+				Keepalive: keepalive,
+			},
+		},
+	})
+}
+
+// SendModelCallEnd closes a model call on the wire.
+func (c *Connection) SendModelCallEnd(end *memqlv1.ModelCallEnd) error {
+	return c.conn.Send(&memqlv1.WorkerClientMessage{
+		Payload: &memqlv1.WorkerClientMessage_ModelCallEnd{ModelCallEnd: end},
 	})
 }
 
