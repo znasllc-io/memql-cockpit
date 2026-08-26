@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"testing"
 
+	"github.com/znasllc-io/memql-cockpit/internal/worker/models"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/tools"
 )
 
@@ -37,7 +38,7 @@ func TestBuildRegister_CarriesValidCapabilityDescriptor(t *testing.T) {
 		Name:         "test-worker",
 		Capabilities: []string{"HEADLESS"},
 		Concurrency:  map[string]uint32{"HEADLESS": 1},
-	}, nil)
+	}, nil, models.Inventory{})
 
 	raw := register.GetCapabilityDescriptorJson()
 	if raw == "" {

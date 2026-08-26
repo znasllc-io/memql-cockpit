@@ -15,6 +15,7 @@ import (
 	"github.com/znasllc-io/memql-cockpit/internal/crash"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/appsession"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/consent"
+	"github.com/znasllc-io/memql-cockpit/internal/worker/modelcall"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/tools"
 )
 
@@ -282,11 +283,23 @@ func handleRun(args []string) {
 		CheckWorkspace: policy.CheckPath,
 	})
 
+	// Local models (memql-cockpit#358..#362). The inventory gates itself
+	// on the hardware floor and on models.allow, so a machine that
+	// offers nothing advertises nothing and the manager below is never
+	// asked for anything.
+	modelInventory := NewModelInventory(policy)
+	calls := modelcall.NewManager(modelcall.Options{
+		Logger:    logger,
+		Inventory: modelInventory,
+	})
+
 	runner, err := NewRunner(Options{
 		Logger:   logger,
 		Config:   cfg,
 		Tools:    dispatcher,
 		Apps:     NewAppInventory(policy),
+		Models:   modelInventory,
+		Calls:    calls,
 		Sessions: sessions,
 		Metrics:  metrics,
 	})
