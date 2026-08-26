@@ -105,7 +105,10 @@ memql-cockpit/
 │   │                       (shell, fs, http; computeruse adds screenshot /
 │   │                       mouse / keyboard / window via RobotGo);
 │   │                       apps/ (local-app detection) + appsession/
-│   │                       (the app-session runner) -- see Local apps
+│   │                       (the app-session runner) -- see Local apps;
+│   │                       models/ (runtime discovery + the hardware
+│   │                       floor) + modelcall/ (the ModelCall server)
+│   │                       -- see Local models
 │   ├── lint/               `memql lint` — author-facing DSL validator
 │   └── setupproject/       `memql setup project` — stamps a memql-project
 │                           workspace (stdin prompts when flags are absent)
@@ -114,7 +117,8 @@ memql-cockpit/
 │                           one-liner. install.sh at the root is the plain
 │                           binary installer from GitHub releases
 ├── deploy/systemd/         memql-worker.service template (user systemd)
-├── docs/                   computer-use.md, local-apps.md;
+├── docs/                   computer-use.md, local-apps.md,
+│                           local-models.md;
 │                           docs/superpowers/specs/ designs
 └── .github/memql-pin       THE pin. Single source of truth
 ```
@@ -176,6 +180,57 @@ Four rules here are load-bearing, and each is the kind that fails silently:
 `usage.known=false` when the app reported nothing, and `exit_code` passes
 through unnormalised -- the engine records the first as billing "unknown" and
 reads the second as a failed run.
+
+## Local models on the fleet
+
+The worker can serve MemQL's own operations -- planning, conductor/routing,
+suggestions, embeddings -- from a model running on **this** machine, over
+the stream it already holds open. The engine half is memql#4676; the
+canonical record is the engine's
+`docs/public/operate/local-models.md`. `docs/local-models.md` here covers
+the machine side.
+
+- **`internal/worker/models`** discovers Ollama natively (`/api/tags` +
+  `/api/show`) and reads OpenAI-compatible endpoints declared in
+  `policy.yaml`. It also owns the **hardware floor** -- Apple Silicon /
+  16 GB / macOS 13+, or x86_64 with a >= 8 GB discrete GPU. The check runs
+  on the machine because only the machine can see its own GPU.
+- **`internal/worker/modelcall`** serves `ModelCallStart / Delta / End /
+  Cancel` against the local runtime: both kinds (`chat`, `embedding`),
+  monotonic delta `seq`, envelope-owned deadlines, and both concurrency
+  ceilings.
+
+Five rules here are load-bearing, and each fails silently:
+
+1. **Every capability defaults to ABSENT.** The engine is fail-closed: a
+   model that says nothing about structured output is never selected for a
+   structured prompt. A probe that cannot establish a capability must claim
+   nothing -- an over-claim surfaces as a parse failure three layers away,
+   naming nothing here. Ollama has no structured-output capability of its
+   own, so `tools` is the proxy; an operator who disagrees declares the
+   model under an OpenAI-compatible runtime instead.
+2. **`max_concurrent` is the exception, and it is never absent.** It is the
+   one attribute whose absence is PERMISSIVE -- the engine reads a missing
+   ceiling as unlimited. `OLLAMA_NUM_PARALLEL` when set, otherwise 1.
+3. **The floor GATES the inventory; it does not annotate it.** Below it a
+   machine advertises nothing at all, and `Discover` does not even probe.
+   `memql worker models` uses `Probe` instead, so an operator can still see
+   what they have.
+4. **Model labels are bound at Register, and Heartbeat cannot refresh
+   them.** `Heartbeat` carries apps but no labels, and the engine's stream
+   handler accepts `Register` exactly once. Re-advertising therefore costs
+   a RECONNECT -- taken only when the advertised labels actually changed,
+   only when nothing is in flight, and never twice inside two minutes.
+5. **`sharedInference` is the owner's grant, never the cockpit's.** The
+   engine reads it from `operatorLabels` alone, because `labels` is
+   overwritten from Register on every reconnect. A cockpit that derived one
+   would be granting itself a permission and revoking it whenever the lid
+   closed.
+
+`policy.yaml models.allow` is default-deny like `apps.allow`, and a model
+present but unlisted is REPORTED as blocked rather than omitted. Usage
+rides on `ModelCallEnd` exactly as the runtime reported it -- silence stays
+silence, which the engine records as billing "unknown".
 
 ## Worker + auth notes
 
