@@ -360,8 +360,11 @@ func TestAdmission_SchemaWithoutTheCapability(t *testing.T) {
 // selecting at the same moment is an ordinary race.
 func TestAdmission_PerModelCap(t *testing.T) {
 	release := make(chan struct{})
+	arrived := make(chan struct{})
+	var once sync.Once
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		drain(r)
+		once.Do(func() { close(arrived) })
 		<-release
 		fmt.Fprintf(w, "%s\n", mustJSON(map[string]any{"done": true, "done_reason": "stop"}))
 	}))
@@ -372,11 +375,12 @@ func TestAdmission_PerModelCap(t *testing.T) {
 	first := newRecorder()
 	m.Start(context.Background(), first, start("one", "m", KindChat))
 
-	// Wait for the first call to actually be admitted.
-	deadline := time.Now().Add(5 * time.Second)
-	for m.Live() == 0 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
+	// The runtime receiving the call is the signal, not Live(). The slot
+	// is taken when the model RESOLVES, which happens in the call's own
+	// goroutine -- so a second call racing that goroutine would be
+	// refused by the machine-wide ceiling instead of the per-model one,
+	// and this test would be asserting whichever one won the race.
+	awaitRequest(t, arrived)
 	if m.Live() != 1 {
 		t.Fatalf("Live() = %d, want 1", m.Live())
 	}

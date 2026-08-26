@@ -27,7 +27,15 @@ type ModelInventory interface {
 // and on every refresh check. Uncached, a machine with ten models pulled
 // would issue eleven requests a minute forever to answer a question whose
 // answer changes when somebody runs `ollama pull`.
-const DefaultModelInventoryTTL = 30 * time.Second
+//
+// WHY LONGER THAN modelRefreshInterval (60s). The runner's refresh ticker
+// is what keeps this warm, and a TTL shorter than its period would leave a
+// window in which the cache is cold and the next reader pays for a full
+// probe. That reader is usually a model call resolving its model, and the
+// probe would land as latency in front of somebody's generation. The
+// ticker refreshes at 60s, comfortably inside 90s, so a cold read happens
+// once -- at the first registration -- and never again while connected.
+const DefaultModelInventoryTTL = 90 * time.Second
 
 // policyModelInventory pairs the discoverer with the policy that gates it.
 // The policy is read on every call rather than captured, so a SIGHUP that

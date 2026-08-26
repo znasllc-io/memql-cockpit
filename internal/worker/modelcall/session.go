@@ -81,13 +81,16 @@ type Manager struct {
 
 type call struct {
 	requestID string
-	modelID   string
 	cancel    context.CancelFunc
 
-	mu     sync.Mutex
-	reason string // why it was aborted: FinishCancelled / FinishTimeout
-	code   string
-	detail string // the human sentence, when the aborter supplied one
+	mu sync.Mutex
+	// modelID is set once the model RESOLVES, which is after the call is
+	// already registered -- see Start. Empty means no concurrency slot
+	// was ever taken for a model, so releasing must not decrement one.
+	modelID string
+	reason  string // why it was aborted: FinishCancelled / FinishTimeout
+	code    string
+	detail  string // the human sentence, when the aborter supplied one
 }
 
 // NewManager builds the manager the worker runs with.
@@ -141,28 +144,57 @@ func (m *Manager) Start(ctx context.Context, sender Sender, start *memqlv1.Model
 		return
 	}
 
-	info, limits, refusal := m.admit(ctx, start)
-	if refusal != nil {
-		refusal.RequestId = requestID
-		if err := sender.SendModelCallEnd(refusal); err != nil {
-			m.logger.Warn("failed to send model call refusal", "request_id", requestID, "error", err)
-		}
+	// EVERYTHING SLOW HAPPENS IN THE GOROUTINE, and the split is not
+	// stylistic. Start runs on the worker's stream-recv goroutine -- the
+	// one goroutine that reads every inbound message -- and resolving the
+	// model reads the live inventory, which can mean probing a runtime
+	// that is not answering. Doing that here would stall tool dispatches,
+	// cancels and drain behind a socket timeout.
+	//
+	// What stays synchronous is the REGISTRATION, and that is not
+	// stylistic either: a Cancel arriving immediately after Start has to
+	// find the call. Registering in the goroutine leaves a window in
+	// which a cancel is silently dropped and the generation runs on to
+	// its own timeout -- exactly the outcome cancel exists to prevent.
+	limits := limitsFrom(start.GetLimits())
+	callCtx, cancel := context.WithTimeout(ctx, limits.timeout)
+	c := &call{requestID: requestID, cancel: cancel}
+
+	m.mu.Lock()
+	_, duplicate := m.live[requestID]
+	if !duplicate {
+		m.live[requestID] = c
+	}
+	m.mu.Unlock()
+
+	if duplicate {
+		cancel()
+		m.sendRefusal(sender, requestID, CodeDuplicateRequest,
+			"a call with this request id is already running on this worker")
 		return
 	}
 
-	callCtx, cancel := context.WithTimeout(ctx, limits.timeout)
-	c := &call{requestID: requestID, modelID: info.ID, cancel: cancel}
-
-	m.mu.Lock()
-	m.live[requestID] = c
-	m.perModel[info.ID]++
-	m.mu.Unlock()
-
 	go func() {
 		defer cancel()
-		defer m.finish(requestID, info.ID)
+		defer m.release(c)
+		info, refusal := m.resolve(ctx, c, start)
+		if refusal != nil {
+			refusal.RequestId = requestID
+			if err := sender.SendModelCallEnd(refusal); err != nil {
+				m.logger.Warn("failed to send model call refusal", "request_id", requestID, "error", err)
+			}
+			return
+		}
 		m.run(callCtx, sender, c, info, limits, start)
 	}()
+}
+
+func (m *Manager) sendRefusal(sender Sender, requestID, code, message string) {
+	end := refuse(code, message)
+	end.RequestId = requestID
+	if err := sender.SendModelCallEnd(end); err != nil {
+		m.logger.Warn("failed to send model call refusal", "request_id", requestID, "error", err)
+	}
 }
 
 // Cancel stops a running call. A cancel for a call this worker is not
@@ -216,10 +248,21 @@ func (m *Manager) abort(requestID, finish, code, reason string) {
 	c.cancel()
 }
 
-func (m *Manager) finish(requestID, modelID string) {
+// release drops the call and the per-model slot it took, if it took one.
+// A call refused before its model resolved never incremented anything, so
+// releasing it must not decrement -- that would let the next call past a
+// ceiling this one never occupied.
+func (m *Manager) release(c *call) {
+	c.mu.Lock()
+	modelID := c.modelID
+	c.mu.Unlock()
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.live, requestID)
+	delete(m.live, c.requestID)
+	if modelID == "" {
+		return
+	}
 	if n := m.perModel[modelID]; n <= 1 {
 		delete(m.perModel, modelID)
 	} else {
@@ -264,14 +307,20 @@ func limitsFrom(l *memqlv1.ModelCallLimits) callLimits {
 	return out
 }
 
-// admit resolves the model and takes a concurrency slot, or returns the
-// End that refuses the call.
-func (m *Manager) admit(ctx context.Context, start *memqlv1.ModelCallStart) (models.Info, callLimits, *memqlv1.ModelCallEnd) {
-	limits := limitsFrom(start.GetLimits())
-
+// resolve finds the model this call names and takes its concurrency slot,
+// or returns the End that refuses the call.
+//
+// It runs AFTER the call is registered (see Start), so a refusal here is a
+// refusal for a call that already exists and is already cancellable. The
+// inventory is read at this moment rather than captured at connect: a
+// model dropped from models.allow stops being servable at the next call
+// rather than at the next reconnect, because the advertisement is a
+// promise and honouring a call outside it would keep a revoked model
+// running on somebody's hardware.
+func (m *Manager) resolve(ctx context.Context, c *call, start *memqlv1.ModelCallStart) (models.Info, *memqlv1.ModelCallEnd) {
 	kind := start.GetKind()
 	if kind != KindChat && kind != KindEmbedding {
-		return models.Info{}, limits, refuse(CodeUnsupportedKind,
+		return models.Info{}, refuse(CodeUnsupportedKind,
 			fmt.Sprintf("this worker serves %q and %q; the call asked for %q", KindChat, KindEmbedding, kind))
 	}
 
@@ -281,7 +330,7 @@ func (m *Manager) admit(ctx context.Context, start *memqlv1.ModelCallStart) (mod
 	}
 	info, ok := inv.Find(start.GetModel())
 	if !ok {
-		return models.Info{}, limits, refuse(CodeModelNotOffered,
+		return models.Info{}, refuse(CodeModelNotOffered,
 			fmt.Sprintf("this machine does not currently offer model %q", start.GetModel()))
 	}
 	if len(start.GetResponseFormatSchema()) > 0 && !info.StructuredOutput {
@@ -289,33 +338,39 @@ func (m *Manager) admit(ctx context.Context, start *memqlv1.ModelCallStart) (mod
 		// the capability, so this is a stale advertisement rather than a
 		// routing bug -- and answering prose instead would defeat the
 		// gating that put the call here.
-		return models.Info{}, limits, refuse(CodeSchemaUnsupported,
+		return models.Info{}, refuse(CodeSchemaUnsupported,
 			fmt.Sprintf("model %q does not advertise structured output on this machine", info.ID))
 	}
 	if kind == KindEmbedding && !info.Embeddings {
-		return models.Info{}, limits, refuse(CodeModelNotOffered,
+		return models.Info{}, refuse(CodeModelNotOffered,
 			fmt.Sprintf("model %q does not advertise embeddings on this machine", info.ID))
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, exists := m.live[start.GetRequestId()]; exists {
-		return models.Info{}, limits, refuse(CodeDuplicateRequest,
-			"a call with this request id is already running on this worker")
-	}
 	// Both ceilings, and both are this machine's to hold. The engine
 	// rations by the advertised numbers, but the advertisement is a claim
 	// about this hardware and two replicas selecting at the same moment
 	// is an ordinary race rather than a bug to fix upstream.
+	//
+	// This call is already in m.live, so it counts itself against the
+	// machine-wide ceiling -- hence the strict `>`.
 	if info.MaxConcurrent > 0 && m.perModel[info.ID] >= info.MaxConcurrent {
-		return models.Info{}, limits, refuse(CodeConcurrencyExceeded,
+		return models.Info{}, refuse(CodeConcurrencyExceeded,
 			fmt.Sprintf("model %q is at its concurrency limit of %d on this machine", info.ID, info.MaxConcurrent))
 	}
-	if ceiling := machineCap(inv); ceiling > 0 && len(m.live) >= ceiling {
-		return models.Info{}, limits, refuse(CodeConcurrencyExceeded,
+	if ceiling := machineCap(inv); ceiling > 0 && len(m.live) > ceiling {
+		return models.Info{}, refuse(CodeConcurrencyExceeded,
 			fmt.Sprintf("this machine is at its model concurrency limit of %d", ceiling))
 	}
-	return info, limits, nil
+
+	// Taking the slot and recording which one was taken happen together;
+	// release reads the same field to know whether to give it back.
+	c.mu.Lock()
+	c.modelID = info.ID
+	c.mu.Unlock()
+	m.perModel[info.ID]++
+	return info, nil
 }
 
 // machineCap is the machine-wide ceiling, derived from the SAME numbers
@@ -345,8 +400,14 @@ func (m *Manager) run(ctx context.Context, sender Sender, c *call, info models.I
 	stream := &deltaStream{sender: sender, requestID: c.requestID}
 	stream.touch()
 
+	// The watchdog is stopped BEFORE the End is sent, not by a defer that
+	// runs after it. A keepalive racing out behind the End is a delta for
+	// a call the engine has already closed -- harmless there, but it is a
+	// protocol violation this side can simply not commit.
 	watchdogDone := make(chan struct{})
-	defer close(watchdogDone)
+	var stopOnce sync.Once
+	stopWatchdog := func() { stopOnce.Do(func() { close(watchdogDone) }) }
+	defer stopWatchdog()
 	go m.watchdog(ctx, c, stream, limits, watchdogDone)
 
 	client := m.clientFor(info)
@@ -364,6 +425,8 @@ func (m *Manager) run(ctx context.Context, sender Sender, c *call, info models.I
 			Schema:   start.GetResponseFormatSchema(),
 		}, stream.emit)
 	}
+
+	stopWatchdog()
 
 	end := &memqlv1.ModelCallEnd{RequestId: c.requestID}
 	if err != nil {
