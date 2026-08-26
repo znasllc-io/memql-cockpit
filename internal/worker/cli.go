@@ -65,6 +65,8 @@ func dispatchHandleCommand(args []string) {
 		handleSetup(args[1:])
 	case "config":
 		handleConfig(args[1:])
+	case "models":
+		handleModels(args[1:])
 	case "consent":
 		handleConsentCmd(args[1:])
 	case "-h", "--help", "help":
@@ -411,6 +413,8 @@ func printUsage() {
 	fmt.Println("                                     LaunchAgent / scripts).")
 	fmt.Println("  memql worker setup         Re-run TCC permissions check (computeruse builds only).")
 	fmt.Println("  memql worker config        Print the effective config.")
+	fmt.Println("  memql worker models        Print the local models this machine would offer,")
+	fmt.Println("                                     or the reason it offers none.")
 	fmt.Println("  memql worker consent <op>  Manage the per-call consent gate (grant/revoke/status/watch).")
 	fmt.Println("")
 	fmt.Println("PAIR FLAGS")
