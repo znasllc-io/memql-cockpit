@@ -114,6 +114,24 @@ func NewRunner(opts Options) (*Runner, error) {
 // Run blocks until ctx is cancelled or the runner is closed. It
 // reconnects with exponential backoff (1s -> 60s, jitter) on every
 // disconnect.
+// RegistrationId returns this machine's v1:worker:registration id, or "" when
+// no stream is currently up.
+//
+// A GETTER rather than a field handed out once, because the id is only known
+// after a RegisterAck and the runner may still be backing off through a
+// reconnect. Callers that need it (the backup sweeper) re-ask each time and
+// skip the pass when it is empty, rather than capturing an empty string at
+// startup and never noticing it filled in.
+func (r *Runner) RegistrationId() string {
+	if r == nil {
+		return ""
+	}
+	if conn := r.conn.Load(); conn != nil {
+		return conn.RegistrationId
+	}
+	return ""
+}
+
 func (r *Runner) Run(ctx context.Context) error {
 	if r == nil {
 		return errors.New("worker.runner: not initialized")

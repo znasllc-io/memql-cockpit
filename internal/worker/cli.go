@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"github.com/znasllc-io/memql-cockpit/internal/config"
 	"github.com/znasllc-io/memql-cockpit/internal/crash"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/appsession"
+	"github.com/znasllc-io/memql-cockpit/internal/worker/backup"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/consent"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/modelcall"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/tools"
@@ -22,6 +24,7 @@ import (
 // HandleCommand dispatches `memql worker <subcommand>`.
 // Subcommands:
 //
+//	memql worker backup            Report (and optionally run) the watched-folder sweep
 //	memql worker pair <code>       Redeem a pairing code, write yaml, run worker
 //	memql worker                   Open the pairing wizard (paste a code)
 //	memql worker run [flags]       Run the worker (assumes worker.yaml already written)
@@ -65,6 +68,8 @@ func dispatchHandleCommand(args []string) {
 		handleSetup(args[1:])
 	case "config":
 		handleConfig(args[1:])
+	case "backup":
+		handleBackup(args[1:])
 	case "models":
 		handleModels(args[1:])
 	case "consent":
@@ -295,6 +300,21 @@ func handleRun(args []string) {
 		Inventory: modelInventory,
 	})
 
+	// Watched-folder backup (memql#4841). Nil unless this machine is signed
+	// in as a user: the Library's HTTP routes take a `class="user"` bearer,
+	// and the worker token this process authenticates its STREAM with is
+	// pinned to WorkerService and cannot reach them. A machine that is paired
+	// but not signed in simply backs nothing up, which is the ordinary state
+	// of a freshly paired worker and must not be a startup failure.
+	backups := backup.New(backup.Options{
+		Logger:     logger,
+		StateDir:   cfg.StateDir,
+		BaseURL:    backupBaseURL(cfg.ClusterURL),
+		Bearer:     backupBearer(cfg.ClusterURL, logger),
+		CheckPath:  policy.CheckBackupPath,
+		HTTPClient: &http.Client{Timeout: 0},
+	})
+
 	runner, err := NewRunner(Options{
 		Logger:   logger,
 		Config:   cfg,
@@ -346,6 +366,13 @@ func handleRun(args []string) {
 		"name", cfg.Name,
 		"capabilities", cfg.Capabilities,
 	)
+	// The sweeper runs BESIDE the stream rather than inside it. It speaks
+	// HTTP as the signed-in user and the stream speaks gRPC as the worker, so
+	// neither waits on the other -- a cluster that has dropped the stream can
+	// still be accepting uploads, and a sweep in flight must not hold up a
+	// reconnect. It ends with the same cancel() every other subsystem does.
+	go backups.Run(ctx, runner.RegistrationId)
+
 	if err := runner.Run(ctx); err != nil && ctx.Err() == nil {
 		logger.Error("worker exited with error", "error", err)
 		if metrics != nil {
@@ -415,6 +442,9 @@ func printUsage() {
 	fmt.Println("  memql worker config        Print the effective config.")
 	fmt.Println("  memql worker models        Print the local models this machine would offer,")
 	fmt.Println("                                     or the reason it offers none.")
+	fmt.Println("  memql worker backup        Print the folders this machine backs up into the")
+	fmt.Println("                                     Library, or the reason it backs up none.")
+	fmt.Println("                                     --once runs one sweep now.")
 	fmt.Println("  memql worker consent <op>  Manage the per-call consent gate (grant/revoke/status/watch).")
 	fmt.Println("")
 	fmt.Println("PAIR FLAGS")
