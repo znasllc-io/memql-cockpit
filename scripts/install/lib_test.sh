@@ -9,6 +9,9 @@
 # list, and its --force clobber guard). The /usr/local/bin system path
 # can't be exercised in CI without elevated privileges, so the
 # system-mode path is checked via the require_sudo failure mode.
+# Also exercises the installers' own lib.sh sourcing: the cloned-repo
+# sibling path, and the curl|bash fallback that fetches lib.sh from
+# MEMQL_INSTALL_RAW_BASE when no sibling exists.
 #
 # Run: bash scripts/install/lib_test.sh
 # Wired into CI by .github/workflows/install-scripts-lint.yml.
@@ -195,6 +198,54 @@ if [[ -f "$_install_sh" ]]; then
 else
     fail "install.sh not found at $_install_sh"
 fi
+
+# ---------------------------------------------------------------
+# Installer sourcing -- cloned repo vs curl|bash (piped stdin)
+# ---------------------------------------------------------------
+#
+# The installers source lib.sh from $(dirname "$0"), which under
+# `curl ... | bash` is the operator's cwd ($0 is `bash`), so they fall
+# back to fetching lib.sh from MEMQL_INSTALL_RAW_BASE. That override is
+# what keeps these tests offline: the real lib.sh in this directory IS
+# the fixture, reached over file://, and the failure case points at a
+# path that cannot resolve. `--help` is the probe because it exits 0
+# before any download / sudo / service work.
+
+_script_dir="$(cd "$(dirname "$0")" && pwd)"
+_piped_cwd="${_tmp}/piped-cwd"
+mkdir -p "$_piped_cwd"
+
+for _installer in install-mac.sh install-linux.sh; do
+    # Piped from a cwd holding no lib.sh, with RAW_BASE at the real
+    # lib.sh: must survive sourcing and reach flag handling.
+    if _out="$(cd "$_piped_cwd" && MEMQL_INSTALL_RAW_BASE="file://${_script_dir}" \
+        bash -s -- --help < "${_script_dir}/${_installer}" 2>&1)" \
+        && [[ "$_out" == *"Usage:"* ]]; then
+        pass "$_installer piped --help sources lib.sh from RAW_BASE"
+    else
+        fail "$_installer piped --help should print usage and exit 0; got: $_out"
+    fi
+
+    # The cloned-repo path must NEVER fetch: with RAW_BASE poisoned,
+    # running next to lib.sh still works because the sibling wins.
+    if _out="$(cd "$_script_dir" && MEMQL_INSTALL_RAW_BASE="file:///nonexistent-raw-base" \
+        "./${_installer}" --help 2>&1)" && [[ "$_out" == *"Usage:"* ]]; then
+        pass "$_installer cloned-repo --help never consults RAW_BASE"
+    else
+        fail "$_installer cloned-repo --help should use the sibling lib.sh; got: $_out"
+    fi
+
+    # Piped with a broken RAW_BASE: must die with an ERROR naming the
+    # lib.sh URL it tried, not a cryptic bash sourcing error.
+    if _out="$(cd "$_piped_cwd" && MEMQL_INSTALL_RAW_BASE="file://${_tmp}/no-such-dir" \
+        bash -s -- --help < "${_script_dir}/${_installer}" 2>&1)"; then
+        fail "$_installer piped with broken RAW_BASE should fail; got: $_out"
+    elif [[ "$_out" == *"ERROR"* && "$_out" == *"file://${_tmp}/no-such-dir/lib.sh"* ]]; then
+        pass "$_installer piped fetch failure names the lib.sh URL"
+    else
+        fail "$_installer piped fetch failure should name the URL it tried; got: $_out"
+    fi
+done
 
 # ---------------------------------------------------------------
 # Summary

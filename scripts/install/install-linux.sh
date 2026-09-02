@@ -9,8 +9,41 @@
 
 set -euo pipefail
 
-# shellcheck source=lib.sh
-source "$(dirname "$0")/lib.sh"
+# Where lib.sh can be fetched from when this script travels alone.
+# Piped execution (`curl ... | bash`) makes $0 `bash`, so the sibling
+# source below would look for lib.sh in the operator's cwd and die.
+# Pinned to main -- the same raw base the one-liner serves this
+# installer from -- and overridable so lib_test.sh can point the fetch
+# at a local file:// fixture and stay offline.
+readonly RAW_BASE="${MEMQL_INSTALL_RAW_BASE:-https://raw.githubusercontent.com/znasllc-io/memql-cockpit/main/scripts/install}"
+
+# Source the shared helper library. A sibling lib.sh (the cloned-repo
+# case) always wins, so a checkout never gains a network dependency.
+# Only the piped case fetches -- into a temp file, checked non-empty
+# BEFORE sourcing, because under `set -e` a bare `source <(curl ...)`
+# turns a failed fetch into a cryptic bash error naming no URL.
+function source_lib() {
+    local sibling
+    sibling="$(dirname "$0")/lib.sh"
+    if [[ -f "$sibling" ]]; then
+        # shellcheck source=lib.sh
+        source "$sibling"
+        return 0
+    fi
+    local url="${RAW_BASE}/lib.sh"
+    local tmp
+    tmp="$(mktemp)"
+    if ! curl -fsSL "$url" -o "$tmp" || [[ ! -s "$tmp" ]]; then
+        rm -f "$tmp"
+        echo "ERROR: failed to fetch $url" >&2
+        echo "       Piped execution needs it; check network access or run from a repo clone." >&2
+        exit 1
+    fi
+    # shellcheck disable=SC1090  # fetched at runtime; the static path is the sibling branch above
+    source "$tmp"
+    rm -f "$tmp"
+}
+source_lib
 
 readonly DEFAULT_DOWNLOAD_BASE="https://github.com/znasllc-io/memql-cockpit/releases/latest/download"
 
