@@ -12,6 +12,11 @@
 # Also exercises the installers' own lib.sh sourcing: the cloned-repo
 # sibling path, and the curl|bash fallback that fetches lib.sh from
 # MEMQL_INSTALL_RAW_BASE when no sibling exists.
+# And the release-asset preflight: preflight_asset's verdicts over
+# file:// fixtures (present passes, missing exits 4 naming the URL and
+# the flavour/platform pair), plus both installers refusing BEFORE any
+# mutation when the asset is missing and proceeding past the preflight
+# to the download when it is present.
 #
 # Run: bash scripts/install/lib_test.sh
 # Wired into CI by .github/workflows/install-scripts-lint.yml.
@@ -244,6 +249,106 @@ for _installer in install-mac.sh install-linux.sh; do
         pass "$_installer piped fetch failure names the lib.sh URL"
     else
         fail "$_installer piped fetch failure should name the URL it tried; got: $_out"
+    fi
+done
+
+# ---------------------------------------------------------------
+# preflight_asset -- refuse a missing release asset before mutating
+# ---------------------------------------------------------------
+#
+# The helper alone first: verdicts over file:// (present -> 0, missing
+# -> 4), which is what keeps these checks offline. file:// is also why
+# the helper carries its ranged-GET fallback -- HEAD support for the
+# FILE protocol varies by curl build -- so passing here proves the
+# fallback chain, not just `curl -I`.
+
+_pf_assets="${_tmp}/preflight-assets"
+mkdir -p "$_pf_assets"
+_pf_headless="$(binary_name_for headless)"
+_pf_computeruse="$(binary_name_for computeruse)"
+printf 'stub-binary' > "${_pf_assets}/${_pf_headless}"
+
+if preflight_asset "file://${_pf_assets}/${_pf_headless}" headless >/dev/null 2>&1; then
+    pass "preflight_asset passes a present asset"
+else
+    fail "preflight_asset should pass a present asset"
+fi
+
+_out="$(preflight_asset "file://${_pf_assets}/${_pf_computeruse}" computeruse 2>&1)"
+_rc=$?
+expect_eq "preflight_asset missing asset returns 4 (prerequisite missing)" "$_rc" "4"
+
+if [[ "$_out" == *"file://${_pf_assets}/${_pf_computeruse}"* ]]; then
+    pass "preflight_asset refusal names the exact asset URL"
+else
+    fail "preflight_asset refusal should name the asset URL; got: $_out"
+fi
+
+if [[ "$_out" == *"flavour: computeruse"* && "$_out" == *"${_os}/${_arch}"* ]]; then
+    pass "preflight_asset refusal names flavour + platform"
+else
+    fail "preflight_asset refusal should name flavour + os/arch; got: $_out"
+fi
+
+# ---------------------------------------------------------------
+# Installer preflight -- refusal mutates nothing; presence passes
+# ---------------------------------------------------------------
+#
+# Now the call site: both installers must refuse AT the preflight --
+# exit 4, nothing created under HOME, no download attempted -- and a
+# present asset must sail through it. --user-local + --no-service keep
+# the runs sudo-free; a fresh HOME per run is what makes "nothing was
+# created" assertable. The success run still fails LATER, by design:
+# download_binary pins --proto '=https' and so refuses the file://
+# fixture. That is fine -- the assertion here is progress PAST the
+# preflight (the download attempt on the same URL), not a completed
+# install.
+
+for _installer in install-mac.sh install-linux.sh; do
+    # Missing asset (--computeruse against a base that publishes
+    # nothing): a clean refusal before any mutation.
+    _pf_home="${_tmp}/pf-404-home-${_installer}"
+    mkdir -p "$_pf_home"
+    _out="$(cd "$_script_dir" && HOME="$_pf_home" "./${_installer}" \
+        --token mql_wkr_test --cluster https://c.example --computeruse \
+        --user-local --no-service \
+        --download-base "file://${_pf_assets}-none" 2>&1)"
+    _rc=$?
+    expect_eq "$_installer missing asset exits 4" "$_rc" "4"
+
+    if [[ "$_out" == *"file://${_pf_assets}-none/${_pf_computeruse}"* \
+        && "$_out" == *"flavour: computeruse"* && "$_out" == *"${_os}/${_arch}"* ]]; then
+        pass "$_installer refusal names the asset URL + flavour/platform"
+    else
+        fail "$_installer refusal should name URL + flavour/platform; got: $_out"
+    fi
+
+    if [[ ! -e "${_pf_home}/.memql" && ! -e "${_pf_home}/Library" \
+        && ! -e "${_pf_home}/.config" && "$_out" != *"INFO: downloading"* ]]; then
+        pass "$_installer refusal mutates nothing (no ~/.memql, no service dir, no download)"
+    else
+        fail "$_installer refusal left state behind or attempted a download"
+    fi
+
+    # Present asset (headless at the fixture base): the preflight
+    # passes and the install proceeds to the download of the SAME URL.
+    _pf_home_ok="${_tmp}/pf-ok-home-${_installer}"
+    mkdir -p "$_pf_home_ok"
+    _out="$(cd "$_script_dir" && HOME="$_pf_home_ok" "./${_installer}" \
+        --token mql_wkr_test --cluster https://c.example \
+        --user-local --no-service \
+        --download-base "file://${_pf_assets}" 2>&1)"
+    _rc=$?
+    if [[ "$_rc" != "4" && "$_out" != *"release asset not found"* ]]; then
+        pass "$_installer present asset passes preflight"
+    else
+        fail "$_installer present asset should pass preflight; rc=$_rc got: $_out"
+    fi
+
+    if [[ "$_out" == *"INFO: downloading file://${_pf_assets}/${_pf_headless}"* ]]; then
+        pass "$_installer proceeds past preflight to the download"
+    else
+        fail "$_installer should reach the download after preflight; got: $_out"
     fi
 done
 
