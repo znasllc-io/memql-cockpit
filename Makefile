@@ -39,7 +39,7 @@ CRED_STORE ?= file
 # ---------------------------------------------------------------------------
 
 .PHONY: all cockpit cockpit-darwin-arm64 cockpit-darwin-amd64 cockpit-linux-amd64 cockpit-linux-arm64 cockpit-all-platforms
-.PHONY: cockpit-computeruse cockpit-computeruse-darwin-arm64 cockpit-computeruse-darwin-amd64 cockpit-computeruse-linux-amd64 cockpit-computeruse-linux-arm64 cockpit-computeruse-all-platforms
+.PHONY: cockpit-computeruse cockpit-computeruse-host cockpit-computeruse-darwin-arm64 cockpit-computeruse-darwin-amd64 cockpit-computeruse-linux-amd64 cockpit-computeruse-linux-arm64 cockpit-computeruse-all-platforms
 
 all: cockpit  ## Build memQL Cockpit (host platform, headless) -- default
 
@@ -80,6 +80,15 @@ cockpit-computeruse-linux-arm64: ## Computer-use cross-build for Linux aarch64
 
 cockpit-computeruse-all-platforms: cockpit-computeruse-darwin-arm64 cockpit-computeruse-darwin-amd64 cockpit-computeruse-linux-amd64 cockpit-computeruse-linux-arm64  ## Computer-use cross-build for all platforms
 
+# release.yml's computeruse matrix builds NATIVELY, one runner per platform
+# (CGO + RobotGo rules out cross-compiling the set from one host), so this
+# target overrides no GOOS/GOARCH -- it builds for the host and stamps the
+# host platform into the artifact name the token installers download
+# (memql-computeruse-<os>-<arch>). Same tags/flags as the per-platform
+# targets above; only the name's os/arch come from `go env`.
+cockpit-computeruse-host: ## Computer-use build for THIS host -> bin/memql-computeruse-<hostos>-<hostarch>
+	CGO_ENABLED=1 $(GO) build $(GOFLAGS) -tags computeruse -o $(BIN_DIR)/memql-computeruse-$$($(GO) env GOOS)-$$($(GO) env GOARCH) ./cmd/memql
+
 # ---------------------------------------------------------------------------
 ##@ Run
 # ---------------------------------------------------------------------------
@@ -109,7 +118,9 @@ forward: ## Port-forward the local k3d svc/bff to localhost:$(BFF_PORT) (low-lev
 # `make dist` produces the distributable artifacts operators + CI install: a
 # versioned tar.gz per platform (binary renamed to plain `memql` +
 # LICENSE + README) plus a SHA256SUMS manifest. Headless only -- the computeruse
-# variant needs CGO + native tooling and is built per-host, so it is not shipped.
+# variant needs CGO + native tooling, so it is never in these tarballs;
+# release.yml's computeruse matrix builds it per-host (cockpit-computeruse-host
+# above) and ships it as raw memql-computeruse-<os>-<arch> release assets.
 
 DIST_DIR := dist
 DIST_PLATFORMS := darwin-arm64 darwin-amd64 linux-amd64 linux-arm64
