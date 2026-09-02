@@ -203,6 +203,18 @@ PLIST
 
 function main() {
     parse_args "$@"
+    # Preflight the exact URL install_binary will fetch -- both derive
+    # it from the same (DOWNLOAD_BASE, binary_name_for "$FLAVOUR") pair,
+    # so the probe can never bless a different asset than the one
+    # downloaded, and --download-base overrides are honored. Runs BEFORE
+    # install_binary, and therefore before require_sudo and every file /
+    # service write: a flavour whose asset the release never published
+    # is a clean refusal here, not a curl 404 after the password prompt
+    # (#374). `local` and the assignment stay separate statements so a
+    # binary_name_for failure still aborts under set -e.
+    local asset_name
+    asset_name="$(binary_name_for "$FLAVOUR")"
+    preflight_asset "${DOWNLOAD_BASE}/${asset_name}" "$FLAVOUR"
     install_binary
     write_config
     install_launch_agent
