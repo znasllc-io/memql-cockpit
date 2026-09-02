@@ -29,6 +29,7 @@ type Policy struct {
 	http       HTTPPolicy
 	apps       AppsPolicy
 	models     ModelsPolicy
+	backup     BackupPolicy
 	configPath string
 }
 
@@ -121,6 +122,35 @@ type ModelsPolicy struct {
 	Runtimes []models.DeclaredRuntime `yaml:"runtimes"`
 }
 
+// BackupPolicy controls which folders this machine will back up into the
+// Library (memql#4841).
+//
+//	backup:
+//	  roots:
+//	    - ~/Clients
+//	    - /Volumes/Work
+//
+// DEFAULT-DENY, the same posture as apps.allow and for a stronger reason.
+// A watched folder is arranged in the GRAPH -- somebody sets it up in a
+// browser, on a different machine -- so the path in it is one the CLUSTER is
+// naming on somebody else's computer. That is exactly the situation
+// appsession's CheckWorkspace exists for, and it gets the same answer: the
+// engine may ASK, and this machine decides. Without it, anyone who could
+// write a watch row could point this cockpit at ~/.ssh and have it uploaded.
+//
+// An empty roots list is the state of every machine that has not been
+// configured, including every machine upgrading into this feature, and it
+// must not mean "all".
+//
+// A refusal is REPORTED rather than silent: the sweep answers
+// originState=refused_by_policy, which the Files app renders as "this machine
+// said no" with the repair -- add the path here -- named on screen. A machine
+// that quietly ignored a watch would be indistinguishable from one that was
+// offline.
+type BackupPolicy struct {
+	Roots []string `yaml:"roots"`
+}
+
 // HTTPPolicy controls workerHost.http_fetch.
 type HTTPPolicy struct {
 	AllowURLs       []string `yaml:"allow_urls"`
@@ -136,6 +166,7 @@ type rawPolicy struct {
 	FS     FSPolicy     `yaml:"fs"`
 	HTTP   HTTPPolicy   `yaml:"http"`
 	Apps   AppsPolicy   `yaml:"apps"`
+	Backup BackupPolicy `yaml:"backup"`
 	Models ModelsPolicy `yaml:"models"`
 }
 
@@ -257,6 +288,7 @@ func (p *Policy) reload() error {
 	}
 	p.fs.Allow = mergeUnique(p.fs.Allow, raw.FS.Allow)
 	p.fs.Deny = mergeUnique(p.fs.Deny, raw.FS.Deny)
+	p.backup.Roots = mergeUnique(p.backup.Roots, raw.Backup.Roots)
 	p.http.AllowURLs = mergeUnique(p.http.AllowURLs, raw.HTTP.AllowURLs)
 	p.http.DenyURLs = mergeUnique(p.http.DenyURLs, raw.HTTP.DenyURLs)
 	if raw.HTTP.MaxBodyBytes > 0 {
@@ -333,6 +365,62 @@ func (p *Policy) CheckPath(path string) error {
 		}
 	}
 	return nil
+}
+
+// CheckBackupPath decides whether this machine will back up a folder the
+// cluster named (memql#4841).
+//
+// SEPARATE FROM CheckPath, and deliberately not layered on it. CheckPath
+// answers "may a tool touch this", and its workspace root is a SINGLE
+// directory an agent works inside; a backup is a standing arrangement over
+// somebody's own documents, which live in several places and never inside a
+// workspace root. Reusing it would have made the feature unusable and then
+// tempted somebody to widen fs.workspace_root, which would widen every tool
+// call on the machine at the same time.
+//
+// The fs DENY list still applies, because a directory somebody marked as
+// never-touch is not a directory to upload either.
+func (p *Policy) CheckBackupPath(path string) error {
+	if p == nil {
+		return errors.New("policy: not configured")
+	}
+	cleaned, err := canonicalPath(path)
+	if err != nil {
+		return err
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, deny := range p.fs.Deny {
+		if matchesPath(cleaned, expandHome(deny)) {
+			return fmt.Errorf("this machine's policy denies %q (fs.deny lists %q)", cleaned, deny)
+		}
+	}
+	if len(p.backup.Roots) == 0 {
+		return fmt.Errorf("this machine backs up nothing yet: add %q (or a folder above it) to backup.roots in policy.yaml", cleaned)
+	}
+	for _, root := range p.backup.Roots {
+		if matchesPath(cleaned, expandHome(root)) {
+			return nil
+		}
+	}
+	return fmt.Errorf("this machine's policy does not list %q: add it (or a folder above it) to backup.roots in policy.yaml", cleaned)
+}
+
+// BackupRoots returns a copy of the folders this machine will back up.
+// The copy matters for AppsAllow's reason: a SIGHUP can reload underneath a
+// sweep that is already walking.
+func (p *Policy) BackupRoots() []string {
+	if p == nil {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if len(p.backup.Roots) == 0 {
+		return nil
+	}
+	out := make([]string, len(p.backup.Roots))
+	copy(out, p.backup.Roots)
+	return out
 }
 
 // CheckURL applies the http policy: allow/deny lists, SSRF

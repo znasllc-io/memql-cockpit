@@ -44,7 +44,34 @@ func EnsureValidTokenWithLogger(ctx context.Context, cluster config.ClusterConfi
 	return ensureValidToken(ctx, cluster, logger)
 }
 
+// ErrLoginRequired is what the non-interactive path returns where the
+// interactive one would have opened a browser.
+var ErrLoginRequired = errors.New("this cluster needs a sign-in that cannot be done from here")
+
+// EnsureValidTokenNonInteractive is EnsureValidToken for callers that must
+// never open a browser (memql#4841).
+//
+// THE BACKGROUND WORKER IS THE CASE. `memql worker run` is started by a
+// LaunchAgent or a systemd unit, usually with no session, no display and
+// nobody watching -- so the browser step is not "slow", it is a process that
+// blocks forever on a window that will never be opened, on a machine whose
+// owner is asleep. main.go already refuses to install the Keychain credential
+// store on the worker path for the same reason, and this is the other half of
+// that decision.
+//
+// Every silent path is unchanged: a PAT short-circuits, a cached token is
+// returned, and an expired one still rolls forward through /auth/refresh. Only
+// the last resort differs -- it returns ErrLoginRequired, so a caller can say
+// "run `memql login` on this machine" instead of hanging.
+func EnsureValidTokenNonInteractive(ctx context.Context, cluster config.ClusterConfig, logger *slog.Logger) (string, error) {
+	return ensureValidTokenMode(ctx, cluster, logger, false)
+}
+
 func ensureValidToken(ctx context.Context, cluster config.ClusterConfig, logger *slog.Logger) (string, error) {
+	return ensureValidTokenMode(ctx, cluster, logger, true)
+}
+
+func ensureValidTokenMode(ctx context.Context, cluster config.ClusterConfig, logger *slog.Logger, interactive bool) (string, error) {
 	// PAT path -- short-circuit the OIDC dance entirely. The PAT IS
 	// the bearer token; the server unwraps it via the pat package's
 	// Verifier (component/identity/pat/verifier.go).
@@ -104,7 +131,12 @@ func ensureValidToken(ctx context.Context, cluster config.ClusterConfig, logger 
 	}
 
 	// No refresh token, or refresh terminally rejected. Open the
-	// browser and ask for a fresh login.
+	// browser and ask for a fresh login -- unless the caller cannot have
+	// one, in which case say so rather than blocking on a window nobody
+	// will ever see.
+	if !interactive {
+		return "", fmt.Errorf("%w: run `memql login` on this machine (cluster %q)", ErrLoginRequired, cluster.Name)
+	}
 	result, err := InteractiveLogin(ctx, cluster.Issuer, cluster.ClientId)
 	if err != nil {
 		return "", fmt.Errorf("login: %w", err)

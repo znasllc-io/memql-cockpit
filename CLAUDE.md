@@ -108,7 +108,8 @@ memql-cockpit/
 │   │                       (the app-session runner) -- see Local apps;
 │   │                       models/ (runtime discovery + the hardware
 │   │                       floor) + modelcall/ (the ModelCall server)
-│   │                       -- see Local models
+│   │                       -- see Local models; backup/ (the watched-folder
+│   │                       sweeper) -- see Watched-folder backup
 │   ├── lint/               `memql lint` — author-facing DSL validator
 │   └── setupproject/       `memql setup project` — stamps a memql-project
 │                           workspace (stdin prompts when flags are absent)
@@ -118,7 +119,7 @@ memql-cockpit/
 │                           binary installer from GitHub releases
 ├── deploy/systemd/         memql-worker.service template (user systemd)
 ├── docs/                   computer-use.md, local-apps.md,
-│                           local-models.md;
+│                           local-models.md, watched-folders.md;
 │                           docs/superpowers/specs/ designs
 └── .github/memql-pin       THE pin. Single source of truth
 ```
@@ -231,6 +232,60 @@ Five rules here are load-bearing, and each fails silently:
 present but unlisted is REPORTED as blocked rather than omitted. Usage
 rides on `ModelCallEnd` exactly as the runtime reported it -- silence stays
 silence, which the engine records as billing "unknown".
+
+
+## Watched-folder backup (memql#4841)
+
+One folder on this machine, kept arriving in a MemQL Library folder. The engine
+half landed in epic memql#4783; this is the half that can see the origin.
+`internal/worker/backup/`, plus `memql worker backup [--once]`. Operator doc:
+[docs/watched-folders.md](docs/watched-folders.md).
+
+**ONE-WAY, FOREVER.** Nothing in that package reads the Library and writes this
+machine, and nothing deletes, moves or hides a copy because of something at the
+origin. A file deleted here is FLAGGED there (`origin_gone`) and stays whole and
+downloadable. Two-way sync and conflict resolution are refused deliberately --
+that is the complexity cliff this sits on the safe side of, and a test asserts
+the sweeper sends no destructive call at all.
+
+**The credential is the SIGNED-IN USER'S, and it has to be.** The Library's
+HTTP routes resolve an actor only for a `class="user"` (or classless) bearer;
+the engine pins every machine class off that surface deliberately. So the
+`mql_wkr_` token this process authenticates its STREAM with cannot reach
+`/artifacts`, and neither can a PAT (PATs verify only on the identity node).
+A machine that is paired but not signed in backs nothing up, which is the
+ordinary state of a fresh worker and must not be a startup failure --
+`backupBearer` returns nil and the manager is a working no-op. The sign-in is
+resolved NON-INTERACTIVELY (`auth.EnsureValidTokenNonInteractive`): under a
+LaunchAgent the browser step is not slow, it is a block on a window that will
+never open.
+
+**The graph says WHICH folder; this machine says WHETHER.** A watch row is
+written from a browser, so its path is one the cluster names on somebody else's
+computer -- the situation `appsession`'s `CheckWorkspace` exists for, and the
+same answer. `policy.yaml`'s `backup.roots` is default-deny, and a refusal is
+REPORTED (`originState=refused_by_policy`) rather than silent: a machine that
+quietly ignored a watch is indistinguishable from one that is offline.
+
+**A SCHEDULED WALK, NOT fsnotify**, and this is a decision rather than a
+shortcut. A backup must RECONCILE -- everything that changed while the process
+was down produced no event; the verify lane has to look on a schedule anyway to
+answer `stale` and `origin_gone`; and recursive watches are not portable
+(inotify is one watch per directory against a per-user cap, and exhausting it
+presents as a backup that silently stops noticing). It also adds no dependency.
+fsnotify is a sensible ACCELERATOR later; the sweep stays the source of truth.
+
+**Three gates, cheapest first**: an unchanged (size, mtime) costs nothing; a
+moved stamp with an unchanged digest costs one read and no upload; only new
+bytes are sent. The ledger under `<state_dir>/backup/<watchId>.json` is a CACHE
+-- losing it costs one expensive sweep, because every re-push is keyed on
+`(machine, path)` and lands as a new VERSION rather than a duplicate.
+
+**A 200 is not success.** `/memql/query` answers HTTP 200 with the refusal in
+an `errors` array, so a client that only checked the status would read "you may
+not see these rows" as "you are watching nothing" -- and a backup with nothing
+to do looks exactly like one that is up to date. Every call reads `errors`
+first.
 
 ## Worker + auth notes
 

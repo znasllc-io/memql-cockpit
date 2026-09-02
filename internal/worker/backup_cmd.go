@@ -1,0 +1,165 @@
+package worker
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/znasllc-io/memql-cockpit/internal/worker/backup"
+	"github.com/znasllc-io/memql-cockpit/internal/worker/tools"
+)
+
+// `memql worker backup` -- what this machine is being asked to back up, and
+// whether it will (memql#4841).
+//
+// IT RUNS THE SAME CODE THE WORKER RUNS, which is the discipline models_cmd.go
+// states and the reason this exists at all: a second implementation could
+// disagree with the first, and the operator would have no way to know which
+// one lied. `--once` drives Manager.SweepOnce -- literally the function the
+// loop calls -- so what an operator sees here is what the background worker
+// does.
+//
+// The listing half is the one thing an operator actually needs when a backup
+// is not working, and it is a question no other surface answers: the Files app
+// can say "this machine said no", and only this command can say WHY, because
+// the reason is in a file on this machine.
+
+const backupProbeTimeout = 60 * time.Second
+
+func handleBackup(args []string) {
+	fs := flag.NewFlagSet("worker backup", flag.ExitOnError)
+	configPath := fs.String("config", DefaultConfigPath(), "path to worker.yaml")
+	once := fs.Bool("once", false, "run one sweep now instead of only listing")
+	_ = fs.Parse(args)
+
+	cfg, err := LoadFile(*configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		os.Exit(1)
+	}
+	policyPath := filepath.Join(filepath.Dir(*configPath), "policy.yaml")
+	policy, err := tools.LoadPolicy(policyPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		os.Exit(1)
+	}
+
+	logger := newLogger(cfg.LogLevel)
+	baseURL := backupBaseURL(cfg.ClusterURL)
+	bearer := backupBearer(cfg.ClusterURL, logger)
+
+	printBackupHeader(os.Stdout, baseURL, policy.BackupRoots(), policyPath, bearer != nil)
+	if bearer == nil {
+		os.Exit(0)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), backupProbeTimeout)
+	defer cancel()
+
+	manager := backup.New(backup.Options{
+		Logger:     logger,
+		StateDir:   cfg.StateDir,
+		BaseURL:    baseURL,
+		Bearer:     bearer,
+		CheckPath:  policy.CheckBackupPath,
+		HTTPClient: &http.Client{},
+	})
+	graph := backup.NewGraph(baseURL, &http.Client{}, bearer)
+
+	// The registration id comes from the RUNNING worker's stream, which this
+	// process is not. Read it from the cluster instead? No -- there is no read
+	// that answers "which registration am I", because the answer is a property
+	// of a connection. So the listing names what it cannot know rather than
+	// guessing at it.
+	fmt.Fprintln(os.Stdout, "")
+	watches, err := graph.Watches(ctx, "")
+	if err != nil {
+		fmt.Fprintf(os.Stdout, "Could not read your watched folders: %v\n", err)
+		os.Exit(1)
+	}
+	printBackupWatches(os.Stdout, watches, policy.CheckBackupPath)
+
+	if !*once {
+		return
+	}
+	fmt.Fprintln(os.Stdout, "")
+	fmt.Fprintln(os.Stdout, "Sweeping now. This is the same pass the worker runs.")
+	manager.SweepOnce(ctx)
+	fmt.Fprintln(os.Stdout, "Done. The Files app shows what each machine reported.")
+}
+
+// printBackupHeader states what this machine will and will not do, before any
+// list. Split out so its shape is assertable with no cluster and no sign-in.
+func printBackupHeader(w io.Writer, baseURL string, roots []string, policyPath string, signedIn bool) {
+	fmt.Fprintln(w, "Watched-folder backup on this machine")
+	fmt.Fprintln(w, "")
+	fmt.Fprintf(w, "Cluster:   %s\n", orNone(baseURL))
+	if signedIn {
+		fmt.Fprintln(w, "Sign-in:   this machine has a usable session")
+	} else {
+		// The exact repair, named. This is the single most common reason a
+		// backup does nothing, and "not signed in" without the command is a
+		// diagnosis with no treatment.
+		fmt.Fprintln(w, "Sign-in:   NONE. Run `memql login` here -- the Library needs a user")
+		fmt.Fprintln(w, "           sign-in, and the worker token this machine runs on cannot")
+		fmt.Fprintln(w, "           reach it.")
+	}
+	fmt.Fprintln(w, "")
+	if len(roots) == 0 {
+		fmt.Fprintln(w, "Allowed folders: NONE.")
+		fmt.Fprintf(w, "  This machine backs up nothing until %s lists one:\n", policyPath)
+		fmt.Fprintln(w, "")
+		fmt.Fprintln(w, "    backup:")
+		fmt.Fprintln(w, "      roots:")
+		fmt.Fprintln(w, "        - ~/Clients")
+		fmt.Fprintln(w, "")
+		fmt.Fprintln(w, "  Default-deny is deliberate: a watched folder is arranged in the")
+		fmt.Fprintln(w, "  cluster, so this machine decides which paths it will honour.")
+		return
+	}
+	fmt.Fprintln(w, "Allowed folders (backup.roots):")
+	for _, root := range roots {
+		fmt.Fprintf(w, "  %s\n", root)
+	}
+}
+
+// printBackupWatches lists the arrangements and says, per row, whether this
+// machine will honour the path.
+func printBackupWatches(w io.Writer, watches []backup.Watch, check func(string) error) {
+	if len(watches) == 0 {
+		fmt.Fprintln(w, "No watched folders are set up for you.")
+		fmt.Fprintln(w, "Set one up in MemQL OS: Files -> Backups -> Back up a folder.")
+		return
+	}
+	fmt.Fprintln(w, "Your watched folders:")
+	for _, watch := range watches {
+		verdict := "will back up"
+		switch {
+		case !watch.Active():
+			verdict = "paused"
+		case check == nil:
+			verdict = "REFUSED (no policy configured)"
+		default:
+			if err := check(watch.LocalPath); err != nil {
+				verdict = "REFUSED: " + err.Error()
+			}
+		}
+		fmt.Fprintf(w, "  %-44s %s\n", watch.LocalPath, verdict)
+		fmt.Fprintf(w, "  %-44s machine %s\n", "", watch.WorkerID)
+	}
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "A folder listed for ANOTHER of your machines shows here too --")
+	fmt.Fprintln(w, "only the machine it names sweeps it.")
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "not configured"
+	}
+	return s
+}
