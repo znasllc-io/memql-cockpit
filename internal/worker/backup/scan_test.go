@@ -38,7 +38,7 @@ func TestScanSkipsWhatNoBackupWants(t *testing.T) {
 	mk(t, root, ".hidden")
 	mk(t, root, "sub/also-kept.txt")
 
-	res, err := Scan(root, nil, false)
+	res, err := Scan(root, nil, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestScanSkipsWhatNoBackupWants(t *testing.T) {
 func TestScanIncludesHiddenOnlyWhenAsked(t *testing.T) {
 	root := t.TempDir()
 	mk(t, root, ".env")
-	res, err := Scan(root, nil, true)
+	res, err := Scan(root, nil, true, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +68,7 @@ func TestScanIncludesHiddenOnlyWhenAsked(t *testing.T) {
 	// The reachable positive for the test above: the same tree with the flag
 	// off returns nothing, so "skipped" is about the flag and not about the
 	// file being missing.
-	res, err = Scan(root, nil, false)
+	res, err = Scan(root, nil, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +85,7 @@ func TestExcludePatternsMeanWhatSomebodyTypingThemMeans(t *testing.T) {
 	mk(t, root, "drafts/nested/two.txt")
 	mk(t, root, "final.txt")
 
-	res, err := Scan(root, []string{"*.tmp", "drafts/**"}, false)
+	res, err := Scan(root, []string{"*.tmp", "drafts/**"}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestExcludePatternsMeanWhatSomebodyTypingThemMeans(t *testing.T) {
 func TestAnUnparseablePatternExcludesNothing(t *testing.T) {
 	root := t.TempDir()
 	mk(t, root, "a.txt")
-	res, err := Scan(root, []string{"["}, false)
+	res, err := Scan(root, []string{"["}, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +119,7 @@ func TestScanIsOrderedSoTwoSweepsAreComparable(t *testing.T) {
 	for _, rel := range []string{"c.txt", "a.txt", "b/z.txt", "b/a.txt"} {
 		mk(t, root, rel)
 	}
-	res, err := Scan(root, nil, false)
+	res, err := Scan(root, nil, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func TestScanDoesNotFollowSymlinksOutOfTheWatchedFolder(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(root, "escape")); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
-	res, err := Scan(root, nil, false)
+	res, err := Scan(root, nil, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,5 +191,82 @@ func TestALedgerSurvivesARoundTripAndAMissingFileIsEmptyNotAnError(t *testing.T)
 	}
 	if got := LoadLedger(dir, "w-2"); len(got.Paths()) != 0 {
 		t.Error("a corrupt ledger was not treated as empty")
+	}
+}
+
+// The deny list has to reach every entry, not just the watched root. Checking
+// only the root left the stated invariant true of one path and false of
+// everything beneath it.
+func TestTheDenyListPrunesSubfoldersNotJustTheRoot(t *testing.T) {
+	root := t.TempDir()
+	mk(t, root, "keep.txt")
+	mk(t, root, ".ssh/id_ed25519")
+	mk(t, root, "private/notes.txt")
+
+	denied := filepath.Join(root, ".ssh")
+	deny := func(path string) error {
+		if path == denied || filepath.Dir(path) == denied {
+			return os.ErrPermission
+		}
+		return nil
+	}
+
+	// includeHidden ON, so the only thing that can keep .ssh out is the deny.
+	res, err := Scan(root, nil, true, deny)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range relsOf(res) {
+		if rel == ".ssh/id_ed25519" {
+			t.Fatalf("a denied subfolder was walked into the backup: %v", relsOf(res))
+		}
+	}
+	// The reachable positive: with no deny, the same tree DOES yield it, so the
+	// assertion above is about the veto rather than about hidden handling.
+	res, err = Scan(root, nil, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawKey bool
+	for _, rel := range relsOf(res) {
+		if rel == ".ssh/id_ed25519" {
+			sawKey = true
+		}
+	}
+	if !sawKey {
+		t.Fatal("the control walk did not reach .ssh at all, so the deny test measures nothing")
+	}
+}
+
+func TestBothSpellingsOfExcludeEverythingExcludeEverything(t *testing.T) {
+	root := t.TempDir()
+	mk(t, root, "a.txt")
+	mk(t, root, "deep/b.txt")
+	for _, pattern := range []string{"**", "/**"} {
+		res, err := Scan(root, []string{pattern}, false, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// `/**` used to cut down to an empty prefix that matched nothing, so
+		// the most emphatic spelling of "exclude everything" excluded nothing.
+		if len(res.Entries) != 0 {
+			t.Errorf("pattern %q left %v", pattern, relsOf(res))
+		}
+	}
+}
+
+func TestAnExcludedNameIsSkippedEvenWhenItIsAFile(t *testing.T) {
+	root := t.TempDir()
+	mk(t, root, ".DS_Store")
+	mk(t, root, "keep.txt")
+	// includeHidden ON, which is the only way .DS_Store used to survive: the
+	// excluded-name list was consulted for directories only.
+	res, err := Scan(root, nil, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := relsOf(res)
+	if len(got) != 1 || got[0] != "keep.txt" {
+		t.Errorf("want only keep.txt, got %v", got)
 	}
 }

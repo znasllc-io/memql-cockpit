@@ -153,14 +153,23 @@ type Watch struct {
 // re-push the folder -- but nothing is scanned or sent.
 func (w Watch) Active() bool { return w.Status != "paused" }
 
-// Watches returns the arrangements for this machine.
+// Watches returns the arrangements for one machine, or -- with a BLANK
+// workerID -- every one the caller has.
 //
-// Asks for THIS worker's own id rather than reading the whole list and
-// filtering here. The query guards the argument, so the narrow question is
-// one word, and asking it says in the call itself that this sweeper only ever
-// acts on its own machine's rows.
+// THE ARGUMENT IS OMITTED WHEN BLANK, and that is the whole difference between
+// the two questions. The query guards it with `when(args.workerId)`, and that
+// guard drops an ABSENT argument, not an empty string: `workerId: ""` is a
+// present value that compares against every row and matches none. Rendering
+// the argument unconditionally therefore turned "show me everything" into
+// "show me the rows belonging to the machine whose id is the empty string" --
+// which answers nothing, forever, and reads exactly like a person having set
+// no backups up.
 func (g *Graph) Watches(ctx context.Context, workerID string) ([]Watch, error) {
-	rows, err := g.call(ctx, "query libraryWatchedFolders(workerId: "+langparser.QuoteString(workerID)+")")
+	call := "query libraryWatchedFolders()"
+	if strings.TrimSpace(workerID) != "" {
+		call = "query libraryWatchedFolders(workerId: " + langparser.QuoteString(workerID) + ")"
+	}
+	rows, err := g.call(ctx, call)
 	if err != nil {
 		return nil, err
 	}

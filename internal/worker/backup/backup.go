@@ -71,10 +71,6 @@ type Options struct {
 	// BaseURL is the cluster's HTTP origin. Derived from the worker's own
 	// cluster_url by the caller -- there is no second host to configure.
 	BaseURL string
-	// WorkerID is this machine's v1:worker:registration id, taken from the
-	// RegisterAck. Empty means the manager does nothing: without it no push
-	// can name its machine, and an unnamed push is a file with no origin.
-	WorkerID string
 	// Bearer resolves the signed-in user's access token. Called per request
 	// so a token that rolls forward mid-sweep is picked up.
 	Bearer func(context.Context) (string, error)
@@ -98,6 +94,11 @@ type Manager struct {
 
 	mu      sync.Mutex
 	ledgers map[string]*Ledger
+
+	// workerID is the registration this sweep is acting as. Written by
+	// SweepOnce from its own parameter and read by the push path beneath it,
+	// all on one goroutine per sweep.
+	workerID string
 }
 
 // New builds a manager, or nil when it has nothing to work with.
@@ -146,10 +147,19 @@ func (m *Manager) Run(ctx context.Context, registrationID func() string) {
 	ticker := time.NewTicker(m.opts.SweepInterval)
 	defer ticker.Stop()
 	announced := false
+	lastSaved := ""
 	for {
 		if id := strings.TrimSpace(registrationID()); id != "" {
-			m.opts.WorkerID = id
-			m.SweepOnce(ctx)
+			if id != lastSaved {
+				// Recorded so `memql worker backup --once` acts as the same
+				// machine. Best-effort: losing it costs that command its id
+				// and costs this sweep nothing.
+				if err := SaveRegistrationID(m.opts.StateDir, id); err != nil {
+					m.logger.Debug("backup: could not record this machine's registration id", "error", err)
+				}
+				lastSaved = id
+			}
+			m.SweepOnce(ctx, id)
 		} else if !announced {
 			// Said ONCE. A machine that has not registered yet is the ordinary
 			// state for the first few seconds, and logging it every five
@@ -169,11 +179,25 @@ func (m *Manager) Run(ctx context.Context, registrationID func() string) {
 // `memql worker backup --once` runs EXACTLY what the loop runs -- the
 // discipline models_cmd.go states: a second implementation could disagree
 // with the first and the operator would have no way to know which one lied.
-func (m *Manager) SweepOnce(ctx context.Context) {
+//
+// THE REGISTRATION ID IS A PARAMETER, not a field read off the manager, and it
+// is REFUSED when blank. Both halves matter. As a field it was set only inside
+// Run, so the `--once` command -- which never calls Run -- swept with the empty
+// string, matched no rows, pushed nothing and printed "Done"; and a push that
+// did happen would have carried `uploadedFromWorkerId: ""`, which the engine
+// refuses. A parameter makes the id impossible to forget, and the guard makes
+// a forgotten one loud rather than a silent no-op that reports success.
+func (m *Manager) SweepOnce(ctx context.Context, workerID string) {
 	if m == nil {
 		return
 	}
-	watches, err := m.graph.Watches(ctx, m.opts.WorkerID)
+	workerID = strings.TrimSpace(workerID)
+	if workerID == "" {
+		m.logger.Warn("backup: no registration id, so nothing was swept -- a push cannot name its machine without one")
+		return
+	}
+	m.workerID = workerID
+	watches, err := m.graph.Watches(ctx, workerID)
 	if err != nil {
 		m.logger.Warn("backup: could not read this machine's watched folders", "error", err)
 		return
@@ -208,7 +232,9 @@ func (m *Manager) sweepWatch(ctx context.Context, watch Watch) {
 		return
 	}
 
-	scan, err := Scan(watch.LocalPath, watch.ExcludeGlobs, watch.IncludeHidden)
+	// The same veto, applied to every entry beneath the root rather than only
+	// to the root itself.
+	scan, err := Scan(watch.LocalPath, watch.ExcludeGlobs, watch.IncludeHidden, check)
 	if err != nil {
 		state := "unreadable"
 		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, os.ErrNotExist) {
@@ -223,6 +249,17 @@ func (m *Manager) sweepWatch(ctx context.Context, watch Watch) {
 	}
 
 	ledger := m.ledgerFor(watch.ID)
+	// DEFERRED, so a sweep cut short by a cancelled context still keeps the
+	// record of what it already sent. Saving only at the end made the unit of
+	// loss a whole SWEEP: every file uploaded before the deadline was
+	// forgotten, and the next run re-pushed all of them, versioning each one
+	// again. A push whose ledger write is lost is safe (the (machine, path)
+	// key versions rather than duplicates) -- but safe is not free.
+	defer func() {
+		if err := ledger.Save(); err != nil {
+			log.Warn("backup: could not save this machine's record of what it sent", "error", err)
+		}
+	}()
 	var pushErr string
 	pushed := 0
 	for _, entry := range scan.Entries {
@@ -244,10 +281,7 @@ func (m *Manager) sweepWatch(ctx context.Context, watch Watch) {
 		}
 	}
 
-	m.verify(ctx, watch, ledger, scan)
-	if err := ledger.Save(); err != nil {
-		log.Warn("backup: could not save this machine's record of what it sent", "error", err)
-	}
+	m.verify(ctx, ledger, scan)
 
 	state := "ok"
 	message := pushErr
@@ -274,6 +308,24 @@ func (m *Manager) pushIfChanged(ctx context.Context, watch Watch, ledger *Ledger
 	if known && prior.Stamp.Unchanged(entry.Stamp) {
 		return false, nil
 	}
+	// RE-STAT FIRST, and push what THIS stat saw.
+	//
+	// The walk's stamp can be minutes or hours old by the time a big folder
+	// gets here, and the declared size is what the session route chunks
+	// against. Declaring a stale, SMALLER size sends only that many bytes of a
+	// file that has since grown -- and the engine's commit check passes,
+	// because staged bytes really do equal the size it was told. The result is
+	// a silently truncated copy. Worse, the digest below was of the CURRENT
+	// content, so the next sweep hashes the same bytes, matches, and never
+	// sends the rest: truncated forever, reported `synced`.
+	//
+	// One observation, used for the size, the digest and the record. A file
+	// that changes DURING the push still converges: the recorded stamp will
+	// not match the next sweep's stat, so it is pushed again.
+	fresh, err := statOf(entry.Path)
+	if err != nil {
+		return false, err
+	}
 	digest, err := Digest(entry.Path)
 	if err != nil {
 		return false, err
@@ -281,19 +333,36 @@ func (m *Manager) pushIfChanged(ctx context.Context, watch Watch, ledger *Ledger
 	if known && prior.Stamp.SHA256 == digest && prior.FileID != "" {
 		// Same bytes, new timestamp. Record the new stamp so the next sweep
 		// takes the cheap path again, and send nothing.
-		prior.Stamp = entry.Stamp
+		prior.Stamp = fresh
 		prior.Stamp.SHA256 = digest
 		ledger.Put(entry.Path, prior)
 		return false, nil
 	}
 
-	result, err := m.library.Push(ctx, m.opts.WorkerID, entry.Path, watch.FolderID, entry.Stamp.Size)
+	// Hand back a session this path left open at this exact size, so a push
+	// interrupted partway resumes instead of starting again. A mismatch is
+	// ignored by the resume check itself.
+	resumeID := ""
+	if known && prior.UploadSize == fresh.Size {
+		resumeID = prior.UploadID
+	}
+	result, err := m.library.Push(ctx, m.workerID, entry.Path, watch.FolderID, fresh.Size, resumeID)
 	if err != nil {
+		// Remember the session the failed push was using, and the size it was
+		// opened for, so the next sweep can pick it up. Nothing else about the
+		// record changes: the file is still not backed up.
+		if result.UploadID != "" {
+			prior.UploadID = result.UploadID
+			prior.UploadSize = fresh.Size
+			ledger.Put(entry.Path, prior)
+		}
 		return false, err
 	}
-	stamp := entry.Stamp
+	stamp := fresh
 	stamp.SHA256 = digest
 	now := time.Now().UTC().Unix()
+	// No UploadID: the session is spent, and a completed one would only ever
+	// cost the next push a wasted inventory read.
 	ledger.Put(entry.Path, Record{
 		Stamp:          stamp,
 		FileID:         result.FileID,
@@ -310,10 +379,23 @@ func (m *Manager) pushIfChanged(ctx context.Context, watch Watch, ledger *Ledger
 
 // verify is the origin-liveness lane: the two states only something looking at
 // the machine can give, plus the paced re-stamp of the one the engine gave.
-func (m *Manager) verify(ctx context.Context, watch Watch, ledger *Ledger, scan ScanResult) {
-	present := make(map[string]struct{}, len(scan.Entries))
+//
+// IT NEEDS THE ENTRIES, NOT JUST THEIR PATHS, and that is what makes `stale`
+// reachable at all. The first version compared presence only, so it could
+// answer `synced` or `origin_gone` and nothing else -- which meant a file whose
+// push had FAILED (out of storage, a 401, a transient 5xx) kept reporting
+// `synced`, because the ledger still held the last successful push's state and
+// nothing contradicted it. The Library went on claiming a copy was current
+// when the machine knew it was not, which is the exact claim this state exists
+// to prevent, and the Files app's "Catching up" tone was unreachable.
+//
+// Comparing the ORIGIN's current stamp against the last one actually PUSHED is
+// the honest test: they differ exactly when there are bytes here that have not
+// arrived there.
+func (m *Manager) verify(ctx context.Context, ledger *Ledger, scan ScanResult) {
+	present := make(map[string]Stamp, len(scan.Entries))
 	for _, entry := range scan.Entries {
-		present[entry.Path] = struct{}{}
+		present[entry.Path] = entry.Stamp
 	}
 	now := time.Now().UTC().Unix()
 
@@ -326,11 +408,17 @@ func (m *Manager) verify(ctx context.Context, watch Watch, ledger *Ledger, scan 
 			continue
 		}
 		want := "synced"
-		if _, here := present[path]; !here {
+		if origin, here := present[path]; !here {
 			// It was pushed from this folder and is not there any more. THE
 			// COPY IS NOT TOUCHED -- this is a label, and the row stays in the
 			// ledger so a later sweep can tell "gone" from "never seen".
 			want = "origin_gone"
+		} else if !origin.Unchanged(rec.Stamp) {
+			// The origin has moved on from what was last successfully pushed.
+			// Reported rather than assumed transient: a push that keeps
+			// failing would otherwise leave the copy described as current
+			// indefinitely, and the person would have no way to see it.
+			want = "stale"
 		}
 		changed := rec.LinkState != want
 		stale := now-rec.VerifiedAtUnix >= int64(verifyRefreshInterval/time.Second)
@@ -339,7 +427,7 @@ func (m *Manager) verify(ctx context.Context, watch Watch, ledger *Ledger, scan 
 		}
 		fileID := rec.FileID
 		if fileID == "" {
-			resolved, err := m.graph.FileIDAt(ctx, m.opts.WorkerID, path)
+			resolved, err := m.graph.FileIDAt(ctx, m.workerID, path)
 			if err != nil || resolved == "" {
 				continue
 			}
@@ -354,13 +442,12 @@ func (m *Manager) verify(ctx context.Context, watch Watch, ledger *Ledger, scan 
 		rec.VerifiedAtUnix = now
 		ledger.Put(path, rec)
 	}
-	_ = watch
 }
 
 // flagAllGone reports every file of a watch whose folder itself has vanished.
 func (m *Manager) flagAllGone(ctx context.Context, watch Watch) {
 	ledger := m.ledgerFor(watch.ID)
-	m.verify(ctx, watch, ledger, ScanResult{})
+	m.verify(ctx, ledger, ScanResult{})
 	if err := ledger.Save(); err != nil {
 		m.logger.Warn("backup: could not save this machine's record", "watch", watch.ID, "error", err)
 	}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -54,6 +55,16 @@ type Record struct {
 	// tell a CHANGE (report it now) from a repeat (report it on the slow
 	// cadence).
 	LinkState string `json:"linkState,omitempty"`
+	// UploadID is a chunked session left open by a push that did not finish,
+	// and UploadSize the size it was opened for. Together they are what makes
+	// the resume real: without the id, every interrupted push of a large file
+	// starts again from chunk 1, which on a domestic uplink is the difference
+	// between a backup that finishes and one that never does.
+	//
+	// Cleared on success. A stale pair costs one extra request and falls
+	// through to a fresh session, so it can never stop a backup.
+	UploadID   string `json:"uploadId,omitempty"`
+	UploadSize int64  `json:"uploadSize,omitempty"`
 }
 
 // Ledger is one watch's record set, held in memory and persisted whole.
@@ -191,3 +202,41 @@ func writeFileAtomic(path string, body []byte, mode os.FileMode) error {
 // ErrNoLedgerDir is returned when a caller asks for ledgers with no state
 // directory configured, which is a wiring mistake rather than a runtime one.
 var ErrNoLedgerDir = errors.New("backup: no state directory configured")
+
+// registrationFile is where the sweeper remembers which registration it swept
+// as, so `memql worker backup --once` can act as the same machine the
+// background worker does.
+//
+// WRITTEN BY THE LOOP, READ BY THE COMMAND. The id arrives on a RegisterAck,
+// inside a connection only the running worker holds -- a separate process has
+// no way to ask for it, and there is no read that answers "which registration
+// am I", because that is a property of a connection rather than of the
+// cluster. Persisting the one the loop already learned is the only honest way
+// for the command to run the same sweep, and running a DIFFERENT sweep is
+// exactly what the command exists not to do.
+func registrationFile(stateDir string) string {
+	return filepath.Join(stateDir, "backup", "registration")
+}
+
+// SaveRegistrationID records the machine this sweeper acts as. Best-effort:
+// failing to write it costs `--once` its id and nothing else, so it must never
+// stop a sweep.
+func SaveRegistrationID(stateDir, id string) error {
+	if strings.TrimSpace(stateDir) == "" || strings.TrimSpace(id) == "" {
+		return ErrNoLedgerDir
+	}
+	return writeFileAtomic(registrationFile(stateDir), []byte(id), ledgerFileMode)
+}
+
+// LoadRegistrationID reads it back, or "" when this machine's worker has not
+// registered since the feature landed.
+func LoadRegistrationID(stateDir string) string {
+	if strings.TrimSpace(stateDir) == "" {
+		return ""
+	}
+	body, err := os.ReadFile(registrationFile(stateDir))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(body))
+}

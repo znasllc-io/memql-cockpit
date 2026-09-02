@@ -82,14 +82,23 @@ type PushResult struct {
 	ArtifactID    string `json:"artifactId"`
 	FileID        string `json:"fileId"`
 	VersionNumber int    `json:"versionNumber"`
+	// UploadID is the session this push used, or "" for the one-shot route.
+	// The caller records it so an interrupted push can be RESUMED rather than
+	// restarted -- see pushSession.
+	UploadID string `json:"-"`
 }
 
 // Push sends one file, choosing the route by size.
-func (l *Library) Push(ctx context.Context, workerID, path, folderID string, size int64) (PushResult, error) {
+//
+// `resumeID` is a session this caller previously opened for the SAME path at
+// the SAME size, or "". It is a hint: an unusable one costs one extra request
+// and falls through to a fresh session.
+func (l *Library) Push(ctx context.Context, workerID, path, folderID string, size int64, resumeID string) (PushResult, error) {
 	if size <= l.oneShotLimit {
-		return l.pushOneShot(ctx, workerID, path, folderID)
+		out, err := l.pushOneShot(ctx, workerID, path, folderID)
+		return out, err
 	}
-	return l.pushSession(ctx, workerID, path, folderID, size)
+	return l.pushSession(ctx, workerID, path, folderID, size, resumeID)
 }
 
 func (l *Library) authorized(ctx context.Context, req *http.Request) error {
@@ -223,8 +232,27 @@ type inventoryResponse struct {
 // On a folder of video over a domestic uplink that is the difference between
 // a backup that finishes and one that starts again every time the laptop
 // sleeps.
-func (l *Library) pushSession(ctx context.Context, workerID, path, folderID string, size int64) (PushResult, error) {
+func (l *Library) pushSession(ctx context.Context, workerID, path, folderID string, size int64, resumeID string) (PushResult, error) {
 	name := filepath.Base(path)
+
+	// RESUME FIRST, and this is the half the first draft was missing. It
+	// opened a brand-new session and then asked THAT session what it already
+	// held -- which is nothing, by construction, because the engine mints a
+	// fresh id per init and de-duplicates on nothing. So the inventory read
+	// was unreachable code and every interrupted push restarted from chunk 1,
+	// while the comments and the runbook both promised otherwise.
+	//
+	// The caller keeps the id, so the resume is a real one: the session is
+	// re-used when it is still open and still describes this file at this
+	// size. Anything else -- completed, gone, a different size -- falls
+	// through to a fresh session rather than failing, because a stale hint
+	// must never be able to stop a backup.
+	if strings.TrimSpace(resumeID) != "" {
+		if session, have, ok := l.resumable(ctx, resumeID, size); ok {
+			return l.streamChunks(ctx, path, name, session, have, size)
+		}
+	}
+
 	body := map[string]any{
 		"name":                 name,
 		"size":                 size,
@@ -268,63 +296,90 @@ func (l *Library) pushSession(ctx context.Context, workerID, path, folderID stri
 		return PushResult{}, fmt.Errorf("backup: open session for %s: the cluster named no chunk size", name)
 	}
 
-	have, err := l.staged(ctx, session.UploadID)
-	if err != nil {
-		return PushResult{}, err
-	}
+	return l.streamChunks(ctx, path, name, sessionRef{ID: session.UploadID, ChunkSize: chunkSize}, nil, size)
+}
 
+// sessionRef is the part of a session the chunk loop needs, whether it was
+// just opened or resumed.
+type sessionRef struct {
+	ID        string
+	ChunkSize int64
+}
+
+// resumable reports whether a previously-opened session can still take the
+// rest of this file, and what it already holds.
+//
+// Refuses on ANY doubt -- not open, a different declared size, an unreadable
+// inventory -- because the cost of a wrong yes is a committed file assembled
+// from two different versions of the bytes, and the cost of a wrong no is one
+// wasted upload.
+func (l *Library) resumable(ctx context.Context, uploadID string, size int64) (sessionRef, map[int]int64, bool) {
+	inv, err := l.inventory(ctx, uploadID)
+	if err != nil || inv.Status != "open" || inv.Size != size || inv.ChunkSize <= 0 {
+		return sessionRef{}, nil, false
+	}
+	have := make(map[int]int64, len(inv.Staged))
+	for _, chunk := range inv.Staged {
+		have[chunk.N] = chunk.Size
+	}
+	return sessionRef{ID: uploadID, ChunkSize: inv.ChunkSize}, have, true
+}
+
+// streamChunks sends everything the server does not already hold, then
+// commits.
+func (l *Library) streamChunks(ctx context.Context, path, name string, session sessionRef, have map[int]int64, size int64) (PushResult, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return PushResult{}, err
 	}
 	defer func() { _ = f.Close() }()
 
-	total := int((size + chunkSize - 1) / chunkSize)
+	total := int((size + session.ChunkSize - 1) / session.ChunkSize)
 	for n := 1; n <= total; n++ {
 		if err := ctx.Err(); err != nil {
-			return PushResult{}, err
+			// The id travels out with the error, so the caller can record it
+			// and pick this session back up next sweep.
+			return PushResult{UploadID: session.ID}, err
 		}
 		if _, ok := have[n]; ok {
 			continue
 		}
-		offset := int64(n-1) * chunkSize
-		length := chunkSize
+		offset := int64(n-1) * session.ChunkSize
+		length := session.ChunkSize
 		if remaining := size - offset; remaining < length {
 			length = remaining
 		}
-		if err := l.putChunk(ctx, session.UploadID, n, io.NewSectionReader(f, offset, length), length, name); err != nil {
-			return PushResult{}, err
+		if err := l.putChunk(ctx, session.ID, n, io.NewSectionReader(f, offset, length), length, name); err != nil {
+			return PushResult{UploadID: session.ID}, err
 		}
 	}
-	return l.complete(ctx, session.UploadID, name)
+	out, err := l.complete(ctx, session.ID, name)
+	out.UploadID = session.ID
+	return out, err
 }
 
-func (l *Library) staged(ctx context.Context, uploadID string) (map[int]int64, error) {
+func (l *Library) inventory(ctx context.Context, uploadID string) (inventoryResponse, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, l.baseURL+"/artifacts/uploads/"+url.PathEscape(uploadID), nil)
 	if err != nil {
-		return nil, err
+		return inventoryResponse{}, err
 	}
 	if err := l.authorized(ctx, req); err != nil {
-		return nil, err
+		return inventoryResponse{}, err
 	}
 	resp, err := l.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("backup: read staged chunks: %w", err)
+		return inventoryResponse{}, fmt.Errorf("backup: read staged chunks: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body := readCapped(resp.Body)
 	if resp.StatusCode/100 != 2 {
-		return nil, statusError("read staged chunks", resp, body)
+		return inventoryResponse{}, statusError("read staged chunks", resp, body)
 	}
 	var inv inventoryResponse
 	if err := json.Unmarshal(body, &inv); err != nil {
-		return nil, fmt.Errorf("backup: read staged chunks: decode response: %w", err)
+		return inventoryResponse{}, fmt.Errorf("backup: read staged chunks: decode response: %w", err)
 	}
-	out := make(map[int]int64, len(inv.Staged))
-	for _, chunk := range inv.Staged {
-		out[chunk.N] = chunk.Size
-	}
-	return out, nil
+	return inv, nil
 }
 
 // putChunk sends one chunk as RAW BYTES -- no multipart, no checksum. `n` is

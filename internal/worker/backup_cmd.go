@@ -29,7 +29,22 @@ import (
 // can say "this machine said no", and only this command can say WHY, because
 // the reason is in a file on this machine.
 
-const backupProbeTimeout = 60 * time.Second
+// backupSweepTimeout bounds `--once`.
+//
+// GENEROUS ON PURPOSE. A first sweep of the folder this feature exists for --
+// client video -- is gigabytes over a domestic uplink, and a minute-long
+// deadline cut it off mid-push: files were uploaded, the context tripped, and
+// the whole sweep's ledger was discarded, so the next run re-pushed every one
+// of them and versioned each again. (The ledger is saved on the way out now
+// either way, which makes an interrupted sweep merely incomplete rather than
+// wasted -- but the deadline should still be one a real folder can finish
+// inside.)
+const backupSweepTimeout = 6 * time.Hour
+
+// backupListTimeout bounds the LISTING, which is two reads and should never
+// take long. Separate so a slow cluster fails the listing fast instead of
+// hanging for hours on a question with a quick answer.
+const backupListTimeout = 30 * time.Second
 
 func handleBackup(args []string) {
 	fs := flag.NewFlagSet("worker backup", flag.ExitOnError)
@@ -58,9 +73,42 @@ func handleBackup(args []string) {
 		os.Exit(0)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), backupProbeTimeout)
-	defer cancel()
+	graph := backup.NewGraph(baseURL, &http.Client{}, bearer)
 
+	// EVERY watch the caller has, not this machine's. The registration id
+	// belongs to the running worker's stream, which this process is not, so the
+	// listing asks the wider question and names the machine on each row -- and
+	// `Watches` OMITS the argument for a blank id rather than rendering
+	// `workerId: ""`, which would have matched nothing and reported that a
+	// person with backups had none.
+	listCtx, cancelList := context.WithTimeout(context.Background(), backupListTimeout)
+	defer cancelList()
+	fmt.Fprintln(os.Stdout, "")
+	watches, err := graph.Watches(listCtx, "")
+	if err != nil {
+		fmt.Fprintf(os.Stdout, "Could not read your watched folders: %v\n", err)
+		os.Exit(1)
+	}
+
+	// The id the running worker recorded the last time it registered here.
+	// Without it this command cannot sweep AS this machine, and a sweep that
+	// named no machine would be refused at the upload anyway.
+	workerID := backup.LoadRegistrationID(cfg.StateDir)
+	printBackupWatches(os.Stdout, watches, policy.CheckBackupPath, workerID)
+
+	if !*once {
+		return
+	}
+	fmt.Fprintln(os.Stdout, "")
+	if workerID == "" {
+		// REFUSED, LOUDLY. Sweeping with no id used to read every row as
+		// "nothing to do" and print "Done" -- a command that did nothing and
+		// said it had succeeded.
+		fmt.Fprintln(os.Stderr, "Cannot sweep: this machine has no recorded registration id.")
+		fmt.Fprintln(os.Stderr, "Start the worker here once (`memql worker run`, or the installed")
+		fmt.Fprintln(os.Stderr, "service) so it registers, then run this again.")
+		os.Exit(4)
+	}
 	manager := backup.New(backup.Options{
 		Logger:     logger,
 		StateDir:   cfg.StateDir,
@@ -69,27 +117,10 @@ func handleBackup(args []string) {
 		CheckPath:  policy.CheckBackupPath,
 		HTTPClient: &http.Client{},
 	})
-	graph := backup.NewGraph(baseURL, &http.Client{}, bearer)
-
-	// The registration id comes from the RUNNING worker's stream, which this
-	// process is not. Read it from the cluster instead? No -- there is no read
-	// that answers "which registration am I", because the answer is a property
-	// of a connection. So the listing names what it cannot know rather than
-	// guessing at it.
-	fmt.Fprintln(os.Stdout, "")
-	watches, err := graph.Watches(ctx, "")
-	if err != nil {
-		fmt.Fprintf(os.Stdout, "Could not read your watched folders: %v\n", err)
-		os.Exit(1)
-	}
-	printBackupWatches(os.Stdout, watches, policy.CheckBackupPath)
-
-	if !*once {
-		return
-	}
-	fmt.Fprintln(os.Stdout, "")
-	fmt.Fprintln(os.Stdout, "Sweeping now. This is the same pass the worker runs.")
-	manager.SweepOnce(ctx)
+	sweepCtx, cancelSweep := context.WithTimeout(context.Background(), backupSweepTimeout)
+	defer cancelSweep()
+	fmt.Fprintf(os.Stdout, "Sweeping now as %s. This is the same pass the worker runs.\n", workerID)
+	manager.SweepOnce(sweepCtx, workerID)
 	fmt.Fprintln(os.Stdout, "Done. The Files app shows what each machine reported.")
 }
 
@@ -130,7 +161,7 @@ func printBackupHeader(w io.Writer, baseURL string, roots []string, policyPath s
 
 // printBackupWatches lists the arrangements and says, per row, whether this
 // machine will honour the path.
-func printBackupWatches(w io.Writer, watches []backup.Watch, check func(string) error) {
+func printBackupWatches(w io.Writer, watches []backup.Watch, check func(string) error, workerID string) {
 	if len(watches) == 0 {
 		fmt.Fprintln(w, "No watched folders are set up for you.")
 		fmt.Fprintln(w, "Set one up in MemQL OS: Files -> Backups -> Back up a folder.")
@@ -138,8 +169,14 @@ func printBackupWatches(w io.Writer, watches []backup.Watch, check func(string) 
 	}
 	fmt.Fprintln(w, "Your watched folders:")
 	for _, watch := range watches {
+		mine := workerID != "" && watch.WorkerID == workerID
 		verdict := "will back up"
 		switch {
+		case workerID != "" && !mine:
+			// The policy check is about THIS machine, so running it against
+			// another machine's path would report a refusal that machine has
+			// not made. Say whose it is instead.
+			verdict = "another machine's"
 		case !watch.Active():
 			verdict = "paused"
 		case check == nil:
@@ -150,11 +187,23 @@ func printBackupWatches(w io.Writer, watches []backup.Watch, check func(string) 
 			}
 		}
 		fmt.Fprintf(w, "  %-44s %s\n", watch.LocalPath, verdict)
-		fmt.Fprintf(w, "  %-44s machine %s\n", "", watch.WorkerID)
+		fmt.Fprintf(w, "  %-44s machine %s%s\n", "", watch.WorkerID, thisMachineMark(mine))
 	}
 	fmt.Fprintln(w, "")
+	if workerID == "" {
+		fmt.Fprintln(w, "This machine has not registered yet, so none of these is marked as its")
+		fmt.Fprintln(w, "own. Start the worker here once and run this again.")
+		return
+	}
 	fmt.Fprintln(w, "A folder listed for ANOTHER of your machines shows here too --")
 	fmt.Fprintln(w, "only the machine it names sweeps it.")
+}
+
+func thisMachineMark(mine bool) string {
+	if mine {
+		return "  (this machine)"
+	}
+	return ""
 }
 
 func orNone(s string) string {

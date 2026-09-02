@@ -64,7 +64,14 @@ memql worker backup            # what is arranged, and whether this machine agre
 memql worker backup --once     # run one sweep now
 ```
 
-`--once` runs exactly the pass the background worker runs.
+`--once` runs exactly the pass the background worker runs. It needs this
+machine to have registered at least once — the worker records its registration
+id when it connects, and a push cannot name its machine without one. If it has
+not, the command says so and does nothing rather than sweeping as nobody.
+
+The listing shows **every** backup you have set up, on any machine, and marks
+the ones this machine sweeps. A folder listed for another of your computers is
+that computer's to honour.
 
 ---
 
@@ -103,6 +110,8 @@ Run `memql worker backup`. It answers the three questions in order.
 | `Allowed folders: NONE` | Add the folder to `backup.roots` above. |
 | `REFUSED: ...` beside a folder | That path is not under any allowed root, or `fs.deny` covers it. |
 | `No watched folders are set up for you` | Nothing is arranged yet — set one up in MemQL OS. |
+| `another machine's` beside a folder | That backup names a different computer; only that one sweeps it. |
+| `no registered cluster matches this worker's cluster_url` in the log | The worker's `cluster_url` and the entry in `memql cluster list` name different hosts (a port on one and not the other is the usual cause). |
 | Nothing arrives, no error | Check the Files app: a backup shows *waiting for this machine* until the first sweep reports. |
 
 A folder listed for **another** of your machines appears here too. Only the

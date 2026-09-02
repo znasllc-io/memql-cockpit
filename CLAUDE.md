@@ -277,9 +277,24 @@ fsnotify is a sensible ACCELERATOR later; the sweep stays the source of truth.
 
 **Three gates, cheapest first**: an unchanged (size, mtime) costs nothing; a
 moved stamp with an unchanged digest costs one read and no upload; only new
-bytes are sent. The ledger under `<state_dir>/backup/<watchId>.json` is a CACHE
--- losing it costs one expensive sweep, because every re-push is keyed on
-`(machine, path)` and lands as a new VERSION rather than a duplicate.
+bytes are sent. **The size a push DECLARES comes from a stat taken immediately
+before it**, never from the walk's -- a stale smaller size makes the session
+route send only that many bytes of a file that has since grown, the engine's
+commit check passes (staged == declared), and the copy is silently truncated
+and then never repaired, because the digest already matches.
+
+The ledger under `<state_dir>/backup/<watchId>.json` is a CACHE -- losing it
+costs one expensive sweep, because every re-push is keyed on `(machine, path)`
+and lands as a new VERSION rather than a duplicate. It is saved on the way OUT
+of a sweep, deferred, so an interrupted one keeps what it already sent; and it
+carries the open session id, which is what makes the resume real (a fresh
+session's inventory is empty by construction, so asking one what it holds
+resumes nothing).
+
+**`memql worker backup --once` needs a recorded registration id.** The id
+arrives on a RegisterAck inside a connection only the running worker holds, so
+the loop persists it and the command reads it. Without one the command REFUSES
+-- sweeping as nobody matched no rows, pushed nothing and reported success.
 
 **A 200 is not success.** `/memql/query` answers HTTP 200 with the refusal in
 an `errors` array, so a client that only checked the status would read "you may

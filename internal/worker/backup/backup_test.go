@@ -187,7 +187,6 @@ func managerFor(t *testing.T, f *fakeEngine, root string, check func(string) err
 	if m == nil {
 		t.Fatal("New returned nil with a base URL and a bearer -- the manager disabled itself")
 	}
-	m.opts.WorkerID = "wkr-1"
 	_ = root
 	return m
 }
@@ -231,7 +230,7 @@ func TestAPathThisMachineHasNotAllowedIsRefusedAndReported(t *testing.T) {
 	f.watches = []map[string]any{watchRow("w-1", root, nil)}
 
 	m := managerFor(t, f, root, func(string) error { return fmt.Errorf("not in backup.roots") })
-	m.SweepOnce(context.Background())
+	m.SweepOnce(context.Background(), "wkr-1")
 
 	if got := f.uploadedPaths(); len(got) != 0 {
 		t.Fatalf("a refused folder was uploaded anyway: %v", got)
@@ -259,7 +258,7 @@ func TestNoPolicyAtAllBacksUpNothing(t *testing.T) {
 	f.watches = []map[string]any{watchRow("w-1", root, nil)}
 
 	m := managerFor(t, f, root, nil)
-	m.SweepOnce(context.Background())
+	m.SweepOnce(context.Background(), "wkr-1")
 
 	if got := f.uploadedPaths(); len(got) != 0 {
 		t.Fatalf("a manager with no policy uploaded files: %v", got)
@@ -274,7 +273,7 @@ func TestASweepPushesEveryFileOnceAndThenStopsPushing(t *testing.T) {
 	f.watches = []map[string]any{watchRow("w-1", root, nil)}
 
 	m := managerFor(t, f, root, allow)
-	m.SweepOnce(context.Background())
+	m.SweepOnce(context.Background(), "wkr-1")
 
 	uploaded := f.uploadedPaths()
 	if len(uploaded) != 2 {
@@ -285,7 +284,7 @@ func TestASweepPushesEveryFileOnceAndThenStopsPushing(t *testing.T) {
 	// stat calls and no bytes, or a folder of client video would be re-sent
 	// every five minutes forever.
 	before := len(f.uploadedPaths())
-	m.SweepOnce(context.Background())
+	m.SweepOnce(context.Background(), "wkr-1")
 	if after := len(f.uploadedPaths()); after != before {
 		t.Errorf("an unchanged folder was re-uploaded: %d files before, %d after", before, after)
 	}
@@ -299,7 +298,7 @@ func TestAChangedFileIsPushedAgainAndATouchedOneIsNot(t *testing.T) {
 	f.watches = []map[string]any{watchRow("w-1", root, nil)}
 
 	m := managerFor(t, f, root, allow)
-	m.SweepOnce(context.Background())
+	m.SweepOnce(context.Background(), "wkr-1")
 	if f.uploadedPaths()[path] != 32 {
 		t.Fatalf("first push did not land: %v", f.uploadedPaths())
 	}
@@ -311,14 +310,14 @@ func TestAChangedFileIsPushedAgainAndATouchedOneIsNot(t *testing.T) {
 	if err := os.Chtimes(path, later, later); err != nil {
 		t.Fatal(err)
 	}
-	m.SweepOnce(context.Background())
+	m.SweepOnce(context.Background(), "wkr-1")
 	if got := f.uploadedPaths()[path]; got != 32 {
 		t.Errorf("a touched file with unchanged bytes was re-uploaded (%d bytes recorded)", got)
 	}
 
 	// Real new bytes DO go.
 	writeFile(t, path, 48)
-	m.SweepOnce(context.Background())
+	m.SweepOnce(context.Background(), "wkr-1")
 	if got := f.uploadedPaths()[path]; got != 48 {
 		t.Errorf("changed bytes were not re-uploaded: recorded %d, want 48", got)
 	}
@@ -336,7 +335,7 @@ func TestAFileOverTheThresholdTakesTheSessionRouteWithTheServersChunkSize(t *tes
 	// Lower the threshold rather than writing 32 MiB, so this exercises the
 	// ROUTE CHOICE in Push and not just the session code beneath it.
 	m.library.oneShotLimit = 1024
-	m.SweepOnce(context.Background())
+	m.SweepOnce(context.Background(), "wkr-1")
 
 	f.mu.Lock()
 	got := append([]int(nil), f.chunks["u-1"]...)
@@ -361,7 +360,7 @@ func TestEveryPushNamesItsMachineAndPath(t *testing.T) {
 	f.watches = []map[string]any{watchRow("w-1", root, nil)}
 
 	m := managerFor(t, f, root, allow)
-	m.SweepOnce(context.Background())
+	m.SweepOnce(context.Background(), "wkr-1")
 
 	if _, ok := f.uploadedPaths()[path]; !ok {
 		t.Fatalf("the upload did not carry uploadedFromPath; recorded: %v", f.uploadedPaths())
@@ -377,12 +376,12 @@ func TestAFileDeletedAtTheOriginIsFlaggedAndNothingIsDeleted(t *testing.T) {
 	f.watches = []map[string]any{watchRow("w-1", root, nil)}
 
 	m := managerFor(t, f, root, allow)
-	m.SweepOnce(context.Background())
+	m.SweepOnce(context.Background(), "wkr-1")
 
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
-	m.SweepOnce(context.Background())
+	m.SweepOnce(context.Background(), "wkr-1")
 
 	states := f.graphCalls("setLibraryFileLinkState")
 	if len(states) == 0 {
@@ -411,7 +410,7 @@ func TestAPausedWatchIsNotSweptAndIsNotReported(t *testing.T) {
 	f.watches = []map[string]any{watchRow("w-1", root, map[string]any{"status": "paused"})}
 
 	m := managerFor(t, f, root, allow)
-	m.SweepOnce(context.Background())
+	m.SweepOnce(context.Background(), "wkr-1")
 
 	if got := f.uploadedPaths(); len(got) != 0 {
 		t.Errorf("a paused watch uploaded files: %v", got)
@@ -427,7 +426,7 @@ func TestAMissingFolderIsReportedAsMissing(t *testing.T) {
 	f.watches = []map[string]any{watchRow("w-1", filepath.Join(t.TempDir(), "gone"), nil)}
 
 	m := managerFor(t, f, "", allow)
-	m.SweepOnce(context.Background())
+	m.SweepOnce(context.Background(), "wkr-1")
 
 	reports := f.graphCalls("reportLibraryWatchedFolderSweep")
 	if len(reports) != 1 || !strings.Contains(reports[0], `"missing"`) {
@@ -487,11 +486,198 @@ func TestTheSweepReportNeverSendsItsOwnCheckTime(t *testing.T) {
 	root := t.TempDir()
 	f.watches = []map[string]any{watchRow("w-1", root, nil)}
 	m := managerFor(t, f, root, allow)
-	m.SweepOnce(context.Background())
+	m.SweepOnce(context.Background(), "wkr-1")
 
 	for _, call := range f.graphCalls("reportLibraryWatchedFolderSweep") {
 		if strings.Contains(call, "lastSweepAt") {
 			t.Errorf("the sweep named its own check time, which the mutation stamps: %s", call)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Regressions from the review pass. Each of these shipped in the first draft
+// and each was silent -- which is why they are named for the wrong OUTCOME
+// rather than for the code.
+// ---------------------------------------------------------------------------
+
+// A sweep with no registration id used to read every row as "nothing to do"
+// and report success. Now it refuses, loudly, and touches nothing.
+func TestASweepWithNoRegistrationIdRefusesInsteadOfReportingSuccess(t *testing.T) {
+	f := newFakeEngine(t)
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a.txt"), 8)
+	f.watches = []map[string]any{watchRow("w-1", root, nil)}
+
+	m := managerFor(t, f, root, allow)
+	m.SweepOnce(context.Background(), "")
+
+	if len(f.calls) != 0 {
+		t.Errorf("a sweep with no id talked to the cluster: %v", f.calls)
+	}
+	if got := f.uploadedPaths(); len(got) != 0 {
+		t.Errorf("a sweep with no id uploaded files: %v", got)
+	}
+}
+
+// Asking for EVERY watch has to omit the argument. The engine's `when()` guard
+// drops an ABSENT argument, not an empty string -- `workerId: ""` is a present
+// value that matches no row, which read exactly like a person having set no
+// backups up.
+func TestAskingForEveryWatchOmitsTheArgumentRatherThanSendingAnEmptyOne(t *testing.T) {
+	f := newFakeEngine(t)
+	g := NewGraph(f.server.URL, f.server.Client(), func(context.Context) (string, error) { return "t", nil })
+
+	if _, err := g.Watches(context.Background(), ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := g.Watches(context.Background(), "wkr-1"); err != nil {
+		t.Fatal(err)
+	}
+	calls := f.graphCalls("libraryWatchedFolders")
+	if len(calls) != 2 {
+		t.Fatalf("want two reads, got %v", calls)
+	}
+	if calls[0] != "query libraryWatchedFolders()" {
+		t.Errorf("a blank id must omit the argument entirely, got: %s", calls[0])
+	}
+	// The reachable positive: a real id still narrows, so the assertion above
+	// is about the blank case rather than about the argument having been
+	// dropped altogether.
+	if !strings.Contains(calls[1], `workerId: "wkr-1"`) {
+		t.Errorf("a named machine must still narrow the read, got: %s", calls[1])
+	}
+}
+
+// A file that GREW between the walk and the push must not be declared at its
+// old size: the session route would send only that many bytes, the engine's
+// commit check would pass (staged == declared), and the copy would be
+// truncated -- then never repaired, because the digest already matched.
+func TestAFileThatGrewAfterTheWalkIsPushedWhole(t *testing.T) {
+	f := newFakeEngine(t)
+	root := t.TempDir()
+	path := filepath.Join(root, "render.mov")
+	writeFile(t, path, 512)
+	f.watches = []map[string]any{watchRow("w-1", root, nil)}
+
+	m := managerFor(t, f, root, allow)
+	m.library.oneShotLimit = 256 // force the session route at this size
+
+	// The walk's view: 512 bytes. Then the file finishes being written.
+	scan, err := Scan(root, nil, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scan.Entries) != 1 {
+		t.Fatalf("want one entry, got %d", len(scan.Entries))
+	}
+	writeFile(t, path, 4096)
+
+	ledger := LoadLedger(t.TempDir(), "w-1")
+	m.workerID = "wkr-1"
+	if _, err := m.pushIfChanged(context.Background(), Watch{ID: "w-1"}, ledger, scan.Entries[0]); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+
+	f.mu.Lock()
+	declared := f.sessionSize
+	f.mu.Unlock()
+	if declared != 4096 {
+		t.Errorf("declared size = %d, want 4096 -- the stale walk-time size would truncate the copy", declared)
+	}
+	// And the recorded stamp is the one that was actually sent, so the next
+	// sweep compares like with like.
+	rec, ok := ledger.Get(path)
+	if !ok || rec.Stamp.Size != 4096 {
+		t.Errorf("ledger recorded size %d, want 4096", rec.Stamp.Size)
+	}
+}
+
+// `stale` had no writer at all: a file whose push failed kept reporting
+// `synced`, so the Library went on claiming a copy was current when this
+// machine knew it was not.
+func TestAFileWhosePushFailedIsReportedStaleRatherThanSynced(t *testing.T) {
+	f := newFakeEngine(t)
+	root := t.TempDir()
+	path := filepath.Join(root, "a.txt")
+	writeFile(t, path, 32)
+	f.watches = []map[string]any{watchRow("w-1", root, nil)}
+
+	m := managerFor(t, f, root, allow)
+	m.SweepOnce(context.Background(), "wkr-1")
+	if _, ok := f.uploadedPaths()[path]; !ok {
+		t.Fatal("the first push did not land, so this test measures nothing")
+	}
+
+	// The file changes and every upload from here on is refused.
+	writeFile(t, path, 64)
+	f.mu.Lock()
+	f.refuseUpload = http.StatusInsufficientStorage
+	f.mu.Unlock()
+
+	m.SweepOnce(context.Background(), "wkr-1")
+
+	states := f.graphCalls("setLibraryFileLinkState")
+	if len(states) == 0 {
+		t.Fatal("nothing reported a state after a failed push")
+	}
+	last := states[len(states)-1]
+	if !strings.Contains(last, `"stale"`) {
+		t.Errorf("want stale after a failed push, got: %s", last)
+	}
+}
+
+// An interrupted sweep must keep the record of what it already sent, or the
+// unit of loss is a whole sweep and the next run re-pushes everything.
+func TestAnInterruptedSweepStillSavesWhatItAlreadySent(t *testing.T) {
+	f := newFakeEngine(t)
+	root := t.TempDir()
+	for _, name := range []string{"a.txt", "b.txt", "c.txt"} {
+		writeFile(t, filepath.Join(root, name), 8)
+	}
+	f.watches = []map[string]any{watchRow("w-1", root, nil)}
+
+	stateDir := t.TempDir()
+	m := New(Options{
+		StateDir:   stateDir,
+		BaseURL:    f.server.URL,
+		Bearer:     func(context.Context) (string, error) { return "token", nil },
+		CheckPath:  allow,
+		HTTPClient: f.server.Client(),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel as soon as the first upload lands, so the push loop bails partway.
+	go func() {
+		for i := 0; i < 200; i++ {
+			if len(f.uploadedPaths()) > 0 {
+				cancel()
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		cancel()
+	}()
+	m.SweepOnce(ctx, "wkr-1")
+
+	// Whatever it managed to send is on disk. The deferred save is what makes
+	// that true; without it the file would not exist at all.
+	back := LoadLedger(stateDir, "w-1")
+	if len(back.Paths()) == 0 && len(f.uploadedPaths()) > 0 {
+		t.Error("a sweep uploaded files and then discarded its whole record of them")
+	}
+}
+
+// The registration id round-trips so `--once` can act as the same machine the
+// worker does.
+func TestTheRegistrationIdRoundTripsAndIsAbsentBeforeAnyRegistration(t *testing.T) {
+	dir := t.TempDir()
+	if got := LoadRegistrationID(dir); got != "" {
+		t.Errorf("a machine that never registered reported id %q", got)
+	}
+	if err := SaveRegistrationID(dir, "wkr-7"); err != nil {
+		t.Fatal(err)
+	}
+	if got := LoadRegistrationID(dir); got != "wkr-7" {
+		t.Errorf("id = %q, want wkr-7", got)
 	}
 }

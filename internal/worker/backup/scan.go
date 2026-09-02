@@ -101,7 +101,14 @@ var defaultExcludes = []string{
 // A DIRECTORY IT CANNOT READ IS COUNTED, NOT FATAL. One unreadable subfolder
 // must not stop the other nine hundred from being backed up, and the count is
 // what lets the caller say so honestly rather than reporting a clean pass.
-func Scan(root string, excludes []string, includeHidden bool) (ScanResult, error) {
+// `deny` is this machine's own veto, applied to EVERY directory and file --
+// not just to the watched root. Checking only the root left the stated
+// invariant ("a directory somebody marked as never-touch is not a directory to
+// upload either") true of one path and false of everything beneath it: a root
+// of `~` with hidden entries included would have walked `~/.ssh` straight into
+// the Library. A nil deny denies nothing, which is only correct for a caller
+// that has already decided (the tests); the sweeper always passes one.
+func Scan(root string, excludes []string, includeHidden bool, deny func(string) error) (ScanResult, error) {
 	info, err := os.Stat(root)
 	if err != nil {
 		return ScanResult{}, err
@@ -135,6 +142,13 @@ func Scan(root string, excludes []string, includeHidden bool) (ScanResult, error
 			if isExcludedName(name) {
 				return fs.SkipDir
 			}
+			if deny != nil && deny(path) != nil {
+				// Pruned rather than skipped per-file: a denied directory has
+				// nothing beneath it worth walking, and descending would list
+				// the names of files the policy says not to touch.
+				out.Skipped++
+				return fs.SkipDir
+			}
 			return nil
 		}
 		if !d.Type().IsRegular() {
@@ -142,6 +156,16 @@ func Scan(root string, excludes []string, includeHidden bool) (ScanResult, error
 			// link would let a link inside a watched folder pull in anything
 			// on the machine, which is the veto's whole point defeated from
 			// the inside.
+			return nil
+		}
+		// The excluded-NAME list applies to files too. `.DS_Store` is on it and
+		// is a file, so with hidden entries included it was backed up despite
+		// being named as something no backup wants.
+		if isExcludedName(name) {
+			return nil
+		}
+		if deny != nil && deny(path) != nil {
+			out.Skipped++
 			return nil
 		}
 		rel, relErr := filepath.Rel(root, path)
@@ -205,6 +229,13 @@ func matchesAny(rel, base string, patterns []string) bool {
 		if pattern == "" {
 			continue
 		}
+		// `**` on its own, and the `/**` spelling of it, both mean everything
+		// beneath the watched folder. Without this, `/**` cut down to an empty
+		// prefix that matched nothing at all -- so somebody typing the most
+		// emphatic form of "exclude everything" excluded nothing.
+		if pattern == "**" || pattern == "/**" {
+			return true
+		}
 		if prefix, ok := strings.CutSuffix(pattern, "/**"); ok {
 			if rel == prefix || strings.HasPrefix(rel, prefix+"/") {
 				return true
@@ -239,4 +270,18 @@ func Digest(path string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// statOf takes one file's cheap stamp, now.
+//
+// Separate from the walk's own stat because the two happen at very different
+// moments: the walk builds the whole picture up front, and a push may reach a
+// given file much later. Anything that DECLARES a size to the cluster has to
+// declare the one it is about to read.
+func statOf(path string) (Stamp, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return Stamp{}, err
+	}
+	return Stamp{Size: fi.Size(), ModUnix: fi.ModTime().UTC().Unix()}, nil
 }

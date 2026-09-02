@@ -81,9 +81,16 @@ func backupBaseURL(clusterURL string) string {
 func backupBearer(clusterURL string, logger *slog.Logger) func(context.Context) (string, error) {
 	cluster, ok := clusterFor(clusterURL)
 	if !ok {
+		// WARN, not Debug. This disables the whole feature, and the most
+		// likely cause is a spelling difference nobody can see: a cluster_url
+		// carrying a non-443 port matches no registry entry, so the sweeper
+		// silently did nothing while every other part of the worker worked.
+		// A line an operator will actually see is the difference between a
+		// five-minute fix and an unexplainable backup.
 		if logger != nil {
-			logger.Debug("backup: this worker's cluster is not in clusters.yaml, so nothing is backed up",
-				"cluster_url", clusterURL)
+			logger.Warn("backup: no registered cluster matches this worker's cluster_url, so no folders are backed up",
+				"cluster_url", clusterURL,
+				"hint", "run `memql cluster list` and make sure one entry's endpoint names the same host")
 		}
 		return nil
 	}
