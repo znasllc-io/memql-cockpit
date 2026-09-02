@@ -87,6 +87,56 @@ function binary_name_for() {
     esac
 }
 
+# preflight_asset probes the resolved release-asset URL BEFORE anything
+# is mutated -- before the sudo prompt, the binary install, the
+# worker.yaml write and the LaunchAgent / systemd load -- so a flavour
+# whose asset the release never published (the --computeruse case,
+# znasllc-io/memql-cockpit#374) is a clean refusal up front instead of a
+# bare curl 404 after the operator has already typed their password.
+#
+# The probe is a HEAD after redirects (`curl -fsIL`; GitHub release
+# download URLs answer HEAD). When HEAD fails, a one-byte ranged GET
+# retries the same question -- some curl builds mishandle HEAD on
+# non-HTTP protocols (file:// among them, which is how lib_test.sh
+# exercises this offline), and GitHub's missing-asset answer to HEAD is
+# a connection drop rather than a clean 404, so the second opinion costs
+# one byte and removes a false refusal either way. Deliberately NO
+# --proto '=https' here: the probe writes nothing (-o /dev/null), so the
+# https-only enforcement stays on download_binary, the call that
+# produces the bytes that get executed.
+#
+# On refusal the message names the exact URL and the flavour/platform
+# pair, and returns 4 -- prerequisite missing, the same capability-script
+# exit convention cut-release.sh uses (2 bad param, 3 refused, 4
+# prerequisite missing). The installers run under `set -e`, so the
+# return surfaces as the process exit code.
+function preflight_asset() {
+    local url="$1"
+    local flavour="$2"  # "headless" or "computeruse", for the message
+    if ! command -v curl >/dev/null 2>&1; then
+        echo "ERROR: curl required" >&2
+        return 4
+    fi
+    echo "INFO: checking release asset $url"
+    if curl -fsIL -o /dev/null "$url"; then
+        return 0
+    fi
+    if curl -fsL -r 0-0 -o /dev/null "$url"; then
+        return 0
+    fi
+    local os arch
+    os="$(detect_os)"
+    arch="$(detect_arch)"
+    echo "ERROR: release asset not found (or unreachable): $url" >&2
+    echo "       (flavour: ${flavour}, platform: ${os}/${arch})" >&2
+    echo "       The default download base is the LATEST release" >&2
+    echo "       (releases/latest/download), which may not publish an asset for" >&2
+    echo "       this flavour. Check the release's published assets, or pass" >&2
+    echo "       --download-base to point at a release that ships it." >&2
+    echo "       Nothing was installed or modified." >&2
+    return 4
+}
+
 # Download the supplied URL to the supplied path, with a basic
 # integrity check (HTTP 200, non-empty file).
 function download_binary() {

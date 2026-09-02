@@ -9,10 +9,11 @@ set -eu
 #   curl -fsSL .../install.sh | MEMQL_COCKPIT_VERSION=v0.9.0 sh
 #   curl -fsSL .../install.sh | BIN_DIR=/usr/local/bin sh
 #
-# The computer-use variant (screenshot/mouse/keyboard) needs native tooling and
-# is built from source -- see the README (`make memql-computeruse` or
-# `go install -tags computeruse ...`). It installs under the SAME name; this
-# installer fetches the headless build.
+# The computer-use variant (screenshot/mouse/keyboard) ships prebuilt as
+# memql-computeruse-<os>-<arch> release assets; the token installers under
+# scripts/install/ install it via their --computeruse flag (building from
+# source stays the alternative -- see the README). It installs under the SAME
+# name; this installer fetches the headless build.
 #
 # UPGRADING FROM A memql-cockpit INSTALL. This script deletes the pre-rename
 # binaries AND retires the pre-rename service, in that order. Deleting the

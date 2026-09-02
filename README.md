@@ -42,8 +42,9 @@ The installed command is **`memql`**:
   (`com.znasllc.memql-worker`) or user-systemd unit on Linux
   (`memql-worker.service`), auto-started at login.
 - **Two build variants, one command** — headless (default, CGO-free) ships
-  from releases; computer-use (`-tags computeruse`, CGO + RobotGo) is built
-  per-host. `memql --version` names the variant.
+  from releases as tar.gz archives; computer-use (`-tags computeruse`, CGO +
+  RobotGo) ships as prebuilt `memql-computeruse-<os>-<arch>` release assets,
+  built natively per platform. `memql --version` names the variant.
 
 It communicates with MemQL clusters over gRPC (`MemqlService.Stream` and
 `WorkerService.Stream`) and does not embed the MemQL engine.
@@ -71,7 +72,9 @@ go install github.com/znasllc-io/memql-cockpit/cmd/memql@latest
 
 Worker-machine installers (binary + service + worker.yaml in one step) live in
 `scripts/install/` — the MemQL Portal's Fleet page composes the exact
-one-liner for you when you add a machine.
+one-liner for you when you add a machine. Their `--computeruse` flag installs
+the prebuilt computer-use binary from the same release; building it from
+source (below) remains the alternative.
 
 ## Commands
 
