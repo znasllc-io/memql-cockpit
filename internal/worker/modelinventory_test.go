@@ -326,4 +326,3 @@ func TestModelInventory_InvalidateIsSafeOnANilReceiver(t *testing.T) {
 	var p *policyModelInventory
 	p.Invalidate()
 }
-
