@@ -99,9 +99,11 @@ func TestBuildRegister_NoModelsContributesNothing(t *testing.T) {
 				}
 			}
 			for k := range register.GetLabels() {
-				if k != "team" {
-					t.Errorf("unexpected label %q", k)
+				// machineId is always stamped for engine reclaim; unrelated to models.
+				if k == "team" || k == LabelMachineId {
+					continue
 				}
+				t.Errorf("unexpected label %q", k)
 			}
 			if _, ok := register.GetConcurrency()[models.Capability]; ok {
 				t.Error("no models means no MODEL concurrency entry")
@@ -324,3 +326,4 @@ func TestModelInventory_InvalidateIsSafeOnANilReceiver(t *testing.T) {
 	var p *policyModelInventory
 	p.Invalidate()
 }
+
