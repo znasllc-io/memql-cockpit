@@ -3,7 +3,6 @@ package worker
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"math/rand"
 	"sync"
@@ -222,8 +221,11 @@ func (r *Runner) Run(ctx context.Context) error {
 		if errors.Is(streamErr, context.Canceled) || errors.Is(streamErr, context.DeadlineExceeded) {
 			return streamErr
 		}
+		code, reason := streamEndCodeReason(streamErr)
 		r.logger.Warn("worker stream ended; will reconnect",
 			"error", streamErr,
+			"code", code,
+			"reason", reason,
 		)
 		if !sleepWithJitter(ctx, backoff) {
 			return ctx.Err()
@@ -594,7 +596,7 @@ func (r *Runner) handleMessage(ctx context.Context, conn *Connection, msg *memql
 		}
 		r.pulls.StopAll("the cluster asked this worker to drain")
 		r.active.Wait()
-		return fmt.Errorf("server requested drain")
+		return errServerDrain
 	case *memqlv1.WorkerServerMessage_RotationResponse:
 		r.logger.Info("worker received rotation response (ignored in MVP)")
 	}
