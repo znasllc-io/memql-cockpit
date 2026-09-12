@@ -18,7 +18,7 @@
 #   --computeruse               Install the computer-use variant (memql-computeruse).
 #   --inference         Also set this machine up to serve local models.
 #   --download-base <u> Base URL for binary downloads.
-#   --force             Overwrite existing worker.yaml.
+#   --force             Remap a home id onto a different cluster_url (not binary overwrite).
 #   --no-service        Skip LaunchAgent installation.
 
 set -euo pipefail
@@ -84,7 +84,10 @@ Options:
                               user account can swap the binary without
                               privilege escalation.
     --download-base <url>     Override binary download base URL
-    --force                   Overwrite existing worker.yaml
+    --force                   Remap a home id onto a different cluster_url
+                              (siblings kept). Not required to refresh the
+                              same cluster_url or re-run install; never
+                              means "binary exists".
     --no-service              Skip LaunchAgent installation
     --help                    Print this help
 EOF
@@ -142,7 +145,9 @@ function install_binary() {
     # `memql-computeruse` would reinstate the second command name D4
     # retires -- and it is the name the docs, the service unit's
     # ExecStart, and `memql --version`'s variant line all assume.
-    install_binary_with_mode "$INSTALL_MODE" "$url" "$binary" "$INSTALLED_COMMAND"
+    local target_ver
+    target_ver="$(resolve_target_version "$DOWNLOAD_BASE")"
+    install_binary_with_mode "$INSTALL_MODE" "$url" "$binary" "$INSTALLED_COMMAND" "$target_ver"
     INSTALLED_BINARY="$INSTALL_BINARY_FRIENDLY"
 }
 
@@ -211,6 +216,11 @@ PLIST
 
 function main() {
     parse_args "$@"
+    local target_ver
+    target_ver="$(resolve_target_version "$DOWNLOAD_BASE")"
+    memql_ascii_banner "$target_ver"
+
+    install_step 1 "Detect platform and release asset"
     # Preflight the exact URL install_binary will fetch -- both derive
     # it from the same (DOWNLOAD_BASE, binary_name_for "$FLAVOUR") pair,
     # so the probe can never bless a different asset than the one
@@ -222,9 +232,16 @@ function main() {
     # binary_name_for failure still aborts under set -e.
     local asset_name
     asset_name="$(binary_name_for "$FLAVOUR")"
+    echo "INFO: os=$(detect_os) arch=$(detect_arch) flavour=${FLAVOUR}"
     preflight_asset "${DOWNLOAD_BASE}/${asset_name}" "$FLAVOUR"
+
+    install_step 2 "Download or skip binary (version-aware)"
     install_binary
+
+    install_step 3 "Write workers.yaml (upsert home; siblings kept)"
     write_config
+
+    install_step 4 "Install and start LaunchAgent"
     install_launch_agent
     # AFTER the LaunchAgent, not before: `worker setup --inference` ends
     # by signalling the running worker to re-read policy.yaml, and a
@@ -232,16 +249,18 @@ function main() {
     # not find. Its own refusals never fail this install -- see
     # setup_inference.
     if [[ "$INFERENCE" == "yes" ]]; then
+        install_step 5 "Set up local model serving (--inference)"
         setup_inference "$INSTALLED_BINARY"
     fi
 
+    install_step finish "Finished"
     cat << EOF
 
 ================================================================
 SUCCESS: memql-worker installed.
 
 Binary:    ${INSTALLED_BINARY}
-Config:    ${HOME}/.memql/worker.yaml
+Config:    ${HOME}/.memql/workers.yaml (legacy mirror: worker.yaml)
 Logs:      ${HOME}/.memql/state/worker.log
 
 The worker is running as a LaunchAgent and will reconnect on
@@ -252,6 +271,12 @@ boot. To check the status:
 To stop it:
 
   launchctl unload ~/Library/LaunchAgents/com.znasllc.memql-worker.plist
+
+To uninstall this worker (keeps clusters.yaml / credentials):
+
+  curl -fsSL https://raw.githubusercontent.com/znasllc-io/memql-cockpit/main/scripts/install/uninstall-mac.sh | bash
+  # or, from a clone:  ./scripts/install/uninstall-mac.sh
+  # add --purge to also remove state + policy.yaml
 ================================================================
 EOF
 }

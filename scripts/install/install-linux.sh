@@ -71,7 +71,10 @@ Options:
                               user account can swap the binary without
                               privilege escalation.
     --download-base <url>     Override binary download base URL
-    --force                   Overwrite existing worker.yaml
+    --force                   Remap a home id onto a different cluster_url
+                              (siblings kept). Not required to refresh the
+                              same cluster_url or re-run install; never
+                              means "binary exists".
     --no-service              Skip systemd unit installation
     --help                    Print this help
 EOF
@@ -129,7 +132,9 @@ function install_binary() {
     # `memql-computeruse` would reinstate the second command name D4
     # retires -- and it is the name the docs, the service unit's
     # ExecStart, and `memql --version`'s variant line all assume.
-    install_binary_with_mode "$INSTALL_MODE" "$url" "$binary" "$INSTALLED_COMMAND"
+    local target_ver
+    target_ver="$(resolve_target_version "$DOWNLOAD_BASE")"
+    install_binary_with_mode "$INSTALL_MODE" "$url" "$binary" "$INSTALLED_COMMAND" "$target_ver"
     INSTALLED_BINARY="$INSTALL_BINARY_FRIENDLY"
 }
 
@@ -231,6 +236,11 @@ UNIT
 
 function main() {
     parse_args "$@"
+    local target_ver
+    target_ver="$(resolve_target_version "$DOWNLOAD_BASE")"
+    memql_ascii_banner "$target_ver"
+
+    install_step 1 "Detect platform and release asset"
     # Preflight the exact URL install_binary will fetch -- both derive
     # it from the same (DOWNLOAD_BASE, binary_name_for "$FLAVOUR") pair,
     # so the probe can never bless a different asset than the one
@@ -243,10 +253,17 @@ function main() {
     # under set -e.
     local asset_name
     asset_name="$(binary_name_for "$FLAVOUR")"
+    echo "INFO: os=$(detect_os) arch=$(detect_arch) flavour=${FLAVOUR}"
     preflight_asset "${DOWNLOAD_BASE}/${asset_name}" "$FLAVOUR"
     mkdir -p "${HOME}/.memql/state"
+
+    install_step 2 "Download or skip binary (version-aware)"
     install_binary
+
+    install_step 3 "Write workers.yaml (upsert home; siblings kept)"
     write_config
+
+    install_step 4 "Install and start systemd user unit"
     install_systemd_unit
     # AFTER the unit, not before: `worker setup --inference` ends by
     # signalling the running worker to re-read policy.yaml, and a worker
@@ -254,16 +271,18 @@ function main() {
     # find. Its own refusals never fail this install -- see
     # setup_inference.
     if [[ "$INFERENCE" == "yes" ]]; then
+        install_step 5 "Set up local model serving (--inference)"
         setup_inference "$INSTALLED_BINARY"
     fi
 
+    install_step finish "Finished"
     cat << EOF
 
 ================================================================
 SUCCESS: memql-worker installed.
 
 Binary:    ${INSTALLED_BINARY}
-Config:    ${HOME}/.memql/worker.yaml
+Config:    ${HOME}/.memql/workers.yaml (legacy mirror: worker.yaml)
 Logs:      ${HOME}/.memql/state/worker.log
 
 To check the status:
@@ -273,6 +292,12 @@ To check the status:
 To stop it:
 
   systemctl --user stop memql-worker.service
+
+To uninstall this worker (keeps clusters.yaml / credentials):
+
+  curl -fsSL https://raw.githubusercontent.com/znasllc-io/memql-cockpit/main/scripts/install/uninstall-linux.sh | bash
+  # or, from a clone:  ./scripts/install/uninstall-linux.sh
+  # add --purge to also remove state + policy.yaml
 ================================================================
 EOF
 }

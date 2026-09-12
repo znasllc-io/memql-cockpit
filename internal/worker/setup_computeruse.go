@@ -154,7 +154,7 @@ func runSetupMacOS() error {
 	fmt.Println("SUCCESS: memql worker permissions look good.")
 	fmt.Println()
 	fmt.Println("Next steps:")
-	fmt.Println("  1. Configure ~/.memql/worker.yaml (cluster_url + token).")
+	fmt.Println("  1. Enroll a home in ~/.memql/workers.yaml (cluster_url + token).")
 	fmt.Println("  2. Run `memql worker run` to start serving.")
 	fmt.Println()
 	fmt.Println("If you'll run this as a LaunchAgent: install via")
