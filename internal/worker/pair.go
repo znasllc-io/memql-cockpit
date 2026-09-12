@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/znasllc-io/memql-cockpit/internal/worker/consent"
+	"github.com/znasllc-io/memql-cockpit/internal/worker/models"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/tools"
 	"github.com/znasllc-io/memql/component/identity/workerpairing"
 )
@@ -42,6 +43,8 @@ type PairOptions struct {
 	IdentityURL string
 	ClusterURL  string
 	Token       string
+	HomeID      string // optional workers.yaml home id
+	Force       bool   // replace matched home only
 	Logger      *slog.Logger
 }
 
@@ -131,13 +134,21 @@ func RunPairWizard(opts PairOptions) error {
 		return errors.New("pair: empty token or cluster_url after redeem")
 	}
 
-	// Write the worker.yaml so subsequent runs (and the
-	// LaunchAgent) pick up the same config.
+	// Upsert this cluster as one home in workers.yaml (additive —
+	// sibling homes are preserved). Legacy worker.yaml is mirrored
+	// for transition. Same single LaunchAgent serves every home.
 	hostname, _ := os.Hostname()
-	if err := WriteWorkerYAML(DefaultConfigPath(), opts.ClusterURL, opts.Token, hostname); err != nil {
-		return fmt.Errorf("pair: write worker.yaml: %w", err)
+	if _, err := UpsertHome(UpsertHomeOptions{
+		ClusterURL:   opts.ClusterURL,
+		Token:        opts.Token,
+		Name:         hostname,
+		ID:           opts.HomeID,
+		Force:        opts.Force,
+		Capabilities: capabilitiesForBuildTag(),
+	}); err != nil {
+		return fmt.Errorf("pair: write workers.yaml: %w", err)
 	}
-	fmt.Printf("Wrote %s.\n", DefaultConfigPath())
+	fmt.Printf("Enrolled home in %s (mirrored %s).\n", DefaultWorkersPath(), DefaultConfigPath())
 
 	// TCC pre-flight (computeruse builds only). On the headless build,
 	// runSetupWizard is a no-op-with-print; we skip it entirely so
@@ -177,23 +188,12 @@ func RunPairWizard(opts PairOptions) error {
 	return nil
 }
 
-// runConfiguredWorker spins up the metrics endpoint + the runner
-// against the freshly-supplied cluster + token. Mirrors handleRun
-// but takes its config from in-memory args rather than worker.yaml,
-// so the wizard can hand the credentials over directly without an
-// extra disk roundtrip.
+// runConfiguredWorker spins up the metrics endpoint + the fleet
+// supervisor after a successful pair. Prefers workers.yaml (all
+// enabled homes) so pairing a second cluster does not hide the
+// first for the rest of this process; falls back to a single-home
+// runner when the registry is unavailable.
 func runConfiguredWorker(clusterURL, token, name string, logger *slog.Logger) error {
-	cfg := Defaults()
-	cfg.ClusterURL = clusterURL
-	cfg.Token = token
-	if name != "" {
-		cfg.Name = name
-	}
-	cfg.Capabilities = capabilitiesForBuildTag()
-	if err := cfg.Validate(); err != nil {
-		return fmt.Errorf("pair-run: %w", err)
-	}
-
 	policyPath := DefaultPolicyPath()
 	policy, err := tools.LoadPolicy(policyPath)
 	if err != nil {
@@ -201,9 +201,6 @@ func runConfiguredWorker(clusterURL, token, name string, logger *slog.Logger) er
 		policy = tools.DefaultPolicy()
 	}
 
-	// Consent gate (memql-cockpit#64). See cli.go's handleRun for
-	// the design notes; same wiring applies on the pair-then-run
-	// path.
 	consentMgr := consent.NewManager()
 	consentSrv := consent.NewServer(consentMgr, consent.DefaultSocketPath(), logger)
 	consentCtx, consentCancel := context.WithCancel(context.Background())
@@ -228,18 +225,60 @@ func runConfiguredWorker(clusterURL, token, name string, logger *slog.Logger) er
 		}
 	}()
 
-	runner, err := NewRunner(Options{
-		Logger:  logger,
-		Config:  cfg,
-		Tools:   dispatcher,
-		Metrics: metrics,
-	})
-	if err != nil {
-		return err
-	}
+	discoverer := &models.Discoverer{}
+	modelInventory := NewModelInventory(policy, discoverer)
+	appInv := NewAppInventory(policy)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	workers, werr := LoadWorkers(DefaultWorkersPath(), DefaultConfigPath())
+	useFleet := werr == nil && workers.ValidateRun() == nil
+
+	var fleet *Fleet
+	var runner *Runner
+	if useFleet {
+		if name != "" {
+			workers.WorkerName = name
+		}
+		fleet, err = NewFleet(FleetOptions{
+			Logger:     logger,
+			Workers:    workers,
+			Policy:     policy,
+			PolicyPath: policyPath,
+			Tools:      dispatcher,
+			Apps:       appInv,
+			Models:     modelInventory,
+			Discoverer: discoverer,
+			Metrics:    metrics,
+		})
+		if err != nil {
+			return err
+		}
+	} else {
+		cfg := Defaults()
+		cfg.ClusterURL = clusterURL
+		cfg.Token = token
+		if name != "" {
+			cfg.Name = name
+		}
+		cfg.Capabilities = capabilitiesForBuildTag()
+		if err := cfg.Validate(); err != nil {
+			return fmt.Errorf("pair-run: %w", err)
+		}
+		runner, err = NewRunner(Options{
+			Logger:         logger,
+			Config:         cfg,
+			Tools:          dispatcher,
+			Apps:           appInv,
+			Models:         modelInventory,
+			Metrics:        metrics,
+			InferenceServe: policy.InferenceServe,
+		})
+		if err != nil {
+			return err
+		}
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
@@ -251,6 +290,11 @@ func runConfiguredWorker(clusterURL, token, name string, logger *slog.Logger) er
 					logger.Warn("policy reload failed", "error", err)
 				} else {
 					logger.Info("policy reloaded")
+					if fleet != nil {
+						fleet.RequestImmediateReadvertise()
+					} else if runner != nil {
+						runner.RequestImmediateReadvertise()
+					}
 				}
 			default:
 				logger.Info("worker shutting down", "signal", sig.String())
@@ -260,13 +304,17 @@ func runConfiguredWorker(clusterURL, token, name string, logger *slog.Logger) er
 		}
 	}()
 
-	// Enable Ctrl+Q on TTY stdin alongside the SIGINT path. Both
-	// trigger the same context cancel; the user can use either.
 	restoreTermios := enableQuitHotkeys(ctx, cancel, logger)
 	defer restoreTermios()
 
-	if err := runner.Run(ctx); err != nil && ctx.Err() == nil {
-		return fmt.Errorf("pair-run: %w", err)
+	var runErr error
+	if fleet != nil {
+		runErr = fleet.Run(ctx)
+	} else {
+		runErr = runner.Run(ctx)
+	}
+	if runErr != nil && ctx.Err() == nil {
+		return fmt.Errorf("pair-run: %w", runErr)
 	}
 	return nil
 }

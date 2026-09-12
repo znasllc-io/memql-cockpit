@@ -7,7 +7,7 @@
 # function-based helpers sourced by the OS-specific drivers
 # install-mac.sh and install-linux.sh, and by their inverses
 # uninstall-mac.sh and uninstall-linux.sh. write_worker_yaml (below) is
-# the single renderer for ~/.memql/worker.yaml, so the config layout
+# the single renderer for ~/.memql/workers.yaml (+ legacy mirror), so the config layout
 # can never drift between the two platforms; the uninstall helpers at
 # the bottom are the single statement of what an uninstall removes,
 # for the same reason. The pure-logic helpers are exercised by
@@ -60,6 +60,230 @@ readonly SERVICE_LABEL_DARWIN="com.znasllc.memql-worker" \
 # Fleet. It has no macOS twin: there the runtime is Homebrew's service.
 # shellcheck disable=SC2034  # read by uninstall-linux.sh, which sources this file
 readonly OLLAMA_LABEL_LINUX="memql-ollama"
+
+# ---------------------------------------------------------------
+# Version-aware install + shared terminal UX
+# ---------------------------------------------------------------
+#
+# VERSION is the cockpit tag (see VERSION / VERSIONING.md). Installed
+# binaries answer `memql --version` as `memql X.Y.Z (headless|computeruse)`.
+# --force never means "binary exists"; it only remaps workers.yaml homes
+# (see write_worker_yaml). Same version → no-op skip; newer installed →
+# refuse downgrade; older/missing → install/upgrade.
+
+# memql_ascii_banner prints a compact mark + wordmark + version line.
+# Inspired by brand/mark.svg (9-node graph); kept small for macOS
+# Terminal and Linux TTYs alike.
+function memql_ascii_banner() {
+    local ver="${1:-}"
+    local ver_line="MemQL Cockpit worker installer"
+    if [[ -n "$ver" ]]; then
+        ver_line="MemQL Cockpit worker installer  v${ver#v}"
+    fi
+    cat << 'BANNER'
+        .  o   .
+     o--+--+--+--o
+        |\/|\/|
+     o--+--+--+--o
+        |\/|\/|
+     o--+--+--+--o
+        '  o   .
+BANNER
+    echo "  ${ver_line}"
+    echo ""
+}
+
+# install_step prints a numbered human-readable step header.
+function install_step() {
+    local n="$1"
+    local msg="$2"
+    echo ""
+    echo "==> [${n}] ${msg}"
+}
+
+# normalize_semver strips a leading v and any build metadata / variant
+# suffix so "v0.12.1", "0.12.1", and "0.12.1 (headless)" compare equal.
+function normalize_semver() {
+    local raw="$1"
+    raw="${raw#v}"
+    raw="${raw%%[[:space:]]*}"
+    raw="${raw%%+*}"
+    raw="${raw%%-*}"
+    echo "$raw"
+}
+
+# parse_memql_version_line extracts X.Y.Z from `memql --version` output
+# (`memql 0.12.1 (headless)`). Empty on failure.
+function parse_memql_version_line() {
+    local line="$1"
+    # Prefer the token after "memql ", else first semver-looking token.
+    local ver
+    ver="$(printf '%s\n' "$line" | sed -n -E 's/^[[:space:]]*memql[[:space:]]+([0-9]+(\.[0-9]+){1,3}).*/\1/p' | head -1)"
+    if [[ -z "$ver" ]]; then
+        ver="$(printf '%s\n' "$line" | sed -n -E 's/.*(^|[[:space:]])v?([0-9]+(\.[0-9]+){1,3}).*/\2/p' | head -1)"
+    fi
+    normalize_semver "$ver"
+}
+
+# read_binary_version runs `$1 --version` and parses it. Empty if the
+# binary is missing or does not answer.
+function read_binary_version() {
+    local bin="$1"
+    if [[ -z "$bin" || ! -x "$bin" ]]; then
+        echo ""
+        return 0
+    fi
+    local out
+    out="$("$bin" --version 2>/dev/null | head -1)" || out=""
+    parse_memql_version_line "$out"
+}
+
+# compare_semver prints -1 / 0 / 1 for a<b / a==b / a>b (numeric dotted).
+# Non-numeric segments compare as 0. Empty either side → treat as 0.0.0.
+function compare_semver() {
+    local a b
+    a="$(normalize_semver "${1:-0}")"
+    b="$(normalize_semver "${2:-0}")"
+    [[ -z "$a" ]] && a="0"
+    [[ -z "$b" ]] && b="0"
+    local IFS=.
+    # shellcheck disable=SC2086
+    set -- $a
+    local a1="${1:-0}" a2="${2:-0}" a3="${3:-0}"
+    # shellcheck disable=SC2086
+    set -- $b
+    local b1="${1:-0}" b2="${2:-0}" b3="${3:-0}"
+    a1="${a1:-0}"; a2="${a2:-0}"; a3="${a3:-0}"
+    b1="${b1:-0}"; b2="${b2:-0}"; b3="${b3:-0}"
+    # Strip non-digits for bash arithmetic safety.
+    a1="${a1%%[!0-9]*}"; a2="${a2%%[!0-9]*}"; a3="${a3%%[!0-9]*}"
+    b1="${b1%%[!0-9]*}"; b2="${b2%%[!0-9]*}"; b3="${b3%%[!0-9]*}"
+    a1="${a1:-0}"; a2="${a2:-0}"; a3="${a3:-0}"
+    b1="${b1:-0}"; b2="${b2:-0}"; b3="${b3:-0}"
+    if (( a1 < b1 )); then echo -1; return; fi
+    if (( a1 > b1 )); then echo 1; return; fi
+    if (( a2 < b2 )); then echo -1; return; fi
+    if (( a2 > b2 )); then echo 1; return; fi
+    if (( a3 < b3 )); then echo -1; return; fi
+    if (( a3 > b3 )); then echo 1; return; fi
+    echo 0
+}
+
+# resolve_target_version picks the version about to be installed.
+# Order: MEMQL_INSTALL_VERSION → sibling/repo VERSION file → version
+# embedded in --download-base (.../releases/download/vX.Y.Z/...) → empty
+# (caller downloads and reads the binary).
+function resolve_target_version() {
+    local download_base="${1:-}"
+    local ver=""
+    if [[ -n "${MEMQL_INSTALL_VERSION:-}" ]]; then
+        normalize_semver "$MEMQL_INSTALL_VERSION"
+        return 0
+    fi
+    local here sibling_version
+    here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || here=""
+    for sibling_version in \
+        "${here}/../../VERSION" \
+        "${here}/../VERSION" \
+        "${MEMQL_INSTALL_VERSION_FILE:-}"
+    do
+        [[ -n "$sibling_version" && -f "$sibling_version" ]] || continue
+        ver="$(tr -d '[:space:]' < "$sibling_version")"
+        if [[ -n "$ver" ]]; then
+            normalize_semver "$ver"
+            return 0
+        fi
+    done
+    # sed keeps this portable on macOS bash 3.2 (no BASH_REMATCH nests).
+    ver="$(printf '%s' "$download_base" | sed -n -E 's#.*/download/v?([0-9]+(\.[0-9]+){1,3})(/.*)?$#\1#p')"
+    if [[ -n "$ver" ]]; then
+        normalize_semver "$ver"
+        return 0
+    fi
+    echo ""
+}
+
+# home_id_from_cluster_url mirrors Go HomeIDFromURL: host only, lowercased.
+function home_id_from_cluster_url() {
+    local cluster_url="$1"
+    local home_id
+    home_id="$(echo "$cluster_url" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##' | sed -E 's#/.*##' | sed -E 's#:[0-9]+$##' | tr '[:upper:]' '[:lower:]')"
+    if [[ -z "$home_id" ]]; then
+        home_id="default"
+    fi
+    echo "$home_id"
+}
+
+# same_cluster_url mirrors Go sameClusterURL (trim, case-fold, trailing /).
+function same_cluster_url() {
+    local a b
+    a="$(echo "$1" | sed -E 's/[[:space:]]+$//; s/^[[:space:]]+//; s#/+$##')"
+    b="$(echo "$2" | sed -E 's/[[:space:]]+$//; s/^[[:space:]]+//; s#/+$##')"
+    local al bl
+    al="$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')"
+    bl="$(printf '%s' "$b" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$al" == "$bl" ]]; then
+        return 0
+    fi
+    local ha hb
+    ha="$(home_id_from_cluster_url "$a")"
+    hb="$(home_id_from_cluster_url "$b")"
+    [[ "$ha" != "default" && "$ha" == "$hb" ]]
+}
+
+# find_home_id_by_cluster_url prints the id of a home whose cluster_url
+# matches, or empty. Used so install (URL-host id) and pair (--home-id
+# local) refresh the same enrollment without --force.
+function find_home_id_by_cluster_url() {
+    local workers_path="$1"
+    local cluster_url="$2"
+    [[ -f "$workers_path" ]] || { echo ""; return 0; }
+    # BSD awk runs END even after exit — guard with found=1.
+    awk -v want="$cluster_url" '
+        function norm(s) {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+            sub(/\/+$/, "", s)
+            return tolower(s)
+        }
+        BEGIN { wantn = norm(want); in_homes=0; cur=""; curl=""; found=0 }
+        /^homes:[[:space:]]*$/ { in_homes=1; next }
+        !in_homes { next }
+        /^[[:space:]]*-[[:space:]]*id:[[:space:]]*/ {
+            if (cur != "" && curl != "" && norm(curl) == wantn) { print cur; found=1; exit }
+            cur=$0; sub(/^[[:space:]]*-[[:space:]]*id:[[:space:]]*/, "", cur)
+            curl=""
+            next
+        }
+        /^[[:space:]]*cluster_url:[[:space:]]*/ {
+            curl=$0; sub(/^[[:space:]]*cluster_url:[[:space:]]*/, "", curl)
+            next
+        }
+        END { if (!found && cur != "" && curl != "" && norm(curl) == wantn) print cur }
+    ' "$workers_path" | head -1
+}
+
+# find_home_cluster_url_by_id prints cluster_url for a given home id.
+function find_home_cluster_url_by_id() {
+    local workers_path="$1"
+    local home_id="$2"
+    [[ -f "$workers_path" ]] || { echo ""; return 0; }
+    awk -v want="$home_id" '
+        BEGIN { in_homes=0; cur=""; curl=""; found=0 }
+        /^homes:[[:space:]]*$/ { in_homes=1; next }
+        !in_homes { next }
+        /^[[:space:]]*-[[:space:]]*id:[[:space:]]*/ {
+            if (cur == want && curl != "") { print curl; found=1; exit }
+            cur=$0; sub(/^[[:space:]]*-[[:space:]]*id:[[:space:]]*/, "", cur)
+            curl=""
+            next
+        }
+        /^[[:space:]]*cluster_url:[[:space:]]*/ {
+            curl=$0; sub(/^[[:space:]]*cluster_url:[[:space:]]*/, "", curl)
+            next
+        }
+        END { if (!found && cur == want && curl != "") print curl }
+    ' "$workers_path" | head -1
+}
 
 # Detect host os ("darwin" or "linux") and arch ("amd64" or "arm64").
 function detect_os() {
@@ -172,17 +396,27 @@ function download_binary() {
     local url="$1"
     local dest="$2"
     if ! command -v curl >/dev/null 2>&1; then
-        echo "ERROR: curl required" >&2
+        echo "ERROR: curl required for the download step." >&2
+        echo "       Install curl, or pass --download-base file:///... for an offline asset." >&2
         return 1
     fi
     echo "INFO: downloading $url"
-    if ! curl -fsSL --proto '=https' "$url" -o "$dest.partial"; then
-        echo "ERROR: download failed" >&2
+    # Progress bar when stdout is a TTY; silent -sS for CI / pipes.
+    local curl_flags=(-fL --proto '=https')
+    if [[ -t 1 ]]; then
+        curl_flags+=(--progress-bar)
+    else
+        curl_flags+=(-sS)
+    fi
+    if ! curl "${curl_flags[@]}" "$url" -o "$dest.partial"; then
+        echo "ERROR: download failed for $url" >&2
+        echo "       Check network access, or pass --download-base to a release that" >&2
+        echo "       publishes this asset. Nothing was installed from this URL." >&2
         rm -f "$dest.partial"
         return 1
     fi
     if [[ ! -s "$dest.partial" ]]; then
-        echo "ERROR: downloaded file is empty" >&2
+        echo "ERROR: downloaded file is empty ($url)" >&2
         rm -f "$dest.partial"
         return 1
     fi
@@ -268,11 +502,62 @@ function install_binary_with_mode() {
     local url="$2"
     local binary="$3"
     local friendly_name="$4"
+    # Optional 5th arg: target version (empty → resolve / read after download).
+    local target_ver="${5:-}"
 
     local dest_dir
     dest_dir="$(install_mode_dir "$mode")"
     INSTALL_BINARY_DEST="$dest_dir/$binary"
     INSTALL_BINARY_FRIENDLY="$dest_dir/$friendly_name"
+    INSTALL_BINARY_ACTION=""   # skip | upgrade | fresh | refuse
+    INSTALL_BINARY_BEFORE=""
+    INSTALL_BINARY_AFTER=""
+
+    local installed_ver=""
+    if [[ -x "$INSTALL_BINARY_FRIENDLY" ]]; then
+        installed_ver="$(read_binary_version "$INSTALL_BINARY_FRIENDLY")"
+    elif [[ -x "$INSTALL_BINARY_DEST" ]]; then
+        installed_ver="$(read_binary_version "$INSTALL_BINARY_DEST")"
+    fi
+    INSTALL_BINARY_BEFORE="$installed_ver"
+
+    if [[ -z "$target_ver" ]]; then
+        target_ver="$(resolve_target_version "")"
+    fi
+
+    # Same version already installed → no-op (no re-download, no --force).
+    if [[ -n "$installed_ver" && -n "$target_ver" ]]; then
+        local cmp
+        cmp="$(compare_semver "$installed_ver" "$target_ver")"
+        if [[ "$cmp" == "0" ]]; then
+            echo "INFO: already at v${installed_ver}; skipping binary download"
+            INSTALL_BINARY_ACTION="skip"
+            INSTALL_BINARY_AFTER="$installed_ver"
+            return 0
+        fi
+        if [[ "$cmp" == "1" ]]; then
+            echo "ERROR: installed memql v${installed_ver} is newer than v${target_ver} about to install." >&2
+            echo "       Refusing to downgrade. Install a newer release, or remove the" >&2
+            echo "       existing binary first (see uninstall-mac.sh / uninstall-linux.sh)." >&2
+            echo "       --force does not override this (it only remaps workers.yaml homes)." >&2
+            INSTALL_BINARY_ACTION="refuse"
+            return 3
+        fi
+        echo "INFO: upgrading memql v${installed_ver} → v${target_ver}"
+        INSTALL_BINARY_ACTION="upgrade"
+    elif [[ -n "$installed_ver" && -z "$target_ver" ]]; then
+        # Unknown target: download to temp, compare, then decide.
+        :
+        INSTALL_BINARY_ACTION="upgrade"
+        echo "INFO: installed memql v${installed_ver}; checking downloaded binary version"
+    else
+        INSTALL_BINARY_ACTION="fresh"
+        if [[ -n "$target_ver" ]]; then
+            echo "INFO: fresh install → v${target_ver}"
+        else
+            echo "INFO: fresh install (version resolved after download)"
+        fi
+    fi
 
     case "$mode" in
         system)
@@ -283,6 +568,34 @@ function install_binary_with_mode() {
                 rm -f "$tmp"
                 return 1
             fi
+            local dl_ver
+            dl_ver="$(read_binary_version "$tmp")"
+            if [[ -z "$target_ver" && -n "$dl_ver" ]]; then
+                target_ver="$dl_ver"
+            fi
+            if [[ -n "$installed_ver" && -n "$dl_ver" ]]; then
+                local cmp2
+                cmp2="$(compare_semver "$installed_ver" "$dl_ver")"
+                if [[ "$cmp2" == "0" ]]; then
+                    echo "INFO: already at v${installed_ver}; downloaded asset matches — leaving binary in place"
+                    rm -f "$tmp"
+                    INSTALL_BINARY_ACTION="skip"
+                    INSTALL_BINARY_AFTER="$installed_ver"
+                    return 0
+                fi
+                if [[ "$cmp2" == "1" ]]; then
+                    echo "ERROR: installed memql v${installed_ver} is newer than downloaded v${dl_ver}." >&2
+                    echo "       Refusing to downgrade. --force does not override this." >&2
+                    rm -f "$tmp"
+                    INSTALL_BINARY_ACTION="refuse"
+                    return 3
+                fi
+                echo "INFO: upgrading memql v${installed_ver} → v${dl_ver}"
+                INSTALL_BINARY_ACTION="upgrade"
+            elif [[ -z "$installed_ver" && -n "$dl_ver" ]]; then
+                echo "INFO: fresh install → v${dl_ver}"
+                INSTALL_BINARY_ACTION="fresh"
+            fi
             sudo mkdir -p "$dest_dir"
             sudo install -m 0755 "$tmp" "$INSTALL_BINARY_DEST"
             rm -f "$tmp"
@@ -290,9 +603,42 @@ function install_binary_with_mode() {
             ;;
         user-local)
             mkdir -p "$dest_dir"
-            if ! download_binary "$url" "$INSTALL_BINARY_DEST"; then
+            local tmp
+            tmp="$(mktemp)"
+            if ! download_binary "$url" "$tmp"; then
+                rm -f "$tmp"
                 return 1
             fi
+            local dl_ver
+            dl_ver="$(read_binary_version "$tmp")"
+            if [[ -z "$target_ver" && -n "$dl_ver" ]]; then
+                target_ver="$dl_ver"
+            fi
+            if [[ -n "$installed_ver" && -n "$dl_ver" ]]; then
+                local cmp2
+                cmp2="$(compare_semver "$installed_ver" "$dl_ver")"
+                if [[ "$cmp2" == "0" ]]; then
+                    echo "INFO: already at v${installed_ver}; downloaded asset matches — leaving binary in place"
+                    rm -f "$tmp"
+                    INSTALL_BINARY_ACTION="skip"
+                    INSTALL_BINARY_AFTER="$installed_ver"
+                    return 0
+                fi
+                if [[ "$cmp2" == "1" ]]; then
+                    echo "ERROR: installed memql v${installed_ver} is newer than downloaded v${dl_ver}." >&2
+                    echo "       Refusing to downgrade. --force does not override this." >&2
+                    rm -f "$tmp"
+                    INSTALL_BINARY_ACTION="refuse"
+                    return 3
+                fi
+                echo "INFO: upgrading memql v${installed_ver} → v${dl_ver}"
+                INSTALL_BINARY_ACTION="upgrade"
+            elif [[ -z "$installed_ver" && -n "$dl_ver" ]]; then
+                echo "INFO: fresh install → v${dl_ver}"
+                INSTALL_BINARY_ACTION="fresh"
+            fi
+            mv "$tmp" "$INSTALL_BINARY_DEST"
+            chmod +x "$INSTALL_BINARY_DEST"
             ln -sf "$INSTALL_BINARY_DEST" "$INSTALL_BINARY_FRIENDLY"
             echo "WARN: --user-local install at $dest_dir provides weaker isolation than"
             echo "      $INSTALL_PREFIX_SYSTEM. A compromised user account can swap the"
@@ -304,6 +650,16 @@ function install_binary_with_mode() {
             return 1
             ;;
     esac
+
+    INSTALL_BINARY_AFTER="$(read_binary_version "$INSTALL_BINARY_FRIENDLY")"
+    if [[ -z "$INSTALL_BINARY_AFTER" ]]; then
+        INSTALL_BINARY_AFTER="$target_ver"
+    fi
+    if [[ -n "$INSTALL_BINARY_BEFORE" && -n "$INSTALL_BINARY_AFTER" && "$INSTALL_BINARY_ACTION" != "skip" ]]; then
+        echo "INFO: binary ${INSTALL_BINARY_BEFORE} → ${INSTALL_BINARY_AFTER}"
+    elif [[ -z "$INSTALL_BINARY_BEFORE" && -n "$INSTALL_BINARY_AFTER" ]]; then
+        echo "INFO: binary fresh install → v${INSTALL_BINARY_AFTER}"
+    fi
 
     # Migrate: drop the pre-rename binaries/symlinks beside the new one
     # (znasllc-io/memql#4553). Harmless when absent. The names come from
@@ -322,10 +678,6 @@ function install_binary_with_mode() {
     done
 }
 
-# Match tools.detectDisplayServer: Wayland wins even when XWayland supplies
-# DISPLAY; an X11 claim requires DISPLAY. Arguments make this independent of
-# the installer's environment and keep it testable without touching HOME.
-# Bash 3.2 has no lowercase expansion, so use a case-insensitive pattern.
 function linux_worker_capabilities() {
     local flavour="$1" wayland_display="$2" session_type="$3" display="$4"
     session_type="${session_type#"${session_type%%[![:space:]]*}"}"
@@ -340,18 +692,22 @@ function linux_worker_capabilities() {
     esac
 }
 
-# write_worker_yaml renders ~/.memql/worker.yaml from the supplied
-# args. It is the SINGLE source of truth for the worker.yaml layout:
-# both install-mac.sh and install-linux.sh call it, so the config can
-# never drift between platforms. Refuses to clobber an existing file
-# unless force == "yes" (the installers' --force flag).
+# write_worker_yaml upserts one home into ~/.memql/workers.yaml and
+# mirrors that home into the legacy worker.yaml path. ADDITIVE: a
+# second install against a different cluster keeps the first home.
+#
+# --force (force == "yes") is ONLY for remapping a home id onto a
+# different cluster_url (cluster identity change). It is NOT required
+# for: same cluster_url refresh (even when the suggested id differs
+# from the enrolled id, e.g. install host-id vs `pair --home-id local`),
+# same-id token rotation, or "binary already exists".
 #
 # Args:
-#   $1 path          -- destination file (usually ~/.memql/worker.yaml)
+#   $1 path          -- legacy worker.yaml path (usually ~/.memql/worker.yaml)
 #   $2 cluster_url   -- cluster edge URL
 #   $3 token         -- worker token (mql_wkr_...)
 #   $4 name          -- worker name
-#   $5 force         -- "yes" to overwrite an existing file (default "no")
+#   $5 force         -- "yes" to remap matched home id → new URL (default "no")
 #   $6 capabilities  -- comma-separated capability list to advertise
 #                       (default "HEADLESS"; pass "HEADLESS,COMPUTERUSE"
 #                       for the computer-use variant). The Wayland
@@ -367,58 +723,169 @@ function write_worker_yaml() {
     local name="$4"
     local force="${5:-no}"
     local capabilities="${6:-HEADLESS}"
-    if [[ -e "$path" && "$force" != "yes" ]]; then
-        echo "ERROR: $path already exists; pass --force to overwrite" >&2
-        return 1
+    local dir workers_path home_id match_id existing_url
+    dir="$(dirname "$path")"
+    workers_path="${dir}/workers.yaml"
+    # Default id from URL host (Go HomeIDFromURL). May be remapped below
+    # when an existing home already holds this cluster_url under a
+    # different id (e.g. pair --home-id local vs install host id).
+    home_id="$(home_id_from_cluster_url "$cluster_url")"
+    match_id="$home_id"
+
+    mkdir -p "$dir"
+
+    # Match semantics (aligned with Go UpsertHome):
+    #   1. Same cluster_url → refresh that home in place; preserve its id.
+    #      No --force. (Fixes install host-id vs pair --home-id local.)
+    #   2. Same home id + same/empty URL → refresh token; no --force.
+    #   3. Same home id + DIFFERENT cluster_url → --force required
+    #      (cluster identity remapping). Siblings are always kept.
+    # --force never means "binary exists" and never wipes sibling homes.
+    if [[ -e "$workers_path" ]]; then
+        local by_url
+        by_url="$(find_home_id_by_cluster_url "$workers_path" "$cluster_url")"
+        by_url="$(printf '%s' "$by_url" | tr -d '\r' | head -1)"
+        if [[ -n "$by_url" ]]; then
+            match_id="$by_url"
+            echo "INFO: refreshing existing home ${match_id} for ${cluster_url} (token upsert; --force not required)"
+        else
+            existing_url="$(find_home_cluster_url_by_id "$workers_path" "$home_id")"
+            if [[ -n "$existing_url" ]]; then
+                if same_cluster_url "$existing_url" "$cluster_url"; then
+                    match_id="$home_id"
+                elif [[ "$force" != "yes" ]]; then
+                    echo "ERROR: $workers_path already has home id '${home_id}' for ${existing_url}." >&2
+                    echo "       Pass --force to remap that home to ${cluster_url} (siblings are preserved)." >&2
+                    echo "       Same cluster_url under another id refreshes without --force." >&2
+                    return 1
+                else
+                    match_id="$home_id"
+                    echo "INFO: --force remapping home ${match_id}: ${existing_url} → ${cluster_url}"
+                fi
+            fi
+        fi
+    elif [[ -e "$path" && "$force" != "yes" ]]; then
+        # Legacy-only machine: promote via rewrite rather than refuse —
+        # the Go loader migrates on first run too. Still require --force
+        # only when we would destroy the legacy token for a *different*
+        # URL; same URL refresh is fine.
+        local legacy_url
+        legacy_url="$(grep -E '^cluster_url:' "$path" | head -1 | sed -E 's/^cluster_url:[[:space:]]*//')"
+        if [[ -n "$legacy_url" ]] && ! same_cluster_url "$legacy_url" "$cluster_url"; then
+            echo "ERROR: $path already exists for ${legacy_url}; pass --force to replace that home (siblings are preserved in workers.yaml)" >&2
+            return 1
+        fi
     fi
-    mkdir -p "$(dirname "$path")"
+
+    # Rebuild workers.yaml: keep sibling homes, upsert this one.
+    # Preserve existing registry HEADER fields (worker_name, labels,
+    # concurrency, state_dir, log_level) when present so a second
+    # install/pair does not clobber Go-tuned shared knobs. Capabilities
+    # still come from this install (computer-use may widen them), matching
+    # Go UpsertHome when Capabilities is non-empty. Fresh files get defaults.
+    local tmp
+    tmp="$(mktemp)"
+    local out_name out_state out_log
+    out_name="$name"
+    out_state="$STATE_DIR_DEFAULT"
+    out_log="info"
+    local labels_block concurrency_block
+    labels_block="$(printf 'labels:\n  os: %s\n  arch: %s\n' "$(detect_os)" "$(detect_arch)")"
+    concurrency_block="$(printf 'concurrency:\n  HEADLESS: 8\n  COMPUTERUSE: 1\n')"
+    if [[ -e "$workers_path" ]]; then
+        local existing
+        existing="$(sed -n -E 's/^worker_name:[[:space:]]*//p' "$workers_path" | head -1)"
+        [[ -n "$existing" ]] && out_name="$existing"
+        existing="$(sed -n -E 's/^state_dir:[[:space:]]*"?([^"#]*[^"#[:space:]])"?[[:space:]]*(#.*)?$/\1/p' "$workers_path" | head -1)"
+        [[ -n "$existing" ]] && out_state="$existing"
+        existing="$(sed -n -E 's/^log_level:[[:space:]]*//p' "$workers_path" | head -1)"
+        [[ -n "$existing" ]] && out_log="$existing"
+        existing="$(awk '
+            /^labels:[[:space:]]*$/ {grab=1; print; next}
+            grab && /^[^[:space:]#]/ {exit}
+            grab {print}
+        ' "$workers_path")"
+        [[ -n "$existing" ]] && labels_block="$existing"
+        existing="$(awk '
+            /^concurrency:[[:space:]]*$/ {grab=1; print; next}
+            grab && /^[^[:space:]#]/ {exit}
+            grab {print}
+        ' "$workers_path")"
+        [[ -n "$existing" ]] && concurrency_block="$existing"
+    fi
+    {
+        echo "version: 1"
+        echo "worker_name: ${out_name}"
+        printf '%s\n' "$labels_block"
+        printf '%s\n' "$concurrency_block"
+        echo "state_dir: ${out_state}"
+        echo "log_level: ${out_log}"
+        echo "capabilities:"
+        echo "$capabilities" | tr ',' '\n' | sed 's/^/  - /'
+        echo "homes:"
+        if [[ -e "$workers_path" ]]; then
+            # Emit sibling home blocks; skip the matched id (URL or id).
+            awk -v keep_id="$match_id" '
+                BEGIN { in_homes=0; skip=0; buf="" }
+                /^homes:[[:space:]]*$/ { in_homes=1; next }
+                !in_homes { next }
+                /^[[:space:]]*-[[:space:]]*id:[[:space:]]*/ {
+                    if (buf != "" && !skip) printf "%s", buf
+                    buf = $0 "\n"
+                    id=$0; sub(/^[[:space:]]*-[[:space:]]*id:[[:space:]]*/, "", id)
+                    skip = (id == keep_id) ? 1 : 0
+                    next
+                }
+                in_homes {
+                    if (buf == "") next
+                    buf = buf $0 "\n"
+                }
+                END { if (buf != "" && !skip) printf "%s", buf }
+            ' "$workers_path"
+        elif [[ -e "$path" ]]; then
+            # Promote legacy single-home when present and URL differs.
+            local leg_url leg_token leg_id
+            leg_url="$(grep -E '^cluster_url:' "$path" | head -1 | sed -E 's/^cluster_url:[[:space:]]*//')"
+            leg_token="$(grep -E '^token:' "$path" | head -1 | sed -E 's/^token:[[:space:]]*//')"
+            if [[ -n "$leg_url" ]] && ! same_cluster_url "$leg_url" "$cluster_url" && [[ -n "$leg_token" ]]; then
+                leg_id="$(home_id_from_cluster_url "$leg_url")"
+                echo "  - id: ${leg_id}"
+                echo "    cluster_url: ${leg_url}"
+                echo "    token: ${leg_token}"
+                echo "    enabled: true"
+            fi
+        fi
+        echo "  - id: ${match_id}"
+        echo "    cluster_url: ${cluster_url}"
+        echo "    token: ${token}"
+        echo "    enabled: true"
+    } > "$tmp"
+    mv "$tmp" "$workers_path"
+    chmod 600 "$workers_path"
+    echo "INFO: upserted home ${match_id} in $workers_path (capabilities: ${capabilities})"
+
+    # Legacy mirror for older tooling / mid-transition LaunchAgents.
+    # state_dir is namespaced per home (homes/<id>) to match ConfigForHome
+    # so a single-file reader does not share registration with siblings.
     cat > "$path" << YAML
 cluster_url: ${cluster_url}
 token: ${token}
-name: ${name}
+name: ${out_name}
 labels:
   os: $(detect_os)
   arch: $(detect_arch)
 concurrency:
   HEADLESS: 8
   COMPUTERUSE: 1
-state_dir: ${STATE_DIR_DEFAULT}
-log_level: info
+state_dir: ${out_state}/homes/${match_id}
+log_level: ${out_log}
 capabilities:
 $(echo "$capabilities" | tr ',' '\n' | sed 's/^/  - /')
 YAML
     chmod 600 "$path"
-    echo "INFO: wrote $path (capabilities: ${capabilities})"
+    echo "INFO: mirrored legacy $path"
 }
 
-# setup_inference turns the freshly paired machine into an INFERENCE
-# machine: `memql worker setup --inference --non-interactive` installs
-# nothing it was not allowed to, pulls the default models, writes
-# models.allow, and signals the worker.
-#
-# IT NEVER FAILS THE INSTALL, and that is the whole of its error
-# handling. A machine that paired fine and could not set up local models
-# is still a working worker -- shell, filesystem, HTTP, computer use,
-# local apps, backup -- and aborting the install over the one capability
-# it could not add would take away the eight it already has. So every
-# non-zero is REPORTED and the function returns 0.
-#
-# Exit 3 is the one that gets its own answer. It is the capability-script
-# contract's "refused: required confirmation not provided", which here
-# means exactly one thing: a runtime install this machine needs, that
-# --non-interactive is not allowed to approve. Nothing is broken and
-# nothing is missing that the operator has to find -- there was simply
-# nobody to ask -- so the right response is to print the interactive
-# command for the person who is standing at this terminal right now,
-# while they are still looking at it. Exit 4 (a prerequisite is absent,
-# such as a machine below the hardware floor) and exit 5 (something
-# failed) are not that, and telling their operators to run an
-# interactive command would send them to a prompt that refuses them
-# identically.
-#
-# The printed command MUST STAY ONE PHYSICAL LINE. It is meant to be
-# copied out of the terminal, and a bracketed paste of a wrapped command
-# has already cost this project once.
 function setup_inference() {
     local binary="$1"
     echo ""
@@ -479,7 +946,7 @@ function record_kept() {
 # under_memql_home answers whether $1 lies inside ${HOME}/.memql, the
 # ONLY tree the uninstallers delete recursively. It is strict about
 # shape on purpose -- absolute, no `..` segment -- because a state_dir
-# read out of worker.yaml is operator-authored text, and the one thing
+# read out of worker config is operator-authored text, and the one thing
 # an uninstaller must never do is `rm -rf` wherever a file it did not
 # write points.
 function under_memql_home() {
@@ -510,6 +977,16 @@ function remove_path_if_present() {
     record_removed "$path"
 }
 
+# remove_worker_config deletes the worker token files on a full
+# uninstall: the multi-home registry (~/.memql/workers.yaml) and the
+# legacy single-home mirror (~/.memql/worker.yaml). Both hold cluster
+# tokens, so both always go -- not only under --purge. clusters.yaml
+# and credentials/ stay: they belong to `memql cluster`, not the worker.
+function remove_worker_config() {
+    remove_path_if_present "${HOME}/.memql/workers.yaml"
+    remove_path_if_present "${HOME}/.memql/worker.yaml"
+}
+
 # remove_tree_if_present deletes a directory recursively, inside the
 # ~/.memql fence and nowhere else. Outside it the directory is KEPT
 # and reported with its path, so the person can decide. That is not
@@ -530,18 +1007,25 @@ function remove_tree_if_present() {
     record_removed "$dir"
 }
 
-# worker_state_dir_from_yaml prints the state_dir worker.yaml names,
-# or the default when the file or the key is absent. The drivers call
-# it BEFORE worker.yaml is removed: --purge has to delete the
+# worker_state_dir_from_yaml prints the state_dir worker config names,
+# or the default when the file or the key is absent. Prefers the path
+# handed in (usually legacy worker.yaml), then the multi-home registry
+# workers.yaml beside it -- install always mirrors both, but a machine
+# that only has the registry still has a purge target. The drivers call
+# it BEFORE the token files are removed: --purge has to delete the
 # directory the worker actually used, and write_worker_yaml's default
 # is only where that usually is. A leading `~/` is expanded the way
 # the shell would have; anything else reaches the fence as written.
 function worker_state_dir_from_yaml() {
     local path="$1"
     local dir=""
-    if [[ -f "$path" ]]; then
-        dir="$(sed -n -E 's/^state_dir:[[:space:]]*"?([^"#]*[^"#[:space:]])"?[[:space:]]*(#.*)?$/\1/p' "$path" | head -1)"
-    fi
+    local try
+    for try in "$path" "$(dirname "$path")/workers.yaml"; do
+        if [[ -f "$try" ]]; then
+            dir="$(sed -n -E 's/^state_dir:[[:space:]]*"?([^"#]*[^"#[:space:]])"?[[:space:]]*(#.*)?$/\1/p' "$try" | head -1)"
+            [[ -n "$dir" ]] && break
+        fi
+    done
     case "$dir" in
         "")   dir="$STATE_DIR_DEFAULT" ;;
         \~/*) dir="${HOME}/${dir#\~/}" ;;

@@ -104,10 +104,17 @@ func buildRegister(cfg Config, inventory []apps.Info, modelInv models.Inventory,
 	// disagree with the first. A machine that offers none contributes
 	// nothing here: no capability, no labels, no concurrency entry.
 	modelReg := modelRegistrationFor(modelInv)
+	labels := mergeModelLabels(cfg.Labels, modelReg.Labels)
+	if mid, err := EnsureMachineID(cfg.StateDir); err == nil && mid != "" {
+		if labels == nil {
+			labels = map[string]string{}
+		}
+		labels[LabelMachineId] = mid
+	}
 	register := &memqlv1.Register{
 		Name:         cfg.Name,
 		Capabilities: withModelCapability(cfg.Capabilities, modelReg.Capability),
-		Labels:       mergeModelLabels(cfg.Labels, modelReg.Labels),
+		Labels:       labels,
 		Concurrency:  withModelConcurrency(cfg.Concurrency, modelReg.Capability, modelReg.Concurrency),
 		Platform: &memqlv1.PlatformInfo{
 			Os:       runtime.GOOS,
@@ -394,7 +401,7 @@ func SetVersion(v string) {
 // cockpitVersionValue defaults to the VERSION file's contents so a build
 // that never calls SetVersion -- a test, or `go run` -- reports something
 // truthful rather than empty.
-var cockpitVersionValue = "0.12.1"
+var cockpitVersionValue = "0.13.3"
 
 func cockpitVersion() string { return cockpitVersionValue }
 func cockpitBuildTag() string {

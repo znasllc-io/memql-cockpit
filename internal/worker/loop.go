@@ -3,7 +3,6 @@ package worker
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"math/rand"
 	"sync"
@@ -159,8 +158,10 @@ func NewRunner(opts Options) (*Runner, error) {
 }
 
 // Run blocks until ctx is cancelled or the runner is closed. It
-// reconnects with exponential backoff (1s -> 60s, jitter) on every
-// disconnect.
+// reconnects with exponential backoff (1s -> 15s, jitter) on every
+// disconnect. The ceiling is deliberately short: a multi-home fleet must
+// regain availability aggressively after a real network blip; a 60s wait
+// left prod machines looking "gone" long after the laptop was awake.
 // RegistrationId returns this machine's v1:worker:registration id, or "" when
 // no stream is currently up.
 //
@@ -186,7 +187,7 @@ func (r *Runner) Run(ctx context.Context) error {
 	defer close(r.closed)
 
 	backoff := time.Second
-	const maxBackoff = 60 * time.Second
+	const maxBackoff = DefaultReconnectMaxBackoff
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -220,8 +221,11 @@ func (r *Runner) Run(ctx context.Context) error {
 		if errors.Is(streamErr, context.Canceled) || errors.Is(streamErr, context.DeadlineExceeded) {
 			return streamErr
 		}
+		code, reason := streamEndCodeReason(streamErr)
 		r.logger.Warn("worker stream ended; will reconnect",
 			"error", streamErr,
+			"code", code,
+			"reason", reason,
 		)
 		if !sleepWithJitter(ctx, backoff) {
 			return ctx.Err()
@@ -292,6 +296,11 @@ func (r *Runner) runStream(ctx context.Context, conn *Connection) error {
 // copy of 15s would stay green while this moved, and the refresh would
 // silently become five minutes.
 const DefaultHeartbeat = 15 * time.Second
+
+// DefaultReconnectMaxBackoff caps stream reconnect delay. Kept at one
+// heartbeat interval so a home that was healthy recovers inside the
+// cluster OnlineWindow rather than sitting dark for a minute.
+const DefaultReconnectMaxBackoff = 15 * time.Second
 
 // hardwareRefreshBeats is how often the hardware inventory is re-scanned
 // onto the heartbeat (design record D1: "refreshed on every tenth
@@ -587,7 +596,7 @@ func (r *Runner) handleMessage(ctx context.Context, conn *Connection, msg *memql
 		}
 		r.pulls.StopAll("the cluster asked this worker to drain")
 		r.active.Wait()
-		return fmt.Errorf("server requested drain")
+		return errServerDrain
 	case *memqlv1.WorkerServerMessage_RotationResponse:
 		r.logger.Info("worker received rotation response (ignored in MVP)")
 	}

@@ -294,3 +294,17 @@ func TestRunnerDefaultsToTheNamedHeartbeat(t *testing.T) {
 		t.Fatalf("heartbeat = %s, want %s", r.heartbeat, DefaultHeartbeat)
 	}
 }
+
+func TestNextBackoffCapsAtDefaultReconnectMax(t *testing.T) {
+	got := nextBackoff(DefaultReconnectMaxBackoff, DefaultReconnectMaxBackoff)
+	if got != DefaultReconnectMaxBackoff {
+		t.Fatalf("nextBackoff at ceiling = %v, want %v", got, DefaultReconnectMaxBackoff)
+	}
+	got = nextBackoff(8*time.Second, DefaultReconnectMaxBackoff)
+	if got != DefaultReconnectMaxBackoff {
+		t.Fatalf("nextBackoff(8s) = %v, want cap %v", got, DefaultReconnectMaxBackoff)
+	}
+	if DefaultReconnectMaxBackoff > 15*time.Second {
+		t.Fatalf("DefaultReconnectMaxBackoff must stay <= 15s; got %v", DefaultReconnectMaxBackoff)
+	}
+}

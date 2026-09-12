@@ -27,16 +27,17 @@ import (
 // Subcommands:
 //
 //	memql worker backup            Report (and optionally run) the watched-folder sweep
-//	memql worker pair <code>       Redeem a pairing code, write yaml, run worker
+//	memql worker pair <code>       Redeem a pairing code, upsert a home, run worker
 //	memql worker                   Open the pairing wizard (paste a code)
-//	memql worker run [flags]       Run the worker (assumes worker.yaml already written)
+//	memql worker run [flags]       Run all enabled homes from workers.yaml
 //	memql worker setup             Re-run TCC permissions check (computeruse builds)
 //	memql worker setup --inference Install a model runtime, pull models, allow them
-//	memql worker config            Print effective config
+//	memql worker config            Print effective config (all homes)
+//	memql worker unpair --cluster  Remove or disable one home
 //
 // `pair` is the primary entry: it walks the user from "I have an
-// XXXX-XXXX code from CoPresent" through redemption, TCC, yaml
-// write-out, and into the running worker -- one command. `run`
+// XXXX-XXXX code from CoPresent" through redemption, TCC, an additive
+// workers.yaml upsert, and into the running worker -- one command. `run`
 // stays as the headless / scripted path for users who want to
 // reinvoke an already-configured worker (LaunchAgent uses this).
 func HandleCommand(args []string) {
@@ -71,6 +72,8 @@ func dispatchHandleCommand(args []string) {
 		handleSetup(args[1:])
 	case "config":
 		handleConfig(args[1:])
+	case "unpair":
+		handleUnpair(args[1:])
 	case "backup":
 		handleBackup(args[1:])
 	case "models":
@@ -106,6 +109,8 @@ func handlePair(args []string) {
 	clusterName := fs.String("cluster", "", "cluster NAME from ~/.memql/clusters.yaml (defaults to the active selection)")
 	overrideIdentity := fs.String("identity", "", "advanced: override identity service URL (skips active-cluster lookup)")
 	token := fs.String("token", "", "advanced: worker token (skip redeem; assumes pre-existing token)")
+	homeID := fs.String("home-id", "", "home id in workers.yaml (default: clusters.yaml name or URL host)")
+	force := fs.Bool("force", false, "remap a home id onto a different cluster_url (not required for same-URL refresh)")
 	logLevel := fs.String("log-level", "info", "log level")
 	_ = fs.Parse(args)
 
@@ -132,6 +137,8 @@ func handlePair(args []string) {
 		PairingCode: code,
 		IdentityURL: identityURL,
 		Token:       *token,
+		HomeID:      *homeID,
+		Force:       *force,
 		Logger:      logger,
 	}
 	if err := RunPairWizard(opts); err != nil {
@@ -179,8 +186,9 @@ func resolveActiveClusterIdentityURL(name string) (string, error) {
 
 func handleRun(args []string) {
 	fs := flag.NewFlagSet("worker run", flag.ExitOnError)
-	configPath := fs.String("config", DefaultConfigPath(), "path to worker.yaml")
-	cluster := fs.String("cluster", "", "cluster URL (overrides config)")
+	configPath := fs.String("config", DefaultConfigPath(), "path to legacy worker.yaml (workers.yaml is preferred beside it)")
+	workersPath := fs.String("workers", DefaultWorkersPath(), "path to workers.yaml multi-home registry")
+	cluster := fs.String("cluster", "", "cluster URL (overrides config; forces single-home mode)")
 	tokenFile := fs.String("token-file", "", "path to a 0600 file whose contents are the worker token (overrides config)")
 	name := fs.String("name", "", "worker name (overrides config)")
 	logLevel := fs.String("log-level", "", "log level: debug | info | warn | error")
@@ -194,21 +202,22 @@ func handleRun(args []string) {
 	tokenInline := fs.String("token", "", "DEPRECATED: worker token literal. Use --token-file or MEMQL_WORKER_TOKEN to avoid leaking into ps/shell history.")
 	fs.Parse(args)
 
-	cfg, err := LoadFile(*configPath)
+	legacyCfg, err := LoadFile(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 		os.Exit(1)
 	}
 	if *cluster != "" {
-		cfg.ClusterURL = *cluster
+		legacyCfg.ClusterURL = *cluster
 	}
 	// Token resolution order (each step overrides the previous):
-	//   1. worker.yaml (already in cfg.Token if present).
+	//   1. worker.yaml / workers.yaml (loaded below for multi-home).
 	//   2. MEMQL_WORKER_TOKEN env var (in-process memory, not argv).
 	//   3. --token-file path (read once, 0600 enforced).
 	//   4. --token literal (DEPRECATED; logs a WARN).
-	if env := os.Getenv("MEMQL_WORKER_TOKEN"); env != "" && cfg.Token == "" {
-		cfg.Token = env
+	cliToken := ""
+	if env := os.Getenv("MEMQL_WORKER_TOKEN"); env != "" {
+		cliToken = env
 	}
 	if *tokenFile != "" {
 		if err := config.VerifyCredentialFileMode(*tokenFile); err != nil {
@@ -220,43 +229,85 @@ func handleRun(args []string) {
 			fmt.Fprintf(os.Stderr, "ERROR: --token-file: %v\n", err)
 			os.Exit(1)
 		}
-		cfg.Token = strings.TrimSpace(string(raw))
+		cliToken = strings.TrimSpace(string(raw))
 	}
 	if *tokenInline != "" {
 		fmt.Fprintln(os.Stderr, "WARNING: --token <literal> leaks the token to `ps` and shell history.")
 		fmt.Fprintln(os.Stderr, "WARNING: Use --token-file or MEMQL_WORKER_TOKEN instead. Continuing for backwards compatibility.")
-		cfg.Token = *tokenInline
+		cliToken = *tokenInline
+	}
+	if cliToken != "" {
+		legacyCfg.Token = cliToken
 	}
 	if *name != "" {
-		cfg.Name = *name
+		legacyCfg.Name = *name
 	}
 	if *logLevel != "" {
-		cfg.LogLevel = *logLevel
+		legacyCfg.LogLevel = *logLevel
 	}
-	if err := cfg.Validate(); err != nil {
+
+	// Single-home override: any explicit cluster/token on the CLI keeps
+	// the legacy one-stream path (scripts, debugging). Otherwise load
+	// the multi-home registry and run every enabled home.
+	singleHome := *cluster != "" || cliToken != ""
+	var workers WorkersFile
+	if !singleHome {
+		workers, err = LoadWorkers(*workersPath, *configPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+			os.Exit(1)
+		}
+		if *name != "" {
+			workers.WorkerName = *name
+		}
+		if *logLevel != "" {
+			workers.LogLevel = *logLevel
+		}
+		if err := workers.ValidateRun(); err != nil {
+			// Fall back to legacy single-file if it validates — a
+			// machine mid-migration with only worker.yaml still runs.
+			if err2 := legacyCfg.Validate(); err2 == nil {
+				singleHome = true
+			} else {
+				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+				fmt.Fprintln(os.Stderr, "")
+				fmt.Fprintln(os.Stderr, "Configure the worker with one of:")
+				fmt.Fprintln(os.Stderr, "  - ~/.memql/workers.yaml (one or more homes)")
+				fmt.Fprintln(os.Stderr, "  - ~/.memql/worker.yaml (legacy single home; auto-migrates)")
+				fmt.Fprintln(os.Stderr, "  - --cluster <url> --token-file <path>")
+				os.Exit(1)
+			}
+		}
+	} else if err := legacyCfg.Validate(); err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Configure the worker with one of:")
+		fmt.Fprintln(os.Stderr, "  - ~/.memql/workers.yaml")
 		fmt.Fprintln(os.Stderr, "  - ~/.memql/worker.yaml")
-		fmt.Fprintln(os.Stderr, "  - --cluster <url> --token mql_wkr_...")
+		fmt.Fprintln(os.Stderr, "  - --cluster <url> --token-file <path>")
 		fmt.Fprintln(os.Stderr, "  - MEMQL_WORKER_TOKEN env var")
 		os.Exit(1)
 	}
 
-	logger := newLogger(cfg.LogLevel)
+	logLevelEffective := legacyCfg.LogLevel
+	if !singleHome && workers.LogLevel != "" {
+		logLevelEffective = workers.LogLevel
+	}
+	logger := newLogger(logLevelEffective)
 
-	policyPath := filepath.Join(filepath.Dir(*configPath), "policy.yaml")
+	policyDir := filepath.Dir(*configPath)
+	if !singleHome {
+		policyDir = filepath.Dir(*workersPath)
+	}
+	policyPath := filepath.Join(policyDir, "policy.yaml")
 	policy, err := tools.LoadPolicy(policyPath)
 	if err != nil {
 		logger.Warn("policy load failed; using defaults", "error", err)
 		policy = tools.DefaultPolicy()
 	}
 
-	// Consent gate (memql-cockpit#64). Default-deny: every tool
-	// call is rejected until the operator runs `memql-cockpit
-	// worker consent grant --window=<duration>` from a different
-	// terminal. The socket goes up alongside the worker; teardown
-	// is wired to the same cancel() that handles SIGTERM below.
+	// Consent gate (memql-cockpit#64). ONE socket for the whole
+	// supervisor — multi-home does not multiply consent.
 	consentMgr := consent.NewManager()
 	consentSrv := consent.NewServer(consentMgr, consent.DefaultSocketPath(), logger)
 	consentCtx, consentCancel := context.WithCancel(context.Background())
@@ -279,174 +330,141 @@ func handleRun(args []string) {
 		}
 	}
 
-	// App sessions (memql-cockpit#347..#350). The manager sweeps any MCP
-	// configuration a previous cockpit process left behind as it is
-	// constructed -- a SIGKILLed worker leaves a bearer on disk, and the
-	// service manager restarts it without anything else noticing.
-	sessions := appsession.NewManager(appsession.Options{
-		Logger:     logger,
-		StateDir:   cfg.StateDir,
-		ClusterURL: cfg.ClusterURL,
-		Allowed: func(appID string) bool {
-			for _, allowed := range policy.AppsAllow() {
-				if strings.EqualFold(strings.TrimSpace(allowed), appID) {
-					return true
-				}
-			}
-			return false
-		},
-		CheckWorkspace: policy.CheckPath,
-	})
-
-	// Local models (memql-cockpit#358..#362). The inventory gates itself
-	// on the hardware floor and on models.allow, so a machine that
-	// offers nothing advertises nothing and the manager below is never
-	// asked for anything.
-	//
-	// ONE discoverer, shared with the pull arm wired into the runner
-	// below: the base URL a cluster-driven pull lands on must be the one
-	// discovery probes, or the model arrives somewhere the inventory
-	// never looks and is never advertised.
 	discoverer := &models.Discoverer{}
 	modelInventory := NewModelInventory(policy, discoverer)
-	calls := modelcall.NewManager(modelcall.Options{
-		Logger:    logger,
-		Inventory: modelInventory,
-	})
-
-	// Watched-folder backup (memql#4841). Nil unless this machine is signed
-	// in as a user: the Library's HTTP routes take a `class="user"` bearer,
-	// and the worker token this process authenticates its STREAM with is
-	// pinned to WorkerService and cannot reach them. A machine that is paired
-	// but not signed in simply backs nothing up, which is the ordinary state
-	// of a freshly paired worker and must not be a startup failure.
-	backups := backup.New(backup.Options{
-		Logger:     logger,
-		StateDir:   cfg.StateDir,
-		BaseURL:    backupBaseURL(cfg.ClusterURL),
-		Bearer:     backupBearer(cfg.ClusterURL, logger),
-		CheckPath:  policy.CheckBackupPath,
-		HTTPClient: &http.Client{Timeout: 0},
-	})
-
-	runner, err := NewRunner(Options{
-		Logger:   logger,
-		Config:   cfg,
-		Tools:    dispatcher,
-		Apps:     NewAppInventory(policy),
-		Models:   modelInventory,
-		Calls:    calls,
-		Sessions: sessions,
-		Metrics:  metrics,
-		// Read from the LIVE policy on every connect, so a SIGHUP that
-		// changed the consent is honoured at the next reconnect
-		// (record D6: "a change takes effect on the next reconnect").
-		InferenceServe: policy.InferenceServe,
-		// The cluster-driven pull (engine epic memql#5103; the install
-		// wizard's D13) runs the path `memql worker models --pull` runs,
-		// from INSIDE this process -- which is why the reload the CLI
-		// obtains by sending this worker a SIGHUP is a function here.
-		ModelPull: &ModelPullOptions{
-			PolicyPath:   policyPath,
-			OllamaBase:   discoverer.ResolvedOllamaBaseURL,
-			PullAllowed:  policy.ModelsPullAllowed,
-			ReloadPolicy: policy.Reload,
-		},
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-		os.Exit(1)
-	}
+	appInv := NewAppInventory(policy)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+
+	var (
+		fleet  *Fleet
+		runner *Runner
+		// stopSessions is invoked on SIGTERM so MCP configs die with us.
+		stopSessions func(string)
+	)
+
+	if singleHome {
+		sessions := appsession.NewManager(appsession.Options{
+			Logger:     logger,
+			StateDir:   legacyCfg.StateDir,
+			ClusterURL: legacyCfg.ClusterURL,
+			Allowed: func(appID string) bool {
+				for _, allowed := range policy.AppsAllow() {
+					if strings.EqualFold(strings.TrimSpace(allowed), appID) {
+						return true
+					}
+				}
+				return false
+			},
+			CheckWorkspace: policy.CheckPath,
+		})
+		stopSessions = sessions.StopAll
+		calls := modelcall.NewManager(modelcall.Options{
+			Logger:    logger,
+			Inventory: modelInventory,
+		})
+		backups := backup.New(backup.Options{
+			Logger:     logger,
+			StateDir:   legacyCfg.StateDir,
+			BaseURL:    backupBaseURL(legacyCfg.ClusterURL),
+			Bearer:     backupBearer(legacyCfg.ClusterURL, logger),
+			CheckPath:  policy.CheckBackupPath,
+			HTTPClient: &http.Client{Timeout: 0},
+		})
+		runner, err = NewRunner(Options{
+			Logger:         logger,
+			Config:         legacyCfg,
+			Tools:          dispatcher,
+			Apps:           appInv,
+			Models:         modelInventory,
+			Calls:          calls,
+			Sessions:       sessions,
+			Metrics:        metrics,
+			InferenceServe: policy.InferenceServe,
+			ModelPull: &ModelPullOptions{
+				PolicyPath:   policyPath,
+				OllamaBase:   discoverer.ResolvedOllamaBaseURL,
+				PullAllowed:  policy.ModelsPullAllowed,
+				ReloadPolicy: policy.Reload,
+			},
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+			os.Exit(1)
+		}
+		go backups.Run(ctx, runner.RegistrationId)
+		logger.Info("worker starting (single-home)",
+			"cluster_url", legacyCfg.ClusterURL,
+			"name", legacyCfg.Name,
+			"capabilities", legacyCfg.Capabilities,
+		)
+	} else {
+		fleet, err = NewFleet(FleetOptions{
+			Logger:     logger,
+			Workers:    workers,
+			Policy:     policy,
+			PolicyPath: policyPath,
+			Tools:      dispatcher,
+			Apps:       appInv,
+			Models:     modelInventory,
+			Discoverer: discoverer,
+			Metrics:    metrics,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+			os.Exit(1)
+		}
+		logger.Info("worker starting (multi-home fleet)",
+			"homes", len(workers.EnabledHomes()),
+			"name", workers.WorkerName,
+			"capabilities", workers.Capabilities,
+		)
+	}
+
 	go func() {
 		for sig := range sigCh {
 			switch sig {
 			case syscall.SIGHUP:
-				// Captured BEFORE the reload so the change can be
-				// named rather than merely implied. An operator who
-				// edits a sharing consent and sees only "policy
-				// reloaded" cannot tell from the log whether the file
-				// they edited is the one the worker read.
 				serveBefore := policy.InferenceServe()
 				if err := policy.Reload(); err != nil {
 					logger.Warn("policy reload failed", "error", err)
 				} else {
 					logger.Info("policy reloaded")
-
-					// A CHANGED CONSENT TAKES EFFECT ON THE NEXT
-					// RECONNECT, and nothing here forces one. The
-					// descriptor is built at Register, which the engine
-					// accepts exactly once per stream -- so the value
-					// on the cluster is the one this worker sent when
-					// it connected.
-					//
-					// No reconnect is taken for it, deliberately. A
-					// reconnect interrupts nothing when the machine is
-					// idle and abandons a running generation when it is
-					// not, and this field steers no call already in
-					// flight: the router chose this machine before the
-					// call started. That is the same trade
-					// RequestImmediateReadvertise refuses to make for
-					// labels, where the payoff is larger.
 					if after := policy.InferenceServe(); after != serveBefore {
 						logger.Info("inference.serve changed; it takes effect on the next reconnect",
 							"from", serveBefore, "to", after)
 					}
-					// A RELOADED models.allow THAT NOBODY
-					// RE-ADVERTISED IS A MODEL THE CLUSTER STILL
-					// CANNOT SEE. Model labels are bound at Register
-					// and Heartbeat carries none of them, so the
-					// reload changes only this machine's own answer to
-					// "may I serve this" -- and `memql worker setup
-					// --inference` and `memql worker models --allow`
-					// both end by sending this signal and telling the
-					// operator the cluster will see the model shortly.
-					// Without this line that sentence is false and the
-					// whole feature ends at "the file changed".
-					//
-					// It drops the inventory cache and waives the
-					// two-minute reconnect floor once; the busy guard
-					// is not waived, so nothing in flight is killed
-					// for it. Read RequestImmediateReadvertise before
-					// moving it.
-					runner.RequestImmediateReadvertise()
+					// Fan out to every home stream.
+					if fleet != nil {
+						fleet.RequestImmediateReadvertise()
+					} else if runner != nil {
+						runner.RequestImmediateReadvertise()
+					}
 				}
 			default:
 				logger.Info("worker shutting down", "signal", sig.String())
-				// Cancel live app sessions before the stream goes, so
-				// each reports its own end and each MCP configuration
-				// file is deleted. A shutdown that just exits leaves an
-				// agent running and a bearer on disk.
-				sessions.StopAll("the cockpit is shutting down")
+				if stopSessions != nil {
+					stopSessions("the cockpit is shutting down")
+				}
 				cancel()
 				return
 			}
 		}
 	}()
 
-	// Enable Ctrl+Q (and keep Ctrl+C via signals) when stdin is
-	// a TTY. Restored on exit so the user's shell goes back to
-	// canonical mode.
 	restoreTermios := enableQuitHotkeys(ctx, cancel, logger)
 	defer restoreTermios()
 
-	logger.Info("worker starting",
-		"cluster_url", cfg.ClusterURL,
-		"name", cfg.Name,
-		"capabilities", cfg.Capabilities,
-	)
-	// The sweeper runs BESIDE the stream rather than inside it. It speaks
-	// HTTP as the signed-in user and the stream speaks gRPC as the worker, so
-	// neither waits on the other -- a cluster that has dropped the stream can
-	// still be accepting uploads, and a sweep in flight must not hold up a
-	// reconnect. It ends with the same cancel() every other subsystem does.
-	go backups.Run(ctx, runner.RegistrationId)
-
-	if err := runner.Run(ctx); err != nil && ctx.Err() == nil {
-		logger.Error("worker exited with error", "error", err)
+	var runErr error
+	if fleet != nil {
+		runErr = fleet.Run(ctx)
+	} else {
+		runErr = runner.Run(ctx)
+	}
+	if runErr != nil && ctx.Err() == nil {
+		logger.Error("worker exited with error", "error", runErr)
 		if metrics != nil {
 			metrics.Stop()
 		}
@@ -598,25 +616,70 @@ func handleSetup(args []string) {
 
 func handleConfig(args []string) {
 	fs := flag.NewFlagSet("worker config", flag.ExitOnError)
-	configPath := fs.String("config", DefaultConfigPath(), "path to worker.yaml")
+	configPath := fs.String("config", DefaultConfigPath(), "path to legacy worker.yaml")
+	workersPath := fs.String("workers", DefaultWorkersPath(), "path to workers.yaml")
 	fs.Parse(args)
-	cfg, err := LoadFile(*configPath)
+
+	w, err := LoadWorkers(*workersPath, *configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Cluster URL: %s\n", emptyOrValue(cfg.ClusterURL))
-	fmt.Printf("Name:        %s\n", emptyOrValue(cfg.Name))
-	fmt.Printf("Token:       %s\n", maskToken(cfg.Token))
-	fmt.Printf("Capabilities:%s\n", " "+strings.Join(cfg.Capabilities, ", "))
-	fmt.Printf("Concurrency: %v\n", cfg.Concurrency)
-	fmt.Printf("State dir:   %s\n", cfg.StateDir)
-	fmt.Printf("Log level:   %s\n", cfg.LogLevel)
-	if err := cfg.Validate(); err != nil {
+	fmt.Printf("Workers file: %s\n", *workersPath)
+	fmt.Printf("Name:         %s\n", emptyOrValue(w.WorkerName))
+	fmt.Printf("Capabilities:%s\n", " "+strings.Join(w.Capabilities, ", "))
+	fmt.Printf("Concurrency:  %v\n", w.Concurrency)
+	fmt.Printf("State dir:    %s\n", w.StateDir)
+	fmt.Printf("Log level:    %s\n", w.LogLevel)
+	fmt.Printf("Homes:        %d (%d enabled)\n", len(w.Homes), len(w.EnabledHomes()))
+	if len(w.Homes) == 0 {
+		fmt.Println("\n(no homes enrolled — run `memql worker pair` or the install script)")
+	}
+	for _, h := range w.Homes {
+		en := "enabled"
+		if !h.IsEnabled() {
+			en = "disabled"
+		}
+		fmt.Printf("\n  [%s] %s\n", h.ID, en)
+		fmt.Printf("    Cluster URL: %s\n", emptyOrValue(h.ClusterURL))
+		fmt.Printf("    Token:       %s\n", maskToken(h.Token))
+		fmt.Printf("    State dir:   %s\n", w.ConfigForHome(h).StateDir)
+	}
+	if err := w.Validate(); err != nil {
 		fmt.Printf("\nValidation: ERROR -- %v\n", err)
+	} else if err := w.ValidateRun(); err != nil {
+		fmt.Printf("\nValidation: OK (registry); run: %v\n", err)
 	} else {
 		fmt.Printf("\nValidation: OK\n")
 	}
+}
+
+func handleUnpair(args []string) {
+	fs := flag.NewFlagSet("worker unpair", flag.ExitOnError)
+	workersPath := fs.String("workers", DefaultWorkersPath(), "path to workers.yaml")
+	cluster := fs.String("cluster", "", "home id to remove (see `memql worker config`)")
+	disable := fs.Bool("disable", false, "disable the home instead of removing it")
+	fs.Parse(args)
+	id := strings.TrimSpace(*cluster)
+	if id == "" && fs.NArg() > 0 {
+		id = fs.Arg(0)
+	}
+	if id == "" {
+		fmt.Fprintln(os.Stderr, "ERROR: unpair requires --cluster <home-id>")
+		os.Exit(1)
+	}
+	w, err := RemoveHome(*workersPath, id, *disable)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		os.Exit(1)
+	}
+	action := "removed"
+	if *disable {
+		action = "disabled"
+	}
+	fmt.Printf("%s home %q (%d homes remain, %d enabled)\n",
+		action, id, len(w.Homes), len(w.EnabledHomes()))
+	fmt.Println("Restart the worker (launchctl unload/load the LaunchAgent) to drop the stream.")
 }
 
 func printUsage() {
@@ -625,8 +688,8 @@ func printUsage() {
 	fmt.Println("USAGE")
 	fmt.Println("  memql worker pair <code>   Redeem an XXXX-XXXX pairing code from")
 	fmt.Println("                                     CoPresent's Settings -> Computer Use card,")
-	fmt.Println("                                     write worker.yaml, run worker. The primary")
-	fmt.Println("                                     enrollment path -- one command.")
+	fmt.Println("                                     upsert a home in workers.yaml, run worker.")
+	fmt.Println("                                     Additive: sibling homes are kept.")
 	fmt.Println("  memql worker               Same flow with a paste prompt (no code arg).")
 	fmt.Println("  memql worker run           Run an already-configured worker (used by")
 	fmt.Println("                                     LaunchAgent / scripts).")
@@ -638,7 +701,9 @@ func printUsage() {
 	fmt.Println("                                     Install the speech runtime, so this machine")
 	fmt.Println("                                     can serve text to speech. --runtime image")
 	fmt.Println("                                     does the same for image generation.")
-	fmt.Println("  memql worker config        Print the effective config.")
+	fmt.Println("  memql worker config        Print the effective config (all homes).")
+	fmt.Println("  memql worker unpair --cluster <id>")
+	fmt.Println("                                     Remove (or --disable) one home; siblings stay.")
 	fmt.Println("  memql worker models        Print the local models this machine would offer,")
 	fmt.Println("                                     or the reason it offers none. --pull <id>")
 	fmt.Println("                                     pulls one; --allow <id> offers one.")
@@ -653,14 +718,17 @@ func printUsage() {
 	fmt.Println("  memql worker consent <op>  Manage the per-call consent gate (grant/revoke/status/watch).")
 	fmt.Println("")
 	fmt.Println("PAIR FLAGS")
-	fmt.Println("  --cluster <url>      Advanced: cluster URL (skip redeem; useful when the")
-	fmt.Println("                       cockpit already has a worker token from elsewhere).")
+	fmt.Println("  --cluster <name>     Cluster NAME from clusters.yaml (identity lookup).")
+	fmt.Println("  --home-id <id>       Home id in workers.yaml (default: URL host / cluster name).")
+	fmt.Println("  --force              Remap a home id onto a different cluster_url (siblings kept).")
+	fmt.Println("  --identity <url>     Advanced: override identity service URL.")
 	fmt.Println("  --token <token>      Advanced: worker token (skip redeem).")
 	fmt.Println("  --log-level <l>      Log level: debug | info | warn | error")
 	fmt.Println("")
 	fmt.Println("RUN FLAGS")
-	fmt.Println("  --config <path>      Path to worker.yaml (default ~/.memql/worker.yaml)")
-	fmt.Println("  --cluster <url>      Cluster URL (overrides config)")
+	fmt.Println("  --workers <path>     Path to workers.yaml (default ~/.memql/workers.yaml)")
+	fmt.Println("  --config <path>      Legacy worker.yaml (default ~/.memql/worker.yaml)")
+	fmt.Println("  --cluster <url>      Cluster URL (forces single-home mode)")
 	fmt.Println("  --token <token>      Worker token (mql_wkr_...; overrides config + MEMQL_WORKER_TOKEN)")
 	fmt.Println("  --name <name>        Worker name (overrides config)")
 	fmt.Println("  --log-level <l>      Log level: debug | info | warn | error")

@@ -2,12 +2,14 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/znasllc-io/memql-cockpit/internal/worker/backup"
@@ -48,16 +50,26 @@ const backupListTimeout = 30 * time.Second
 
 func handleBackup(args []string) {
 	fs := flag.NewFlagSet("worker backup", flag.ExitOnError)
-	configPath := fs.String("config", DefaultConfigPath(), "path to worker.yaml")
+	configPath := fs.String("config", DefaultConfigPath(), "path to legacy worker.yaml")
+	workersPath := fs.String("workers", DefaultWorkersPath(), "path to workers.yaml")
+	homeID := fs.String("home", "", "home id when multiple homes are enrolled (see memql worker config)")
 	once := fs.Bool("once", false, "run one sweep now instead of only listing")
 	_ = fs.Parse(args)
 
-	cfg, err := LoadFile(*configPath)
+	w, err := LoadWorkers(*workersPath, *configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 		os.Exit(1)
 	}
-	policyPath := filepath.Join(filepath.Dir(*configPath), "policy.yaml")
+	_, cfg, err := selectBackupHome(w, *homeID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		os.Exit(1)
+	}
+	policyPath := filepath.Join(filepath.Dir(*workersPath), "policy.yaml")
+	if _, err := os.Stat(policyPath); err != nil {
+		policyPath = filepath.Join(filepath.Dir(*configPath), "policy.yaml")
+	}
 	policy, err := tools.LoadPolicy(policyPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
@@ -122,6 +134,35 @@ func handleBackup(args []string) {
 	fmt.Fprintf(os.Stdout, "Sweeping now as %s. This is the same pass the worker runs.\n", workerID)
 	manager.SweepOnce(sweepCtx, workerID)
 	fmt.Fprintln(os.Stdout, "Done. The Files app shows what each machine reported.")
+}
+
+// selectBackupHome picks the home whose namespaced state_dir / cluster
+// the backup command should act as. One enabled home is unambiguous;
+// multiple require --home so we never sweep or read registration for
+// the wrong sibling.
+func selectBackupHome(w WorkersFile, homeID string) (Home, Config, error) {
+	homeID = strings.TrimSpace(homeID)
+	if homeID != "" {
+		for _, h := range w.Homes {
+			if h.ID == homeID {
+				return h, w.ConfigForHome(h), nil
+			}
+		}
+		return Home{}, Config{}, fmt.Errorf("home %q not found in workers.yaml", homeID)
+	}
+	homes := w.EnabledHomes()
+	switch len(homes) {
+	case 0:
+		return Home{}, Config{}, errors.New("no enabled homes in workers.yaml (pair a cluster or pass --home)")
+	case 1:
+		return homes[0], w.ConfigForHome(homes[0]), nil
+	default:
+		ids := make([]string, 0, len(homes))
+		for _, h := range homes {
+			ids = append(ids, h.ID)
+		}
+		return Home{}, Config{}, fmt.Errorf("multiple enabled homes (%s); pass --home <id>", strings.Join(ids, ", "))
+	}
 }
 
 // printBackupHeader states what this machine will and will not do, before any

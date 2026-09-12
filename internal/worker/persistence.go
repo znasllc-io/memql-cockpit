@@ -5,56 +5,34 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
-	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
-// WriteWorkerYAML persists the cluster URL + token + sensible
-// defaults to ~/.memql/worker.yaml. Replaces any existing file
-// (the wizard never partial-writes; if it succeeds the user can
-// just `worker run` and it works).
+// WriteWorkerYAML upserts one home into ~/.memql/workers.yaml
+// (and mirrors that home into path as legacy worker.yaml).
 //
-// The YAML is identical to what install-mac.sh / install-linux.sh
-// drop, so the two enrollment paths produce interchangeable
-// configs.
+// ADDITIVE: pairing a second cluster does not clobber an existing
+// home. Pass force via UpsertHome when replacing one home's token.
+// The install scripts call the same UpsertHome path through
+// write_worker_yaml in lib.sh.
 func WriteWorkerYAML(path, clusterURL, token, name string) error {
-	if path == "" {
-		path = DefaultConfigPath()
+	workersPath := DefaultWorkersPath()
+	if path != "" && path != DefaultConfigPath() {
+		// Tests / advanced callers that point --config at a temp
+		// dir get workers.yaml beside that legacy path.
+		workersPath = filepath.Join(filepath.Dir(path), "workers.yaml")
 	}
-	hostname, _ := os.Hostname()
-	if name == "" {
-		name = hostname
-	}
-	cfg := Config{
-		ClusterURL: strings.TrimSpace(clusterURL),
-		Token:      strings.TrimSpace(token),
-		Name:       name,
-		Labels: map[string]string{
-			"os":       runtime.GOOS,
-			"arch":     runtime.GOARCH,
-			"hostname": hostname,
-		},
-		Concurrency:  map[string]uint32{"HEADLESS": 8, "COMPUTERUSE": 1},
-		StateDir:     defaultStateDir(),
-		LogLevel:     "info",
+	_, err := UpsertHome(UpsertHomeOptions{
+		WorkersPath:  workersPath,
+		LegacyPath:   path,
+		ClusterURL:   clusterURL,
+		Token:        token,
+		Name:         name,
 		Capabilities: capabilitiesForBuildTag(),
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("worker.yaml: mkdir: %w", err)
-	}
-	body, err := yaml.Marshal(cfg)
-	if err != nil {
-		return fmt.Errorf("worker.yaml: marshal: %w", err)
-	}
-	// 0600 -- the file holds the worker token in plaintext, no
-	// reason to leave it group-readable.
-	if err := os.WriteFile(path, body, 0o600); err != nil {
-		return fmt.Errorf("worker.yaml: write: %w", err)
-	}
-	return nil
+	})
+	return err
 }
 
 // capabilitiesForBuildTag returns the capabilities the running

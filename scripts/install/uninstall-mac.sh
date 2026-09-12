@@ -7,7 +7,8 @@
 # backwards, in one line, because an install that is one line and an
 # uninstall that is a runbook leaves the token on machines nobody
 # finishes cleaning up. Unloads and removes the LaunchAgent, removes
-# the binary and its symlink, removes worker.yaml (the token); --purge
+# the binary and its symlink, removes workers.yaml and worker.yaml
+# (the tokens); --purge
 # takes policy.yaml, the state dir and an emptied ~/.memql as well.
 # Every step says what it did, or that there was nothing to do, and
 # nothing here prompts except sudo.
@@ -64,8 +65,9 @@ function show_help() {
 Usage: $(basename "$0") [options]
 
 Removes memql-worker from this machine: the LaunchAgent, the binary
-and its symlink, and ~/.memql/worker.yaml (the token). Nothing outside
-~/.memql, the plist files and the binary path is touched.
+and its symlink, and ~/.memql/workers.yaml plus the legacy
+worker.yaml (the tokens). Nothing outside ~/.memql, the plist files
+and the binary path is touched.
 
 Options:
     --user-local              Remove a --user-local install from
@@ -144,22 +146,22 @@ function remove_launch_agent() {
 
 function main() {
     parse_args "$@"
-    # Read BEFORE worker.yaml goes: --purge deletes the directory the
+    # Read BEFORE the token files go: --purge deletes the directory the
     # worker actually used, and the default is only where that usually
     # is.
     local state_dir
     state_dir="$(worker_state_dir_from_yaml "${HOME}/.memql/worker.yaml")"
-    # Service, binary, token: the install in reverse, and the order that
+    # Service, binary, tokens: the install in reverse, and the order that
     # leaves the least behind if a step is interrupted -- a KeepAlive
     # agent still running would re-exec a binary that is about to go,
     # with a token that is about to go.
     remove_launch_agent
     # A binary that needs sudo this run cannot get is reported and
-    # left; the token still goes, because it matters more, and the exit
+    # left; the tokens still go, because they matter more, and the exit
     # code carries the leftover.
     local binary_rc=0
     remove_binaries_with_mode "$REMOVE_MODE" || binary_rc=$?
-    remove_path_if_present "${HOME}/.memql/worker.yaml"
+    remove_worker_config
     if [[ "$PURGE" == "yes" ]]; then
         purge_worker_state "$state_dir"
     else
