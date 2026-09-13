@@ -8,7 +8,7 @@
 
 **Tech Stack:** Go 1.26.1 (`go` directive in both `go.mod`; cockpit CI toolchain go1.26.6), grpc-go v1.83.2 (`google.golang.org/grpc`), protobuf-go v1.36.12, the race detector (`go test -race`).
 
-**Spec:** Audit finding C-1 in `the audit attached as a comment on znasllc-io/memql#5327 (finding C-1)` (section D "CRITICAL C-1"; architecture map in section A). That file lives in a session scratchpad and will not travel, so the finding and the writer enumeration are reproduced in "The defect" below with every line number re-verified against the trees named there.
+**Spec:** Audit finding C-1 in the cockpit-cluster audit attached as a comment on znasllc-io/memql#5327 (section D "CRITICAL C-1"; architecture map in section A). The finding and the writer enumeration are also reproduced in "The defect" below with every line number re-verified against the trees named there.
 
 **Trees:** cockpit `/home/znas/projects/memql/memql-cockpit`, `main` at `efa804e` (the audit cites `132934b`, the PR #422 merge, which is an ancestor on `main`; the commits between are the v0.13.4 release and two dependabot bumps and touch none of the files below). Engine `/home/znas/projects/memql/memql`, `main` at `5f98c76a1`. `go.work` at `/home/znas/projects/memql` lists both; the cockpit's `go.mod` carries `replace github.com/znasllc-io/memql => ../memql` and keeps it.
 
