@@ -66,7 +66,14 @@ jobs:
           cache-dependency-path: memql-cockpit/go.sum
       - name: go test
         working-directory: memql-cockpit
-        run: go test -count=1 -timeout=300s ./...
+        # -race: the worker holds one gRPC stream that many goroutines
+        # write (heartbeat, pong, tool results, model deltas, pulls, app
+        # sessions), and the runner's loop, hold and drain run beside them
+        # (memql-cockpit#426, #434). The lock is in the SDK; the tests in
+        # internal/worker/connect_send_test.go and loop_run_test.go have
+        # nothing to catch without the detector. The suite is race-clean;
+        # the timeout is doubled for the detector's overhead on the runner.
+        run: go test -race -count=1 -timeout=600s ./...
 
   # fuzz runs every native Go fuzz target for a short burst.
   #

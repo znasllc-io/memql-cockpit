@@ -234,22 +234,41 @@ function same_cluster_url() {
 # find_home_id_by_cluster_url prints the id of a home whose cluster_url
 # matches, or empty. Used so install (URL-host id) and pair (--home-id
 # local) refresh the same enrollment without --force.
+#
+# MATCHED THE WAY GO'S sameClusterURL MATCHES (memql-cockpit#433): the same
+# URL (trimmed, case-folded, no trailing slash), or failing that the same
+# HOST -- so https://api.example.com and https://api.example.com:443 are
+# one cluster. An exact match wins over a host match. Matching on the
+# exact string alone appended a second home for the same cluster whenever
+# the URL was spelled differently, and one machine then held two streams
+# to one cluster with two tokens.
 function find_home_id_by_cluster_url() {
     local workers_path="$1"
     local cluster_url="$2"
     [[ -f "$workers_path" ]] || { echo ""; return 0; }
-    # BSD awk runs END even after exit — guard with found=1.
     awk -v want="$cluster_url" '
         function norm(s) {
             gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
             sub(/\/+$/, "", s)
             return tolower(s)
         }
-        BEGIN { wantn = norm(want); in_homes=0; cur=""; curl=""; found=0 }
+        function host(s) {
+            s = norm(s)
+            sub(/^[a-z][a-z0-9+.-]*:\/\//, "", s)
+            sub(/\/.*$/, "", s)
+            sub(/:[0-9]+$/, "", s)
+            return s
+        }
+        function consider(id, url) {
+            if (id == "" || url == "") return
+            if (exact == "" && norm(url) == wantn) exact = id
+            if (byhost == "" && wanth != "" && host(url) == wanth) byhost = id
+        }
+        BEGIN { wantn = norm(want); wanth = host(want); in_homes=0; cur=""; curl=""; exact=""; byhost="" }
         /^homes:[[:space:]]*$/ { in_homes=1; next }
         !in_homes { next }
         /^[[:space:]]*-[[:space:]]*id:[[:space:]]*/ {
-            if (cur != "" && curl != "" && norm(curl) == wantn) { print cur; found=1; exit }
+            consider(cur, curl)
             cur=$0; sub(/^[[:space:]]*-[[:space:]]*id:[[:space:]]*/, "", cur)
             curl=""
             next
@@ -258,7 +277,11 @@ function find_home_id_by_cluster_url() {
             curl=$0; sub(/^[[:space:]]*cluster_url:[[:space:]]*/, "", curl)
             next
         }
-        END { if (!found && cur != "" && curl != "" && norm(curl) == wantn) print cur }
+        END {
+            consider(cur, curl)
+            if (exact != "") print exact
+            else if (byhost != "") print byhost
+        }
     ' "$workers_path" | head -1
 }
 

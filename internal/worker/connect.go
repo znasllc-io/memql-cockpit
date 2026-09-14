@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -41,7 +43,30 @@ type Connection struct {
 	// the only way to re-advertise, because the engine's stream handler
 	// accepts Register exactly once, at the handshake.
 	ModelFingerprint string
+
+	// AdvertisedServe is the sharing consent (inference.serve) this
+	// connection registered with. It is part of the advertisement for the
+	// same reason the labels are: it rides Register's capability
+	// descriptor and nothing else, so a consent the owner withdrew while
+	// this stream is up reaches the cluster only by registering again.
+	// The runner compares the live policy against it (memql-cockpit#428).
+	AdvertisedServe string
+
+	// cancel ends the context this connection's stream was opened on (the
+	// runner opens each stream on its own); Close uses it when a graceful
+	// close cannot finish.
+	cancel context.CancelFunc
+	// closing is set once the runner has decided to close this connection
+	// to re-register, so a later evaluation on the same heartbeat loop does
+	// not decide -- and say -- it all again.
+	closing atomic.Bool
 }
+
+// closeGrace is how long Close waits for the graceful half-close before it
+// cancels the stream's context. Ordinarily the half-close takes one frame's
+// write; this bound exists for the one case that does not end on its own.
+// A variable only so a test can shorten it.
+var closeGrace = 5 * time.Second
 
 // stream is what Connection needs from the SDK's connection: the three
 // calls the worker protocol makes on it.
@@ -58,16 +83,22 @@ type stream interface {
 	Close()
 }
 
-// Connect dials the cluster (via the SDK), opens the stream, and
-// sends the worker-protocol Register handshake. Returns the live
-// connection and the registration metadata pulled from the
-// RegisterAck.
-func Connect(ctx context.Context, cfg Config, inventory []apps.Info, modelInv models.Inventory, inferenceServe string, logger *slog.Logger) (*Connection, error) {
+// The SDK's connection is what fills the seam in production, and this is
+// the compile-time record of it: the lock that serializes every write on
+// the gRPC stream lives in (*sdkworker.Connection).Send, and the seam's
+// Send is that method.
+var _ stream = (*sdkworker.Connection)(nil)
+
+// dialSDK opens the SDK's stream to the cluster: dial, TLS, token, stream
+// open -- everything before the first worker-protocol message. It is the
+// Runner's default stream opener; a test puts a scripted stream there
+// instead and drives the REAL handshake and loop against it. The Runner
+// then runs handshake: Register, and the RegisterAck's metadata.
+func dialSDK(ctx context.Context, cfg Config, logger *slog.Logger) (stream, error) {
 	endpoint, useTLS, err := sdkworker.ParseClusterURL(cfg.ClusterURL)
 	if err != nil {
 		return nil, err
 	}
-
 	sdkConn, err := sdkworker.Dial(ctx, sdkworker.DialConfig{
 		Endpoint: endpoint,
 		UseTLS:   useTLS,
@@ -77,17 +108,39 @@ func Connect(ctx context.Context, cfg Config, inventory []apps.Info, modelInv mo
 	if err != nil {
 		return nil, err
 	}
+	return sdkConn, nil
+}
 
+// handshake runs Register / RegisterAck over an open stream and returns
+// the live connection, or closes the stream and returns why it failed.
+func handshake(ctx context.Context, s stream, cfg Config, inventory []apps.Info, modelInv models.Inventory, hw hardware.Inventory, inferenceServe string, logger *slog.Logger) (*Connection, error) {
 	c := &Connection{
-		conn:   sdkConn,
+		conn:   s,
 		logger: logger,
 	}
-
-	if err := c.register(ctx, cfg, inventory, modelInv, inferenceServe); err != nil {
+	if err := c.register(ctx, cfg, inventory, modelInv, hw, inferenceServe); err != nil {
 		c.Close()
 		return nil, err
 	}
 	return c, nil
+}
+
+// RegisterRefusedError is the cluster answering the handshake with a
+// RegisterError instead of a RegisterAck: it heard this machine and said
+// no. Typed, rather than folded into a string, because the runner treats
+// a refusal differently from a cluster it could not reach -- retrying a
+// refusal every few seconds asks the same question of the same answer
+// (memql-cockpit#427).
+type RegisterRefusedError struct {
+	// Code is the engine's stable code (register_failed,
+	// register_required).
+	Code string
+	// Message is the engine's own sentence, passed through unchanged.
+	Message string
+}
+
+func (e *RegisterRefusedError) Error() string {
+	return fmt.Sprintf("worker.register: %s: %s", e.Code, e.Message)
 }
 
 // buildRegister assembles the worker-protocol Register handshake
@@ -105,7 +158,7 @@ func buildRegister(cfg Config, inventory []apps.Info, modelInv models.Inventory,
 	// nothing here: no capability, no labels, no concurrency entry.
 	modelReg := modelRegistrationFor(modelInv)
 	labels := mergeModelLabels(cfg.Labels, modelReg.Labels)
-	if mid, err := EnsureMachineID(cfg.StateDir); err == nil && mid != "" {
+	if mid, err := machineIDFor(cfg); err == nil && mid != "" {
 		if labels == nil {
 			labels = map[string]string{}
 		}
@@ -148,21 +201,35 @@ func buildRegister(cfg Config, inventory []apps.Info, modelInv models.Inventory,
 }
 
 // register sends the Register message and waits for the RegisterAck.
-func (c *Connection) register(ctx context.Context, cfg Config, inventory []apps.Info, modelInv models.Inventory, inferenceServe string) error {
-	register := buildRegister(cfg, inventory, modelInv, hardware.Local(ctx), inferenceServe)
+func (c *Connection) register(ctx context.Context, cfg Config, inventory []apps.Info, modelInv models.Inventory, hw hardware.Inventory, inferenceServe string) error {
+	register := buildRegister(cfg, inventory, modelInv, hw, inferenceServe)
 	c.ModelFingerprint = advertisedFingerprint(modelInv.Labels())
-	if err := c.conn.Send(&memqlv1.WorkerClientMessage{
+	c.AdvertisedServe = inferenceServe
+	if err := c.Send(&memqlv1.WorkerClientMessage{
 		Payload: &memqlv1.WorkerClientMessage_Register{Register: register},
 	}); err != nil {
+		if !errors.Is(err, io.EOF) {
+			return fmt.Errorf("worker.register: send: %w", err)
+		}
+		// io.EOF FROM A SEND MEANS "ASK RECV WHY". grpc-go's contract:
+		// when the server has already ended the stream, SendMsg returns
+		// io.EOF and the real status is only available from RecvMsg. A
+		// cluster refusing this machine's token ends the stream at the
+		// door, so returning the EOF here would report "send: EOF" for
+		// what is actually Unauthenticated -- and the runner could not
+		// tell a revoked token from a network blip.
+		if _, rerr := c.Recv(); rerr != nil && !errors.Is(rerr, io.EOF) {
+			return fmt.Errorf("worker.register: %w", rerr)
+		}
 		return fmt.Errorf("worker.register: send: %w", err)
 	}
 
-	resp, err := c.conn.Recv()
+	resp, err := c.Recv()
 	if err != nil {
 		return fmt.Errorf("worker.register: recv: %w", err)
 	}
 	if errMsg := resp.GetRegisterError(); errMsg != nil {
-		return fmt.Errorf("worker.register: %s: %s", errMsg.GetCode(), errMsg.GetMessage())
+		return &RegisterRefusedError{Code: errMsg.GetCode(), Message: errMsg.GetMessage()}
 	}
 	ack := resp.GetRegisterAck()
 	if ack == nil {
@@ -185,6 +252,18 @@ func (c *Connection) register(ctx context.Context, cfg Config, inventory []apps.
 }
 
 // Send writes a single message on the worker side of the stream.
+//
+// THIS IS THE ONE SEAM. Every Send* helper below routes through here,
+// and this is the only call to the SDK connection's Send in the
+// repository (TestEveryWorkerWriteGoesThroughConnectionSend). The SDK's
+// Send holds the lock that serializes every write on the gRPC stream --
+// grpc-go forbids SendMsg from two goroutines on one stream, and this
+// worker writes from the heartbeat goroutine, the recv goroutine (Pong),
+// every tool dispatch, every model call's deltas and keepalives, every
+// pull's progress and every app session's chunks at once. The lock lives
+// in the SDK rather than here because the SDK owns the stream: a second
+// lock at this layer would protect nothing the SDK's does not, and would
+// have to be re-invented by every other worker host.
 func (c *Connection) Send(msg *memqlv1.WorkerClientMessage) error {
 	if c == nil || c.conn == nil {
 		return errors.New("worker: connection is closed")
@@ -247,7 +326,7 @@ func (c *Connection) SendModelPullEnd(end *memqlv1.ModelPullEnd) error {
 // Once a build supports the field, every beat asserts the full truth,
 // including "none".
 func (c *Connection) SendHeartbeat(active uint32, perCap map[string]uint32, inventory []apps.Info, hw *hardware.Inventory) error {
-	return c.conn.Send(&memqlv1.WorkerClientMessage{
+	return c.Send(&memqlv1.WorkerClientMessage{
 		Payload: &memqlv1.WorkerClientMessage_Heartbeat{
 			Heartbeat: buildHeartbeat(active, perCap, inventory, hw),
 		},
@@ -315,7 +394,7 @@ func hardwareToProto(inv *hardware.Inventory) *memqlv1.HardwareInventory {
 // than appending them, so renumbering a resend would open a gap in the
 // transcript that no later reader could detect.
 func (c *Connection) SendAppSessionChunk(sessionID, stream string, data []byte, seq uint64) error {
-	return c.conn.Send(&memqlv1.WorkerClientMessage{
+	return c.Send(&memqlv1.WorkerClientMessage{
 		Payload: &memqlv1.WorkerClientMessage_AppSessionChunk{
 			AppSessionChunk: &memqlv1.AppSessionChunk{
 				SessionId: sessionID,
@@ -329,7 +408,7 @@ func (c *Connection) SendAppSessionChunk(sessionID, stream string, data []byte, 
 
 // SendAppSessionEnd closes an app session on the wire.
 func (c *Connection) SendAppSessionEnd(end *memqlv1.AppSessionEnd) error {
-	return c.conn.Send(&memqlv1.WorkerClientMessage{
+	return c.Send(&memqlv1.WorkerClientMessage{
 		Payload: &memqlv1.WorkerClientMessage_AppSessionEnd{AppSessionEnd: end},
 	})
 }
@@ -341,7 +420,7 @@ func (c *Connection) SendAppSessionEnd(end *memqlv1.AppSessionEnd) error {
 // a renumbering here would open a gap in the generation that no later
 // reader could detect.
 func (c *Connection) SendModelCallDelta(requestID string, seq uint64, content string, keepalive bool) error {
-	return c.conn.Send(&memqlv1.WorkerClientMessage{
+	return c.Send(&memqlv1.WorkerClientMessage{
 		Payload: &memqlv1.WorkerClientMessage_ModelCallDelta{
 			ModelCallDelta: &memqlv1.ModelCallDelta{
 				RequestId: requestID,
@@ -355,7 +434,7 @@ func (c *Connection) SendModelCallDelta(requestID string, seq uint64, content st
 
 // SendModelCallEnd closes a model call on the wire.
 func (c *Connection) SendModelCallEnd(end *memqlv1.ModelCallEnd) error {
-	return c.conn.Send(&memqlv1.WorkerClientMessage{
+	return c.Send(&memqlv1.WorkerClientMessage{
 		Payload: &memqlv1.WorkerClientMessage_ModelCallEnd{ModelCallEnd: end},
 	})
 }
@@ -368,17 +447,42 @@ func (c *Connection) SendToolResult(callId string, success *memqlv1.Success, fai
 	} else if failure != nil {
 		res.Payload = &memqlv1.ToolResult_Failure{Failure: failure}
 	}
-	return c.conn.Send(&memqlv1.WorkerClientMessage{
+	return c.Send(&memqlv1.WorkerClientMessage{
 		Payload: &memqlv1.WorkerClientMessage_ToolResult{ToolResult: res},
 	})
 }
 
-// Close terminates the stream and the underlying SDK connection.
+// Close ends the stream and the underlying SDK connection.
+//
+// GRACEFULLY WHEN IT CAN: the SDK takes CloseSend under its send lock, so
+// the cluster reads a clean end of the stream rather than a reset -- and
+// that half-close waits for a Send already in flight. A Send blocked on
+// flow control, behind a cluster that is alive but has stopped reading
+// this stream, would hold it for as long as the cluster stays that way:
+// keepalive never fires for a peer that still acks pings. So the wait is
+// bounded by closeGrace, and past it the stream's own context is
+// cancelled, which ends that Send and lets the close finish. The context
+// is cancelled on the way out regardless, so it is never leaked.
 func (c *Connection) Close() {
 	if c == nil || c.conn == nil {
 		return
 	}
-	c.conn.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.conn.Close()
+	}()
+	select {
+	case <-done:
+	case <-time.After(closeGrace):
+		if c.cancel != nil {
+			c.cancel()
+		}
+		<-done
+	}
+	if c.cancel != nil {
+		c.cancel()
+	}
 }
 
 // SetVersion tells the worker which version to register as.

@@ -234,6 +234,49 @@ else
     fail "write_worker_yaml should refresh same cluster_url without --force when ids differ"
 fi
 
+# The same cluster spelled another way (an explicit :443, a trailing
+# slash, capitals) is the SAME home: refreshed in place, never a second
+# entry (memql-cockpit#433 -- two enabled homes on one cluster open one
+# stream between them, and the token just issued must be the one that
+# connects).
+_hostmatch="$(mktemp -d)/worker.yaml"
+_hostmatch_workers="$(dirname "$_hostmatch")/workers.yaml"
+cat > "$_hostmatch_workers" << 'WY'
+version: 1
+worker_name: host1
+state_dir: /tmp/x
+log_level: info
+capabilities:
+  - HEADLESS
+homes:
+  - id: local
+    cluster_url: https://api.example.com
+    token: mql_wkr_old_bbbbbbbbbbbbbb
+    enabled: true
+  - id: other
+    cluster_url: https://api.other.example
+    token: mql_wkr_oth_bbbbbbbbbbbbbb
+    enabled: true
+WY
+expect_eq "find_home_id_by_cluster_url matches the same host on another port" \
+    "$(find_home_id_by_cluster_url "$_hostmatch_workers" "https://API.example.com:443/")" "local"
+expect_eq "find_home_id_by_cluster_url prefers the exact URL" \
+    "$(find_home_id_by_cluster_url "$_hostmatch_workers" "https://api.other.example")" "other"
+expect_eq "find_home_id_by_cluster_url finds nothing for another cluster" \
+    "$(find_home_id_by_cluster_url "$_hostmatch_workers" "https://api.third.example")" ""
+if write_worker_yaml "$_hostmatch" "https://api.example.com:443" "mql_wkr_new_cccccccccccccc" "host1" "no" "HEADLESS" >/dev/null 2>&1; then
+    if [[ "$(grep -c 'cluster_url: https://api.example.com' "$_hostmatch_workers")" == "1" ]] &&
+        grep -q 'id: local' "$_hostmatch_workers" && grep -q 'mql_wkr_new_cccccccccccccc' "$_hostmatch_workers" &&
+        ! grep -q 'mql_wkr_old_bbbbbbbbbbbbbb' "$_hostmatch_workers"; then
+        pass "write_worker_yaml refreshes the same host on another port in place"
+    else
+        fail "write_worker_yaml appended a second home for the same host"
+        cat "$_hostmatch_workers" >&2
+    fi
+else
+    fail "write_worker_yaml should refresh the same host without --force"
+fi
+
 # Same id + different cluster_url still requires --force.
 _remap="$(mktemp -d)/worker.yaml"
 _remap_workers="$(dirname "$_remap")/workers.yaml"
@@ -307,8 +350,17 @@ printf '%s\n' '#!/bin/sh' 'echo "memql 0.12.1 (headless)"' > "$_verdir/memql-sam
 chmod +x "$_verdir/memql-same"
 expect_eq "read_binary_version" "$(read_binary_version "$_verdir/memql-same")" "0.12.1"
 
-# resolve_target_version from download-base tag path
-expect_eq "resolve_target_version from download-base"     "$(resolve_target_version 'https://github.com/znasllc-io/memql-cockpit/releases/download/v0.12.1')"     "0.12.1"
+# resolve_target_version from download-base tag path. Run from a copy of
+# lib.sh with no VERSION file beside it: in a repository checkout the
+# sibling VERSION wins over the URL (as it should for a cloned-repo
+# install), so asserting the URL path there only ever passed while
+# VERSION happened to say 0.12.1.
+_rtv="$(mktemp -d)"
+mkdir -p "$_rtv/a/b"
+cp "$(dirname "$0")/lib.sh" "$_rtv/a/b/lib.sh"
+expect_eq "resolve_target_version from download-base" \
+    "$(cd "$_rtv" && bash -c 'source ./a/b/lib.sh >/dev/null 2>&1; resolve_target_version "https://github.com/znasllc-io/memql-cockpit/releases/download/v0.12.1"')" \
+    "0.12.1"
 
 # Second upsert must preserve Go-tuned shared header knobs (concurrency,
 # labels, worker_name, state_dir, log_level), not rebuild them from

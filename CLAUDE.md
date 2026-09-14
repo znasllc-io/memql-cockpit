@@ -680,6 +680,94 @@ records describe, at field numbers DELIBERATELY not the ones they
 illustrate, and runs the real decode against it; that is the only way to
 test a wire this repository cannot yet see.
 
+## The stream, hardened (epic memql-cockpit#425)
+
+One worker process holds one `WorkerService.Stream` per enrolled cluster, and
+this is what keeps those streams honest. The findings are the cockpit half of
+the 2026-09-13 connection-layer audit (a comment on znasllc-io/memql#5327);
+the engine half is epic memql#5327. There is no separate design record.
+
+**EVERY WRITE REACHES THE SDK'S LOCK THROUGH ONE SEAM.** grpc-go forbids
+`SendMsg` from two goroutines on one stream, and this worker writes from the
+heartbeat, the recv loop (Pong), every tool dispatch, every model call's
+deltas, every pull and every app session at once. The lock lives in
+`sdk/go/worker.Connection.Send` (memql#5351, which also deleted the raw
+`Stream()` accessor); `Connection.Send` in `connect.go` is the ONLY call to it
+here, and `TestEveryWorkerWriteGoesThroughConnectionSend` walks every Go file
+to keep it that way. Do not add a lock in the cockpit "to be safe" -- it
+protects nothing the SDK's does not -- and do not call the SDK connection
+from anywhere else. CI runs the suite under `-race`.
+
+**A WORKER-SIDE REFUSAL IS A FAILED CALL.** At the current pin the engine
+treats any error a worker ends a model call with as the call having run, and
+does not try another machine. So nothing here refuses a call to make itself
+convenient: the model ceiling WAITS, and a consent withdrawal waits for idle
+rather than refusing its way there. Revisit both once the engine reroutes a
+refusal made before start.
+
+**A REFUSAL BY THE CLUSTER IS NOT A BLIP, AND NOT A REASON TO DISABLE A
+HOME.** Unauthenticated, or the engine's exact sentences for an inactive or
+expired token or a revoked registration, get a HOLD once the cluster has
+refused at least three times IN A ROW (an unreachable attempt starts the
+count over) AND for at least 30 seconds: one error line, a
+retry every minute doubling to fifteen, the `worker_home_refused` gauge, and
+`<home state dir>/refused.json`, which `memql worker config` prints
+(`refusal.go`). The engine maps EVERY token lookup failure to "invalid worker
+token", so a database blip during a deploy looks exactly like a revocation
+from here -- which is why the grace exists and why nothing writes `enabled:
+false`. The first accepted handshake ends all of it. A Send that answers
+io.EOF during the handshake is followed by a Recv, because grpc only reports
+the real status there; without it a refused token read as "send: EOF".
+
+**THE BACKOFF RESETS ONLY FOR A STREAM THAT PROVED ITSELF** -- one heartbeat
+sent. A cluster that accepts Register and drops the stream used to be asked
+again every second, each time a full Register and a hardware scan.
+
+**THE CONSENT IS PART OF THE ADVERTISEMENT.** `inference.serve` rides
+Register's descriptor and nothing else, so a changed consent re-registers
+(`Connection.AdvertisedServe` beside `ModelFingerprint`). A WITHDRAWAL skips
+the two-minute floor; if work is in flight it waits, re-checking every
+second instead of every minute, and re-registers at the first idle second.
+It never cuts work short and never refuses a call to get there (see above).
+Restoring the consent before it lands ends the wait. The heartbeat goroutine
+is joined before `runStream` returns, so a stale one can never act on the
+next stream's state. Each stream is opened on its own context, and
+`Connection.Close` cancels it if the graceful half-close is still stuck
+after `closeGrace` -- a Send blocked behind a cluster that stopped reading
+would otherwise hold it indefinitely, since such a peer still acks
+keepalive pings.
+
+**THE WORKERS FILE IS THE WHOLE TRUTH ONCE IT EXISTS.** `worker run` reads
+`worker.yaml` as a home only on a machine that has never had a
+`workers.yaml` (`decideRunMode`). `syncLegacyMirror` keeps the legacy mirror
+naming an enabled home with its current token, or deletes it -- on every
+`unpair` and at every `worker run` start, so a token an older unpair left
+behind does not stay on disk. It touches ONLY the mirror, the `worker.yaml`
+beside `workers.yaml` (`isMirrorOf`): a `--config` anywhere else is a file
+a person wrote. A registry with nothing enabled makes the
+worker wait, connected to nothing: at a terminal it says so and exits; under
+the LaunchAgent or the user unit it says so once and waits (a SIGHUP does not
+end the wait), because both restart a worker that exits.
+
+**ONE MACHINE ID, AT THE STATE ROOT.** `machineStateRoot` maps a per-home
+state dir (`<root>/homes/<id>`, which the legacy mirror carries too) to
+`<root>`, where `machine-id` lives; the fleet resolves it once before any home
+connects, resolution is serialized in-process, and a per-home id from an
+earlier build is ADOPTED, not replaced.
+
+**PER CLUSTER: CONSENT, METRICS, STREAMS. PER MACHINE: THE MODEL CEILING.**
+`consent.Homes` holds one window per home and each home's dispatcher asks its
+own; `consent revoke` with no `--cluster` closes every window. Every
+per-stream metric carries `home`, and each home's series exist from startup.
+Two enabled homes on one cluster open ONE stream (`runnableHomes`: the later
+entry, which holds the newer token); the file stays valid so pair and unpair
+still work on it, and the installer matches clusters by host as Go does so it
+no longer produces one. The model concurrency ceiling is one
+`modelcall.Limiter` shared by every home -- a semaphore: a call that finds
+the machine full waits, with keepalives, for up to its own idle ceiling.
+`Fleet.Run` builds every home before it starts any, and joins every
+goroutine it starts.
+
 ## Worker + auth notes
 
 - **Enrollment:** `memql cluster add <domain>` fetches
@@ -691,6 +779,10 @@ test a wire this repository cannot yet see.
 - **Services:** macOS LaunchAgent label `com.znasllc.memql-worker`; Linux
   user-systemd `memql-worker.service`. Installers retire the pre-rename
   `memql-cockpit-worker` agent/unit and binaries in place.
+- **Unpairing:** `memql worker unpair --cluster <id>` removes (or
+  `--disable`s) one home and keeps the legacy mirror honest; the running
+  worker keeps that stream until it restarts, and the command prints the
+  restart for the platform.
 - **Credential stores:** OS keyring preferred, file fallback
   (`~/.memql/credentials/`, 0600). `MEMQL_COCKPIT_CRED_STORE` forces one.
   The keyring service name stays `com.znasllc.memql-cockpit` on purpose —

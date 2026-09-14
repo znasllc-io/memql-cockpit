@@ -387,6 +387,14 @@ stream that is already open. Both kinds: `chat` and `embedding`.
   — from the same numbers the registration advertises. The engine rations too,
   but the advertisement is a claim about this hardware and two replicas
   selecting at the same moment is an ordinary race.
+- **The ceilings are the whole machine's, not each cluster's.** A machine
+  paired with two clusters advertises the same numbers to both, and the calls
+  of both count against one ceiling — two clusters cannot each drive the full
+  cap at once and run the GPU at twice what it said it could. A call that
+  finds the machine full **waits** for a slot, sending keepalives so the
+  cluster knows it is alive, for up to its own idle ceiling (90 seconds by
+  default) — as long as a call queued inside the runtime could have waited
+  — and only then ends with `model_concurrency_exceeded`.
 
 A refusal names its own fix: `model_not_offered`,
 `model_concurrency_exceeded`, `schema_unsupported`, `unsupported_kind`,
@@ -583,10 +591,32 @@ owner's behalf — the same rule that keeps `sharedInference` off the cockpit
 entirely.
 
 An unrecognised value is `owner`: not an error and not the grant. A typo must
-not widen a permission, and it must not stop a worker starting either. The
-field is re-read on `SIGHUP`, logged when it changes, and **takes effect on
-the next reconnect** — no reconnect is forced for it, because a reconnect
-abandons a running generation and this field steers no call already in flight.
+not widen a permission, and it must not stop a worker starting either.
+
+**A change re-registers every cluster stream.** The consent travels in the
+registration and nowhere else, so the worker re-registers to carry it — the
+field is re-read on `SIGHUP` (which `memql worker models --allow` and the
+inference setup send for you), and the reconnect it takes never cuts short
+work in flight:
+
+- **Granting** (`owner` → `cluster`) re-registers as soon as the worker is
+  idle, like a changed model set.
+- **Withdrawing** (`cluster` → `owner`) is the urgent direction — until the
+  cluster sees it, other people's prompts keep arriving. It skips the
+  two-minute floor, and if calls are running it checks every second and
+  re-registers at the first moment nothing is running. It does not refuse
+  new calls to get there sooner: the cluster does not yet send a refused
+  call to another machine — it fails it — so a machine kept busy without a
+  break (a long app session, a pull, back-to-back calls) is routed to until
+  that break comes. Restoring the consent before then needs no reconnect at
+  all.
+
+The log says which is happening:
+
+```
+inference.serve no longer shares this machine with the cluster; re-registering at the first moment nothing is running
+inference.serve withdrew this machine from the cluster; reconnecting so the cluster stops routing other people's calls here
+```
 
 ---
 
