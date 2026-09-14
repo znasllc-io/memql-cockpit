@@ -200,12 +200,19 @@ type Options struct {
 	// drives and the harness word the registration advertised come from
 	// one cache and cannot be a probe apart.
 	Detector *apps.Detector
+	// ToolVersions reports the developer tools the session fingerprint
+	// lists. Nil probes this machine (fingerprint.go); tests set it, so a
+	// session test does not fork every compiler on the machine running it.
+	ToolVersions func(ctx context.Context) []harness.ToolVersion
 }
 
 // Manager owns every live session on this machine.
 type Manager struct {
 	opts   Options
 	logger *slog.Logger
+	// tools is the fingerprint's toolchain probe, shared by every session
+	// so its cache is too.
+	tools *toolchain
 
 	mu       sync.Mutex
 	sessions map[string]*session
@@ -224,7 +231,7 @@ func NewManager(opts Options) *Manager {
 	if opts.Detector == nil {
 		opts.Detector = &apps.Detector{}
 	}
-	m := &Manager{opts: opts, logger: logger, sessions: map[string]*session{}}
+	m := &Manager{opts: opts, logger: logger, sessions: map[string]*session{}, tools: newToolchain()}
 	if swept := Sweep(opts.StateDir); swept > 0 {
 		// Worth a line at boot: it means a previous process died with a
 		// live session, and a bearer sat on disk until now.
@@ -327,6 +334,15 @@ func (m *Manager) Live() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return len(m.sessions)
+}
+
+// toolVersions is the fingerprint's toolchain: Options.ToolVersions when
+// a caller supplied one, this machine's probe otherwise.
+func (m *Manager) toolVersions(ctx context.Context) []harness.ToolVersion {
+	if m.opts.ToolVersions != nil {
+		return m.opts.ToolVersions(ctx)
+	}
+	return m.tools.versions(ctx)
 }
 
 func (m *Manager) forget(id string) {
@@ -498,6 +514,11 @@ func (s *session) execute(ctx context.Context) (int, error) {
 	// run PRODUCED, not everything already in the directory.
 	before := snapshotWorkspace(workspace)
 	s.before = before
+
+	// THE FINGERPRINT IS THE SESSION'S FIRST EVENT (fingerprint.go): the
+	// world as the app is about to find it -- inputs landed, scaffolding
+	// written and left out -- sent before any kind starts anything.
+	s.sendFingerprint(ctx, spec, workspace)
 
 	switch s.start.GetKind() {
 	case KindOpen:
@@ -680,11 +701,17 @@ func (s *session) pullInputs(ctx context.Context, workspace string) error {
 	s.mu.Unlock()
 
 	for _, id := range inputs {
-		if _, err := library.Pull(ctx, id, workspace); err != nil {
+		path, err := library.Pull(ctx, id, workspace)
+		if err != nil {
 			// Name the id that failed. "an input could not be fetched"
 			// sends whoever reads this to check all of them.
 			return err
 		}
+		// Where it landed, for the fingerprint's digest of what the app
+		// was handed.
+		s.mu.Lock()
+		s.pulled = append(s.pulled, pulledInput{artifact: id, path: path})
+		s.mu.Unlock()
 	}
 	s.logger.Info("app session inputs landed", "count", len(inputs))
 	return nil

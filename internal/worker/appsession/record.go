@@ -294,9 +294,3 @@ func within(root, path string) bool {
 	}
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
-
-// pulledInput is one Library input and where it landed.
-type pulledInput struct {
-	artifact string
-	path     string
-}

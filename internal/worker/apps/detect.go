@@ -219,6 +219,24 @@ func (d *Detector) ResolveSpec(ctx context.Context, id string) (Spec, bool) {
 	return d.resolveHarness(ctx, spec, path), true
 }
 
+// Version returns the app's own version string, as Detect reports it and
+// from the same cache, or "" when the app is not on PATH or would not say.
+//
+// The session fingerprint asks this, so the version it records and the
+// version the registration advertised are one probe's answer rather than
+// two that could disagree.
+func (d *Detector) Version(ctx context.Context, id string) string {
+	spec, ok := SpecFor(strings.TrimSpace(id))
+	if !ok {
+		return ""
+	}
+	path, err := d.lookPath(spec.Binary)
+	if err != nil || strings.TrimSpace(path) == "" {
+		return ""
+	}
+	return Truncate(d.version(ctx, spec, path))
+}
+
 // resolveHarness returns spec with its harness fields settled for the
 // binary at path.
 //

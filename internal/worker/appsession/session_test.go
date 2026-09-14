@@ -20,6 +20,7 @@ import (
 	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 
 	"github.com/znasllc-io/memql-cockpit/internal/worker/apps"
+	"github.com/znasllc-io/memql-cockpit/internal/worker/harness"
 )
 
 // --- the test rig ----------------------------------------------------
@@ -242,9 +243,22 @@ func newRig(t *testing.T, allow ...string) *rig {
 		LibraryBase: lib.server.URL,
 		HTTPClient:  lib.server.Client(),
 		Allowed:     func(id string) bool { return allowed[id] },
+		// The fingerprint asks the app for its version and the machine for
+		// its tools. Neither is asked for real here: several fake apps fork
+		// a grandchild on EVERY invocation, and a session test must not
+		// run every compiler on the machine running it.
+		Detector: &apps.Detector{RunVersion: func(context.Context, string, []string) (string, error) {
+			return rigAppVersion, nil
+		}},
+		ToolVersions: func(context.Context) []harness.ToolVersion { return rigTools },
 	})
 	return h
 }
+
+// The rig's fixed answers for the fingerprint's app version and tools.
+const rigAppVersion = "9.9.9 (rig)"
+
+var rigTools = []harness.ToolVersion{{Name: "git", Version: "git version 2.43.0"}}
 
 func (h *rig) start(t *testing.T, mutate func(*memqlv1.AppSessionStart)) *memqlv1.AppSessionEnd {
 	t.Helper()
