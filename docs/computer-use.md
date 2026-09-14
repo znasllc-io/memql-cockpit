@@ -483,12 +483,31 @@ The worker exposes a local control socket (`~/.memql/worker.sock`,
 mode 0600; override with `MEMQL_WORKER_CONSENT_SOCKET`):
 
 ```bash
-memql worker consent grant --window=1h [--strict]  # open a window
-memql worker consent revoke                        # close immediately
-memql worker consent status                        # show current state
-memql worker consent watch                         # live event tail
+memql worker consent grant --window=1h [--strict] [--cluster <id>]  # open a window
+memql worker consent revoke [--cluster <id>]                        # close immediately
+memql worker consent status [--cluster <id>]                        # show current state
+memql worker consent watch [--cluster <id>]                         # live event tail
 ```
 
+- **Consent is per cluster.** A machine paired with more than one cluster
+  holds a separate window for each: a window opened while you work with one
+  cluster admits nothing another cluster dispatches. `--cluster` takes the
+  home id `memql worker config` shows. On a machine that serves one cluster
+  it can be left off; on one that serves several, a grant without it is
+  refused with the exact command for each cluster, and `status` shows every
+  cluster in one table:
+
+  ```
+  Consent is per cluster. This machine serves 2:
+
+    CLUSTER      CONSENT       EXPIRES    REMAINING   STRICT
+    local        not granted
+    production   GRANTED       14:40:00   40m         off
+  ```
+
+- **`revoke` without `--cluster` closes every window** — the kill switch
+  never asks which. With `--cluster` it closes that one and says which
+  others are still open.
 - A second `grant` overwrites the active window (most recent decision
   wins). `revoke` also denies every pending strict-mode approval.
 - **Strict mode** (`--strict`): flags the window for per-call
@@ -514,7 +533,7 @@ worker.
 
 | Error code | Cause | Fix |
 |---|---|---|
-| `consent_required` | No active consent window on the worker host (or the window expired). | On the worker host: `memql worker consent grant --window=<duration>`. |
+| `consent_required` | No active consent window on the worker host for the cluster that dispatched the call (or the window expired). | On the worker host: `memql worker consent grant --window=<duration>` -- with `--cluster <id>` when the machine serves more than one cluster; the error message names the exact command. |
 | `permission_denied` | macOS TCC grant missing or revoked: Accessibility (input actions) or Screen Recording (screenshot). Checked per call, so mid-session revocation surfaces immediately. | System Settings -> Privacy & Security -> Accessibility / Screen Recording: enable `memql` (the binary itself, not just Terminal, for LaunchAgent use). Re-run `memql worker setup` to verify. |
 | `display_server_unsupported` | Linux session is Wayland (`WAYLAND_DISPLAY`/`XDG_SESSION_TYPE` -- wins even when `DISPLAY` is set) or has no display server at all; RobotGo drives X11 only. | Log into an X11 (Xorg) session, or register the worker HEADLESS-only (`install-linux.sh` does this automatically on Wayland). |
 | `out_of_bounds` | Coordinates outside the emitted screenshot rect, or the mapped logical point falls in a gap between displays (union-of-rects validation). The message names the valid rect(s). | Take a fresh default-policy `screenshot` of the target display and derive coordinates from THAT image; pass the same `display` arg on the mouse action. Don't target dead zones between monitors. |
