@@ -62,8 +62,13 @@ func jsonType(v any) string {
 // decodeValue decodes exactly one JSON value, numbers kept as written. It
 // reports false for anything else, including a value with more text
 // behind it -- "1 2" is not JSON, whatever a lenient reader makes of it.
+//
+// Only JSON's own whitespace is trimmed. bytes.TrimSpace would also strip
+// a vertical tab or a form feed, and "0\v" would then be typed a number
+// although it is not JSON at all (FuzzResultShapeIsClosed found that one;
+// its reproducer is under testdata/fuzz).
 func decodeValue(raw json.RawMessage) (any, bool) {
-	trimmed := bytes.TrimSpace(raw)
+	trimmed := bytes.Trim(raw, jsonWhitespace)
 	if len(trimmed) == 0 {
 		return nil, false
 	}
@@ -78,6 +83,9 @@ func decodeValue(raw json.RawMessage) (any, bool) {
 	}
 	return v, true
 }
+
+// jsonWhitespace is the whitespace RFC 8259 allows around a value.
+const jsonWhitespace = " \t\n\r"
 
 // decodeTolerant decodes raw into v and keeps every field that decoded
 // when one did not. A field whose TYPE changed in a later app release is

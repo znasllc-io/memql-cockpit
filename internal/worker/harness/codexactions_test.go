@@ -1,0 +1,376 @@
+package harness
+
+import (
+	"context"
+	"encoding/json"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+)
+
+// codexactions_test.go drives both Codex clients against recorded tool
+// traffic and asserts the recording, then holds the two apps to one shape.
+//
+// codexTurnRecorded was CAPTURED from codex-cli 0.153.4 on 2026-09-13:
+// `codex app-server -c 'mcp_servers.echo...'` driven through initialize,
+// thread/start {cwd, approvalPolicy: never} and one turn/start asking for
+// the same six steps the Claude Code fixture took. Codex read notes.txt
+// with `cat`, wrote out.txt with `printf` and edited it with `sed -i` --
+// shell commands, all of them, which is exactly why its reads are found
+// through its own command parse. Item lines are as printed with the
+// workspace path shortened to /w; the account, rate-limit, MCP-startup and
+// token-usage notifications are dropped. The fake answers with the lines
+// verbatim through a quoted heredoc, so no shell ever rewrites them.
+const codexTurnRecorded = `
+printf '{"jsonrpc":"2.0","id":%s,"result":{"turn":{"id":"turn_rec","items":[],"itemsView":"notLoaded","status":"inProgress","error":null,"startedAt":null,"completedAt":null,"durationMs":null}}}\n' "$id"
+cat <<'CODEX_JSON'
+{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"THREAD","turnId":"turn_rec","startedAtMs":1789365994259,"item":{"type":"commandExecution","id":"exec-b77282f9-db64-4899-96a4-18794035bba6","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc 'cat notes.txt'","cwd":"/w","processId":"97104","source":"unifiedExecStartup","status":"inProgress","commandActions":[{"type":"read","command":"cat notes.txt","name":"notes.txt","path":"/w/notes.txt"}],"aggregatedOutput":null,"exitCode":null,"durationMs":null}}}
+{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"THREAD","turnId":"turn_rec","completedAtMs":1789365994259,"item":{"type":"commandExecution","id":"exec-b77282f9-db64-4899-96a4-18794035bba6","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc 'cat notes.txt'","cwd":"/w","processId":"97104","source":"unifiedExecStartup","status":"completed","commandActions":[{"type":"read","command":"cat notes.txt","name":"notes.txt","path":"/w/notes.txt"}],"aggregatedOutput":"alpha\nbeta\n","exitCode":0,"durationMs":0}}}
+{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"THREAD","turnId":"turn_rec","startedAtMs":1789365996388,"item":{"type":"commandExecution","id":"exec-02337035-bc20-401a-a4e4-630a60d68442","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc 'ls -1'","cwd":"/w","processId":"97074","source":"unifiedExecStartup","status":"inProgress","commandActions":[{"type":"listFiles","command":"ls -1","path":null}],"aggregatedOutput":null,"exitCode":null,"durationMs":null}}}
+{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"THREAD","turnId":"turn_rec","completedAtMs":1789365996388,"item":{"type":"commandExecution","id":"exec-02337035-bc20-401a-a4e4-630a60d68442","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc 'ls -1'","cwd":"/w","processId":"97074","source":"unifiedExecStartup","status":"completed","commandActions":[{"type":"listFiles","command":"ls -1","path":null}],"aggregatedOutput":"notes.txt\n","exitCode":0,"durationMs":0}}}
+{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"THREAD","turnId":"turn_rec","startedAtMs":1789365998809,"item":{"type":"commandExecution","id":"exec-d8855f30-ddea-4313-a829-8f981ca16799","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc \"sh -c 'echo oops >&2; exit 3'\"","cwd":"/w","processId":"39845","source":"unifiedExecStartup","status":"inProgress","commandActions":[{"type":"unknown","command":"sh -c 'echo oops >&2; exit 3'"}],"aggregatedOutput":null,"exitCode":null,"durationMs":null}}}
+{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"THREAD","turnId":"turn_rec","completedAtMs":1789365998809,"item":{"type":"commandExecution","id":"exec-d8855f30-ddea-4313-a829-8f981ca16799","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc \"sh -c 'echo oops >&2; exit 3'\"","cwd":"/w","processId":"39845","source":"unifiedExecStartup","status":"failed","commandActions":[{"type":"unknown","command":"sh -c 'echo oops >&2; exit 3'"}],"aggregatedOutput":"oops\n","exitCode":3,"durationMs":0}}}
+{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"THREAD","turnId":"turn_rec","startedAtMs":1789366001388,"item":{"type":"commandExecution","id":"exec-a9bda5da-698f-4906-ae4c-a5eba582397d","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc \"printf 'hello\\\\n' > out.txt\"","cwd":"/w","processId":"68520","source":"unifiedExecStartup","status":"inProgress","commandActions":[{"type":"unknown","command":"printf 'hello\\n' > out.txt"}],"aggregatedOutput":null,"exitCode":null,"durationMs":null}}}
+{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"THREAD","turnId":"turn_rec","completedAtMs":1789366001388,"item":{"type":"commandExecution","id":"exec-a9bda5da-698f-4906-ae4c-a5eba582397d","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc \"printf 'hello\\\\n' > out.txt\"","cwd":"/w","processId":"68520","source":"unifiedExecStartup","status":"completed","commandActions":[{"type":"unknown","command":"printf 'hello\\n' > out.txt"}],"aggregatedOutput":null,"exitCode":0,"durationMs":0}}}
+{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"THREAD","turnId":"turn_rec","startedAtMs":1789366004490,"item":{"type":"commandExecution","id":"exec-c4568bae-9956-48d6-9e08-8445424f7bfd","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc \"sed -i 's/hello/goodbye/' out.txt\"","cwd":"/w","processId":"67768","source":"unifiedExecStartup","status":"inProgress","commandActions":[{"type":"unknown","command":"sed -i 's/hello/goodbye/' out.txt"}],"aggregatedOutput":null,"exitCode":null,"durationMs":null}}}
+{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"THREAD","turnId":"turn_rec","completedAtMs":1789366004491,"item":{"type":"commandExecution","id":"exec-c4568bae-9956-48d6-9e08-8445424f7bfd","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc \"sed -i 's/hello/goodbye/' out.txt\"","cwd":"/w","processId":"67768","source":"unifiedExecStartup","status":"completed","commandActions":[{"type":"unknown","command":"sed -i 's/hello/goodbye/' out.txt"}],"aggregatedOutput":null,"exitCode":0,"durationMs":0}}}
+{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"THREAD","turnId":"turn_rec","startedAtMs":1789366009184,"item":{"type":"mcpToolCall","id":"exec-6df80e5a-51b0-4d75-aa52-79e22177519a","server":"echo","tool":"echo","status":"inProgress","arguments":{"text":"ping"},"appContext":null,"pluginId":null,"readOnlyHint":null,"result":null,"error":null,"durationMs":null}}}
+{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"THREAD","turnId":"turn_rec","completedAtMs":1789366009187,"item":{"type":"mcpToolCall","id":"exec-6df80e5a-51b0-4d75-aa52-79e22177519a","server":"echo","tool":"echo","status":"completed","arguments":{"text":"ping"},"appContext":null,"pluginId":null,"readOnlyHint":null,"result":{"content":[{"type":"text","text":"echo: ping"}],"structuredContent":null,"_meta":null},"error":null,"durationMs":2}}}
+{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"THREAD","turnId":"turn_rec","completedAtMs":1789366011232,"item":{"type":"agentMessage","id":"msg_0bf177e203eb66a2016aa78efb1d3087d0a97f0552752a34a9","text":"done","phase":"final_answer","memoryCitation":null,"delivery":null,"questions":null}}}
+{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"THREAD","turn":{"id":"turn_rec","items":[],"itemsView":"notLoaded","status":"completed","error":null,"startedAt":1789365989,"completedAt":1789366011,"durationMs":21513}}}
+CODEX_JSON
+`
+
+// codexTurnFileChange is a fileChange item in the v2 ThreadItem shape
+// (codex-cli 0.153.4 generate-ts: {type, id, changes: [{path, kind, diff}],
+// status}). The recorded turn has none -- that Codex wrote with the shell
+// -- so this one is BUILT from the type rather than captured, and says so.
+const codexTurnFileChange = `
+printf '{"jsonrpc":"2.0","id":%s,"result":{"turn":{"id":"turn_fc","items":[],"itemsView":"notLoaded","status":"inProgress","error":null,"startedAt":null,"completedAt":null,"durationMs":null}}}\n' "$id"
+cat <<'CODEX_JSON'
+{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"THREAD","turnId":"turn_fc","startedAtMs":1,"item":{"type":"fileChange","id":"call_patch","changes":[{"path":"/w/out.txt","kind":{"type":"add"},"diff":"hello\n"}],"status":"inProgress"}}}
+{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"THREAD","turnId":"turn_fc","completedAtMs":2,"item":{"type":"fileChange","id":"call_patch","changes":[{"path":"/w/out.txt","kind":{"type":"add"},"diff":"hello\n"},{"path":"/w/old.txt","kind":{"type":"delete"},"diff":""},{"path":"/w/a.txt","kind":{"type":"update","move_path":"/w/b.txt"},"diff":"@@"},{"path":"rel.txt","kind":{"type":"update","move_path":null},"diff":"@@"}],"status":"completed"}}}
+{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"THREAD","turnId":"turn_fc","completedAtMs":3,"item":{"type":"fileChange","id":"call_refused","changes":[{"path":"/w/nope.txt","kind":{"type":"add"},"diff":"x"}],"status":"declined"}}}
+{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"THREAD","turnId":"turn_fc","completedAtMs":4,"item":{"type":"agentMessage","id":"msg_fc","text":"done","phase":"final_answer","memoryCitation":null,"delivery":null,"questions":null}}}
+{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"THREAD","turn":{"id":"turn_fc","items":[],"itemsView":"notLoaded","status":"completed","error":null,"startedAt":1,"completedAt":2,"durationMs":1}}}
+CODEX_JSON
+`
+
+// codexTurnLeavesACallOpen starts a command and ends the turn interrupted
+// before the command completes.
+const codexTurnLeavesACallOpen = `
+printf '{"jsonrpc":"2.0","id":%s,"result":{"turn":{"id":"turn_open","items":[],"itemsView":"notLoaded","status":"inProgress","error":null,"startedAt":null,"completedAt":null,"durationMs":null}}}\n' "$id"
+cat <<'CODEX_JSON'
+{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"THREAD","turnId":"turn_open","startedAtMs":1,"item":{"type":"commandExecution","id":"exec-open","command":"/bin/bash -lc 'sleep 60'","cwd":"/w","processId":null,"source":"agent","status":"inProgress","commandActions":[{"type":"unknown","command":"sleep 60"}],"aggregatedOutput":null,"exitCode":null,"durationMs":null}}}
+{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"THREAD","turn":{"id":"turn_open","items":[],"itemsView":"notLoaded","status":"interrupted","error":null,"startedAt":1,"completedAt":2,"durationMs":1}}}
+CODEX_JSON
+`
+
+// codexMCPToolRecorded is the fallback's core events for the same calls,
+// in the field spellings of codex-rs/protocol/src/protocol.rs at
+// rust-v0.153.4 (ExecCommandBeginEvent / EndEvent, PatchApplyBeginEvent /
+// EndEvent, McpToolCallBeginEvent / EndEvent, ViewImageToolCallEvent),
+// with the cwd and image path as the file:// URLs PathUri serialises to.
+// The patch_apply_end carries no `changes` -- the field is
+// `#[serde(default)]`, and an older Codex does not send it -- and the
+// last command never ends.
+const codexMCPToolRecorded = `
+cat <<'CODEX_JSON'
+{"jsonrpc":"2.0","method":"codex/event","params":{"id":"sub_1","msg":{"type":"exec_command_begin","call_id":"call_exec","turn_id":"turn_1","command":["bash","-lc","cat notes.txt"],"cwd":"file:///w","parsed_cmd":[{"type":"read","cmd":"cat notes.txt","name":"notes.txt","path":"/w/notes.txt"}],"source":"agent"},"_meta":{"requestId":1}}}
+{"jsonrpc":"2.0","method":"codex/event","params":{"id":"sub_1","msg":{"type":"exec_command_end","call_id":"call_exec","turn_id":"turn_1","command":["bash","-lc","cat notes.txt"],"cwd":"file:///w","parsed_cmd":[{"type":"read","cmd":"cat notes.txt","name":"notes.txt","path":"/w/notes.txt"}],"source":"agent","stdout":"alpha\nbeta\n","stderr":"","aggregated_output":"alpha\nbeta\n","exit_code":0,"duration":{"secs":0,"nanos":1000000},"formatted_output":"alpha\nbeta\n","status":"completed"},"_meta":{"requestId":1}}}
+{"jsonrpc":"2.0","method":"codex/event","params":{"id":"sub_1","msg":{"type":"exec_command_begin","call_id":"call_fail","turn_id":"turn_1","command":["bash","-lc","sh -c 'echo oops >&2; exit 3'"],"cwd":"file:///w","parsed_cmd":[{"type":"unknown","cmd":"sh -c 'echo oops >&2; exit 3'"}],"source":"agent"},"_meta":{"requestId":1}}}
+{"jsonrpc":"2.0","method":"codex/event","params":{"id":"sub_1","msg":{"type":"exec_command_end","call_id":"call_fail","turn_id":"turn_1","command":["bash","-lc","sh -c 'echo oops >&2; exit 3'"],"cwd":"file:///w","parsed_cmd":[{"type":"unknown","cmd":"sh -c 'echo oops >&2; exit 3'"}],"source":"agent","stdout":"","stderr":"oops\n","aggregated_output":"oops\n","exit_code":3,"duration":{"secs":0,"nanos":1000000},"formatted_output":"oops\n","status":"failed"},"_meta":{"requestId":1}}}
+{"jsonrpc":"2.0","method":"codex/event","params":{"id":"sub_1","msg":{"type":"patch_apply_begin","call_id":"call_patch","turn_id":"turn_1","auto_approved":true,"changes":{"/w/out.txt":{"type":"add","content":"hello\n"}}},"_meta":{"requestId":1}}}
+{"jsonrpc":"2.0","method":"codex/event","params":{"id":"sub_1","msg":{"type":"patch_apply_end","call_id":"call_patch","turn_id":"turn_1","stdout":"Success. Updated the following files:\nA /w/out.txt\n","stderr":"","success":true,"status":"completed"},"_meta":{"requestId":1}}}
+{"jsonrpc":"2.0","method":"codex/event","params":{"id":"sub_1","msg":{"type":"mcp_tool_call_begin","call_id":"call_mcp","invocation":{"server":"echo","tool":"echo","arguments":{"text":"ping"}}},"_meta":{"requestId":1}}}
+{"jsonrpc":"2.0","method":"codex/event","params":{"id":"sub_1","msg":{"type":"mcp_tool_call_end","call_id":"call_mcp","invocation":{"server":"echo","tool":"echo","arguments":{"text":"ping"}},"duration":{"secs":0,"nanos":2000000},"result":{"Ok":{"content":[{"type":"text","text":"echo: ping"}],"isError":false}}},"_meta":{"requestId":1}}}
+{"jsonrpc":"2.0","method":"codex/event","params":{"id":"sub_1","msg":{"type":"view_image_tool_call","call_id":"call_img","path":"file:///w/shot.png"},"_meta":{"requestId":1}}}
+{"jsonrpc":"2.0","method":"codex/event","params":{"id":"sub_1","msg":{"type":"exec_command_begin","call_id":"call_never","turn_id":"turn_1","command":["sleep","60"],"cwd":"file:///w","parsed_cmd":[],"source":"agent"},"_meta":{"requestId":1}}}
+CODEX_JSON
+printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"done"}],"structuredContent":{"threadId":"THREAD","content":"done"}}}\n' "$id"
+`
+
+func runCodexAppServer(t *testing.T, body string) ([]Action, Spec, error) {
+	t.Helper()
+	bin, _ := fakeCodexAppServer(t, body)
+	spec := codexSpec(t, bin)
+	h := startCodexAppServer(t, spec)
+	rec := &recorder{}
+	_, err := h.Turn(context.Background(), "do the steps", rec)
+	return rec.recorded(), spec, err
+}
+
+// TestCodexAppServerRecordsOneActionPerCompletedItem: one action per
+// completed tool item, in order, with Codex's own exit codes.
+func TestCodexAppServerRecordsOneActionPerCompletedItem(t *testing.T) {
+	got, spec, err := runCodexAppServer(t, codexTurnRecorded)
+	if err != nil {
+		t.Fatalf("turn: %v", err)
+	}
+	want := []struct {
+		tool, command, exit, isError string
+	}{
+		{ActionExec, "/bin/bash -lc 'cat notes.txt'", "0", "false"},
+		{ActionExec, "/bin/bash -lc 'ls -1'", "0", "false"},
+		{ActionExec, `/bin/bash -lc "sh -c 'echo oops >&2; exit 3'"`, "3", "true"},
+		{ActionExec, `/bin/bash -lc "printf 'hello\\n' > out.txt"`, "0", "false"},
+		{ActionExec, `/bin/bash -lc "sed -i 's/hello/goodbye/' out.txt"`, "0", "false"},
+		{ActionMCP, "", "absent", "false"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("recorded %d actions, want %d: %+v", len(got), len(want), got)
+	}
+	for i, w := range want {
+		a := got[i]
+		if a.Seq != uint64(i+1) || a.Turn != 1 || a.Tool != w.tool || a.Command != w.command {
+			t.Errorf("action %d = seq %d turn %d %s %q, want seq %d turn 1 %s %q",
+				i, a.Seq, a.Turn, a.Tool, a.Command, i+1, w.tool, w.command)
+		}
+		if exitOf(a) != w.exit || errOf(a) != w.isError {
+			t.Errorf("action %d: exit %s isError %s, want %s %s", i, exitOf(a), errOf(a), w.exit, w.isError)
+		}
+	}
+	cat, printf, mcp := got[0], got[3], got[5]
+	if !reflect.DeepEqual(cat.Contents, []Content{{Op: ContentRead, Path: "/w/notes.txt"}}) {
+		t.Errorf("cat contents = %+v, want Codex's own parse of the read", cat.Contents)
+	}
+	if cat.ResultDigest != Digest([]byte("alpha\nbeta\n")) || cat.Cwd != "/w" || cat.AppTool != "commandExecution" {
+		t.Errorf("cat = %+v", cat)
+	}
+	if printf.ResultType != "string" || printf.ResultDigest != Digest(nil) || printf.Contents != nil {
+		t.Errorf("printf = %+v, want the empty text it printed and no read", printf)
+	}
+	if mcp.MCP == nil || *mcp.MCP != (MCPTarget{Server: "echo", Tool: "echo"}) || mcp.Cwd != spec.Workspace {
+		t.Errorf("mcp = %+v", mcp)
+	}
+	if mcp.ResultDigest != Digest([]byte("echo: ping")) || mcp.ResultType != "string" {
+		t.Errorf("mcp result = %s %s", mcp.ResultType, mcp.ResultDigest)
+	}
+}
+
+func TestCodexAppServerFileChangeIsAWrite(t *testing.T) {
+	got, spec, err := runCodexAppServer(t, codexTurnFileChange)
+	if err != nil {
+		t.Fatalf("turn: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("recorded %d, want the change and the refusal: %+v", len(got), got)
+	}
+	change, refused := got[0], got[1]
+	if change.Tool != ActionFSWrite || change.AppTool != "fileChange" || errOf(change) != "false" || change.ResultType != "null" {
+		t.Errorf("change = %+v", change)
+	}
+	want := []Content{
+		{Op: ContentWrite, Path: "/w/out.txt"},
+		{Op: ContentDelete, Path: "/w/old.txt"},
+		{Op: ContentDelete, Path: "/w/a.txt"},
+		{Op: ContentWrite, Path: "/w/b.txt"},
+		{Op: ContentWrite, Path: filepath.Join(spec.Workspace, "rel.txt")},
+	}
+	if !reflect.DeepEqual(change.Contents, want) {
+		t.Errorf("contents = %+v, want %+v: the COMPLETED item's changes, a move as a delete and a write", change.Contents, want)
+	}
+	if !strings.Contains(string(change.Args), `"changes"`) {
+		t.Errorf("args = %s", change.Args)
+	}
+	if refused.ID != "call_refused" || errOf(refused) != "true" || refused.Contents != nil {
+		t.Errorf("a declined change = %+v, want isError and no file read", refused)
+	}
+}
+
+func TestCodexAppServerTurnThatEndsWithOpenItemsRecordsThemIncomplete(t *testing.T) {
+	got, _, err := runCodexAppServer(t, codexTurnLeavesACallOpen)
+	if err == nil {
+		t.Fatal("an interrupted turn reported success")
+	}
+	if len(got) != 1 || !got[0].Incomplete || got[0].ID != "exec-open" || got[0].IsError != nil {
+		t.Fatalf("recorded %+v, want exec-open incomplete with no verdict", got)
+	}
+	if got[0].Command != "/bin/bash -lc 'sleep 60'" {
+		t.Errorf("command = %q, want what the started item said", got[0].Command)
+	}
+}
+
+func TestCodexMCPFallbackRecordsCoreEvents(t *testing.T) {
+	bin, _ := fakeCodexMCP(t, codexMCPToolRecorded)
+	spec := codexSpec(t, bin)
+	h := startCodexMCP(t, spec)
+	rec := &recorder{}
+	if _, err := h.Turn(context.Background(), "do the steps", rec); err != nil {
+		t.Fatalf("turn: %v", err)
+	}
+	got := rec.recorded()
+	if len(got) != 6 {
+		t.Fatalf("recorded %d actions, want 6: %+v", len(got), got)
+	}
+	exec, fail, patch, mcp, img, never := got[0], got[1], got[2], got[3], got[4], got[5]
+	if exec.Command != "bash -lc 'cat notes.txt'" || exec.Cwd != "/w" || exitOf(exec) != "0" || errOf(exec) != "false" {
+		t.Errorf("exec = %+v", exec)
+	}
+	if !reflect.DeepEqual(exec.Contents, []Content{{Op: ContentRead, Path: "/w/notes.txt"}}) ||
+		exec.ResultDigest != Digest([]byte("alpha\nbeta\n")) {
+		t.Errorf("exec read = %+v %s", exec.Contents, exec.ResultDigest)
+	}
+	if exitOf(fail) != "3" || errOf(fail) != "true" || fail.Command != `bash -lc 'sh -c '\''echo oops >&2; exit 3'\'''` {
+		t.Errorf("failed exec = %+v", fail)
+	}
+	if patch.Tool != ActionFSWrite || errOf(patch) != "false" ||
+		!reflect.DeepEqual(patch.Contents, []Content{{Op: ContentWrite, Path: "/w/out.txt"}}) {
+		t.Errorf("patch = %+v, want the begin's changes kept when the end carries none", patch)
+	}
+	if mcp.MCP == nil || mcp.MCP.Server != "echo" || mcp.ResultDigest != Digest([]byte("echo: ping")) || errOf(mcp) != "false" {
+		t.Errorf("mcp = %+v", mcp)
+	}
+	if img.Tool != ActionFSRead || !reflect.DeepEqual(img.Contents, []Content{{Op: ContentRead, Path: "/w/shot.png"}}) {
+		t.Errorf("image view = %+v", img)
+	}
+	if never.ID != "call_never" || !never.Incomplete || never.Command != "sleep 60" {
+		t.Errorf("never-ended exec = %+v", never)
+	}
+}
+
+// TestCodexMCPEndThatCarriesNoOutputRecordsNoResult: the older end event
+// in codexMCPToolOK carries an exit code and nothing it printed. The
+// result is unknown, and unknown is absent -- not the digest of nothing.
+func TestCodexMCPEndThatCarriesNoOutputRecordsNoResult(t *testing.T) {
+	bin, _ := fakeCodexMCP(t, codexMCPToolOK)
+	h := startCodexMCP(t, codexSpec(t, bin))
+	rec := &recorder{}
+	if _, err := h.Turn(context.Background(), "list", rec); err != nil {
+		t.Fatalf("turn: %v", err)
+	}
+	got := rec.recorded()
+	if len(got) != 1 {
+		t.Fatalf("recorded %+v", got)
+	}
+	a := got[0]
+	if a.Command != "ls -a" || exitOf(a) != "0" || errOf(a) != "false" || a.Cwd != "/w" {
+		t.Errorf("= %+v, want the begin's command and cwd with the end's status", a)
+	}
+	if a.ResultType != "" || a.ResultDigest != "" {
+		t.Errorf("result = %q %q, want absent", a.ResultType, a.ResultDigest)
+	}
+}
+
+// TestRecordingIsTheSameShapeFromBothApps is #442's acceptance criterion:
+// the same actions, from Claude Code's fixture and from the Codex
+// app-server's, record in the same shape -- the same keys, the same kind,
+// the same verdict, and where the apps report the same bytes, the same
+// digest. What legitimately differs is named: the app's own id and tool
+// word, the arguments as each app expressed them, and a result each app
+// words its own way (Claude Code's Bash drops the trailing newline Codex
+// keeps; its Write answers in prose where a Codex file change answers
+// nothing).
+func TestRecordingIsTheSameShapeFromBothApps(t *testing.T) {
+	cRec, _, err := runClaudeFixture(t, claudeRecordedTurn)
+	if err != nil {
+		t.Fatalf("claude turn: %v", err)
+	}
+	claude := cRec.recorded()
+	codex, _, err := runCodexAppServer(t, codexTurnRecorded)
+	if err != nil {
+		t.Fatalf("codex turn: %v", err)
+	}
+	change, _, err := runCodexAppServer(t, codexTurnFileChange)
+	if err != nil {
+		t.Fatalf("codex file-change turn: %v", err)
+	}
+	pairs := []struct {
+		name          string
+		claude, codex Action
+		sameResult    bool
+	}{
+		{"a command that succeeded", claude[1], codex[1], false},
+		{"a command that exited 3", claude[2], codex[2], false},
+		{"a file written", claude[3], change[0], false},
+		{"an MCP call", claude[6], codex[5], true},
+	}
+	for _, p := range pairs {
+		t.Run(p.name, func(t *testing.T) {
+			if a, b := jsonKeys(t, p.claude), jsonKeys(t, p.codex); !reflect.DeepEqual(a, b) {
+				t.Errorf("keys differ:\n claude %v\n codex  %v", a, b)
+			}
+			if p.claude.Tool != p.codex.Tool || exitOf(p.claude) != exitOf(p.codex) || errOf(p.claude) != errOf(p.codex) {
+				t.Errorf("claude %s exit %s isError %s, codex %s exit %s isError %s",
+					p.claude.Tool, exitOf(p.claude), errOf(p.claude), p.codex.Tool, exitOf(p.codex), errOf(p.codex))
+			}
+			if p.claude.Tool == ActionExec && p.claude.ResultType != p.codex.ResultType {
+				t.Errorf("result types %q and %q", p.claude.ResultType, p.codex.ResultType)
+			}
+			if p.sameResult && (p.claude.ResultDigest != p.codex.ResultDigest || p.claude.ResultType != p.codex.ResultType) {
+				t.Errorf("one server answer digests two ways: %s %s vs %s %s",
+					p.claude.ResultType, p.claude.ResultDigest, p.codex.ResultType, p.codex.ResultDigest)
+			}
+			if p.claude.Tool == ActionFSWrite &&
+				(len(p.codex.Contents) == 0 || !reflect.DeepEqual(p.claude.Contents[0], p.codex.Contents[0])) {
+				t.Errorf("the one file both wrote: claude %+v, codex %+v", p.claude.Contents, p.codex.Contents)
+			}
+		})
+	}
+	// The MCP call's arguments are the one argument set both apps pass
+	// through untouched, so they must be the same value.
+	var a, b any
+	_ = json.Unmarshal(claude[6].Args, &a)
+	_ = json.Unmarshal(codex[5].Args, &b)
+	if !reflect.DeepEqual(a, b) || !reflect.DeepEqual(claude[6].MCP, codex[5].MCP) {
+		t.Errorf("mcp args %s vs %s, target %+v vs %+v", claude[6].Args, codex[5].Args, claude[6].MCP, codex[5].MCP)
+	}
+	// And the same file read -- Claude Code's Read tool, Codex's `cat` --
+	// names the same file for the session to digest, though the calls are
+	// different kinds.
+	if !reflect.DeepEqual(claude[0].Contents, codex[0].Contents) {
+		t.Errorf("the one read of notes.txt: claude %+v, codex %+v", claude[0].Contents, codex[0].Contents)
+	}
+}
+
+func TestCodexItemsThatAreNotCallsAreNotRecorded(t *testing.T) {
+	for _, raw := range []string{
+		`{"type":"agentMessage","id":"m","text":"hi","phase":"final_answer"}`,
+		`{"type":"reasoning","id":"r","summary":[],"content":[]}`,
+		`{"type":"userMessage","id":"u","content":[]}`,
+		`not json`,
+	} {
+		if _, _, ok := codexItemCall(json.RawMessage(raw), "/w"); ok {
+			t.Errorf("%s was recorded as a call", raw)
+		}
+	}
+	a, _, ok := codexItemCall(json.RawMessage(`{"type":"webSearch","id":"w","query":"go","action":{"type":"openPage","url":"https://go.dev"}}`), "/w")
+	if !ok || a.Tool != ActionFetch || a.Query != "go" || a.URL != "https://go.dev" {
+		t.Errorf("web search = %+v", a)
+	}
+}
+
+func TestShellJoin(t *testing.T) {
+	for _, tc := range []struct {
+		argv []string
+		want string
+	}{
+		{[]string{"ls", "-a"}, "ls -a"},
+		{[]string{"bash", "-lc", "ls -1"}, "bash -lc 'ls -1'"},
+		{[]string{"echo", "it's"}, `echo 'it'\''s'`},
+		{[]string{"printf", ""}, "printf ''"},
+		{[]string{"=cmd", "a=b"}, "'=cmd' a=b"},
+		{[]string{"go", "test", "./..."}, "go test ./..."},
+	} {
+		if got := shellJoin(tc.argv); got != tc.want {
+			t.Errorf("shellJoin(%q) = %s, want %s", tc.argv, got, tc.want)
+		}
+	}
+}
+
+func TestCodexPath(t *testing.T) {
+	for in, want := range map[string]string{
+		"file:///w/notes.txt":        "/w/notes.txt",
+		"file:///w/with%20space.txt": "/w/with space.txt",
+		"file://localhost/w/a":       "/w/a",
+		"file://elsewhere/share/a":   "",
+		"/plain/path":                "/plain/path",
+		"":                           "",
+		"  file:///w/trimmed.txt  ":  "/w/trimmed.txt",
+	} {
+		if got := codexPath(in); got != want {
+			t.Errorf("codexPath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
