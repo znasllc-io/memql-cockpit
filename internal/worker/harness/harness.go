@@ -151,6 +151,18 @@ type TurnResult struct {
 	// harnesses that run a process per turn. The engine reads non-zero
 	// as a FAILED run, so flattening a 2 to a 1 misfiles the outcome.
 	ExitCode int
+	// Model is the model the APP REPORTED this turn running on, and empty
+	// when it said nothing. It is never the model this harness asked for:
+	// a request is not a report, and the engine records this value as the
+	// model that SERVED (design D9), so a copy of the request would be
+	// recorded as a measurement nobody made.
+	Model string
+	// Effort is the reasoning effort the APP REPORTED, under the same
+	// rule. Claude Code's headless output states no effort anywhere
+	// (verified on 2.1.270), so a Claude Code turn leaves this empty even
+	// when --effort was passed -- which is also the answer for an app that
+	// ignored the effort it was given.
+	Effort string
 }
 
 // Spec is everything a harness needs to run a session's turns.
@@ -174,6 +186,16 @@ type Spec struct {
 	// ResumeRef starts the session already attached to the app's own
 	// prior session, for the attach kind. Empty starts fresh.
 	ResumeRef string
+	// Level is the engine's level for this session -- one of core/airoute's
+	// words, from AppSessionStart.level. Empty runs the app at its own
+	// defaults. A harness turns it into the app's knobs through Levels in
+	// Start and refuses a level it cannot translate (levels.go).
+	Level string
+	// Levels translates Level into this app's knobs. Nil means the
+	// harness's built-in table (BuiltinLevels); the session passes the
+	// built-in table with the machine owner's policy.yaml entries laid
+	// over it.
+	Levels Table
 	// Launch forks every process this harness needs. Required: a nil
 	// Launch is a programming error rather than a reason to fall back
 	// to os/exec, because falling back would silently lose the process
