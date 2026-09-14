@@ -342,10 +342,8 @@ func (c *jsonrpcConn) route(line []byte) {
 		return
 	}
 	var msg rpcMessage
-	// The `jsonrpc` test is what separates a protocol frame from
-	// anything else the process printed. Requiring it rather than
-	// merely "parses as JSON" is the difference between this package
-	// and the transcript-guessing it replaces.
+	// A protocol frame is decided by its shape (isFrame), not by the
+	// `jsonrpc` header the app-server never sends.
 	if json.Unmarshal(trimmed, &msg) != nil || !msg.isFrame() {
 		c.emit(StreamStdout, line)
 		return

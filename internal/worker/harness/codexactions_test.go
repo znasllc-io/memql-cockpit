@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // codexactions_test.go drives both Codex clients against recorded tool
@@ -18,27 +19,33 @@ import (
 // the same six steps the Claude Code fixture took. Codex read notes.txt
 // with `cat`, wrote out.txt with `printf` and edited it with `sed -i` --
 // shell commands, all of them, which is exactly why its reads are found
-// through its own command parse. Item lines are as printed with the
-// workspace path shortened to /w; the account, rate-limit, MCP-startup and
-// token-usage notifications are dropped. The fake answers with the lines
-// verbatim through a quoted heredoc, so no shell ever rewrites them.
+// through its own command parse.
+//
+// The item lines are EXACTLY as printed, and that includes what they
+// lack: the app-server omits the "jsonrpc":"2.0" header on every frame
+// (codex-rs/app-server/README.md at rust-v0.153.4: "JSON-RPC 2.0 messages
+// (with the "jsonrpc":"2.0" header omitted on the wire)"). Only the
+// workspace path is shortened to /w and the thread and turn ids replaced;
+// the account, rate-limit, MCP-startup and token-usage notifications are
+// dropped. The fake answers through a quoted heredoc, so no shell ever
+// rewrites a byte of them.
 const codexTurnRecorded = `
-printf '{"jsonrpc":"2.0","id":%s,"result":{"turn":{"id":"turn_rec","items":[],"itemsView":"notLoaded","status":"inProgress","error":null,"startedAt":null,"completedAt":null,"durationMs":null}}}\n' "$id"
+printf '{"id":%s,"result":{"turn":{"id":"turn_rec","items":[],"itemsView":"notLoaded","status":"inProgress","error":null,"startedAt":null,"completedAt":null,"durationMs":null}}}\n' "$id"
 cat <<'CODEX_JSON'
-{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"THREAD","turnId":"turn_rec","startedAtMs":1789365994259,"item":{"type":"commandExecution","id":"exec-b77282f9-db64-4899-96a4-18794035bba6","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc 'cat notes.txt'","cwd":"/w","processId":"97104","source":"unifiedExecStartup","status":"inProgress","commandActions":[{"type":"read","command":"cat notes.txt","name":"notes.txt","path":"/w/notes.txt"}],"aggregatedOutput":null,"exitCode":null,"durationMs":null}}}
-{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"THREAD","turnId":"turn_rec","completedAtMs":1789365994259,"item":{"type":"commandExecution","id":"exec-b77282f9-db64-4899-96a4-18794035bba6","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc 'cat notes.txt'","cwd":"/w","processId":"97104","source":"unifiedExecStartup","status":"completed","commandActions":[{"type":"read","command":"cat notes.txt","name":"notes.txt","path":"/w/notes.txt"}],"aggregatedOutput":"alpha\nbeta\n","exitCode":0,"durationMs":0}}}
-{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"THREAD","turnId":"turn_rec","startedAtMs":1789365996388,"item":{"type":"commandExecution","id":"exec-02337035-bc20-401a-a4e4-630a60d68442","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc 'ls -1'","cwd":"/w","processId":"97074","source":"unifiedExecStartup","status":"inProgress","commandActions":[{"type":"listFiles","command":"ls -1","path":null}],"aggregatedOutput":null,"exitCode":null,"durationMs":null}}}
-{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"THREAD","turnId":"turn_rec","completedAtMs":1789365996388,"item":{"type":"commandExecution","id":"exec-02337035-bc20-401a-a4e4-630a60d68442","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc 'ls -1'","cwd":"/w","processId":"97074","source":"unifiedExecStartup","status":"completed","commandActions":[{"type":"listFiles","command":"ls -1","path":null}],"aggregatedOutput":"notes.txt\n","exitCode":0,"durationMs":0}}}
-{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"THREAD","turnId":"turn_rec","startedAtMs":1789365998809,"item":{"type":"commandExecution","id":"exec-d8855f30-ddea-4313-a829-8f981ca16799","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc \"sh -c 'echo oops >&2; exit 3'\"","cwd":"/w","processId":"39845","source":"unifiedExecStartup","status":"inProgress","commandActions":[{"type":"unknown","command":"sh -c 'echo oops >&2; exit 3'"}],"aggregatedOutput":null,"exitCode":null,"durationMs":null}}}
-{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"THREAD","turnId":"turn_rec","completedAtMs":1789365998809,"item":{"type":"commandExecution","id":"exec-d8855f30-ddea-4313-a829-8f981ca16799","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc \"sh -c 'echo oops >&2; exit 3'\"","cwd":"/w","processId":"39845","source":"unifiedExecStartup","status":"failed","commandActions":[{"type":"unknown","command":"sh -c 'echo oops >&2; exit 3'"}],"aggregatedOutput":"oops\n","exitCode":3,"durationMs":0}}}
-{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"THREAD","turnId":"turn_rec","startedAtMs":1789366001388,"item":{"type":"commandExecution","id":"exec-a9bda5da-698f-4906-ae4c-a5eba582397d","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc \"printf 'hello\\\\n' > out.txt\"","cwd":"/w","processId":"68520","source":"unifiedExecStartup","status":"inProgress","commandActions":[{"type":"unknown","command":"printf 'hello\\n' > out.txt"}],"aggregatedOutput":null,"exitCode":null,"durationMs":null}}}
-{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"THREAD","turnId":"turn_rec","completedAtMs":1789366001388,"item":{"type":"commandExecution","id":"exec-a9bda5da-698f-4906-ae4c-a5eba582397d","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc \"printf 'hello\\\\n' > out.txt\"","cwd":"/w","processId":"68520","source":"unifiedExecStartup","status":"completed","commandActions":[{"type":"unknown","command":"printf 'hello\\n' > out.txt"}],"aggregatedOutput":null,"exitCode":0,"durationMs":0}}}
-{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"THREAD","turnId":"turn_rec","startedAtMs":1789366004490,"item":{"type":"commandExecution","id":"exec-c4568bae-9956-48d6-9e08-8445424f7bfd","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc \"sed -i 's/hello/goodbye/' out.txt\"","cwd":"/w","processId":"67768","source":"unifiedExecStartup","status":"inProgress","commandActions":[{"type":"unknown","command":"sed -i 's/hello/goodbye/' out.txt"}],"aggregatedOutput":null,"exitCode":null,"durationMs":null}}}
-{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"THREAD","turnId":"turn_rec","completedAtMs":1789366004491,"item":{"type":"commandExecution","id":"exec-c4568bae-9956-48d6-9e08-8445424f7bfd","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc \"sed -i 's/hello/goodbye/' out.txt\"","cwd":"/w","processId":"67768","source":"unifiedExecStartup","status":"completed","commandActions":[{"type":"unknown","command":"sed -i 's/hello/goodbye/' out.txt"}],"aggregatedOutput":null,"exitCode":0,"durationMs":0}}}
-{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"THREAD","turnId":"turn_rec","startedAtMs":1789366009184,"item":{"type":"mcpToolCall","id":"exec-6df80e5a-51b0-4d75-aa52-79e22177519a","server":"echo","tool":"echo","status":"inProgress","arguments":{"text":"ping"},"appContext":null,"pluginId":null,"readOnlyHint":null,"result":null,"error":null,"durationMs":null}}}
-{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"THREAD","turnId":"turn_rec","completedAtMs":1789366009187,"item":{"type":"mcpToolCall","id":"exec-6df80e5a-51b0-4d75-aa52-79e22177519a","server":"echo","tool":"echo","status":"completed","arguments":{"text":"ping"},"appContext":null,"pluginId":null,"readOnlyHint":null,"result":{"content":[{"type":"text","text":"echo: ping"}],"structuredContent":null,"_meta":null},"error":null,"durationMs":2}}}
-{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"THREAD","turnId":"turn_rec","completedAtMs":1789366011232,"item":{"type":"agentMessage","id":"msg_0bf177e203eb66a2016aa78efb1d3087d0a97f0552752a34a9","text":"done","phase":"final_answer","memoryCitation":null,"delivery":null,"questions":null}}}
-{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"THREAD","turn":{"id":"turn_rec","items":[],"itemsView":"notLoaded","status":"completed","error":null,"startedAt":1789365989,"completedAt":1789366011,"durationMs":21513}}}
+{"method":"item/started","params":{"item":{"type":"commandExecution","id":"exec-b77282f9-db64-4899-96a4-18794035bba6","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc 'cat notes.txt'","cwd":"/w","processId":"97104","source":"unifiedExecStartup","status":"inProgress","commandActions":[{"type":"read","command":"cat notes.txt","name":"notes.txt","path":"/w/notes.txt"}],"aggregatedOutput":null,"exitCode":null,"durationMs":null},"threadId":"THREAD","turnId":"turn_rec","startedAtMs":1789365994259},"emittedAtMs":1789365994262}
+{"method":"item/completed","params":{"item":{"type":"commandExecution","id":"exec-b77282f9-db64-4899-96a4-18794035bba6","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc 'cat notes.txt'","cwd":"/w","processId":"97104","source":"unifiedExecStartup","status":"completed","commandActions":[{"type":"read","command":"cat notes.txt","name":"notes.txt","path":"/w/notes.txt"}],"aggregatedOutput":"alpha\nbeta\n","exitCode":0,"durationMs":0},"threadId":"THREAD","turnId":"turn_rec","completedAtMs":1789365994259},"emittedAtMs":1789365994263}
+{"method":"item/started","params":{"item":{"type":"commandExecution","id":"exec-02337035-bc20-401a-a4e4-630a60d68442","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc 'ls -1'","cwd":"/w","processId":"97074","source":"unifiedExecStartup","status":"inProgress","commandActions":[{"type":"listFiles","command":"ls -1","path":null}],"aggregatedOutput":null,"exitCode":null,"durationMs":null},"threadId":"THREAD","turnId":"turn_rec","startedAtMs":1789365996388},"emittedAtMs":1789365996388}
+{"method":"item/completed","params":{"item":{"type":"commandExecution","id":"exec-02337035-bc20-401a-a4e4-630a60d68442","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc 'ls -1'","cwd":"/w","processId":"97074","source":"unifiedExecStartup","status":"completed","commandActions":[{"type":"listFiles","command":"ls -1","path":null}],"aggregatedOutput":"notes.txt\n","exitCode":0,"durationMs":0},"threadId":"THREAD","turnId":"turn_rec","completedAtMs":1789365996388},"emittedAtMs":1789365996394}
+{"method":"item/started","params":{"item":{"type":"commandExecution","id":"exec-d8855f30-ddea-4313-a829-8f981ca16799","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc \"sh -c 'echo oops >&2; exit 3'\"","cwd":"/w","processId":"39845","source":"unifiedExecStartup","status":"inProgress","commandActions":[{"type":"unknown","command":"sh -c 'echo oops >&2; exit 3'"}],"aggregatedOutput":null,"exitCode":null,"durationMs":null},"threadId":"THREAD","turnId":"turn_rec","startedAtMs":1789365998809},"emittedAtMs":1789365998809}
+{"method":"item/completed","params":{"item":{"type":"commandExecution","id":"exec-d8855f30-ddea-4313-a829-8f981ca16799","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc \"sh -c 'echo oops >&2; exit 3'\"","cwd":"/w","processId":"39845","source":"unifiedExecStartup","status":"failed","commandActions":[{"type":"unknown","command":"sh -c 'echo oops >&2; exit 3'"}],"aggregatedOutput":"oops\n","exitCode":3,"durationMs":0},"threadId":"THREAD","turnId":"turn_rec","completedAtMs":1789365998809},"emittedAtMs":1789365998811}
+{"method":"item/started","params":{"item":{"type":"commandExecution","id":"exec-a9bda5da-698f-4906-ae4c-a5eba582397d","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc \"printf 'hello\\\\n' > out.txt\"","cwd":"/w","processId":"68520","source":"unifiedExecStartup","status":"inProgress","commandActions":[{"type":"unknown","command":"printf 'hello\\n' > out.txt"}],"aggregatedOutput":null,"exitCode":null,"durationMs":null},"threadId":"THREAD","turnId":"turn_rec","startedAtMs":1789366001388},"emittedAtMs":1789366001388}
+{"method":"item/completed","params":{"item":{"type":"commandExecution","id":"exec-a9bda5da-698f-4906-ae4c-a5eba582397d","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc \"printf 'hello\\\\n' > out.txt\"","cwd":"/w","processId":"68520","source":"unifiedExecStartup","status":"completed","commandActions":[{"type":"unknown","command":"printf 'hello\\n' > out.txt"}],"aggregatedOutput":null,"exitCode":0,"durationMs":0},"threadId":"THREAD","turnId":"turn_rec","completedAtMs":1789366001388},"emittedAtMs":1789366001390}
+{"method":"item/started","params":{"item":{"type":"commandExecution","id":"exec-c4568bae-9956-48d6-9e08-8445424f7bfd","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc \"sed -i 's/hello/goodbye/' out.txt\"","cwd":"/w","processId":"67768","source":"unifiedExecStartup","status":"inProgress","commandActions":[{"type":"unknown","command":"sed -i 's/hello/goodbye/' out.txt"}],"aggregatedOutput":null,"exitCode":null,"durationMs":null},"threadId":"THREAD","turnId":"turn_rec","startedAtMs":1789366004490},"emittedAtMs":1789366004491}
+{"method":"item/completed","params":{"item":{"type":"commandExecution","id":"exec-c4568bae-9956-48d6-9e08-8445424f7bfd","pluginId":null,"scriptPath":null,"command":"/bin/bash -lc \"sed -i 's/hello/goodbye/' out.txt\"","cwd":"/w","processId":"67768","source":"unifiedExecStartup","status":"completed","commandActions":[{"type":"unknown","command":"sed -i 's/hello/goodbye/' out.txt"}],"aggregatedOutput":null,"exitCode":0,"durationMs":0},"threadId":"THREAD","turnId":"turn_rec","completedAtMs":1789366004491},"emittedAtMs":1789366004494}
+{"method":"item/started","params":{"item":{"type":"mcpToolCall","id":"exec-6df80e5a-51b0-4d75-aa52-79e22177519a","server":"echo","tool":"echo","status":"inProgress","arguments":{"text":"ping"},"appContext":null,"pluginId":null,"readOnlyHint":null,"result":null,"error":null,"durationMs":null},"threadId":"THREAD","turnId":"turn_rec","startedAtMs":1789366009184},"emittedAtMs":1789366009186}
+{"method":"item/completed","params":{"item":{"type":"mcpToolCall","id":"exec-6df80e5a-51b0-4d75-aa52-79e22177519a","server":"echo","tool":"echo","status":"completed","arguments":{"text":"ping"},"appContext":null,"pluginId":null,"readOnlyHint":null,"result":{"content":[{"type":"text","text":"echo: ping"}],"structuredContent":null,"_meta":null},"error":null,"durationMs":2},"threadId":"THREAD","turnId":"turn_rec","completedAtMs":1789366009187},"emittedAtMs":1789366009191}
+{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg_0bf177e203eb66a2016aa78efb1d3087d0a97f0552752a34a9","text":"done","phase":"final_answer","memoryCitation":null,"delivery":null,"questions":null},"threadId":"THREAD","turnId":"turn_rec","completedAtMs":1789366011232},"emittedAtMs":1789366011238}
+{"method":"turn/completed","params":{"threadId":"THREAD","turn":{"id":"turn_rec","items":[{"type":"agentMessage","id":"msg_0bf177e203eb66a2016aa78efb1d3087d0a97f0552752a34a9","text":"done","phase":"final_answer","memoryCitation":null,"delivery":null,"questions":null}],"itemsView":"summary","status":"completed","error":null,"startedAt":1789365989,"completedAt":1789366011,"durationMs":21513}},"emittedAtMs":1789366011264}
 CODEX_JSON
 `
 
@@ -372,5 +379,61 @@ func TestCodexPath(t *testing.T) {
 		if got := codexPath(in); got != want {
 			t.Errorf("codexPath(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// fakeCodexAppServerAsPrinted is a fake app-server that answers the way
+// codex-cli 0.153.4 does -- with no "jsonrpc" header on any frame it
+// prints, the handshake included. The client's own requests still carry
+// the header, and the server accepts them either way.
+func fakeCodexAppServerAsPrinted(t *testing.T, turnBody string) string {
+	t.Helper()
+	body := strings.ReplaceAll(turnBody, "THREAD", codexFakeThread)
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" != \"app-server\" ]; then echo \"unexpected argv: $*\" >&2; exit 64; fi\n" +
+		"while IFS= read -r line; do\n" +
+		"  id=$(printf '%s' \"$line\" | sed -n 's/^{\"jsonrpc\":\"2.0\",\"id\":\\([0-9]*\\),.*/\\1/p')\n" +
+		"  case \"$line\" in\n" +
+		"    *'\"method\":\"initialize\"'*)\n" +
+		"      printf '{\"id\":%s,\"result\":{\"userAgent\":\"memql-cockpit/0.153.4\",\"codexHome\":\"/tmp/codex-home\",\"platformFamily\":\"unix\",\"platformOs\":\"linux\"}}\\n' \"$id\"\n" +
+		"      printf '{\"method\":\"remoteControl/status/changed\",\"params\":{\"status\":\"disabled\"}}\\n'\n" +
+		"      ;;\n" +
+		"    *'\"method\":\"thread/start\"'*)\n" +
+		"      printf '{\"id\":%s,\"result\":{\"thread\":{\"id\":\"" + codexFakeThread + "\"},\"model\":\"gpt-5.1-codex\"}}\\n' \"$id\"\n" +
+		"      ;;\n" +
+		"    *'\"method\":\"turn/start\"'*)\n" +
+		body +
+		"      ;;\n" +
+		"  esac\n" +
+		"done\n"
+	return fakeBinary(t, "codex", script)
+}
+
+// TestCodexAppServerSpeaksTheWireAsPrinted: the app-server leaves the
+// JSON-RPC header off every frame. A client that required it took the
+// answer to `initialize` for stray output and waited for it forever --
+// every Codex session on a machine with the app-server hung at start,
+// saying nothing, until its wall-clock ceiling. Found on 2026-09-13 by
+// driving codex-cli 0.153.4 through this runner; the fakes above had
+// always added a header the real server never sends.
+func TestCodexAppServerSpeaksTheWireAsPrinted(t *testing.T) {
+	spec := codexSpec(t, fakeCodexAppServerAsPrinted(t, codexTurnRecorded))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	h := &codexAppServer{}
+	if err := h.Start(ctx, spec); err != nil {
+		t.Fatalf("Start against the header-less wire: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+	rec := &recorder{}
+	res, err := h.Turn(ctx, "do the steps", rec)
+	if err != nil {
+		t.Fatalf("turn: %v", err)
+	}
+	if res.AppSessionRef != codexFakeThread || res.Text != "done" {
+		t.Errorf("result = ref %q text %q, want the thread and the final answer", res.AppSessionRef, res.Text)
+	}
+	if got := rec.recorded(); len(got) != 6 {
+		t.Errorf("recorded %d actions, want 6", len(got))
 	}
 }
