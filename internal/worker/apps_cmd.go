@@ -33,10 +33,18 @@ const appsProbeTimeout = 15 * time.Second
 
 func handleApps(args []string) {
 	fs := flag.NewFlagSet("worker apps", flag.ExitOnError)
-	configPath := fs.String("config", DefaultConfigPath(), "path to worker.yaml")
+	configPath := fs.String("config", DefaultConfigPath(), "path to legacy worker.yaml")
+	workersPath := fs.String("workers", DefaultWorkersPath(), "path to workers.yaml")
 	_ = fs.Parse(args)
 
-	policyPath := filepath.Join(filepath.Dir(*configPath), "policy.yaml")
+	// The policy.yaml the worker itself reads: beside workers.yaml for a
+	// fleet, beside worker.yaml otherwise -- the order `memql worker
+	// backup` already follows. A report read from the other file would be
+	// a confident answer about a policy the worker never loads.
+	policyPath := filepath.Join(filepath.Dir(*workersPath), "policy.yaml")
+	if _, err := os.Stat(policyPath); err != nil {
+		policyPath = filepath.Join(filepath.Dir(*configPath), "policy.yaml")
+	}
 	policy, err := tools.LoadPolicy(policyPath)
 	if err != nil {
 		// Unlike the worker, which runs on defaults when the file does not
