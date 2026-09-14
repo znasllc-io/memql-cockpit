@@ -104,7 +104,12 @@ func (r *recording) flush() []Action {
 // drops an action that arrives behind a higher one, so the lower call
 // would be lost. Holding the lock through the send makes the order on the
 // wire the order of the seq. It also means a flush waits for a completion
-// that is mid-send, so nothing is still being sent once a turn returns.
+// that is mid-send, so nothing is still being sent once a turn returns --
+// and "send" includes the session reading the call's files, so a
+// cancelled turn returns only once those reads are done. That wait is
+// bounded by the files, never by the app: the app is killed on cancel
+// either way. A workspace whose filesystem hangs hangs the session with
+// or without it, since the transcript is written there on every chunk.
 // (Claude Code's client completes and flushes on one goroutine and keeps
 // the plain methods.)
 func (r *recording) completeAndEmit(id string, finish func(*Action), emit func(Action)) {

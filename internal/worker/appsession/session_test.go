@@ -677,6 +677,36 @@ func TestSession_ProducedFilesAndTranscriptArePushed(t *testing.T) {
 	}
 }
 
+// TestSession_AFileHoldingTheBearerIsNotPushed: an app that copies its MCP
+// configuration into the workspace has produced a file holding the
+// session's bearer. The bearer cannot be revoked, so the file is not
+// pushed to the Library -- and the transcript says so, as it does for any
+// file left behind.
+func TestSession_AFileHoldingTheBearerIsNotPushed(t *testing.T) {
+	fakeApp(t, "claude", "cp .mcp.json leaked.json\necho fine > ok.txt\n"+quietClaude)
+	h := newRig(t)
+	end := h.start(t, nil)
+	if end.GetExitCode() != 0 || end.GetError() != "" {
+		t.Fatalf("end = %d %q", end.GetExitCode(), end.GetError())
+	}
+	sawOK := false
+	for name, body := range h.library.uploaded() {
+		if strings.Contains(string(body), testBearer) {
+			t.Errorf("%s carried the bearer to the Library", name)
+		}
+		if strings.Contains(name, "leaked") {
+			t.Errorf("%s was pushed", name)
+		}
+		sawOK = sawOK || strings.HasSuffix(name, "ok.txt")
+	}
+	if !sawOK {
+		t.Error("the file without the bearer was not pushed")
+	}
+	if !strings.Contains(h.sender.transcript(), "not pushed to the Library: leaked.json (it holds this session's credential)") {
+		t.Error("the transcript does not say the file was held back")
+	}
+}
+
 // TestSession_BearerNeverReachesAChunk. The transcript is persisted on
 // the engine side and rendered in the portal, so a chunk carrying the
 // credential publishes it everywhere that record reaches.

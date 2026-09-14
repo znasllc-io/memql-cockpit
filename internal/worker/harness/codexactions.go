@@ -177,6 +177,12 @@ func codexItemFinish(a *Action, it codexItem) {
 	switch it.Type {
 	case "commandExecution":
 		verdict(statusFailed || (it.ExitCode != nil && *it.ExitCode != 0))
+		if it.Status == "declined" {
+			// The command never ran: an exit code or an output on the item
+			// is not a result of it (the fallback reads its events the same
+			// way, in codexCoreFinish).
+			break
+		}
 		a.ExitCode = it.ExitCode
 		switch {
 		case it.AggregatedOutput != nil:

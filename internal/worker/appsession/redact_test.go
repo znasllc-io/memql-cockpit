@@ -65,3 +65,31 @@ func TestRedactor_NilIsSafe(t *testing.T) {
 	}
 	r.add("something")
 }
+
+// TestSecretScanFindsACredentialAcrossWrites: the scan runs over a file
+// in the reads that hash it, so a credential split between two of them --
+// or spread over several short ones -- is still found, and nothing that
+// is not a credential is.
+func TestSecretScanFindsACredentialAcrossWrites(t *testing.T) {
+	r := newRedactor(testBearer)
+	body := []byte("before " + testBearer + " after")
+	for size := 1; size <= len(body); size++ {
+		scan := r.scanner()
+		for i := 0; i < len(body); i += size {
+			end := min(i+size, len(body))
+			_, _ = scan.Write(body[i:end])
+		}
+		if !scan.found {
+			t.Fatalf("writes of %d bytes hid the credential", size)
+		}
+	}
+	clean := r.scanner()
+	_, _ = clean.Write([]byte("before " + testBearer[:len(testBearer)-1]))
+	_, _ = clean.Write([]byte("X after"))
+	if clean.found {
+		t.Error("a near miss was taken for the credential")
+	}
+	if newRedactor().scanner() != nil {
+		t.Error("a redactor with nothing to find still scans")
+	}
+}

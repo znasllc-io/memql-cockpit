@@ -671,10 +671,13 @@ through), and only a regular file checked on the OPEN descriptor
 (`O_NONBLOCK|O_NOFOLLOW`, so a pipe cannot hang the session). The check
 is repeated on the file that OPENED -- `/proc/self/fd` on Linux,
 re-resolve plus `os.SameFile` elsewhere -- because a directory swapped for
-a link between the check and the open is followed, and the scaffolding is
-matched BY IDENTITY, file and every directory up to the workspace, because
-a hard link or a Mac's case-insensitive `.MCP.json` is a second name no
-string compare sees.
+a link between the check and the open is followed. The configuration files
+and every directory up to the workspace are also matched BY IDENTITY,
+because a hard link to the bearer's file or a Mac's case-insensitive
+`.MCP.json` is a second name no string compare sees. (A hard link to some
+other file under `.memql-session/` is an ordinary file; the credential scan
+still applies to it.) The write rule and the digest cache use the path that
+OPENED, not the one checked.
 
 **A READ NEVER SENDS MORE OF A FILE THAN THE APP ALREADY DID.** A READ's
 bytes travel only when they equal what the app's own result already carried
@@ -682,10 +685,14 @@ bytes travel only when they equal what the app's own result already carried
 output when its parse names exactly one read). `head -1 .env` reported one
 line, so the rest travels as a digest (`digest_only`). A WRITE's bytes are
 the app's own output and travel, except under a `pushExcludedDirs`
-directory (`.git/config` holds remote URLs and their tokens). Bytes
-holding any credential the session was given travel as neither data nor
-digest (`contains_credential`) -- the redactor cannot see one inside
-base64. 256 KiB per file and 1 MiB per action travel inline; up to 64 MiB
+directory (`.git/config` holds remote URLs and their tokens). A file
+holding any credential the session was given travels as neither data nor
+digest (`contains_credential`), at any size -- it is scanned in the pass
+that hashes it -- and the end-of-session push skips it too
+(`redactor.holdsFile`): the redactor rewrites text on its way out, but it
+never sees inside base64 or a file pushed whole, and the bearer cannot be
+revoked. A remembered digest is trusted only while the redactor holds no
+new credential. 256 KiB per file and 1 MiB per action travel inline; up to 64 MiB
 is digested (remembered by identity, size and mtime once the mtime is 2s
 old, so forty reads of one large file hash it once); the rest carries a
 closed `omitted` reason. The digest is over the whole file, not the window

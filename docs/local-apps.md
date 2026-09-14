@@ -417,11 +417,11 @@ transcript artifact; the recording is about what the app *did*.
 | `parentId` | The call this one ran inside, for a Claude Code sub-agent's calls. |
 | `tool` | `exec`, `fs_read`, `fs_write`, `fetch`, `mcp`, `agent` (the app's own bookkeeping — nothing outside it moved) or `other` (not classified; effects **unknown**). |
 | `appTool` | The app's own name for the tool. Provenance only. |
-| `args` | The call's arguments, **whole**, as the app expressed them — unless they would make the action too large to send (a Codex patch deleting a large file carries all of it). Then `args` is `null`, `argsDigest` is their `sha256` and `argsOmitted` is `too_large`. |
+| `args` | The call's arguments, **whole**, as the app expressed them — unless they would make the action too large to send (a Codex patch deleting a large file carries all of it). Then `args` is `null`, `argsDigest` is the `sha256` of their canonical JSON (keys sorted, no insignificant space) and `argsOmitted` is `too_large`. |
 | `command` / `mcp` / `url` / `query` | The one thing a reader needs without parsing `args`: the command line an `exec` ran, the `{server, tool}` an `mcp` call reached, what a `fetch` asked for. |
 | `exitCode` | Present **only when the app reported one**. |
 | `isError` | The app's own verdict. Absent when nobody knows: an `incomplete` call, an end event this build could not read, or a call the app gives no verdict on (a Codex web search, image view or sleep). |
-| `resultType` / `resultDigest` | The result's inferred JSON type and `sha256`. Text that is JSON is typed by what it parses as. Absent when the app reported no result — a Codex file change answers nothing, and a declined command never ran. |
+| `resultType` / `resultDigest` | The result's inferred JSON type and `sha256`. Text that is JSON is typed by what it parses as. Absent when the app reported no result — a file change through `codex-app-server` answers nothing, and a declined command never ran. |
 | `contents` | The files the call read or wrote — see below. |
 | `incomplete` | The app started this call and the session never saw it finish: the process died, the turn was cancelled, or the result was too large to read. Recorded, never dropped, never assumed. |
 
@@ -468,9 +468,12 @@ read, at the moment the call completes, only when:
 - it is not the session's own scaffolding: `.mcp.json` with the per-run bearer,
   `.memql-session/` (the transcript, Codex's per-session home and the `auth.json`
   linked into it), a configuration moved aside, or the temporary file the bearer
-  is written through. These are recognised by **identity**, not only by name,
-  so a hard link to one — or `.MCP.json` on a Mac, where names ignore case — is
-  refused too;
+  is written through. The configuration files and `.memql-session/` are also
+  recognised by **identity**, not only by name, so a hard link to the bearer's
+  configuration, or `.MCP.json` / `.MEMQL-SESSION/` on a Mac where names ignore
+  case, is refused too. (A hard link to some other file inside
+  `.memql-session/` is read like any other file — the credential check below
+  still applies to it);
 - it is a **regular file**, checked on the opened descriptor, so a path swapped
   for a named pipe cannot hang the session.
 
@@ -488,7 +491,9 @@ is on the action:
   (`digest_only` there — `.git/config` holds remote URLs and the tokens in
   them);
 - a file holding this session's own credential travels as **neither bytes nor
-  digest** (`omitted: contains_credential`), wherever it is.
+  digest** (`omitted: contains_credential`), wherever it is and whatever its
+  size — every file is scanned for it in the same pass that digests it — and it
+  is not pushed to the Library as an output either (see Outputs).
 
 | The file | What travels |
 |---|---|
@@ -585,6 +590,10 @@ applied silently:
 - `.git`, `node_modules`, `vendor`, `target`, `dist`, `build`, `.venv`,
   `__pycache__` and friends are never pushed — reproducible, enormous, and
   they would bury the actual output;
+- a file holding this session's credential is never pushed — the app copied
+  the bearer out of its configuration, and an artifact would keep a
+  credential nothing can revoke. It is named in a chunk like any other file
+  left behind;
 - nested paths are flattened (`api/schema.json` → `api__schema.json`) because
   the Library keys on one path segment, and two `schema.json` files from
   different directories would otherwise arrive indistinguishable.
@@ -616,9 +625,9 @@ applied silently:
 | an action's file carries `omitted: outside_workspace` or `session_scaffolding` | the app named a file the recording will not read: outside the session's workspace, or the session's own files. Correct refusal; the path is still recorded |
 | an action carries `incomplete: true` | the app started the call and the turn ended before it finished — a cancel, a crash, or a result line over 1 MiB the harness could not parse |
 | a file the app read carries `omitted: digest_only` and no bytes | the app's own result did not carry the whole file — it read part of it, or the file changed after it was read. By design: the recording sends no more of a file than the app did. A file written inside `.git/` or `node_modules/` gets the same |
-| a file carries `omitted: contains_credential` | the file holds this session's bearer — the app copied it out of its MCP configuration. Neither the bytes nor their digest leave the machine |
+| a file carries `omitted: contains_credential` | the file holds this session's bearer — the app copied it out of its MCP configuration. The recording carries neither its bytes nor its digest, and the output push skips it with `not pushed to the Library: … (it holds this session's credential)` |
 | an action carries `argsOmitted: too_large` | its arguments would have made it larger than the 8 MiB an action may be — usually a Codex patch deleting or rewriting a large file. `argsDigest` identifies them |
-| the action `seq` skips a number | an action could not be sent: too large even without its arguments, or the stream failed. The worker log names the call |
+| the action `seq` skips a number | an action could not be sent: too large even without its arguments, or the stream failed — the worker log names the call — or the app reported it finishing after its turn had already ended, when nothing was listening for it |
 
 ## Related
 

@@ -200,10 +200,12 @@ type contentPolicy struct {
 	digests map[string]digestEntry
 }
 
-// digestEntry is one remembered digest and the file it was taken from.
+// digestEntry is one remembered digest, the file it was taken from, and
+// how many credentials the file was scanned for when it was.
 type digestEntry struct {
-	info   os.FileInfo
-	digest string
+	info    os.FileInfo
+	digest  string
+	secrets int
 }
 
 // newContentPolicy builds the policy for a workspace, never reading the
@@ -295,11 +297,11 @@ func (p *contentPolicy) read(c *harness.Content, budget *int64) {
 	c.Bytes, c.Digest, c.Omitted = got.size, got.digest, got.omitted
 	switch {
 	case got.omitted != "":
+	case got.credential:
+		c.Digest, c.Omitted = "", harness.OmittedCredential
 	case got.data == nil:
 		c.Omitted = harness.OmittedOverCeiling
-	case p.secrets.holds(got.data):
-		c.Digest, c.Omitted = "", harness.OmittedCredential
-	case !p.mayCarry(c.Op, real, got.data, seen):
+	case !p.mayCarry(c.Op, got.where, got.data, seen):
 		c.Omitted = harness.OmittedDigestOnly
 	case int64(len(got.data)) > *budget:
 		c.Omitted = harness.OmittedOverBudget
@@ -334,28 +336,46 @@ type fileRead struct {
 	// data is the file's bytes when there were at most keepMax of them.
 	data    []byte
 	omitted string
+	// credential says the file holds a credential this session was given,
+	// found while it was hashed, at any size.
+	credential bool
+	// where is the file that opened, as confirm placed it.
+	where string
 }
 
 // readFile hashes one file the policy resolved, keeping its bytes when
-// they could travel.
+// they could travel and scanning them for the session's credentials in
+// the same pass.
+//
+// Everything after the open is decided on the file that OPENED (where):
+// the write rule and the remembered digests too, not only confirm.
 func (p *contentPolicy) readFile(real string) fileRead {
 	f, info, got := openRegular(real)
 	if f == nil {
 		return got
 	}
 	defer f.Close()
-	if why := p.confirm(f, info, real); why != "" {
+	where, why := p.confirm(f, info, real)
+	if why != "" {
 		return fileRead{omitted: why}
 	}
+	secrets := p.secrets.count()
 	if info.Size() > maxInlineFileBytes && info.Size() <= maxDigestFileBytes {
-		if digest, ok := p.remembered(real, info); ok {
+		if digest, ok := p.remembered(where, info, secrets); ok {
 			size := info.Size()
-			return fileRead{size: &size, digest: digest}
+			return fileRead{size: &size, digest: digest, where: where}
 		}
 	}
-	got = hashOpen(f, info, maxInlineFileBytes)
+	scan := p.secrets.scanner()
+	got = hashOpen(f, info, maxInlineFileBytes, scan)
+	got.where = where
+	if scan != nil && scan.found {
+		got.credential = true
+		got.data = nil
+		return got
+	}
 	if got.digest != "" && got.data == nil && got.size != nil && *got.size == info.Size() {
-		p.remember(real, info, got.digest)
+		p.remember(where, info, got.digest, secrets)
 	}
 	return got
 }
@@ -372,7 +392,9 @@ func (p *contentPolicy) readFile(real string) fileRead {
 // compare misses a second name for the same file: a hard link to the
 // bearer's configuration, or `.MCP.json` on a filesystem that ignores
 // case -- the default on a Mac.
-func (p *contentPolicy) confirm(f *os.File, info os.FileInfo, real string) string {
+//
+// It returns where the open file is, or the reason not to read it.
+func (p *contentPolicy) confirm(f *os.File, info os.FileInfo, real string) (string, string) {
 	where, ok := openedPath(f)
 	if !ok {
 		where = resolvedPath(real)
@@ -380,21 +402,21 @@ func (p *contentPolicy) confirm(f *os.File, info os.FileInfo, real string) strin
 		if err != nil || !os.SameFile(now, info) {
 			// The path names another file than the one open: it changed
 			// under the read, and what is open cannot be placed.
-			return harness.OmittedUnreadable
+			return "", harness.OmittedUnreadable
 		}
 	}
 	if !within(p.root, where) {
-		return harness.OmittedOutsideWorkspace
+		return "", harness.OmittedOutsideWorkspace
 	}
 	for _, e := range p.excluded {
 		if within(e, where) {
-			return harness.OmittedScaffolding
+			return "", harness.OmittedScaffolding
 		}
 	}
 	if p.isScaffolding(where, info) {
-		return harness.OmittedScaffolding
+		return "", harness.OmittedScaffolding
 	}
-	return ""
+	return where, ""
 }
 
 // isScaffolding reports whether the open file, or a directory between it
@@ -427,15 +449,17 @@ func (p *contentPolicy) isScaffolding(where string, info os.FileInfo) bool {
 }
 
 // remembered is the digest taken earlier of this very file, unchanged
-// since and settled.
-func (p *contentPolicy) remembered(real string, info os.FileInfo) (string, bool) {
+// since, settled, and scanned for every credential the session holds now.
+// Only a file found to hold none is ever remembered.
+func (p *contentPolicy) remembered(real string, info os.FileInfo, secrets int) (string, bool) {
 	if time.Since(info.ModTime()) < digestSettle {
 		return "", false
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e, ok := p.digests[real]
-	if !ok || !os.SameFile(e.info, info) || e.info.Size() != info.Size() || !e.info.ModTime().Equal(info.ModTime()) {
+	if !ok || e.secrets != secrets || !os.SameFile(e.info, info) || e.info.Size() != info.Size() ||
+		!e.info.ModTime().Equal(info.ModTime()) {
 		return "", false
 	}
 	return e.digest, true
@@ -443,7 +467,7 @@ func (p *contentPolicy) remembered(real string, info os.FileInfo) (string, bool)
 
 // remember keeps a digest for remembered, dropping an arbitrary entry
 // when the cache is full.
-func (p *contentPolicy) remember(real string, info os.FileInfo, digest string) {
+func (p *contentPolicy) remember(real string, info os.FileInfo, digest string, secrets int) {
 	if time.Since(info.ModTime()) < digestSettle {
 		return
 	}
@@ -458,7 +482,7 @@ func (p *contentPolicy) remember(real string, info os.FileInfo, digest string) {
 			break
 		}
 	}
-	p.digests[real] = digestEntry{info: info, digest: digest}
+	p.digests[real] = digestEntry{info: info, digest: digest, secrets: secrets}
 }
 
 // readForRecord hashes a file the session itself put somewhere -- a
@@ -470,7 +494,7 @@ func readForRecord(path string, keepMax int64) fileRead {
 		return got
 	}
 	defer f.Close()
-	return hashOpen(f, info, keepMax)
+	return hashOpen(f, info, keepMax, nil)
 }
 
 // openRegular opens a file for the recording and refuses anything but a
@@ -496,8 +520,9 @@ func openRegular(path string) (*os.File, os.FileInfo, fileRead) {
 }
 
 // hashOpen hashes an open regular file and keeps its bytes when there
-// are at most keepMax of them.
-func hashOpen(f *os.File, info os.FileInfo, keepMax int64) fileRead {
+// are at most keepMax of them; scan, when there is one, sees every byte
+// the hash does.
+func hashOpen(f *os.File, info os.FileInfo, keepMax int64, scan *secretScan) fileRead {
 	size := info.Size()
 	if size > maxDigestFileBytes {
 		return fileRead{size: &size, omitted: harness.OmittedTooLarge}
@@ -507,7 +532,11 @@ func hashOpen(f *os.File, info os.FileInfo, keepMax int64) fileRead {
 		keep.max = 0
 	}
 	hash := sha256.New()
-	n, err := io.Copy(io.MultiWriter(hash, keep), io.LimitReader(f, maxDigestFileBytes+1))
+	sinks := []io.Writer{hash, keep}
+	if scan != nil {
+		sinks = append(sinks, scan)
+	}
+	n, err := io.Copy(io.MultiWriter(sinks...), io.LimitReader(f, maxDigestFileBytes+1))
 	if err != nil {
 		return fileRead{omitted: harness.OmittedUnreadable}
 	}

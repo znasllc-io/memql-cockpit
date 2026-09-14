@@ -5,6 +5,7 @@ package appsession
 import (
 	"encoding/base64"
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -296,12 +297,32 @@ func TestContentPolicyNeverCarriesTheCredential(t *testing.T) {
 			t.Errorf("%s = %+v, want contains_credential with nothing derived from it", c.Path, c)
 		}
 	}
-	// A credential renewed mid-session is refused as well.
+	// At any size: a file too large to travel inline would otherwise carry
+	// its digest, and the bearer can sit across the boundary between two
+	// of the reads that hash it.
+	big := writeFile(t, ws, "big.log", strings.Repeat("z", 32<<10-10)+testBearer+strings.Repeat("z", int(maxInlineFileBytes)))
+	if got := readOne(p, harness.ContentWrite, big); got.Omitted != harness.OmittedCredential || got.Digest != "" || got.Bytes == nil {
+		t.Errorf("a large file holding the bearer = %+v, want contains_credential with its size and no digest", got)
+	}
+
+	// A credential renewed mid-session is refused as well -- including in
+	// a large file whose digest was remembered before the renewal.
 	renewed := "renewed-" + strings.Repeat("r", 40)
-	p.secrets.add(renewed)
 	after := writeFile(t, ws, "after.txt", renewed)
+	settled := writeFile(t, ws, "settled.dat", renewed+strings.Repeat("s", int(maxInlineFileBytes)))
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(settled, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if got := readOne(p, harness.ContentWrite, settled); got.Digest == "" {
+		t.Fatalf("before the renewal = %+v, want a digest", got)
+	}
+	p.secrets.add(renewed)
 	if got := readOne(p, harness.ContentWrite, after); got.Omitted != harness.OmittedCredential {
 		t.Errorf("the renewed credential = %+v", got)
+	}
+	if got := readOne(p, harness.ContentWrite, settled); got.Omitted != harness.OmittedCredential || got.Digest != "" {
+		t.Errorf("a remembered file holding the renewed credential = %+v, want it scanned again and refused", got)
 	}
 }
 
@@ -340,7 +361,7 @@ func TestContentPolicyKnowsTheScaffoldingByIdentity(t *testing.T) {
 		t.Fatalf("open: %+v", got)
 	}
 	defer f.Close()
-	if why := p.confirm(f, info, resolvedPath(inside)); why != harness.OmittedScaffolding {
+	if _, why := p.confirm(f, info, resolvedPath(inside)); why != harness.OmittedScaffolding {
 		t.Errorf("confirm = %q, want session_scaffolding through the directory's identity", why)
 	}
 }
@@ -361,19 +382,19 @@ func TestContentPolicyChecksTheFileThatOpened(t *testing.T) {
 		t.Fatalf("open: %+v", got)
 	}
 	defer f.Close()
-	why := p.confirm(f, info, resolvedPath(claimed))
+	where, why := p.confirm(f, info, resolvedPath(claimed))
 	// /proc names the file outright; elsewhere the approved path names a
 	// different file than the one open, which is refused as unreadable.
-	if why != harness.OmittedOutsideWorkspace && why != harness.OmittedUnreadable {
-		t.Errorf("confirm = %q, want the opened file refused", why)
+	if why != harness.OmittedOutsideWorkspace && why != harness.OmittedUnreadable || where != "" {
+		t.Errorf("confirm = %q %q, want the opened file refused", where, why)
 	}
 	g, ginfo, _ := openRegular(claimed)
 	if g == nil {
 		t.Fatal("open the real one")
 	}
 	defer g.Close()
-	if why := p.confirm(g, ginfo, resolvedPath(claimed)); why != "" {
-		t.Errorf("the file the path names = %q, want it allowed", why)
+	if where, why := p.confirm(g, ginfo, resolvedPath(claimed)); why != "" || where != resolvedPath(claimed) {
+		t.Errorf("the file the path names = %q %q, want it allowed where it is", where, why)
 	}
 }
 
@@ -408,12 +429,25 @@ func TestContentPolicyRemembersTheDigestOfALargeSettledFile(t *testing.T) {
 		t.Errorf("an unchanged stamp re-hashed the file: %s", got.Digest)
 	}
 
-	// A fresh mtime is never trusted, and a replaced file is another file.
-	if err := os.Chtimes(path, time.Now(), time.Now()); err != nil {
+	// A fresh mtime is never trusted: a write inside the same clock tick
+	// can leave the stamp exactly as it was. Read at a fresh mtime, rewrite
+	// at the same size, put the same mtime back, and the second read must
+	// still hash.
+	fresh := time.Now()
+	if err := os.Chtimes(path, fresh, fresh); err != nil {
 		t.Fatal(err)
 	}
 	if got := readOne(p, harness.ContentWrite, path); got.Digest != harness.Digest([]byte(strings.Repeat("b", size))) {
-		t.Errorf("a file written just now was served from memory: %s", got.Digest)
+		t.Fatalf("a file written just now was served from memory: %s", got.Digest)
+	}
+	if err := os.WriteFile(path, []byte(strings.Repeat("d", size)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, fresh, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if got := readOne(p, harness.ContentWrite, path); got.Digest != harness.Digest([]byte(strings.Repeat("d", size))) {
+		t.Errorf("a rewrite inside the settle window was served the digest of the bytes before it: %s", got.Digest)
 	}
 	replacement := writeFile(t, ws, "big.new", strings.Repeat("c", size))
 	if err := os.Chtimes(replacement, old, old); err != nil {
@@ -492,6 +526,37 @@ func TestEncodeActionShedsWhatCostsLeastFirst(t *testing.T) {
 	}
 	if body[len(body)-1] != '\n' {
 		t.Error("an event line ends in a newline")
+	}
+}
+
+// TestSession_RecordActionSendsWhatEncodeActionAllows: the session's own
+// send path is the one that sheds -- an action whose arguments carry more
+// than the stream may take leaves without them, and text is not escaped.
+func TestSession_RecordActionSendsWhatEncodeActionAllows(t *testing.T) {
+	f := newFakeSender()
+	s := &session{id: "s-big", sender: f, logger: slog.Default()}
+	huge := json.RawMessage(`{"patch":"` + strings.Repeat("x", maxActionBytes) + `"}`)
+	s.recordAction(harness.Action{Type: harness.ActionEventType, V: harness.RecordVersion, Seq: 1, Turn: 1,
+		ID: "big", Tool: harness.ActionFSWrite, AppTool: "fileChange", Args: huge, Cwd: "/w"})
+	s.recordAction(harness.Action{Type: harness.ActionEventType, V: harness.RecordVersion, Seq: 2, Turn: 1,
+		ID: "small", Tool: harness.ActionExec, AppTool: "commandExecution", Args: json.RawMessage(`{}`),
+		Cwd: "/w", Command: "a < b && c > d"})
+	got := f.recorded()
+	if len(got) != 2 {
+		t.Fatalf("sent %d chunks, want 2", len(got))
+	}
+	if len(got[0].data) > maxActionBytes {
+		t.Errorf("the large action went out at %d bytes, over %d", len(got[0].data), maxActionBytes)
+	}
+	var big harness.Action
+	if err := json.Unmarshal([]byte(got[0].data), &big); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if string(big.Args) != "null" || big.ArgsOmitted != harness.ArgsTooLarge || big.ArgsDigest != harness.ArgsDigest(huge) {
+		t.Errorf("the large action = %+v, want its arguments shed with their digest", big)
+	}
+	if !strings.Contains(got[1].data, "a < b && c > d") {
+		t.Errorf("the command was escaped on the way out: %s", got[1].data)
 	}
 }
 

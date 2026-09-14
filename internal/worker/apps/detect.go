@@ -3,6 +3,7 @@ package apps
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -75,6 +76,10 @@ const DefaultVersionTTL = 5 * time.Minute
 // and the fallback harness.
 const probeTimeout = 5 * time.Second
 
+// probeWaitDelay is how long a version probe that has exited may still
+// hold its output open (runVersion).
+const probeWaitDelay = 500 * time.Millisecond
+
 type versionEntry struct {
 	version string
 	stamp   string
@@ -127,8 +132,15 @@ func (d *Detector) runVersion(ctx context.Context, bin string, args []string) (s
 	}
 	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, bin, args...).Output()
-	if err != nil {
+	cmd := exec.CommandContext(ctx, bin, args...)
+	// WaitDelay bounds the wait for the OUTPUT as well as the exit. An app
+	// behind a version-manager shim can leave a child holding stdout open
+	// after the probe itself has answered, and Output would otherwise wait
+	// on that pipe long past the deadline -- in front of a session's start,
+	// now that the fingerprint asks this too.
+	cmd.WaitDelay = probeWaitDelay
+	out, err := cmd.Output()
+	if err != nil && !errors.Is(err, exec.ErrWaitDelay) {
 		return "", err
 	}
 	return string(out), nil

@@ -3,10 +3,12 @@ package harness
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -74,6 +76,25 @@ cat <<'CODEX_JSON'
 {"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"THREAD","turnId":"turn_pc","completedAtMs":1,"item":{"type":"imageView","id":"img_1","path":"/w/shot.png"}}}
 {"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"THREAD","turnId":"turn_pc","completedAtMs":2,"item":{"type":"calendarInvite","id":"cal_1","status":"completed","attendees":["a@b.c"]}}}
 {"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"THREAD","turn":{"id":"turn_pc","items":[],"itemsView":"notLoaded","status":"completed","error":null,"startedAt":1,"completedAt":2,"durationMs":1}}}
+CODEX_JSON
+`
+
+// codexTurnTwoOpen starts two commands, completes the first, and never
+// ends the turn; codexMCPTwoOpen is the same on the fallback.
+const codexTurnTwoOpen = `
+printf '{"jsonrpc":"2.0","id":%s,"result":{"turn":{"id":"turn_2","items":[],"itemsView":"notLoaded","status":"inProgress","error":null,"startedAt":null,"completedAt":null,"durationMs":null}}}\n' "$id"
+cat <<'CODEX_JSON'
+{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"THREAD","turnId":"turn_2","startedAtMs":1,"item":{"type":"commandExecution","id":"exec-a","command":"true","cwd":"/w","processId":null,"source":"agent","status":"inProgress","commandActions":[],"aggregatedOutput":null,"exitCode":null,"durationMs":null}}}
+{"jsonrpc":"2.0","method":"item/started","params":{"threadId":"THREAD","turnId":"turn_2","startedAtMs":2,"item":{"type":"commandExecution","id":"exec-b","command":"sleep 60","cwd":"/w","processId":null,"source":"agent","status":"inProgress","commandActions":[],"aggregatedOutput":null,"exitCode":null,"durationMs":null}}}
+{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"THREAD","turnId":"turn_2","completedAtMs":3,"item":{"type":"commandExecution","id":"exec-a","command":"true","cwd":"/w","processId":null,"source":"agent","status":"completed","commandActions":[],"aggregatedOutput":"","exitCode":0,"durationMs":1}}}
+CODEX_JSON
+`
+
+const codexMCPTwoOpen = `
+cat <<'CODEX_JSON'
+{"jsonrpc":"2.0","method":"codex/event","params":{"id":"sub_1","msg":{"type":"exec_command_begin","call_id":"exec-a","turn_id":"turn_1","command":["true"],"cwd":"file:///w","parsed_cmd":[],"source":"agent"},"_meta":{"requestId":1}}}
+{"jsonrpc":"2.0","method":"codex/event","params":{"id":"sub_1","msg":{"type":"exec_command_begin","call_id":"exec-b","turn_id":"turn_1","command":["sleep","60"],"cwd":"file:///w","parsed_cmd":[],"source":"agent"},"_meta":{"requestId":1}}}
+{"jsonrpc":"2.0","method":"codex/event","params":{"id":"sub_1","msg":{"type":"exec_command_end","call_id":"exec-a","turn_id":"turn_1","command":["true"],"cwd":"file:///w","parsed_cmd":[],"source":"agent","stdout":"","stderr":"","aggregated_output":"","exit_code":0,"duration":{"secs":0,"nanos":1000000},"formatted_output":"","status":"completed"},"_meta":{"requestId":1}}}
 CODEX_JSON
 `
 
@@ -227,6 +248,78 @@ func TestCodexAppServerProgressCallsAreRecordedAfterTheirEventLine(t *testing.T)
 		if prev := rec.before(id); !strings.HasPrefix(prev, StreamEvent+" ") || !strings.Contains(prev, `"id":"`+id+`"`) {
 			t.Errorf("before action %s came %q, want the app's own event line for it", id, prev)
 		}
+	}
+}
+
+// gateSink holds the action with one id inside Record until released,
+// and keeps the order actions reached it in.
+type gateSink struct {
+	hold             string
+	entered, release chan struct{}
+	once             sync.Once
+	mu               sync.Mutex
+	order            []string
+}
+
+func (g *gateSink) Chunk(string, []byte) {}
+
+func (g *gateSink) Record(a Action) {
+	if a.ID == g.hold {
+		g.once.Do(func() { close(g.entered) })
+		<-g.release
+	}
+	g.mu.Lock()
+	g.order = append(g.order, fmt.Sprintf("%s:%d", a.ID, a.Seq))
+	g.mu.Unlock()
+}
+
+// TestCodexCancelledTurnFlushesAfterTheCompletionInFlight: the reader is
+// still sending a completion (seq 1) when the turn is cancelled, and the
+// turn's own flush numbers the call left open (seq 2) on another
+// goroutine. The flush must wait for the send in flight -- the engine
+// drops an action that arrives behind a higher seq, so a flush that went
+// first would lose seq 1. Both Codex clients complete on the reader and
+// flush on the turn, so both are held to it.
+func TestCodexCancelledTurnFlushesAfterTheCompletionInFlight(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		start func(t *testing.T) Harness
+	}{
+		{"app-server", func(t *testing.T) Harness {
+			bin, _ := fakeCodexAppServer(t, codexTurnTwoOpen)
+			return startCodexAppServer(t, codexSpec(t, bin))
+		}},
+		{"mcp-server", func(t *testing.T) Harness {
+			bin, _ := fakeCodexMCP(t, codexMCPTwoOpen)
+			return startCodexMCP(t, codexSpec(t, bin))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := tc.start(t)
+			g := &gateSink{hold: "exec-a", entered: make(chan struct{}), release: make(chan struct{})}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				_, _ = h.Turn(ctx, "go", g)
+			}()
+			select {
+			case <-g.entered:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the completion never reached the sink")
+			}
+			cancel()
+			// Room for a flush that did not wait to get ahead.
+			time.Sleep(200 * time.Millisecond)
+			close(g.release)
+			<-done
+			g.mu.Lock()
+			defer g.mu.Unlock()
+			if !reflect.DeepEqual(g.order, []string{"exec-a:1", "exec-b:2"}) {
+				t.Fatalf("the sink saw %v, want exec-a:1 then exec-b:2", g.order)
+			}
+		})
 	}
 }
 
@@ -434,6 +527,9 @@ func TestCodexItemFinishRecordsOnlyWhatTheItemReported(t *testing.T) {
 	}{
 		{"a declined command never ran",
 			`{"type":"commandExecution","id":"c","command":"rm -rf x","status":"declined","commandActions":[{"type":"read","path":"a.txt"}],"aggregatedOutput":null,"exitCode":null}`,
+			"true", "absent", "", 0},
+		{"a declined command that says more still never ran",
+			`{"type":"commandExecution","id":"c","command":"rm -rf x","status":"declined","commandActions":[],"aggregatedOutput":"declined by the user","exitCode":-1}`,
 			"true", "absent", "", 0},
 		{"a command that printed nothing printed the empty text",
 			`{"type":"commandExecution","id":"c","command":"true","status":"completed","aggregatedOutput":null,"exitCode":0}`,
