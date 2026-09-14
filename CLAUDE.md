@@ -247,12 +247,20 @@ prints the effective table. Five rules, each of which fails silently:
 4. **`apps.levels` is NOT default-deny.** Absent means the built-in table; an
    entry replaces its row WHOLE; the block REPLACES on SIGHUP. An entry the
    app would misread REFUSES its level with the policy's sentence -- never a
-   fallback to the built-in row it was written to replace. Entries no session
-   can reach (unknown app, `fastt`, `embeddings`) are logged, not refused.
+   fallback to the built-in row it was written to replace, and the refused
+   row leaves the table the harness sees. Entries no session can reach
+   (unknown app, `fastt`, `embeddings`) are logged, not refused. The block is
+   read from its `yaml.Node`, NOT a typed decode: a typed decode drops an
+   unknown key (`efort`) silently and fails the WHOLE file on a shorthand
+   (`reasoning: opus`) -- and a worker that cannot parse policy.yaml runs on
+   defaults that allow no app. Keep it a node walk.
 5. **The level is resolved before any side effect.** The session refuses it
    before writing the bearer, pulling inputs or opening a transcript, and the
    harness resolves the same table again in `Start` with the same function.
-   The `open` kind reads no level: a person picks their own model.
+   The `open` kind reads no level: a person picks their own model. An
+   attach through `codex-mcp` cannot take one at all (`codex-reply` declares
+   no configuration), so `harness.CheckResume` refuses it rather than let
+   the transcript claim a level the app never received.
 
 **The memql#5096 app-session fields are mapped** (memql-cockpit#444): the
 follow-up is `AppSessionControl.prompt` (never `reason`), the schema is

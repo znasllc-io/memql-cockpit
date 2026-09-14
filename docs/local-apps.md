@@ -245,7 +245,20 @@ Why these values:
 Both Codex harnesses take the same knobs: the app-server sets them on the
 thread (`thread/start` and `thread/resume`), and `codex-mcp` on the `codex` tool
 call that opens the session. `codex-reply` takes no configuration, so a
-continuation runs at the settings the session started with.
+continuation runs at the settings the session started with — and an **attach**
+through `codex-mcp` (which continues with `codex-reply` from its first call)
+**cannot take a level at all**. It is refused, with the two ways out: attach
+without a level, or upgrade Codex to a version with `codex app-server`. A knob a
+row leaves unset is decided by Codex's own defaults — the session runs under a
+per-session `CODEX_HOME` holding only MemQL's MCP server, not your
+`~/.codex/config.toml`.
+
+**Claude Code 2.1.111 or later** for the built-in table: `xhigh` (the
+`reasoning` row) arrived in 2.1.111, and `--effort` itself shortly before 2.1.72.
+An older Claude Code answers an effort it does not know with its own error or
+its default effort (the End reports the effort as unknown either way, since
+Claude Code never states one). Upgrade, or override the row — for example
+`reasoning: {model: opus, effort: high}`.
 
 ### Choosing your own
 
@@ -287,8 +300,12 @@ cockpit checks every entry first — Claude Code's efforts are `low`, `medium`,
 account's model then judges; a model name must start with a letter or a digit
 and contain no spaces — and a bad entry refuses **that level only**, with a
 sentence naming the line, rather than quietly falling back to the built-in row
-you wrote it to replace. An entry for an app or a level no session can ask for
-(a typo like `fastt`, an unknown app, `embeddings`) is ignored and reported.
+you wrote it to replace. An entry of the wrong **shape** is refused the same
+way and never costs the rest of the file: a shorthand (`reasoning: opus` — an
+entry is `{model: …, effort: …}`), a key that is neither knob (`efort: max`), or
+a list where a single word belongs. An entry for an app or a level no session
+can ask for (a typo like `fastt`, an unknown app, `embeddings`) is ignored and
+reported.
 
 Both kinds of problem are logged whenever `policy.yaml` is read:
 
@@ -332,7 +349,7 @@ request is not a report, and the engine records these as what *served*.
 | App | Model | Effort |
 |---|---|---|
 | Claude Code | the result event's `modelUsage` — the session's own model when it spent tokens, else the one that produced the most output | **always empty**: Claude Code states no effort anywhere in its output |
-| Codex (app-server) | the thread's `model` as the app stated it, replaced by a `model/rerouted` | the thread's `reasoningEffort` |
+| Codex (app-server) | the thread's `model` as the app stated it (`thread/start`, `thread/resume`, later `thread/settings/updated`); a `model/rerouted` replaces it for the turn it names | the thread's `reasoningEffort` / `effort` |
 | Codex (`codex-mcp`) | `session_configured`'s `model` | `session_configured`'s `reasoning_effort` |
 
 Empty means the app said nothing, and the engine records it as unknown. A turn
@@ -410,7 +427,9 @@ applied silently:
 | `cannot run at level "embeddings"` | correct refusal: no app has an embedder. The engine should not route an embedding to an app |
 | `cannot run at level "…": unknown level` | the engine sent a word that is not one of `fast`, `strong`, `reasoning`, `embeddings` — an engine newer than this cockpit, or a bug on that side |
 | `apps.levels.<app>.<level>: … refuses <level> sessions` | your own `policy.yaml` entry for that level is one the app would misread. Fix the line (`memql worker apps` shows it) and `SIGHUP` the worker |
-| the model on a finished session is not the one the level names | the End reports what the APP said served it. Claude Code may bill part of a turn to its small housekeeping model; Codex may reroute a turn. The first transcript line says what was asked for |
+| the model on a finished session is not the one the level names | usually just the name: the level passes an alias (`opus`) and the End carries the full id the app resolved it to (`claude-opus-5`). Otherwise the app ran something else and said so — Codex rerouted the turn (`model/rerouted` is in the transcript), or a Claude Code turn spent nothing on the session's own model. The `[memql] level …` transcript line says what was asked for |
+| `codex mcp-server cannot set a level on a thread it resumes` | an attach at a level on a Codex without the app-server. Attach without a level, or upgrade Codex |
+| `apps.levels.<app>.<level>: an entry is a mapping of model and effort` | a shorthand like `reasoning: opus`. Write `reasoning: {model: opus}` |
 | `the app answered, but not against the schema` | the run SUCCEEDED and produced no structured result. For `codex-mcp` that is expected: it cannot constrain the answer at all |
 | `not found (404) -- either the artifact does not exist, or the owning user cannot reach it` | the Library answers 404 for both on purpose, so a link cannot probe which ids exist. Check the OWNING USER's access, not the worker token |
 | `the session credential was rejected (401)` | this one IS the cockpit's side: the bearer expired or is malformed |
