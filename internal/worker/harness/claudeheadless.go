@@ -69,6 +69,10 @@ const (
 	claudeTypeAssistant = "assistant"
 	claudeTypeUser      = "user"
 	claudeTypeResult    = "result"
+	// claudeTypeSystem with subtype init opens every turn and names the
+	// model the session runs on (2.1.270: `"model":"claude-haiku-4-5-..."`).
+	claudeTypeSystem  = "system"
+	claudeSubtypeInit = "init"
 )
 
 // Content block types inside an assistant or user message.
@@ -84,8 +88,12 @@ const (
 // mutable state lives in claudeTurn instead, so two turns cannot see
 // each other's half-parsed stream.
 type claudeHeadless struct {
-	mu      sync.Mutex
-	spec    Spec
+	mu   sync.Mutex
+	spec Spec
+	// knobs are the session's level as this app spells it, settled once in
+	// Start and passed to every turn's process -- a resumed turn included,
+	// because each turn is a fresh process that knows only its own argv.
+	knobs   Knobs
 	ref     string
 	started bool
 	closed  bool
@@ -125,10 +133,18 @@ func (h *claudeHeadless) Start(_ context.Context, spec Spec) error {
 	if strings.TrimSpace(spec.Binary) == "" {
 		return errors.New("harness: claude-headless was given no binary to run")
 	}
+	// The level is settled here rather than at the first turn, so a level
+	// this app cannot run at fails while the session is still starting --
+	// before a process, and before a turn that would read as a bad prompt.
+	knobs, err := spec.knobs(HarnessClaudeHeadless)
+	if err != nil {
+		return fmt.Errorf("harness: claude-headless: %w", err)
+	}
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.spec = spec
+	h.knobs = knobs
 	h.ref = strings.TrimSpace(spec.ResumeRef)
 	h.started = true
 	h.closed = false
@@ -161,7 +177,7 @@ func (h *claudeHeadless) Close() error {
 // conversation that silently forgot half of itself.
 func (h *claudeHeadless) Turn(ctx context.Context, prompt string, sink Sink) (TurnResult, error) {
 	h.mu.Lock()
-	spec, ref, started, closed, running := h.spec, h.ref, h.started, h.closed, h.running
+	spec, knobs, ref, started, closed, running := h.spec, h.knobs, h.ref, h.started, h.closed, h.running
 	if started && !closed && !running {
 		h.running = true
 	}
@@ -183,7 +199,7 @@ func (h *claudeHeadless) Turn(ctx context.Context, prompt string, sink Sink) (Tu
 		h.mu.Unlock()
 	}()
 
-	argv := claudeArgv(spec, prompt, ref)
+	argv := claudeArgv(spec, knobs, prompt, ref)
 	proc, err := spec.Launch(ctx, spec.Workspace, argv, spec.Env, false)
 	if err != nil {
 		return TurnResult{ExitCode: -1, AppSessionRef: ref},
@@ -230,6 +246,12 @@ func (h *claudeHeadless) Turn(ctx context.Context, prompt string, sink Sink) (Tu
 		res.Text = ev.Result
 		res.Usage = ev.usage()
 	}
+	// What the app says served this turn -- for a failed turn too, since a
+	// run that spent tokens on a model before it failed still ran on it.
+	// Effort is left empty on purpose: Claude Code states none anywhere in
+	// its stream (2.1.270), so the only value that could go here is the
+	// --effort this client passed, and a request is not a report.
+	res.Model = turn.servedModel()
 
 	// The exit status is the first question: a process that died has
 	// nothing to say about whether its answer was structured.
@@ -284,8 +306,20 @@ func (h *claudeHeadless) rememberRef(ref string) {
 // `--output-format=stream-json` is REFUSED without it ("When using
 // --print, --output-format=stream-json requires --verbose"), so
 // dropping it turns every turn into an immediate failure.
-func claudeArgv(spec Spec, prompt, ref string) []string {
+//
+// The level's knobs go straight after it, before --mcp-config, and each
+// is a single-value option (`--model <model>`, `--effort <level>` on
+// 2.1.270), so neither can swallow a following argument the way the
+// variadic can. CheckKnobs has already refused a value that begins with
+// a dash, which is the one value that would read as a flag of its own.
+func claudeArgv(spec Spec, knobs Knobs, prompt, ref string) []string {
 	argv := []string{spec.Binary, "-p", "--output-format", "stream-json", "--verbose"}
+	if knobs.Model != "" {
+		argv = append(argv, "--model", knobs.Model)
+	}
+	if knobs.Effort != "" {
+		argv = append(argv, "--effort", knobs.Effort)
+	}
 	if path := strings.TrimSpace(spec.MCPConfigPath); path != "" {
 		argv = append(argv, "--mcp-config", path)
 	}
@@ -315,6 +349,11 @@ type claudeTurn struct {
 	// Written by the stdout pump only.
 	sessionID string
 	result    *claudeResultEvent
+	// initModel is the model the turn's init event says the session runs
+	// on. It is not a report on its own -- it is a setting, printed before
+	// anything has run -- and servedModel uses it only to pick the
+	// session's own model out of a result that names several.
+	initModel string
 
 	// Written by the stderr pump only.
 	stderrTail []byte
@@ -389,6 +428,11 @@ func (t *claudeTurn) route(line []byte) {
 	}
 	if id := strings.TrimSpace(ev.SessionID); id != "" {
 		t.sessionID = id
+	}
+	if ev.Type == claudeTypeSystem && ev.Subtype == claudeSubtypeInit {
+		if m := strings.TrimSpace(ev.Model); m != "" {
+			t.initModel = m
+		}
 	}
 
 	switch ev.Type {
@@ -541,7 +585,8 @@ func readClaudeLines(src io.Reader, onLine, onOversize func([]byte)) {
 
 // claudeEvent is the envelope every stream-json line shares.
 //
-// Only the three fields this client routes on are declared. The rest is
+// Only the fields this client routes on are declared -- the three every
+// line carries, plus the init event's subtype and model. The rest is
 // forwarded verbatim rather than modelled, so a Claude Code release that
 // adds a field costs this package nothing.
 //
@@ -551,7 +596,9 @@ func readClaudeLines(src io.Reader, onLine, onOversize func([]byte)) {
 // one classification an operator cannot tell from a crash.
 type claudeEvent struct {
 	Type      string          `json:"type"`
+	Subtype   string          `json:"subtype"`
 	SessionID string          `json:"session_id"`
+	Model     string          `json:"model"`
 	Message   json.RawMessage `json:"message"`
 }
 
@@ -587,6 +634,47 @@ type claudeResultEvent struct {
 		InputTokens  int64 `json:"input_tokens"`
 		OutputTokens int64 `json:"output_tokens"`
 	} `json:"usage"`
+	// ModelUsage is the app's own account of which models SPENT this
+	// turn's tokens, keyed by model id (2.1.270:
+	// `{"claude-haiku-4-5-20251001":{"inputTokens":909,"outputTokens":284,
+	// "costUSD":0.02,...}}`). It is the report servedModel reads: a key here
+	// is a model that ran, where the init event's model is only the one the
+	// session was set up with.
+	ModelUsage map[string]claudeModelUsage `json:"modelUsage"`
+}
+
+// claudeModelUsage is the one figure of a modelUsage entry this client
+// reads: the output that model produced, which decides between several.
+type claudeModelUsage struct {
+	OutputTokens int64 `json:"outputTokens"`
+}
+
+// servedModel is the model the app REPORTED this turn running on.
+//
+// A turn can spend on more than one model -- a subagent, or the small model
+// Claude Code uses for its own housekeeping -- so the session's OWN model,
+// the one the init event names, wins when it is among them. Otherwise the
+// model that produced the most output is the best statement there is, with
+// the name as the tie-break so the answer never depends on map order.
+//
+// No modelUsage, or an empty one, is NO report. The recorded failed resume
+// says `"modelUsage":{}` because no model ran, and naming the init event's
+// model for it would report a model that never did; a result from a Claude
+// Code that printed no modelUsage at all is the same silence.
+func (t *claudeTurn) servedModel() string {
+	if t.result == nil || len(t.result.ModelUsage) == 0 {
+		return ""
+	}
+	if _, ok := t.result.ModelUsage[t.initModel]; ok && t.initModel != "" {
+		return t.initModel
+	}
+	best, most := "", int64(-1)
+	for id, u := range t.result.ModelUsage {
+		if u.OutputTokens > most || (u.OutputTokens == most && id < best) {
+			best, most = id, u.OutputTokens
+		}
+	}
+	return best
 }
 
 // usage returns what the app STATED about its own spend.
