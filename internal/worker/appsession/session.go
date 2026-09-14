@@ -174,6 +174,16 @@ type Options struct {
 	// Nil means nothing is allowed, which is the default-deny posture
 	// the rest of the worker has.
 	Allowed func(appID string) bool
+	// Levels returns the machine owner's policy.yaml apps.levels entries
+	// for one app, and the levels those entries refuse, each with the
+	// sentence saying why (tools.Policy.AppLevels). The session lays the
+	// entries over the harness's built-in table.
+	//
+	// Nil means no entries, and every app runs the built-in table
+	// (harness.BuiltinLevels) -- which is also what an absent block
+	// means. Unlike Allowed, silence here grants nothing: it decides how
+	// an allowed app runs, not whether it may.
+	Levels func(appID string) (harness.Table, map[string]string)
 	// CheckWorkspace vetoes a workspace path. The delegation policy
 	// picks the workspace root, but the cockpit still gets to refuse a
 	// path outside its own -- the engine is naming a directory on
@@ -373,6 +383,10 @@ type session struct {
 	appRef    string
 	// result is the LAST turn's structured answer, when it produced one.
 	result []byte
+	// servedModel and servedEffort are what the app REPORTED serving the
+	// last turn that reported a model, kept as a pair -- see recordTurn.
+	servedModel  string
+	servedEffort string
 }
 
 // run drives the whole session and is the only place End is sent.
@@ -412,6 +426,17 @@ func (s *session) execute(ctx context.Context) (int, error) {
 	spec, err := s.resolveApp(ctx)
 	if err != nil {
 		return -1, err
+	}
+	// The level is settled here, before anything is written or fetched: a
+	// session this machine will not run at its level costs the refusal and
+	// nothing else -- no bearer on disk, no inputs pulled, no transcript
+	// pushed. The open kind hands the app to a PERSON, who picks their own
+	// model, so it reads no level at all.
+	var plan levelPlan
+	if s.start.GetKind() != KindOpen {
+		if plan, err = s.resolveLevel(spec); err != nil {
+			return -1, err
+		}
 	}
 	workspace, err := s.resolveWorkspace()
 	if err != nil {
@@ -485,9 +510,9 @@ func (s *session) execute(ctx context.Context) (int, error) {
 				"so it needs a prompt; there is no way to stream a run already in flight",
 				s.start.GetAppSessionRef())
 		}
-		return s.runTurns(ctx, spec, workspace, ref)
+		return s.runTurns(ctx, spec, workspace, ref, plan)
 	case KindRun, "":
-		return s.runTurns(ctx, spec, workspace, "")
+		return s.runTurns(ctx, spec, workspace, "", plan)
 	default:
 		return -1, fmt.Errorf("app session: unknown kind %q", s.start.GetKind())
 	}
@@ -532,6 +557,74 @@ func (s *session) resolveApp(ctx context.Context) (apps.Spec, error) {
 		return apps.Spec{}, fmt.Errorf("app session: %q is allowed here but is not on this worker's PATH", id)
 	}
 	return spec, nil
+}
+
+// levelPlan is what a session's LEVEL became on this machine
+// (memql-cockpit#437): the table the harness resolves it through, the
+// knobs that produced, and whose entry they were.
+type levelPlan struct {
+	level string
+	table harness.Table
+	knobs harness.Knobs
+	// owner is true when the level's entry came from the machine owner's
+	// policy.yaml rather than the built-in table -- the first thing a
+	// person reading the transcript needs when the model is not the one
+	// they expected.
+	owner bool
+}
+
+// resolveLevel settles the knobs this session runs at.
+//
+// The table is the built-in one for the harness THIS machine drives the
+// app through (so both Codex harnesses share Codex's), with the owner's
+// apps.levels entries laid over it level by level. The harness resolves the
+// level through the same table again in its own Start, with the same
+// function, so the two cannot disagree; resolving it here as well is what
+// lets the refusal come before the session has written or fetched anything.
+//
+// An owner's entry the app would misread REFUSES its level, in the
+// policy's own sentence naming the line to fix, rather than falling back to
+// the built-in entry it was written to replace (tools.Policy.AppLevels says
+// why). The refusal names the app and the level either way, because the
+// person reading it is the one deciding whether to fix a policy file or a
+// call site.
+func (s *session) resolveLevel(spec apps.Spec) (levelPlan, error) {
+	level := s.start.GetLevel()
+	var override harness.Table
+	var refused map[string]string
+	if f := s.manager.opts.Levels; f != nil {
+		override, refused = f(spec.ID)
+	}
+	if reason, ok := refused[level]; ok && level != "" {
+		return levelPlan{}, fmt.Errorf("app session: %s", reason)
+	}
+	table := harness.MergeLevels(harness.BuiltinLevels(spec.Harness), override)
+	knobs, err := harness.ResolveLevel(level, table)
+	if err == nil {
+		err = harness.CheckKnobs(spec.Harness, knobs)
+	}
+	if err != nil {
+		return levelPlan{}, fmt.Errorf("app session: %s cannot run at level %q: %w", spec.ID, level, err)
+	}
+	_, owner := override[level]
+	return levelPlan{level: level, table: table, knobs: knobs, owner: owner}, nil
+}
+
+// levelNote is the line a session writes into its transcript saying what
+// its level became here and where that came from, e.g.
+//
+//	[memql] level reasoning runs claude-code with --model opus --effort xhigh (the cockpit's built-in table)
+//
+// It is the one place a person reading a session can see that "reasoning"
+// meant Opus on this machine -- the End reports what the app SAID it ran,
+// and when the two differ, both halves are what explains it.
+func levelNote(spec apps.Spec, p levelPlan) string {
+	source := "the cockpit's built-in table"
+	if p.owner {
+		source = "this machine's policy.yaml apps.levels"
+	}
+	return fmt.Sprintf("[memql] level %s runs %s with %s (%s)\n",
+		p.level, spec.ID, harness.DescribeKnobs(spec.Harness, p.knobs), source)
 }
 
 // resolveWorkspace validates the directory the engine named.
@@ -594,7 +687,7 @@ func (s *session) pullInputs(ctx context.Context, workspace string) error {
 // the behaviour a session had before follow-ups existed: the engine
 // waits on an End, and a cockpit that held every session open until it
 // was cancelled would park every run for its whole wall-clock ceiling.
-func (s *session) runTurns(ctx context.Context, spec apps.Spec, workspace, resumeRef string) (int, error) {
+func (s *session) runTurns(ctx context.Context, spec apps.Spec, workspace, resumeRef string, plan levelPlan) (int, error) {
 	h, err := harness.New(spec.Harness)
 	if err != nil {
 		// The set of harness words is closed; this is a descriptor and a
@@ -616,6 +709,8 @@ func (s *session) runTurns(ctx context.Context, spec apps.Spec, workspace, resum
 		MCPConfigPath:  s.mcpConfigPath(),
 		ResponseSchema: startResponseSchema(s.start),
 		ResumeRef:      resumeRef,
+		Level:          plan.level,
+		Levels:         plan.table,
 		Launch:         s.launcher(),
 	}
 	if err := h.Start(ctx, hspec); err != nil {
@@ -626,6 +721,14 @@ func (s *session) runTurns(ctx context.Context, spec apps.Spec, workspace, resum
 		return -1, s.turnFailure(ctx, err)
 	}
 	defer func() { _ = h.Close() }()
+
+	// Said once the harness has taken the level, so the line never
+	// describes a session that did not start at it.
+	if plan.level != "" {
+		s.logger.Info("app session running at its level",
+			"level", plan.level, "model", plan.knobs.Model, "effort", plan.knobs.Effort, "owner_entry", plan.owner)
+		_ = s.emitChunk(StreamStderr, []byte(levelNote(spec, plan)))
+	}
 
 	// Every chunk the app produces arrives here already classified by
 	// the harness, which reads the app's own protocol. This replaces the

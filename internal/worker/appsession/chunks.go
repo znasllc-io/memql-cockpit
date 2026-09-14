@@ -164,6 +164,17 @@ func (s *session) recordTurn(res harness.TurnResult) {
 	// question nobody asked.
 	s.result = res.ResultJSON
 
+	// What the app SAID served it (design D9), as a PAIR from the last
+	// turn that named a model. A turn that said nothing -- one that died
+	// before its result, say -- does not erase what an earlier turn said,
+	// because silence is not a report that the model changed. But a model
+	// is never joined to an effort from a different turn: a later turn that
+	// names only a model reports that model at an effort nobody stated.
+	if m := strings.TrimSpace(res.Model); m != "" {
+		s.servedModel = m
+		s.servedEffort = strings.TrimSpace(res.Effort)
+	}
+
 	if !res.Usage.Known {
 		s.usageGaps++
 		return
@@ -288,10 +299,17 @@ func (s *session) pushOutputs(ctx context.Context) ([]string, error) {
 // empty field, never a synthesised `{}` -- that would read downstream as
 // "the app answered nothing", which bills and retries differently from
 // "the app answered in prose".
+//
+// model and effort are what the APP REPORTED serving (see recordTurn),
+// never the level's knobs: the engine records them as the model and effort
+// that SERVED, and a copy of the request would record as measured something
+// nobody measured. Empty is the app saying nothing, which the engine files
+// as unknown.
 func (s *session) sendEnd(code int, message string, artifacts []string) {
 	s.usageMu.Lock()
 	ref := s.appRef
 	result := s.result
+	model, effort := s.servedModel, s.servedEffort
 	s.usageMu.Unlock()
 	if strings.TrimSpace(ref) == "" {
 		ref = s.start.GetAppSessionRef()
@@ -305,6 +323,8 @@ func (s *session) sendEnd(code int, message string, artifacts []string) {
 		ProducedArtifactIds: artifacts,
 		Error:               s.redact.apply2(message),
 		ResultJson:          string(result),
+		Model:               model,
+		Effort:              effort,
 	}
 	if err := s.sender.SendAppSessionEnd(end); err != nil {
 		s.logger.Warn("app session end could not be sent", "error", err)
@@ -312,6 +332,8 @@ func (s *session) sendEnd(code int, message string, artifacts []string) {
 	}
 	s.logger.Info("app session ended",
 		"exit_code", code,
+		"served_model", model,
+		"served_effort", effort,
 		"artifacts", len(artifacts),
 		"usage_known", end.GetUsage().GetKnown(),
 		"error", message != "",
