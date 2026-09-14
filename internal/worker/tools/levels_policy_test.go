@@ -175,6 +175,89 @@ func TestAppLevels_UnknownAppsAndLevelsAreProblemsNotRefusals(t *testing.T) {
 	}
 }
 
+// A MISSPELLED KEY IS NOT DROPPED. A typed decode ignores a key it does not
+// know, and since an entry replaces its row whole, `efort: max` would run
+// the level at the app's default effort with nothing anywhere saying so --
+// the same silent failure CheckKnobs exists for, one level up. It refuses
+// the level and names the key.
+func TestAppLevels_AMisspelledKeyRefusesItsLevel(t *testing.T) {
+	p := policyFrom(t, "apps:\n  levels:\n    claude-code:\n      reasoning:\n        model: opus\n        efort: max\n")
+	table, refused := p.AppLevels("claude-code")
+	reason := refused["reasoning"]
+	for _, want := range []string{`"efort"`, "model and effort", "refuses reasoning sessions"} {
+		if !strings.Contains(reason, want) {
+			t.Errorf("refusal %q is missing %q", reason, want)
+		}
+	}
+	if _, ok := table["reasoning"]; ok {
+		t.Error("an entry with a key the cockpit does not know must not stand half-read")
+	}
+}
+
+// A SHORTHAND REFUSES ITS LEVEL, NOT THE FILE. `reasoning: opus` does not
+// decode into a mapping, and a typed decode would fail the whole of
+// policy.yaml -- which the worker then replaces with the defaults, and the
+// defaults allow no app at all. One wrong entry must cost that entry.
+func TestAppLevels_AScalarEntryRefusesItsLevelNotTheFile(t *testing.T) {
+	p := policyFrom(t, `shell:
+  allow: [terraform]
+apps:
+  allow: [claude-code]
+  levels:
+    claude-code:
+      reasoning: opus
+      fast: {model: haiku}
+`)
+	if got := p.AppsAllow(); len(got) != 1 || got[0] != "claude-code" {
+		t.Fatalf("apps.allow = %v; one bad level entry took the rest of the file with it", got)
+	}
+	if err := p.CheckShell("terraform plan"); err != nil {
+		t.Errorf("the owner's shell allow list was lost to a level entry: %v", err)
+	}
+	table, refused := p.AppLevels("claude-code")
+	if !strings.Contains(refused["reasoning"], "a mapping of model and effort") {
+		t.Errorf("refused = %v, want reasoning refused for its shape", refused)
+	}
+	if table["fast"].Model != "haiku" {
+		t.Error("the app's other levels must stand")
+	}
+}
+
+func TestAppLevels_ABlockOfTheWrongShapeIsAProblem(t *testing.T) {
+	for name, body := range map[string]string{
+		"a list of apps":   "apps:\n  allow: [codex]\n  levels:\n    - claude-code\n",
+		"a word for a app": "apps:\n  allow: [codex]\n  levels:\n    claude-code: opus\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := policyFrom(t, body)
+			if got := p.AppsAllow(); len(got) != 1 {
+				t.Fatalf("apps.allow = %v; the file was lost to the levels block", got)
+			}
+			if problems := p.AppLevelProblems(); len(problems) != 1 || !strings.Contains(problems[0], "is ignored") {
+				t.Errorf("problems = %v, want one sentence saying the block is ignored", problems)
+			}
+		})
+	}
+}
+
+// `fast:` with nothing after it is YAML for null, which reads the same as
+// `fast: {}`: an entry that stands with no knobs, the app's own defaults.
+func TestAppLevels_ANullEntryIsTheAppsDefaults(t *testing.T) {
+	p := policyFrom(t, "apps:\n  levels:\n    codex:\n      fast:\n")
+	table, refused := p.AppLevels("codex")
+	if k, ok := table["fast"]; !ok || k != (harness.Knobs{}) || len(refused) != 0 {
+		t.Errorf("fast = %+v ok=%v refused=%v, want an entry with no knobs", k, ok, refused)
+	}
+}
+
+func TestAppLevels_AListForAKnobRefusesItsLevel(t *testing.T) {
+	p := policyFrom(t, "apps:\n  levels:\n    codex:\n      strong:\n        model: [gpt-5.5, gpt-6-astra]\n")
+	_, refused := p.AppLevels("codex")
+	if !strings.Contains(refused["strong"], "model") {
+		t.Errorf("refused = %v, want strong refused naming its model", refused)
+	}
+}
+
 // apps.levels REPLACES on reload, the way models.runtimes does: an entry is
 // a record, and merging two generations of it would run one file's model at
 // another file's effort. Removing the block returns the built-in table.
