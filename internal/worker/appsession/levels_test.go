@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -230,19 +231,88 @@ func TestSession_AnEntryTheAppWouldMisreadRefusesOnlyItsLevel(t *testing.T) {
 
 // The open kind hands the app to a PERSON, who picks their own model, so it
 // reads no level at all -- not even to refuse one.
+//
+// The app IS on PATH, so resolveApp passes and the level is the next thing
+// a session would check. With no display the open then fails on its own
+// terms -- which is also what keeps this test from opening a real window
+// for a person who is not here. Had the open read the level, "turbo" would
+// have refused it first, and the error would name the level instead.
 func TestSession_OpenReadsNoLevel(t *testing.T) {
-	// Nothing named `claude` on PATH, so the open fails for the reason it
-	// would have failed anyway -- and must not open a real app for a person
-	// who is not here.
-	t.Setenv("PATH", t.TempDir())
+	if runtime.GOOS != "linux" {
+		t.Skip("the no-display refusal that makes this safe is Linux's; elsewhere an open would launch a terminal")
+	}
+	levelApp(t)
+	t.Setenv("DISPLAY", "")
+	t.Setenv("WAYLAND_DISPLAY", "")
 	h := newRig(t)
 	end := h.start(t, func(s *memqlv1.AppSessionStart) {
 		s.Kind = KindOpen
 		s.Level = "turbo"
 	})
-	if !strings.Contains(end.GetError(), "PATH") || strings.Contains(end.GetError(), "level") {
+	if !strings.Contains(end.GetError(), "display") || strings.Contains(end.GetError(), "level") {
 		t.Errorf("error = %q; an open session fails on its own terms, never over a level it never uses",
 			end.GetError())
+	}
+}
+
+// An attach through the Codex MCP fallback cannot take a level (codex-reply
+// declares no configuration), and the session refuses it at its level --
+// before a bearer is written or an mcp-server is started -- rather than run
+// at whatever settings the thread already has while its transcript claimed
+// otherwise.
+func TestSession_ACodexMCPAttachCannotTakeALevel(t *testing.T) {
+	dir := t.TempDir()
+	invocations := filepath.Join(dir, "invocations")
+	// A Codex without the app-server: the probe exits non-zero, so this
+	// machine drives it through codex-mcp.
+	fakeApp(t, "codex", fmt.Sprintf(`
+echo "$*" >> %q
+if [ "$1" = "app-server" ] && [ "$2" = "--help" ]; then exit 9; fi
+exit 9
+`, invocations))
+
+	h := newRig(t, apps.IDCodex)
+	end := h.start(t, func(s *memqlv1.AppSessionStart) {
+		s.SessionId = "sess-codex-attach-level"
+		s.App = apps.IDCodex
+		s.Kind = KindAttach
+		s.AppSessionRef = "019bbb20-bff6-7130-83aa-bf45ab33250e"
+		s.Level = "strong"
+	})
+	if !strings.Contains(end.GetError(), "codex-reply takes no configuration") {
+		t.Errorf("error = %q, want the attach refused at its level", end.GetError())
+	}
+	for _, line := range readArgv(t, invocations) {
+		if strings.HasPrefix(line, "mcp-server") {
+			t.Errorf("an mcp-server was started for an attach refused at its level: %v", readArgv(t, invocations))
+		}
+	}
+	if seen := h.library.seenBearers(); len(seen) != 0 {
+		t.Errorf("the Library was called %d times for a session refused at its level", len(seen))
+	}
+}
+
+// A refused level's built-in row must not survive in the table the harness
+// is handed: the harness resolves the level again, and a table that still
+// held the row would run the default the owner's broken entry was written
+// to replace, the moment anything skipped the session's own check.
+func TestSession_ARefusedLevelLeavesTheTable(t *testing.T) {
+	s := &session{
+		start: &memqlv1.AppSessionStart{Level: "fast"},
+		manager: &Manager{opts: Options{Levels: func(string) (harness.Table, map[string]string) {
+			return nil, map[string]string{"strong": "apps.levels.claude-code.strong: refused"}
+		}}},
+	}
+	spec, _ := apps.SpecFor(apps.IDClaudeCode)
+	plan, err := s.resolveLevel(spec)
+	if err != nil {
+		t.Fatalf("fast is not refused: %v", err)
+	}
+	if _, ok := plan.table["strong"]; ok {
+		t.Errorf("the refused strong row is still in the table the harness would resolve through: %v", plan.table)
+	}
+	if plan.table["fast"].Model != "haiku" {
+		t.Errorf("fast = %+v, want the built-in row", plan.table["fast"])
 	}
 }
 

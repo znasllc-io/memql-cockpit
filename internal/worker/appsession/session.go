@@ -599,9 +599,23 @@ func (s *session) resolveLevel(spec apps.Spec) (levelPlan, error) {
 		return levelPlan{}, fmt.Errorf("app session: %s", reason)
 	}
 	table := harness.MergeLevels(harness.BuiltinLevels(spec.Harness), override)
+	// A refused level leaves the table too, not only this session: the
+	// harness resolves the level again through this table, and a built-in
+	// row left standing under a refused entry is the default the owner's
+	// entry was written to replace -- one skipped check away from running.
+	for level := range refused {
+		delete(table, level)
+	}
 	knobs, err := harness.ResolveLevel(level, table)
 	if err == nil {
 		err = harness.CheckKnobs(spec.Harness, knobs)
+	}
+	// An attach resumes a session rather than starting one, and the Codex
+	// MCP fallback cannot configure a session it resumes. The harness
+	// refuses that too, in Start; asking here is what makes the refusal
+	// come before the bearer and the inputs.
+	if err == nil && s.start.GetKind() == KindAttach {
+		err = harness.CheckResume(spec.Harness, knobs)
 	}
 	if err != nil {
 		return levelPlan{}, fmt.Errorf("app session: %s cannot run at level %q: %w", spec.ID, level, err)
