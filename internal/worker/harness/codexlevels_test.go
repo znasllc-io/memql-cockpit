@@ -263,6 +263,164 @@ func TestCodexAppServerNullEffortIsEmpty(t *testing.T) {
 	}
 }
 
+// --- the mcp-server fallback ----------------------------------------
+
+// codexMCPSessionConfigured is the session_configured event codex-cli
+// 0.153.4's mcp-server emitted on 2026-09-13 for a `codex` call configured
+// at low, trimmed of the permission profile and the rollout path. It is the
+// only line in that stream that states a model or an effort.
+const codexMCPSessionConfigured = `
+printf '{"jsonrpc":"2.0","method":"codex/event","params":{"_meta":{"requestId":1,"threadId":"THREAD"},"msg":{"type":"session_configured","session_id":"THREAD","thread_id":"THREAD","model":"gpt-6-astra","model_provider_id":"openai","service_tier":"default","approval_policy":"never","reasoning_effort":"low"},"id":""}}\n'
+`
+
+// codexMCPConfiguredOnFirstCall states the session's settings on the `codex`
+// call only, the way a session is configured once: a codex-reply continues
+// the thread and restates nothing.
+const codexMCPConfiguredOnFirstCall = `
+case "$line" in
+  *'"name":"codex-reply"'*) ;;
+  *)` + codexMCPSessionConfigured + `  ;;
+esac
+` + codexMCPToolOK
+
+func TestCodexMCPEveryLevelReachesTheCodexTool(t *testing.T) {
+	for level, want := range BuiltinLevels(HarnessCodexMCP) {
+		t.Run(level, func(t *testing.T) {
+			bin, log := fakeCodexMCP(t, codexMCPToolOK)
+			spec := codexSpec(t, bin)
+			spec.Level = level
+			h := startCodexMCP(t, spec)
+
+			if _, err := h.Turn(context.Background(), "do the thing", &recorder{}); err != nil {
+				t.Fatalf("turn: %v", err)
+			}
+			calls := codexToolCalls(t, log)
+			if len(calls) != 1 || calls[0].Name != mcpToolCodex {
+				t.Fatalf("want one codex call, got %+v", calls)
+			}
+			if got := codexConfigEffort(calls[0].Arguments); got != want.Effort {
+				t.Errorf("config.model_reasoning_effort = %q, want %q", got, want.Effort)
+			}
+			if _, ok := calls[0].Arguments["model"]; ok {
+				t.Errorf("the built-in Codex table names no model, but the codex tool got one: %v", calls[0].Arguments)
+			}
+		})
+	}
+}
+
+func TestCodexMCPOwnerModelReachesTheCodexTool(t *testing.T) {
+	bin, log := fakeCodexMCP(t, codexMCPToolOK)
+	spec := codexSpec(t, bin)
+	spec.Level = "reasoning"
+	spec.Levels = Table{"reasoning": {Model: "gpt-5.5", Effort: "xhigh"}}
+	h := startCodexMCP(t, spec)
+
+	if _, err := h.Turn(context.Background(), "do the thing", &recorder{}); err != nil {
+		t.Fatalf("turn: %v", err)
+	}
+	args := codexToolCalls(t, log)[0].Arguments
+	if args["model"] != "gpt-5.5" || codexConfigEffort(args) != "xhigh" {
+		t.Errorf("codex tool arguments = %v, want the owner's model and effort", args)
+	}
+}
+
+// codex-reply declares prompt and threadId and nothing else, so a
+// continuation carries no knobs -- and needs none, since the thread keeps
+// the settings its first call gave it.
+func TestCodexMCPReplyCarriesNoKnobs(t *testing.T) {
+	bin, log := fakeCodexMCP(t, codexMCPToolOK)
+	spec := codexSpec(t, bin)
+	spec.Level = "strong"
+	h := startCodexMCP(t, spec)
+
+	for _, prompt := range []string{"first", "second"} {
+		if _, err := h.Turn(context.Background(), prompt, &recorder{}); err != nil {
+			t.Fatalf("turn %q: %v", prompt, err)
+		}
+	}
+	calls := codexToolCalls(t, log)
+	if len(calls) != 2 || calls[1].Name != mcpToolCodexReply {
+		t.Fatalf("want a codex call then a codex-reply, got %+v", calls)
+	}
+	for key := range calls[1].Arguments {
+		if key != "threadId" && key != "prompt" {
+			t.Errorf("codex-reply was sent %q, which it does not declare: %v", key, calls[1].Arguments)
+		}
+	}
+}
+
+func TestCodexMCPReportsSessionConfigured(t *testing.T) {
+	bin, _ := fakeCodexMCP(t, codexMCPConfiguredOnFirstCall)
+	spec := codexSpec(t, bin)
+	spec.Level = "reasoning" // asks for high; the app states low
+	h := startCodexMCP(t, spec)
+
+	rec := &recorder{}
+	res, err := h.Turn(context.Background(), "do the thing", rec)
+	if err != nil {
+		t.Fatalf("turn: %v", err)
+	}
+	if res.Model != "gpt-6-astra" || res.Effort != "low" {
+		t.Errorf("Model/Effort = %q/%q, want the app's session_configured statement", res.Model, res.Effort)
+	}
+	if !strings.Contains(rec.joined(StreamEvent), "session_configured") {
+		t.Error("session_configured must still reach the transcript as an event")
+	}
+
+	// The statement outlives the call that carried it: codex-reply does
+	// not restate it, and the thread still runs at it.
+	again, err := h.Turn(context.Background(), "and again", &recorder{})
+	if err != nil {
+		t.Fatalf("second turn: %v", err)
+	}
+	if again.Model != "gpt-6-astra" || again.Effort != "low" {
+		t.Errorf("second turn Model/Effort = %q/%q, want the thread's settings carried", again.Model, again.Effort)
+	}
+}
+
+// A call that came back flagged isError did not show the model answered, so
+// it names no model even though the session was configured with one.
+func TestCodexMCPToolErrorReportsNoModel(t *testing.T) {
+	bin, _ := fakeCodexMCP(t, codexMCPSessionConfigured+codexMCPToolError)
+	h := startCodexMCP(t, codexSpec(t, bin))
+
+	res, err := h.Turn(context.Background(), "do the thing", &recorder{})
+	if err == nil {
+		t.Fatal("an isError result reported success")
+	}
+	if res.Model != "" || res.Effort != "" {
+		t.Errorf("Model/Effort = %q/%q, want nothing for a turn that failed", res.Model, res.Effort)
+	}
+}
+
+func TestCodexMCPWithoutSessionConfiguredReportsNothing(t *testing.T) {
+	bin, _ := fakeCodexMCP(t, codexMCPToolOK)
+	h := startCodexMCP(t, codexSpec(t, bin))
+
+	res, err := h.Turn(context.Background(), "do the thing", &recorder{})
+	if err != nil {
+		t.Fatalf("turn: %v", err)
+	}
+	if res.Model != "" || res.Effort != "" {
+		t.Errorf("Model/Effort = %q/%q, want nothing: the app stated neither", res.Model, res.Effort)
+	}
+}
+
+func TestCodexMCPRefusesAnUnknownLevelBeforeLaunching(t *testing.T) {
+	bin, log := fakeCodexMCP(t, codexMCPToolOK)
+	spec := codexSpec(t, bin)
+	spec.Level = "turbo"
+
+	h := &codexMCP{}
+	if err := h.Start(context.Background(), spec); err == nil {
+		t.Fatal("Start accepted a level it cannot run at")
+	}
+	_ = h.Close()
+	if _, statErr := os.Stat(log); !os.IsNotExist(statErr) {
+		t.Errorf("an mcp-server was launched for a session that could never run (%v)", statErr)
+	}
+}
+
 // codexConfigEffort pulls config.model_reasoning_effort out of decoded
 // params, "" when either level is absent.
 func codexConfigEffort(params map[string]any) string {
