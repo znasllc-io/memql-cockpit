@@ -92,9 +92,8 @@ const (
 	ActionCancel          = "cancel"
 	ActionRenewCredential = "renew_credential"
 	// ActionMessage starts the NEXT turn of a session that is already
-	// running one (design D7). The action is a plain string on the wire,
-	// so this word needs no proto change at all -- only the prompt it
-	// carries does, which is what controlPrompt is for.
+	// running one (design D7). The prompt it carries has a field of its
+	// own, read by controlPrompt.
 	ActionMessage = "message"
 )
 
@@ -111,58 +110,44 @@ const transcriptRel = ".memql-session/transcript.log"
 // indistinguishable to the person who typed it from one the app ignored.
 const maxQueuedFollowUps = 8
 
-// --- what memql#5096 adds to the wire, and what stands in until it lands
+// --- the memql#5096 fields, read in one place each
 //
-// Three fields of this feature do not exist on the proto at the pinned
-// engine sha, and each has exactly ONE accessor below rather than a
-// fallback scattered across the call sites. The day the pin carries
-// memql#5096, each becomes a one-line change here and nothing else
-// moves; a fallback written out in two places is how half of it survives
-// the upgrade.
+// The follow-up prompt, the response schema and the structured result
+// each have ONE accessor rather than reads scattered across the call
+// sites. That was the design while the fields did not exist yet -- a
+// stand-in in one place is a one-line change on the day the field lands
+// -- and it is why the day came and went unnoticed: the 2026-09-08 pin
+// bump carried all three and none of the one-line changes was made, so
+// every follow-up arrived empty, no session was asked for a schema, and
+// no structured answer reached the engine (memql-cockpit#444). The
+// accessors stay single for the same reason they were: a field read in
+// one place is a field one test can pin.
 
-// controlPrompt is the follow-up prompt on AppSessionControl{message}.
+// controlPrompt is the follow-up prompt on AppSessionControl{message}:
+// its `prompt` field, and nothing else.
 //
-// A WIRE FACT: AppSessionControl carries session_id, action, credential
-// and reason, and nothing else. `action` is a plain string, so the
-// cockpit can honour "message" today -- only the prompt has nowhere to
-// come from. memql#5096 adds `prompt`; until then the text travels in
-// `reason`, which is already free text the engine fills in and the
-// cockpit already carries into the transcript.
+// `reason` is NOT a fallback. The proto documents it as transcript
+// free-text on cancel, and the engine gives the follow-up its own field
+// precisely because one field meaning two things cannot be read without
+// knowing which branch wrote it. A message control with no prompt is
+// refused by followUp, loudly.
 func controlPrompt(c *memqlv1.AppSessionControl) string {
-	return strings.TrimSpace(c.GetReason())
+	return strings.TrimSpace(c.GetPrompt())
 }
 
 // startResponseSchema is the JSON Schema the engine asked this session's
-// final answer to satisfy.
+// final answer to satisfy -- AppSessionStart.response_schema_json.
 //
-// A WIRE FACT of the same kind: AppSessionStart carries session_id, app,
-// kind, prompt, inputs, workspace, credential, mcp_endpoint, limits,
-// run_id, step_id and app_session_ref -- and no schema. memql#5096 adds
-// `response_schema` (design 4.1). Until then every turn runs
-// unconstrained, which is the honest reading of "the engine asked for
-// nothing": a harness that invented a schema would change what the app
-// says, and the answer would be structured because the COCKPIT decided
-// it should be.
-func startResponseSchema(_ *memqlv1.AppSessionStart) string {
-	return ""
+// EMPTY MEANS THE ENGINE ASKED FOR NONE, and a harness must then not
+// invent one: a schema the caller did not ask for changes what the app
+// says, and the answer would be structured because the COCKPIT decided it
+// should be. Whether this machine's harness can honour one is the app
+// descriptor's business (Register.app_descriptors): a harness that cannot
+// constrain an answer reports structured_result=false, and the engine does
+// not send it a schema.
+func startResponseSchema(s *memqlv1.AppSessionStart) string {
+	return strings.TrimSpace(s.GetResponseSchemaJson())
 }
-
-// resultEventType names the final `event` chunk that carries a turn's
-// structured answer.
-//
-// A WIRE FACT again: AppSessionEnd carries session_id, exit_code, usage,
-// app_session_ref, produced_artifact_ids and error -- there is no
-// `result` field, and memql#5096 adds one. Until then the answer leaves
-// as an event chunk, which is inside the existing contract rather than
-// invented wire: `stream` is "stdout"/"stderr"/"event" and an event
-// chunk is DEFINED as a JSON body the engine maps to a progress event.
-//
-// The type word is NAMESPACED because that same stream carries the APP's
-// own events verbatim, and Claude Code's last stream-json line is
-// literally {"type":"result",...}. A bare "result" here would be
-// indistinguishable from the app's own, to every later reader of a
-// transcript nobody can re-derive.
-const resultEventType = "memql.app_session.result"
 
 // Sender is the worker's side of the stream, as this package needs it.
 type Sender interface {
@@ -699,7 +684,12 @@ func (s *session) turnFailure(ctx context.Context, err error) error {
 // followUp queues a `message` control's prompt as the next turn.
 func (s *session) followUp(prompt string) {
 	if prompt == "" {
+		// Into the transcript as well as the log, for the reason a refused
+		// queue says so there: an empty follow-up is exactly what every
+		// follow-up looked like while this runner read the wrong field, and
+		// a person reading the session is the one who would have to notice.
 		s.logger.Warn("app session message control carried no prompt; ignoring")
+		_ = s.emitChunk(StreamStderr, []byte("[memql] a follow-up arrived with no prompt, so no turn was started\n"))
 		return
 	}
 	if err := s.queueFollowUp(prompt); err != nil {
