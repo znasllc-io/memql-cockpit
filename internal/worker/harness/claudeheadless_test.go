@@ -125,16 +125,31 @@ type recordedChunk struct {
 	data   string
 }
 
-// recorder is a Sink that keeps every chunk in arrival order.
+// recorder is a Sink that keeps every chunk in arrival order, and every
+// Action the harness recorded.
 type recorder struct {
-	mu     sync.Mutex
-	chunks []recordedChunk
+	mu      sync.Mutex
+	chunks  []recordedChunk
+	actions []Action
 }
 
 func (r *recorder) Chunk(stream string, data []byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.chunks = append(r.chunks, recordedChunk{stream: stream, data: string(data)})
+}
+
+func (r *recorder) Record(a Action) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.actions = append(r.actions, a)
+}
+
+// recorded returns the actions, in the order the harness recorded them.
+func (r *recorder) recorded() []Action {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]Action(nil), r.actions...)
 }
 
 func (r *recorder) on(stream string) []string {

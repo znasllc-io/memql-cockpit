@@ -40,6 +40,7 @@ package harness
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 )
@@ -103,11 +104,23 @@ var ErrNoStructuredResult = errors.New("harness: the turn produced no structured
 // it is already sequenced. An error is not returned because there is
 // nothing a harness could do with one -- the stream to the server dying
 // is the session's problem, and it is watching for it.
+//
+// Record receives the RECORDING: one Action for every tool call the app
+// completed (record.go). It is a method of its own rather than one more
+// stream word because the two are bounded differently -- the session caps
+// narration at limits.max_transcript_bytes and must never cap the
+// recording -- and a stream word is one typo away from being the other.
 type Sink interface {
 	Chunk(stream string, data []byte)
+	Record(a Action)
 }
 
 // SinkFunc adapts a function to Sink.
+//
+// It has no recording of its own to keep apart, so an Action reaches the
+// function as the event chunk it would be on the wire. A caller that
+// wants the recording sent past the transcript cap implements Sink
+// itself, as the app-session runner does.
 type SinkFunc func(stream string, data []byte)
 
 // Chunk implements Sink.
@@ -115,6 +128,18 @@ func (f SinkFunc) Chunk(stream string, data []byte) {
 	if f != nil {
 		f(stream, data)
 	}
+}
+
+// Record implements Sink.
+func (f SinkFunc) Record(a Action) {
+	if f == nil {
+		return
+	}
+	body, err := json.Marshal(a)
+	if err != nil {
+		return
+	}
+	f(StreamEvent, append(body, '\n'))
 }
 
 // Usage is what the app REPORTED about its own spend.
