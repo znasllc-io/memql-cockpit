@@ -2,7 +2,6 @@ package appsession
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -61,13 +60,12 @@ func (s *session) openTranscript(workspace string) error {
 // than appending them, so renumbering a retry does not "fix" anything --
 // it produces a gap the reader cannot see and a record that no longer
 // matches what the app printed.
+//
+// Every chunk is subject to limits.max_transcript_bytes. There used to be
+// one exemption -- the chunk that carried a turn's structured answer while
+// AppSessionEnd had no field for it -- and it went with that chunk: the
+// answer rides result_json on the End now, which no transcript cap touches.
 func (s *session) emitChunk(stream string, data []byte) error {
-	return s.emit(stream, data, true)
-}
-
-// emit is emitChunk with the transcript cap made a decision rather than
-// an assumption. See emitUncapped.
-func (s *session) emit(stream string, data []byte, capped bool) error {
 	if len(data) == 0 {
 		return nil
 	}
@@ -87,7 +85,7 @@ func (s *session) emit(stream string, data []byte, capped bool) error {
 		}
 	}
 
-	if capped && s.transcriptCapReached(int64(len(clean))) {
+	if s.transcriptCapReached(int64(len(clean))) {
 		return nil
 	}
 
@@ -144,20 +142,6 @@ func (s *session) transcriptCapReached(n int64) bool {
 	return true
 }
 
-// emitUncapped sends a chunk that limits.max_transcript_bytes must not
-// swallow.
-//
-// The cap bounds the TRANSCRIPT -- the running narration the engine
-// keeps on the session row, whose complete form is pushed as an artifact
-// anyway. A turn's structured ANSWER is not narration: it is the thing
-// the caller asked for, it is a few hundred bytes, and losing it because
-// the app was chatty would look exactly like an app that answered
-// nothing. So the one chunk that carries a result is exempt, and nothing
-// else is.
-func (s *session) emitUncapped(stream string, data []byte) error {
-	return s.emit(stream, data, false)
-}
-
 // recordTurn folds one turn's result into what the End will carry.
 //
 // Called once per turn, in the loop, before the next one starts, so
@@ -179,6 +163,17 @@ func (s *session) recordTurn(res harness.TurnResult) {
 	// carrying an older answer forward would report an answer to a
 	// question nobody asked.
 	s.result = res.ResultJSON
+
+	// What the app SAID served it (design D9), as a PAIR from the last
+	// turn that named a model. A turn that said nothing -- one that died
+	// before its result, say -- does not erase what an earlier turn said,
+	// because silence is not a report that the model changed. But a model
+	// is never joined to an effort from a different turn: a later turn that
+	// names only a model reports that model at an effort nobody stated.
+	if m := strings.TrimSpace(res.Model); m != "" {
+		s.servedModel = m
+		s.servedEffort = strings.TrimSpace(res.Effort)
+	}
 
 	if !res.Usage.Known {
 		s.usageGaps++
@@ -290,61 +285,31 @@ func (s *session) pushOutputs(ctx context.Context) ([]string, error) {
 	return ids, nil
 }
 
-// structuredResultChunk is the body of the final `event` chunk that
-// carries a turn's structured answer. See resultEventType for why the
-// answer travels this way and why the type word is namespaced.
-type structuredResultChunk struct {
-	Type      string          `json:"type"`
-	SessionID string          `json:"session_id"`
-	Result    json.RawMessage `json:"result"`
-}
-
-// sendStructuredResult is THE SEAM for AppSessionEnd.result.
-//
-// One place holds the last turn's structured answer and one place emits
-// it, so when memql#5096 lands the field the change is to assign it on
-// the End here and stop emitting the chunk -- not to hunt for the value
-// through the runner.
-//
-// It goes out BEFORE the End and after everything else, which makes it
-// the session's last chunk: a chunk sent after the End is a chunk the
-// engine has nowhere to put.
-func (s *session) sendStructuredResult() {
-	s.usageMu.Lock()
-	result := s.result
-	s.usageMu.Unlock()
-	if len(result) == 0 {
-		// No schema was asked for, or the app did not answer against
-		// one. Nothing is synthesised: an empty object here reads
-		// downstream as "the app answered nothing", which bills and
-		// retries differently from "the app answered in prose".
-		return
-	}
-	body, err := json.Marshal(structuredResultChunk{
-		Type:      resultEventType,
-		SessionID: s.id,
-		Result:    json.RawMessage(result),
-	})
-	if err != nil {
-		s.logger.Warn("the turn's structured result could not be encoded for the transcript", "error", err)
-		return
-	}
-	if err := s.emitUncapped(StreamEvent, append(body, '\n')); err != nil {
-		s.logger.Warn("the turn's structured result could not be sent", "error", err)
-	}
-}
-
 // sendEnd closes the session on the wire, exactly once.
 //
 // exit_code is the app's REAL code. The engine reads a non-zero exit as a
 // FAILED run rather than an ended one, so normalising a 2 to a 1 -- or
 // worse, to a 0 -- misfiles the outcome in a record that is read back
 // later by people deciding whether the thing worked.
+//
+// result_json is the LAST turn's structured answer, set whatever the exit
+// code says: a harness can answer the schema and still exit non-zero, and
+// the proto keeps the answer apart from the failure so the one part of a
+// failed run we can read is not thrown away with it. No answer is an
+// empty field, never a synthesised `{}` -- that would read downstream as
+// "the app answered nothing", which bills and retries differently from
+// "the app answered in prose".
+//
+// model and effort are what the APP REPORTED serving (see recordTurn),
+// never the level's knobs: the engine records them as the model and effort
+// that SERVED, and a copy of the request would record as measured something
+// nobody measured. Empty is the app saying nothing, which the engine files
+// as unknown.
 func (s *session) sendEnd(code int, message string, artifacts []string) {
-	s.sendStructuredResult()
-
 	s.usageMu.Lock()
 	ref := s.appRef
+	result := s.result
+	model, effort := s.servedModel, s.servedEffort
 	s.usageMu.Unlock()
 	if strings.TrimSpace(ref) == "" {
 		ref = s.start.GetAppSessionRef()
@@ -357,6 +322,9 @@ func (s *session) sendEnd(code int, message string, artifacts []string) {
 		AppSessionRef:       ref,
 		ProducedArtifactIds: artifacts,
 		Error:               s.redact.apply2(message),
+		ResultJson:          string(result),
+		Model:               model,
+		Effort:              effort,
 	}
 	if err := s.sender.SendAppSessionEnd(end); err != nil {
 		s.logger.Warn("app session end could not be sent", "error", err)
@@ -364,6 +332,8 @@ func (s *session) sendEnd(code int, message string, artifacts []string) {
 	}
 	s.logger.Info("app session ended",
 		"exit_code", code,
+		"served_model", model,
+		"served_effort", effort,
 		"artifacts", len(artifacts),
 		"usage_known", end.GetUsage().GetKnown(),
 		"error", message != "",

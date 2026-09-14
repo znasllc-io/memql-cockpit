@@ -67,4 +67,31 @@
 # Fleet discovery and Ask reliability (memql PR #5244): shared authorized
 # catalog, streaming readiness, stable context allocation, and persistent
 # node liveness. Pin the exact tested engine main merge.
-275623b3d90d57368d0efec62261705db400a33d
+
+# BUMPED 2026-09-14 to memql main at the merge of memql PR #5424 (memql#5393,
+# the wire half of the app door completion, epic memql#5391; the cockpit half
+# is epic memql-cockpit#436). It carries `level` on AppSessionStart and
+# ModelCallStart, the `model` and `effort` the app REPORTED on AppSessionEnd,
+# and `effort` beside the existing `model` on ModelCallUsage -- design D8/D9
+# of the engine's docs/superpowers/specs/2026-09-13-app-session-recording-
+# and-learning-program-design.md, landed proto-first as that record orders.
+# The merge also descends from memql PR #5423 (the SDK's serialized
+# worker-stream send, memql#5351), so a later pin for epic
+# memql-cockpit#425 moves forward from here rather than past it.
+#
+# THE LESSON OF THE PREVIOUS BUMP, written down so it is not repeated. The
+# 2026-09-08 bump above carried four memql#5096 fields --
+# AppSessionControl.prompt, AppSessionStart.response_schema_json,
+# AppSessionEnd.result_json and Register.app_descriptors -- and no cockpit
+# code read any of them for a week (memql-cockpit#444): follow-ups arrived
+# empty, no session was asked for a schema, no structured answer reached the
+# engine. A bump that lands a field lands its mapping in the same PR; grep for
+# the stand-in (the "until memql#NNNN lands" comment) before calling it done.
+#
+# `go mod tidy` moved github.com/znasllc-io/memql/core to a direct require
+# (internal/worker/harness imports core/airoute, the engine's own level
+# vocabulary) and google.golang.org/grpc with it (the grpc/codes and
+# grpc/status imports were already direct), and dropped go.sum lines the
+# dependency bumps had left behind. No module landed or left between the two
+# pins, so the replace block is unchanged.
+456623efe52136f70c540f6b907067f3846e5901

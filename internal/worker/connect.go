@@ -129,6 +129,10 @@ func buildRegister(cfg Config, inventory []apps.Info, modelInv models.Inventory,
 		// in, and has no other way to learn any of this -- it cannot
 		// dial this machine.
 		Apps: appsToProto(inventory),
+		// And how each is driven (memql-cockpit#444), which the engine
+		// reads to keep structured calls and follow-ups off a harness
+		// that cannot take them.
+		AppDescriptors: appDescriptorsToProto(inventory),
 	}
 	// Capability descriptor (memql-cockpit#166): the same JSON the
 	// workerComputer.capabilities action returns, sent up front so

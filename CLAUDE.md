@@ -218,6 +218,58 @@ Four rules here are load-bearing, and each is the kind that fails silently:
 through unnormalised -- the engine records the first as billing "unknown" and
 reads the second as a failed run.
 
+**A LEVEL IS TRANSLATED ON THE MACHINE** (epic memql-cockpit#436, the cockpit
+half of the engine's 2026-09-13 recording-and-learning record, epic A, D8/D9).
+`AppSessionStart.level` carries core/airoute's word -- `fast`, `strong`,
+`reasoning`, `embeddings` -- and `internal/worker/harness/levels.go` turns it
+into the app's own knobs: Claude Code `--model`/`--effort` by alias (haiku /
+sonnet high / opus xhigh), Codex `model_reasoning_effort` only (low / medium /
+high; no model, because Codex has no tier aliases and its catalogue is per
+account). `policy.yaml apps.levels` overrides a row. `memql worker apps`
+prints the effective table. Five rules, each of which fails silently:
+
+1. **The vocabulary is the engine's package, not a copy.** `harness` imports
+   `core/airoute` (stdlib-only), so a rename fails at the pin bump instead of
+   refusing every session afterwards. `embeddings` NEVER runs through an app
+   (D10), an undefined word refuses, and an empty level is the app's own
+   defaults -- nothing else falls back to defaults.
+2. **Report, never request.** `AppSessionEnd.model/effort` are what the APP
+   stated (Claude Code: `modelUsage`; Codex: the thread's settings, a
+   `model/rerouted`, `session_configured`), and empty when it said nothing.
+   Claude Code states NO effort anywhere (verified 2.1.270), so its effort is
+   always empty -- copying `--effort` there would record the request as a
+   measurement. Codex echoes even a model nothing answers to, so its settings
+   are reported only for a turn that completed or reported spend.
+3. **`CheckKnobs` exists because Claude Code IGNORES an effort it does not
+   know** (a stderr warning, exit 0). The check runs on the built-in table (a
+   test), on every `apps.levels` entry when the file is read, and in every
+   harness's `Start` before anything forks.
+4. **`apps.levels` is NOT default-deny.** Absent means the built-in table; an
+   entry replaces its row WHOLE; the block REPLACES on SIGHUP. An entry the
+   app would misread REFUSES its level with the policy's sentence -- never a
+   fallback to the built-in row it was written to replace, and the refused
+   row leaves the table the harness sees. Entries no session can reach
+   (unknown app, `fastt`, `embeddings`) are logged, not refused. The block is
+   read from its `yaml.Node`, NOT a typed decode: a typed decode drops an
+   unknown key (`efort`) silently and fails the WHOLE file on a shorthand
+   (`reasoning: opus`) -- and a worker that cannot parse policy.yaml runs on
+   defaults that allow no app. Keep it a node walk.
+5. **The level is resolved before any side effect.** The session refuses it
+   before writing the bearer, pulling inputs or opening a transcript, and the
+   harness resolves the same table again in `Start` with the same function.
+   The `open` kind reads no level: a person picks their own model. An
+   attach through `codex-mcp` cannot take one at all (`codex-reply` declares
+   no configuration), so `harness.CheckResume` refuses it rather than let
+   the transcript claim a level the app never received.
+
+**The memql#5096 app-session fields are mapped** (memql-cockpit#444): the
+follow-up is `AppSessionControl.prompt` (never `reason`), the schema is
+`AppSessionStart.response_schema_json`, the answer is
+`AppSessionEnd.result_json` (the `memql.app_session.result` chunk is gone),
+and `Register.app_descriptors` says which harness drives each app. The pin
+carried all four for a week before anything read them -- when a pin bump
+lands a field, grep for the stand-in the same commit.
+
 ## Local models on the fleet
 
 The worker can serve MemQL's own operations -- planning, conductor/routing,

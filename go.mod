@@ -15,9 +15,11 @@ require (
 	github.com/znasllc-io/memql/component/identity v0.0.0
 	github.com/znasllc-io/memql/component/language v0.0.0
 	github.com/znasllc-io/memql/component/memql v0.0.0
+	github.com/znasllc-io/memql/core v0.0.0
 	golang.org/x/image v0.45.0
 	golang.org/x/sys v0.48.0
 	golang.org/x/term v0.45.0
+	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -98,7 +100,6 @@ require (
 	github.com/znasllc-io/memql/component/provenance v0.0.0 // indirect
 	github.com/znasllc-io/memql/component/safety v0.0.0 // indirect
 	github.com/znasllc-io/memql/component/secret v0.0.0 // indirect
-	github.com/znasllc-io/memql/core v0.0.0 // indirect
 	github.com/znasllc-io/memql/docs v0.0.0 // indirect
 	github.com/znasllc-io/memql/dsl v0.0.0 // indirect
 	go.opentelemetry.io/otel v1.44.0 // indirect
@@ -110,7 +111,6 @@ require (
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
-	google.golang.org/grpc v1.83.2 // indirect
 	mellium.im/sasl v0.3.2 // indirect
 )
 

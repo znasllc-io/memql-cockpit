@@ -477,6 +477,14 @@ func refuse(code, message string) *memqlv1.ModelCallEnd {
 // -----------------------------------------------------------------------------
 
 func (m *Manager) run(ctx context.Context, sender Sender, c *call, info models.Info, limits callLimits, start *memqlv1.ModelCallStart) {
+	// The level rides along for the owner's own logs (memql#5393). It
+	// steers NOTHING here: the router chose this model from this machine's
+	// advertisement, and a level is translated into knobs only for an app,
+	// which has them. A runtime has the model it was asked for.
+	m.logger.Debug("model call running",
+		"request_id", c.requestID, "model", info.ID, "kind", start.GetKind(),
+		"level", start.GetLevel(), "purpose", start.GetPurpose())
+
 	stream := &deltaStream{sender: sender, requestID: c.requestID}
 	stream.touch()
 
@@ -955,6 +963,12 @@ func paramsFrom(p *memqlv1.ModelCallParams) Params {
 // usageProto returns nil when the runtime reported nothing. Absent is not
 // zero: the engine records the first as billing "unknown" and the second
 // as a measured zero.
+//
+// `model` is the served-model report design D9 asks of a model call, and
+// `effort` beside it (memql#5393) is left EMPTY on purpose: neither Ollama
+// nor an OpenAI-compatible response states an effort, so the only value
+// that could go there is one taken from the request -- and the engine
+// records this field as what SERVED.
 func usageProto(u Usage) *memqlv1.ModelCallUsage {
 	if !u.Known && u.Model == "" {
 		return nil

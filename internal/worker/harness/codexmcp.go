@@ -103,6 +103,11 @@ const codexEventMethod = "codex/event"
 const (
 	codexEventMessage      = "agent_message"
 	codexEventMessageDelta = "agent_message_content_delta"
+	// codexEventSessionConfigured is the app stating what the session runs
+	// at: `model` and `reasoning_effort`, once, when the `codex` tool sets
+	// the session up (verified on 0.153.4 -- the only line in the stream
+	// that carries either word).
+	codexEventSessionConfigured = "session_configured"
 )
 
 // codexMCPToolEvents are the EventMsg types that are tool activity.
@@ -132,6 +137,9 @@ var codexMCPToolEvents = map[string]bool{
 type codexMCP struct {
 	spec Spec
 	conn *jsonrpcConn
+	// knobs are the session's level in Codex's words, settled in Start and
+	// put on the `codex` tool call that opens the session.
+	knobs Knobs
 
 	mu sync.Mutex
 	// started is guarded for the reason the app-server client's is:
@@ -140,6 +148,12 @@ type codexMCP struct {
 	started  bool
 	threadID string
 	turn     *codexMCPTurn
+	// servedModel and servedEffort are what session_configured stated. The
+	// statement is made once per session and outlives the call that
+	// carried it: a codex-reply continues the same thread at the same
+	// settings and restates nothing.
+	servedModel  string
+	servedEffort string
 }
 
 // Name implements Harness.
@@ -155,7 +169,14 @@ func (h *codexMCP) Start(ctx context.Context, spec Spec) error {
 	if err := checkCodexSpec("codex mcp-server", spec); err != nil {
 		return err
 	}
+	// Before the process, for the app-server client's reason: a level
+	// Codex cannot run at must not start a server on somebody's machine.
+	knobs, err := spec.knobs(HarnessCodexMCP)
+	if err != nil {
+		return fmt.Errorf("codex mcp-server: %w", err)
+	}
 	h.spec = spec
+	h.knobs = knobs
 	h.threadID = strings.TrimSpace(spec.ResumeRef)
 
 	proc, err := spec.Launch(ctx, spec.Workspace, []string{spec.Binary, "mcp-server"}, spec.Env, true)
@@ -233,10 +254,29 @@ func (h *codexMCP) Turn(ctx context.Context, prompt string, sink Sink) (TurnResu
 		// process was pointed at.
 		"approval-policy": "never",
 	}
+	// The level's knobs ride the `codex` tool, which is the call that
+	// configures the session. `model` is one of its declared options, and
+	// the effort goes in `config` -- "individual config settings that will
+	// override what is in CODEX_HOME/config.toml", in the tool's own schema
+	// (0.153.4) -- as model_reasoning_effort. `config` is also the one
+	// option the schema declares open, which matters here: every other key
+	// the tool is sent must be one it declares, or the call is refused.
+	if h.knobs.Model != "" {
+		args["model"] = h.knobs.Model
+	}
+	if h.knobs.Effort != "" {
+		args["config"] = map[string]any{"model_reasoning_effort": h.knobs.Effort}
+	}
 	if ref := h.currentThread(); ref != "" {
 		// Continuing takes the OTHER tool and the OTHER vocabulary,
 		// and takes no cwd: the thread already has one, and an
 		// undeclared argument here is a refused call.
+		//
+		// It takes no knobs either, for the same reason: codex-reply
+		// declares prompt and threadId and nothing else. A thread this
+		// harness opened keeps the settings its `codex` call gave it; one
+		// an attach resumes keeps the settings its own first call chose,
+		// and the report stays empty until the app states them.
 		name, args = mcpToolCodexReply, map[string]any{
 			"threadId": ref,
 			"prompt":   prompt,
@@ -306,6 +346,14 @@ func (h *codexMCP) Turn(ctx context.Context, prompt string, sink Sink) (TurnResu
 		return result, fmt.Errorf("codex mcp-server: the turn failed: %s", reason)
 	}
 
+	// The tool answered, so the model ran -- and ran at what the session
+	// was configured with, which is the one thing this protocol lets the
+	// app state. It is set here, past the isError return, because a call
+	// that failed has not shown any model answered it; and before the
+	// schema check, because an answer in prose was still an answer a
+	// model produced.
+	result.Model, result.Effort = h.served()
+
 	if strings.TrimSpace(h.spec.ResponseSchema) != "" {
 		structured, ok := codexJSONValue(text)
 		if !ok {
@@ -314,6 +362,14 @@ func (h *codexMCP) Turn(ctx context.Context, prompt string, sink Sink) (TurnResu
 		result.ResultJSON = structured
 	}
 	return result, nil
+}
+
+// served is the session's model and effort as session_configured stated
+// them, empty until it has.
+func (h *codexMCP) served() (model, effort string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.servedModel, h.servedEffort
 }
 
 // result assembles what this protocol can honestly report.
@@ -351,6 +407,11 @@ func (h *codexMCP) handleNotification(method string, params json.RawMessage, raw
 			Type    string `json:"type"`
 			Delta   string `json:"delta"`
 			Message string `json:"message"`
+			// Model and ReasoningEffort are session_configured's. The
+			// effort is a pointer because the app sends null for a
+			// session with none set, and null stays empty.
+			Model           string  `json:"model"`
+			ReasoningEffort *string `json:"reasoning_effort"`
 		} `json:"msg"`
 	}
 	if json.Unmarshal(params, &event) != nil {
@@ -388,6 +449,19 @@ func (h *codexMCP) handleNotification(method string, params json.RawMessage, raw
 	case codexMCPToolEvents[event.Msg.Type]:
 		h.conn.emit(StreamTool, raw)
 		return
+
+	case event.Msg.Type == codexEventSessionConfigured:
+		// Kept for the turn to report once it has shown the model ran
+		// (see Turn), and still forwarded below: it is the line a person
+		// reading the transcript looks for to see what the session ran at.
+		effort := ""
+		if event.Msg.ReasoningEffort != nil {
+			effort = strings.TrimSpace(*event.Msg.ReasoningEffort)
+		}
+		h.mu.Lock()
+		h.servedModel = strings.TrimSpace(event.Msg.Model)
+		h.servedEffort = effort
+		h.mu.Unlock()
 	}
 
 	h.conn.emit(StreamEvent, raw)
