@@ -6,11 +6,14 @@ import (
 	"net"
 	"net/url"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/znasllc-io/memql-cockpit/internal/worker/apps"
+	"github.com/znasllc-io/memql-cockpit/internal/worker/harness"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/models"
 )
 
@@ -85,8 +88,42 @@ type FSPolicy struct {
 // "present, blocked" instead of rendering it identically to "not
 // installed" -- one of those an operator can fix, the other sends them
 // looking for the wrong problem.
+//
+// LEVELS ARE THE OPPOSITE POSTURE, and on purpose (memql-cockpit#438,
+// design D8). allow decides WHETHER an app may run here, which only the
+// owner can grant; levels decide HOW it runs once it may -- which model and
+// effort a LEVEL the engine names becomes -- and the cockpit ships an
+// answer for that (internal/worker/harness BuiltinLevels). So an absent
+// block is the built-in table, not "nothing":
+//
+//	apps:
+//	  levels:
+//	    claude-code:
+//	      reasoning:
+//	        model: fable
+//	        effort: max
+//	    codex:
+//	      strong:
+//	        model: gpt-5.5
+//	        effort: xhigh
+//
+// An entry replaces its level's built-in entry WHOLE, model and effort
+// together; a level with no entry keeps the built-in one; an entry with
+// neither knob runs that level at the app's own defaults. An entry the app
+// would misread REFUSES its level rather than falling back -- see
+// AppLevels.
 type AppsPolicy struct {
-	Allow []string `yaml:"allow"`
+	Allow  []string                         `yaml:"allow"`
+	Levels map[string]map[string]LevelKnobs `yaml:"levels"`
+}
+
+// LevelKnobs is one apps.levels entry: what one app runs one level at, in
+// the app's own words -- Claude Code's --model / --effort, Codex's model /
+// model_reasoning_effort. Either may be left out, and a knob left out is one
+// the app decides for itself.
+type LevelKnobs struct {
+	Model  string `yaml:"model"`
+	Effort string `yaml:"effort"`
 }
 
 // ModelsPolicy controls which local models this machine will serve, and
@@ -364,6 +401,11 @@ func (p *Policy) reload() error {
 	// app without a worker restart. There is no baseline to merge onto:
 	// DefaultPolicy leaves this empty, which is the default-deny above.
 	p.apps.Allow = mergeUnique(p.apps.Allow, raw.Apps.Allow)
+	// apps.levels REPLACES, for the reason models.runtimes does below: an
+	// entry is a record, and merging two generations of one would run a
+	// model from one file at an effort from another. A SIGHUP that removed
+	// the block returns this machine to the built-in table.
+	p.apps.Levels = raw.Apps.Levels
 	// models.allow merges the way apps.allow does, so SIGHUP makes a
 	// newly pulled model offerable without a worker restart.
 	p.models.Allow = mergeUnique(p.models.Allow, raw.Models.Allow)
@@ -607,6 +649,129 @@ func (p *Policy) AppsAllow() []string {
 	return out
 }
 
+// AppLevels returns the owner's apps.levels entries for one app that
+// stand, and -- per level -- the sentence refusing any entry the app would
+// misread. No entries at all is the built-in table (the session lays these
+// over harness.BuiltinLevels), which is what an absent block means.
+//
+// A REFUSED ENTRY REFUSES ITS LEVEL; it does not fall back to the built-in
+// entry. An owner who pinned a cheaper model for a level did not agree to
+// the expensive default because of a typo, and Claude Code in particular
+// IGNORES an effort word it does not know rather than refusing it -- so the
+// refusal here is the only one anybody would see. It is REPORTED on the
+// session's End, naming the line to fix, where a quiet fallback would be
+// indistinguishable from the owner's entry working.
+//
+// The maps are the caller's own, built fresh on every call, for
+// AppsAllow's reason: a SIGHUP can reload underneath a session that is
+// still deciding.
+func (p *Policy) AppLevels(appID string) (harness.Table, map[string]string) {
+	if p == nil {
+		return nil, nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	read := readAppLevels(p.apps.Levels)
+	id := normalAppID(appID)
+	return read.table[id], read.refused[id]
+}
+
+// AppLevelProblems is every problem apps.levels has, as sentences an owner
+// can act on: the refusals AppLevels reports, and the entries no session can
+// reach -- an app this cockpit does not drive, a word that is not a level,
+// the embeddings level -- which are ignored. The worker logs them when the
+// file is read and `memql worker apps` prints them, because an entry that
+// silently did nothing is indistinguishable from one that worked.
+func (p *Policy) AppLevelProblems() []string {
+	if p == nil {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return readAppLevels(p.apps.Levels).problems
+}
+
+// appLevelsRead is apps.levels read against what this cockpit can drive.
+type appLevelsRead struct {
+	// table holds the entries that stand, per app id.
+	table map[string]harness.Table
+	// refused holds, per app id and level, the sentence refusing sessions
+	// at that level.
+	refused map[string]map[string]string
+	// problems is every sentence, in a stable order.
+	problems []string
+}
+
+// readAppLevels validates apps.levels. It is a pure function of the raw
+// block, run on every read rather than cached, so there is no second copy
+// of the answer for a reload to leave stale.
+//
+// Every judgement is borrowed rather than restated: the app ids are
+// apps.Specs', the level words are the engine's (harness.CheckAppLevel), and
+// what an app would misread is the harness's own check (harness.CheckKnobs,
+// the same one every harness runs in Start). The keys are walked in sorted
+// order because yaml.v3 hands back a map, and a problem list that shuffled
+// between two reads of one file would read as the file changing.
+func readAppLevels(raw map[string]map[string]LevelKnobs) appLevelsRead {
+	read := appLevelsRead{
+		table:   map[string]harness.Table{},
+		refused: map[string]map[string]string{},
+	}
+	for _, key := range sortedKeys(raw) {
+		appID := normalAppID(key)
+		spec, ok := apps.SpecFor(appID)
+		if !ok {
+			read.problems = append(read.problems, fmt.Sprintf(
+				"apps.levels.%s: this cockpit drives no app called %q (it drives %s), so the entry is ignored",
+				key, key, knownAppIDs()))
+			continue
+		}
+		for _, level := range sortedKeys(raw[key]) {
+			where := "apps.levels." + key + "." + level
+			if err := harness.CheckAppLevel(level); err != nil {
+				read.problems = append(read.problems, fmt.Sprintf("%s: %v, so the entry is ignored", where, err))
+				continue
+			}
+			entry := raw[key][level]
+			knobs := harness.Knobs{
+				Model:  strings.TrimSpace(entry.Model),
+				Effort: strings.TrimSpace(entry.Effort),
+			}
+			if err := harness.CheckKnobs(spec.Harness, knobs); err != nil {
+				sentence := fmt.Sprintf("%s: %v -- this machine refuses %s sessions for %s until the entry is fixed",
+					where, err, level, appID)
+				if read.refused[appID] == nil {
+					read.refused[appID] = map[string]string{}
+				}
+				read.refused[appID][level] = sentence
+				read.problems = append(read.problems, sentence)
+				continue
+			}
+			if read.table[appID] == nil {
+				read.table[appID] = harness.Table{}
+			}
+			read.table[appID][level] = knobs
+		}
+	}
+	return read
+}
+
+// normalAppID reads an app id the way the detector reads apps.allow:
+// without regard to case or surrounding space, so the two keys an owner
+// writes side by side agree about what they name.
+func normalAppID(id string) string {
+	return strings.ToLower(strings.TrimSpace(id))
+}
+
+// knownAppIDs names the apps this cockpit drives, for a sentence.
+func knownAppIDs() string {
+	var ids []string
+	for _, s := range apps.Specs() {
+		ids = append(ids, s.ID)
+	}
+	return strings.Join(ids, ", ")
+}
+
 // ModelsAllow returns a copy of the allowed model ids. Empty is
 // default-deny, not "all".
 func (p *Policy) ModelsAllow() []string {
@@ -730,6 +895,17 @@ func firstToken(cmd string) string {
 		}
 	}
 	return cmd
+}
+
+// sortedKeys returns a map's keys in order, for the walks whose output a
+// person reads.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func mergeUnique(a, b []string) []string {
