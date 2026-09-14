@@ -171,6 +171,26 @@ func (e *rpcError) Error() string {
 	return fmt.Sprintf("%s (code %d)", e.Message, e.Code)
 }
 
+// isFrame reports whether a decoded line is a JSON-RPC message at all.
+//
+// THE `jsonrpc` HEADER IS NOT THE TEST, because codex app-server does not
+// send it. Its README says so ("with the "jsonrpc":"2.0" header omitted on
+// the wire"), and the real codex-cli 0.153.4 omits it on every frame
+// (recorded 2026-09-13: `{"id":1,"result":{"userAgent":...}}`,
+// `{"method":"remoteControl/status/changed","params":{...}}`), while the
+// mcp-server fallback does send it. Requiring the header filed the
+// initialize answer as stdout, so every app-server session hung at Start
+// until its deadline -- and the fakes all sent the header, so no test saw
+// it (the #440 session found it by driving the real binary).
+//
+// So a frame is what JSON-RPC 2.0 makes one: the header, a method (a
+// request or a notification), or an id carrying a result or an error (a
+// response). A JSON line that is none of those -- a structured log line
+// the process printed, say -- is still narration and stays on stdout.
+func (m rpcMessage) isFrame() bool {
+	return m.JSONRPC != "" || m.Method != "" || (m.ID != nil && (len(m.Result) > 0 || m.Error != nil))
+}
+
 // rpcMethodNotFound is what this client answers a server request with.
 //
 // Source: JSON-RPC 2.0, section 5.1.
@@ -314,7 +334,7 @@ func (c *jsonrpcConn) route(line []byte) {
 	// anything else the process printed. Requiring it rather than
 	// merely "parses as JSON" is the difference between this package
 	// and the transcript-guessing it replaces.
-	if json.Unmarshal(trimmed, &msg) != nil || msg.JSONRPC == "" {
+	if json.Unmarshal(trimmed, &msg) != nil || !msg.isFrame() {
 		c.emit(StreamStdout, line)
 		return
 	}

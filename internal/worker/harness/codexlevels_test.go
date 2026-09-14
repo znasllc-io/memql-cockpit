@@ -2,9 +2,11 @@ package harness
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // codexlevels_test.go pins what a LEVEL does to a Codex session on both of
@@ -540,6 +542,91 @@ printf '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"THREAD"
 	}
 	if string(res.ResultJSON) != `{"answer":"42"}` {
 		t.Errorf("ResultJSON = %s, want the final answer beside the failure", res.ResultJSON)
+	}
+}
+
+// THE REAL APP-SERVER SENDS NO `jsonrpc` HEADER. codex-cli 0.153.4 omits
+// "jsonrpc":"2.0" on every frame -- its README says so, and a live
+// initialize answered `{"id":1,"result":{...}}` -- while the mcp-server
+// sends it. A client that required the header dropped the initialize
+// answer as stdout, and every app-server session hung at Start until its
+// deadline; the fakes all sent the header, so nothing here noticed. This
+// test runs the whole session -- handshake, thread, a turn at a level, the
+// report -- against frames with the header stripped, under a deadline so a
+// regression fails fast instead of hanging.
+func TestCodexAppServerSpeaksToFramesWithoutTheHeader(t *testing.T) {
+	bin, log := fakeCodexAppServerSettings(t, codexStatedSettings, codexTurnOK)
+	stripJSONRPCHeader(t, bin)
+	spec := codexSpec(t, bin)
+	spec.Level = "strong"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	h := &codexAppServer{}
+	if err := h.Start(ctx, spec); err != nil {
+		t.Fatalf("Start against a header-less app-server: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+
+	rec := &recorder{}
+	res, err := h.Turn(ctx, "do the thing", rec)
+	if err != nil {
+		t.Fatalf("turn: %v", err)
+	}
+	if res.Text != "the answer is 42" || res.Model != "gpt-6-astra" || res.Effort != "low" {
+		t.Errorf("Text/Model/Effort = %q/%q/%q, want the turn's answer and the thread's statement",
+			res.Text, res.Model, res.Effort)
+	}
+	if got := rec.joined(StreamStdout); got != "" {
+		t.Errorf("StreamStdout = %q; header-less protocol frames were misfiled as narration", got)
+	}
+	if got := codexConfigEffort(codexCalls(t, log, codexMethodThreadStart)[0]); got != "medium" {
+		t.Errorf("config.model_reasoning_effort = %q, want the strong level's medium", got)
+	}
+}
+
+// A line that is JSON but no JSON-RPC message -- no header, no method, no
+// id with a result or an error -- is still what the process printed rather
+// than protocol, and stays on stdout.
+func TestJSONRPCFrameTest(t *testing.T) {
+	cases := map[string]bool{
+		`{"jsonrpc":"2.0","method":"x"}`:                        true,
+		`{"id":1,"result":{"ok":true}}`:                         true,
+		`{"id":1,"result":null}`:                                true,
+		`{"id":2,"error":{"code":-32601,"message":"nope"}}`:     true,
+		`{"method":"remoteControl/status/changed","params":{}}`: true,
+		`{"id":7}`:                            false,
+		`{"level":"warn","msg":"a log line"}`: false,
+	}
+	for line, want := range cases {
+		var msg rpcMessage
+		if err := json.Unmarshal([]byte(line), &msg); err != nil {
+			t.Fatalf("%s: %v", line, err)
+		}
+		if got := msg.isFrame(); got != want {
+			t.Errorf("isFrame(%s) = %v, want %v", line, got, want)
+		}
+	}
+}
+
+// stripJSONRPCHeader rewrites a fake app-server so every frame it PRINTS
+// omits "jsonrpc":"2.0", the way the real 0.153.4 prints them. Only the
+// printf lines change: the sed that reads the client's request id matches
+// the client's own frames, which still carry the header.
+func stripJSONRPCHeader(t *testing.T, binary string) {
+	t.Helper()
+	body, err := os.ReadFile(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(body), "\n")
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "printf '{") {
+			lines[i] = strings.ReplaceAll(line, `"jsonrpc":"2.0",`, "")
+		}
+	}
+	if err := os.WriteFile(binary, []byte(strings.Join(lines, "\n")), 0o755); err != nil {
+		t.Fatal(err)
 	}
 }
 
