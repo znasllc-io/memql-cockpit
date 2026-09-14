@@ -131,18 +131,35 @@ type recorder struct {
 	mu      sync.Mutex
 	chunks  []recordedChunk
 	actions []Action
+	// order is every call in the order it arrived: "<stream> <data>" for a
+	// chunk, "action <id>" for an action.
+	order []string
 }
 
 func (r *recorder) Chunk(stream string, data []byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.chunks = append(r.chunks, recordedChunk{stream: stream, data: string(data)})
+	r.order = append(r.order, stream+" "+string(data))
 }
 
 func (r *recorder) Record(a Action) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.actions = append(r.actions, a)
+	r.order = append(r.order, "action "+a.ID)
+}
+
+// before is what arrived immediately before the action with id.
+func (r *recorder) before(id string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i, entry := range r.order {
+		if entry == "action "+id && i > 0 {
+			return r.order[i-1]
+		}
+	}
+	return ""
 }
 
 // recorded returns the actions, in the order the harness recorded them.

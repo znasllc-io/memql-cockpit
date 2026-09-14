@@ -61,18 +61,27 @@ func splitShellWords(line string) ([]string, bool) {
 // FuzzShellJoinRoundTrips. The fallback's exec events carry an argv, and
 // the recording carries it as one command line. The property: a shell
 // reading that line back gets EXACTLY the argv the app ran -- the same
-// words, the same boundaries, nothing expanded. A rendering that did not
-// round-trip would record a command the app never ran, and a replay would
-// run it.
+// words, the same boundaries, nothing expanded, and a first word that is
+// the command rather than an assignment or a keyword. A rendering that
+// did not round-trip would record a command the app never ran, and a
+// replay would run it.
 func FuzzShellJoinRoundTrips(f *testing.F) {
 	for _, seed := range [][2]string{
 		{"bash", "-lc"}, {"sh -c 'echo oops >&2; exit 3'", ""}, {"it's", "a\"b"},
 		{"=cmd", "$HOME"}, {"a b", "`id`"}, {"*.go", "~"}, {"\n", "\t"}, {"", "'"},
+		{"FOO=bar", "ls"}, {"if", "true"}, {"time", "make"},
 	} {
 		f.Add(seed[0], seed[1])
 	}
+	// Checked against lists of the test's own, not against the ones
+	// shellJoin trusts, so a word dropped from those by mistake is caught.
+	keywords := map[string]bool{
+		"case": true, "do": true, "done": true, "elif": true, "else": true, "esac": true,
+		"fi": true, "for": true, "if": true, "in": true, "then": true, "until": true,
+		"while": true, "time": true, "function": true, "select": true, "coproc": true,
+	}
 	f.Fuzz(func(t *testing.T, a, b string) {
-		argv := []string{"cmd", a, b}
+		argv := []string{a, b, "x"}
 		line := shellJoin(argv)
 		got, ok := splitShellWords(line)
 		if !ok || len(got) != len(argv) {
@@ -83,10 +92,15 @@ func FuzzShellJoinRoundTrips(f *testing.F) {
 				t.Fatalf("shellJoin(%q) = %s: word %d reads back as %q", argv, line, i, got[i])
 			}
 		}
+		// The command's name left bare is never one a shell reads as
+		// something else.
+		if first, _, _ := strings.Cut(line, " "); first == argv[0] {
+			if strings.Contains(first, "=") || keywords[first] {
+				t.Fatalf("shellJoin(%q) = %s: the command %q is left bare", argv, line, first)
+			}
+		}
 		// A word left bare is only ever made of characters no shell reads
-		// specially -- checked against a list of its own, not against the
-		// set shellWord trusts, so a character added there by mistake is
-		// caught here.
+		// specially.
 		for _, w := range argv {
 			if shellWord(w) != w {
 				continue

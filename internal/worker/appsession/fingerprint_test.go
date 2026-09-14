@@ -231,3 +231,23 @@ func TestToolchainNeverRunsAMacShimWithoutTheDeveloperTools(t *testing.T) {
 		t.Error("with the developer tools installed, /usr/bin/git is git and must be asked")
 	}
 }
+
+// TestRunToolVersionDoesNotWaitOnAChildHoldingItsOutput: a version
+// command that leaves a child behind -- a shim starting a daemon, a
+// version manager warming a cache -- leaves that child holding stdout
+// open. The probe returns once its own process is done, with what it
+// printed, instead of waiting on the pipe.
+func TestRunToolVersionDoesNotWaitOnAChildHoldingItsOutput(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "lingers")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nsleep 5 &\necho 'lingers 1.2.3'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	out, err := runToolVersion(context.Background(), bin, []string{"--version"})
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("the probe waited %v on a child holding its output", elapsed)
+	}
+	if err != nil || strings.TrimSpace(out) != "lingers 1.2.3" {
+		t.Errorf("= %q, %v, want the version it printed", out, err)
+	}
+}

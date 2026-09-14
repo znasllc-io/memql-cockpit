@@ -107,3 +107,22 @@ func (r *redactor) apply2(s string) string {
 	}
 	return string(r.apply([]byte(s)))
 }
+
+// holds reports whether data carries any credential this session was
+// ever given. The recording asks it before a file's bytes travel: apply
+// would rewrite a credential in a file carried as text, but a file carried
+// as base64 hides it from apply entirely -- and a rewritten copy would no
+// longer match its own digest.
+func (r *redactor) holds(data []byte) bool {
+	if r == nil || len(data) == 0 {
+		return false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, secret := range r.secrets {
+		if bytes.Contains(data, secret) {
+			return true
+		}
+	}
+	return false
+}

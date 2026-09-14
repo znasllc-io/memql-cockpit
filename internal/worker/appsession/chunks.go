@@ -86,11 +86,19 @@ func (s *session) emitRecord(data []byte) error {
 
 // emit is the one send path emitChunk and emitRecord share; capped says
 // whether limits.max_transcript_bytes applies.
+//
+// ONE CHUNK AT A TIME, numbered and sent under sendMu -- the transcript
+// line included, so the artifact reads in the order the stream does. The
+// cost is that a send retrying holds the others back, which is the point:
+// a chunk that overtook it would make the engine drop it.
 func (s *session) emit(stream string, data []byte, capped bool) error {
 	if len(data) == 0 {
 		return nil
 	}
 	clean := s.redact.apply(data)
+
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
 
 	// The transcript artifact carries the FULL output, whatever the
 	// engine's row-level cap is. That is the division of labour the
@@ -136,7 +144,8 @@ func (s *session) emit(stream string, data []byte, capped bool) error {
 // sending past it spends bandwidth on bytes that get dropped. Stopping
 // silently, though, would leave a reader believing the run went quiet --
 // so the cap emits one notice naming itself and pointing at the artifact
-// that does have the rest.
+// that does have the rest. The caller holds sendMu, so the notice is sent
+// here directly and in its turn, never through emit.
 func (s *session) transcriptCapReached(n int64) bool {
 	max := s.start.GetLimits().GetMaxTranscriptBytes()
 	if max <= 0 {

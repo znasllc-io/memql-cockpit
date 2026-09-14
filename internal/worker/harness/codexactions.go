@@ -75,12 +75,31 @@ type codexItemError struct {
 	Message string `json:"message"`
 }
 
+// codexNonCallItems are the ThreadItem types that are not tool calls: the
+// conversation itself and the app's own state (v2/ThreadItem.ts, 0.153.4).
+//
+// Every OTHER type is recorded -- a type this build has never seen as
+// `other`, whose effects are unknown -- because the two mistakes do not
+// cost the same: an extra `other` only makes a replay fall back to the
+// app, while a call missing from the recording is one a replay would skip.
+var codexNonCallItems = map[string]bool{
+	"userMessage":       true,
+	"hookPrompt":        true,
+	"agentMessage":      true,
+	"plan":              true,
+	"reasoning":         true,
+	"subAgentActivity":  true,
+	"enteredReviewMode": true,
+	"exitedReviewMode":  true,
+	"contextCompaction": true,
+}
+
 // codexItemCall builds the call half of an Action from a ThreadItem, and
 // reports false for an item that is not a tool call at all -- the
 // assistant's prose, its reasoning, its plan.
 func codexItemCall(raw json.RawMessage, workspace string) (Action, codexItem, bool) {
 	var it codexItem
-	if !decodeTolerant(raw, &it) {
+	if !decodeTolerant(raw, &it) || it.Type == "" || codexNonCallItems[it.Type] {
 		return Action{}, it, false
 	}
 	a := Action{ID: it.ID, AppTool: it.Type, Cwd: workspace}
@@ -126,59 +145,89 @@ func codexItemCall(raw json.RawMessage, workspace string) (Action, codexItem, bo
 		a.Tool = ActionOther
 		a.Args = argsOf(map[string]any{"name": it.Name, "namespace": it.Namespace})
 	default:
-		return Action{}, it, false
+		// Not a type this build knows. Its arguments are not known either,
+		// so the item itself stands in for them, whole.
+		a.Tool = ActionOther
+		a.Args = rawOrNull(raw)
 	}
 	return a, it, true
 }
 
 // codexItemFinish writes what a completed item reported onto its call.
 //
-// `completed` is the only status that means the call did what it was
-// asked; failed and declined are the two that do not, and anything newer
-// is read the same way, because a status this build has not heard of is
-// not evidence of success.
+// ONLY WHAT THE ITEM REPORTED. `completed` is the one status that means
+// the call did what it was asked; failed and declined are the two that do
+// not, and anything newer is read the same way, because a status this
+// build has not heard of is not evidence of success. An item with no
+// status at all -- a web search, an image view, a sleep -- reported no
+// verdict, and none is recorded. An item with no result reported no
+// result: a null there is recorded as absent, never as the digest of
+// null, which would give two different searches one identity.
 func codexItemFinish(a *Action, it codexItem) {
+	var failed *bool
+	verdict := func(f bool) { failed = &f }
 	statusFailed := it.Status != "completed"
-	failed := false
 	var result any
+	known := false
+	value := func(raw json.RawMessage) {
+		if v, ok := decodeValue(raw); ok && v != nil {
+			result, known = v, true
+		}
+	}
 	switch it.Type {
 	case "commandExecution":
-		failed = statusFailed || (it.ExitCode != nil && *it.ExitCode != 0)
+		verdict(statusFailed || (it.ExitCode != nil && *it.ExitCode != 0))
 		a.ExitCode = it.ExitCode
-		// A command that printed nothing reports null, and its result is
-		// the empty text it produced -- recorded 2026-09-13 from a
-		// `printf ... > out.txt` that completed with exitCode 0 and
-		// aggregatedOutput null.
-		out := ""
-		if it.AggregatedOutput != nil {
-			out = *it.AggregatedOutput
+		switch {
+		case it.AggregatedOutput != nil:
+			result, known = *it.AggregatedOutput, true
+		case it.ExitCode != nil:
+			// A command that ran and printed nothing reports null, and its
+			// result is the empty text it produced -- recorded 2026-09-13
+			// from a `printf ... > out.txt` that completed with exitCode 0
+			// and aggregatedOutput null. One that never ran (declined) has
+			// no exit code and so no result.
+			result, known = "", true
 		}
-		result = out
 	case "fileChange", "collabAgentToolCall":
-		failed = statusFailed
+		verdict(statusFailed)
 	case "mcpToolCall":
-		failed = statusFailed || it.Error != nil
+		verdict(statusFailed || it.Error != nil)
 		if it.Error != nil {
-			result = it.Error.Message
-		} else if v, ok := decodeValue(it.Result); ok {
-			result = mcpResultValue(v)
+			result, known = it.Error.Message, true
+		} else if v, ok := decodeValue(it.Result); ok && v != nil {
+			result, known = mcpResultValue(v), true
 		}
 	case "dynamicToolCall":
-		failed = statusFailed || (it.Success != nil && !*it.Success)
-		result, _ = decodeValue(it.ContentItems)
-	case "webSearch":
-		result, _ = decodeValue(it.Results)
+		verdict(statusFailed || (it.Success != nil && !*it.Success))
+		value(it.ContentItems)
 	case "imageGeneration":
-		failed = !isNull(it.Failure)
+		switch {
+		case !isNull(it.Failure):
+			verdict(true)
+		case it.Status == "completed":
+			verdict(false)
+		}
 		// The image as the app returned it: digested, never carried.
-		result, _ = decodeValue(it.Result)
+		value(it.Result)
+	case "webSearch":
+		value(it.Results)
 	case "functionCallOutput":
-		result, _ = decodeValue(it.Output)
+		value(it.Output)
 	}
-	a.IsError = &failed
-	a.ResultType, a.ResultDigest = resultShape(result)
-	if failed {
+	a.IsError = failed
+	if known {
+		a.ResultType, a.ResultDigest = resultShape(result)
+	}
+	if failed != nil && *failed {
 		a.Contents = nil
+		return
+	}
+	// A command whose own parse names exactly one read reported that
+	// file's bytes as its output, when it printed the whole file (`cat`)
+	// -- and nothing like them when it printed a line of it (`head -1`).
+	if it.Type == "commandExecution" && len(a.Contents) == 1 && it.AggregatedOutput != nil {
+		a.Contents[0].Seen = []byte(*it.AggregatedOutput)
 	}
 }
 
@@ -350,49 +399,65 @@ func codexCoreCall(ev codexCoreEvent, workspace string) (Action, int, bool) {
 	return a, phase, true
 }
 
-// codexCoreFinish writes what an end event reported onto its call.
-//
-// An end event this build cannot read the outcome of reports nothing --
-// isError stays absent rather than guessing either way.
+// codexCoreFinish writes what an end event reported onto its call, by
+// the rules codexItemFinish keeps: a verdict only where the event gives
+// one, a result only where it carries one. A web search and an image view
+// report no verdict, and an end event this build cannot read the outcome
+// of reports nothing either -- isError stays absent rather than guessing.
 func codexCoreFinish(a *Action, ev codexCoreEvent) {
 	statusFailed := ev.Status != "" && ev.Status != "completed"
 	var failed *bool
+	verdict := func(f bool) { failed = &f }
 	var result any
-	known := true
-	switch ev.Type {
-	case "exec_command_end":
-		f := statusFailed || (ev.ExitCode != nil && *ev.ExitCode != 0)
-		failed = &f
-		a.ExitCode = ev.ExitCode
+	known := false
+	printed := func() {
 		switch {
 		case ev.AggregatedOutput != nil:
-			result = *ev.AggregatedOutput
+			result, known = *ev.AggregatedOutput, true
 		case ev.Stdout != nil || ev.Stderr != nil:
-			result = deref(ev.Stdout) + deref(ev.Stderr)
-		default:
-			// An end that carries no output at all reported no result.
-			known = false
+			result, known = deref(ev.Stdout)+deref(ev.Stderr), true
 		}
+	}
+	switch ev.Type {
+	case "exec_command_end":
+		verdict(statusFailed || (ev.ExitCode != nil && *ev.ExitCode != 0))
+		if ev.Status == "declined" {
+			// The command never ran: an exit code or an output on the event
+			// is not a result of it.
+			break
+		}
+		a.ExitCode = ev.ExitCode
+		printed()
 	case "patch_apply_end":
-		f := statusFailed || (ev.Success != nil && !*ev.Success)
-		failed = &f
+		verdict(statusFailed || (ev.Success != nil && !*ev.Success))
+		// What the patch printed -- "Success. Updated the following files"
+		// or the reason it did not apply.
+		printed()
 	case "mcp_tool_call_end":
 		result, failed = codexCoreMCPResult(ev.Result)
-		known = failed != nil
+		known = failed != nil && result != nil
 	case "web_search_end":
-		f := false
-		failed = &f
-		result, _ = decodeValue(ev.Results)
-	case "view_image_tool_call":
-		f := false
-		failed = &f
+		if v, ok := decodeValue(ev.Results); ok && v != nil {
+			result, known = v, true
+		}
 	}
 	a.IsError = failed
 	if known {
 		a.ResultType, a.ResultDigest = resultShape(result)
 	}
-	if failed == nil || *failed {
+	if failed != nil && *failed {
 		a.Contents = nil
+		return
+	}
+	// As on the app-server: a command whose parse names one read printed
+	// that file's bytes to stdout when it printed the whole file.
+	if ev.Type == "exec_command_end" && len(a.Contents) == 1 {
+		switch {
+		case ev.Stdout != nil:
+			a.Contents[0].Seen = []byte(*ev.Stdout)
+		case ev.AggregatedOutput != nil:
+			a.Contents[0].Seen = []byte(*ev.AggregatedOutput)
+		}
 	}
 }
 
@@ -482,7 +547,26 @@ func shellJoin(argv []string) string {
 	for i, a := range argv {
 		words[i] = shellWord(a)
 	}
+	// The FIRST word is the command, and a shell reads two kinds of bare
+	// first word as something else: NAME=value is an assignment that runs
+	// nothing, and a reserved word opens its own grammar (`if`, `time`).
+	// Quoted, either is only a name.
+	if len(argv) > 0 && words[0] == argv[0] && (strings.Contains(argv[0], "=") || shellReserved[argv[0]]) {
+		words[0] = "'" + argv[0] + "'"
+	}
 	return strings.Join(words, " ")
+}
+
+// shellReserved are the bare words a shell reads as grammar when they
+// open a command: POSIX's, and those bash and zsh add. The ones spelled
+// with a character shellSafe rejects -- `!`, `{`, `[[` -- are quoted
+// already.
+var shellReserved = map[string]bool{
+	"case": true, "do": true, "done": true, "elif": true, "else": true,
+	"esac": true, "fi": true, "for": true, "if": true, "in": true,
+	"then": true, "until": true, "while": true,
+	"function": true, "select": true, "time": true, "coproc": true,
+	"foreach": true, "end": true, "repeat": true, "nocorrect": true, "noglob": true,
 }
 
 func shellWord(s string) string {

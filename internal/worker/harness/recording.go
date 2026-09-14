@@ -72,13 +72,49 @@ func (r *recording) begin(a Action) {
 // session can see is still a completed call. The bare call is `other`
 // with no arguments, which is exactly what is known about it.
 func (r *recording) complete(id string, finish func(*Action)) (Action, bool) {
+	var out Action
+	var ok bool
+	r.completeAndEmit(id, finish, func(a Action) { out, ok = a, true })
+	return out, ok
+}
+
+// flush closes every call still open as Incomplete, in the order they
+// began.
+//
+// It runs at the end of every turn. A call begun in a turn that has ended
+// will never finish -- Claude Code's next turn is a new process, and a
+// Codex turn that ended took its in-flight items with it -- so holding it
+// open would lose it silently, which is the one thing a recording must
+// not do. What it would have reported is unknown, so nothing about a
+// result survives into the record, and no file is read for it.
+func (r *recording) flush() []Action {
+	var out []Action
+	r.flushAndEmit(func(a Action) { out = append(out, a) })
+	return out
+}
+
+// completeAndEmit is complete with the numbered action handed to emit
+// while the recording's lock is still held, and flushAndEmit is flush the
+// same way.
+//
+// A HARNESS WITH TWO GOROUTINES NEEDS THESE. The Codex clients complete
+// calls on the connection's reader and flush them on the turn's own
+// goroutine when the turn ends; numbering under the lock and sending after
+// it let a flushed seq 2 leave before a completed seq 1 -- and the engine
+// drops an action that arrives behind a higher one, so the lower call
+// would be lost. Holding the lock through the send makes the order on the
+// wire the order of the seq. It also means a flush waits for a completion
+// that is mid-send, so nothing is still being sent once a turn returns.
+// (Claude Code's client completes and flushes on one goroutine and keeps
+// the plain methods.)
+func (r *recording) completeAndEmit(id string, finish func(*Action), emit func(Action)) {
 	if r == nil {
-		return Action{}, false
+		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if id != "" && r.completed[id] {
-		return Action{}, false
+		return
 	}
 	call, held := r.pending[id]
 	if held {
@@ -93,25 +129,15 @@ func (r *recording) complete(id string, finish func(*Action)) (Action, bool) {
 	if id != "" {
 		r.completed[id] = true
 	}
-	return r.stamp(*call), true
+	emit(r.stamp(*call))
 }
 
-// flush closes every call still open as Incomplete, in the order they
-// began.
-//
-// It runs at the end of every turn. A call begun in a turn that has ended
-// will never finish -- Claude Code's next turn is a new process, and a
-// Codex turn that ended took its in-flight items with it -- so holding it
-// open would lose it silently, which is the one thing a recording must
-// not do. What it would have reported is unknown, so nothing about a
-// result survives into the record, and no file is read for it.
-func (r *recording) flush() []Action {
+func (r *recording) flushAndEmit(emit func(Action)) {
 	if r == nil {
-		return nil
+		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	out := make([]Action, 0, len(r.order))
 	for _, id := range r.order {
 		call := r.pending[id]
 		if call == nil {
@@ -122,11 +148,10 @@ func (r *recording) flush() []Action {
 		call.ResultType, call.ResultDigest = "", ""
 		call.Contents = nil
 		r.completed[id] = true
-		out = append(out, r.stamp(*call))
+		emit(r.stamp(*call))
 	}
 	r.pending = map[string]*Action{}
 	r.order = nil
-	return out
 }
 
 // stamp numbers an action for the wire. Callers hold r.mu.

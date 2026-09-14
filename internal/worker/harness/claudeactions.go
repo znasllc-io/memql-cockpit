@@ -154,7 +154,30 @@ func claudeFinish(a *Action, content json.RawMessage, isError bool, record json.
 	}
 	if isError {
 		a.Contents = nil
+		return
 	}
+	if a.AppTool == "Read" && len(a.Contents) == 1 {
+		a.Contents[0].Seen = claudeReadSeen(record)
+	}
+}
+
+// claudeReadSeen is the file content a Read's own record says the app
+// got: `tool_use_result.file.content`, the raw text without the line
+// numbers the model is shown (recorded from 2.1.270:
+// {"type":"text","file":{"filePath":...,"content":"alpha\nbeta\n",...}}).
+// A window of the file -- an offset, a limit, a truncated long line --
+// is still what the app got, and the session compares it with the file:
+// only a Read that got the whole file lets the file's bytes travel.
+func claudeReadSeen(record json.RawMessage) []byte {
+	var rec struct {
+		File *struct {
+			Content *string `json:"content"`
+		} `json:"file"`
+	}
+	if !decodeTolerant(record, &rec) || rec.File == nil || rec.File.Content == nil {
+		return nil
+	}
+	return []byte(*rec.File.Content)
 }
 
 // claudeExitLine is how a failed Bash call reports its status: the

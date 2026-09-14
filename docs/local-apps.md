@@ -380,10 +380,12 @@ Every tool call an app completes on this machine leaves the session as **one
 drove it — so the cluster never has to learn that Claude Code calls it `Bash`
 and Codex calls it `commandExecution`. The session's **first** event describes
 the machine as the run found it. Together they are the recording the engine
-turns into work-spine rows ([memql#5396](https://github.com/znasllc-io/memql/issues/5396));
-an engine that predates that shows each one as a progress line and keeps it in
-the transcript, so nothing is lost in the meantime. Nothing on the wire changed
-to carry them: an `event` chunk has always been a JSON body.
+turns into work-spine rows ([memql#5396](https://github.com/znasllc-io/memql/issues/5396)).
+An engine that predates that shows each one as a progress line and appends it
+to the session's transcript. That transcript is bounded on the engine's side,
+so past its bound the actions survive only in the full transcript artifact
+this machine pushes when the session ends. Nothing on the wire changed to carry
+them: an `event` chunk has always been a JSON body.
 
 The model's **prose is not recorded here**. It stays on `text` and in the
 transcript artifact; the recording is about what the app *did*.
@@ -415,11 +417,11 @@ transcript artifact; the recording is about what the app *did*.
 | `parentId` | The call this one ran inside, for a Claude Code sub-agent's calls. |
 | `tool` | `exec`, `fs_read`, `fs_write`, `fetch`, `mcp`, `agent` (the app's own bookkeeping — nothing outside it moved) or `other` (not classified; effects **unknown**). |
 | `appTool` | The app's own name for the tool. Provenance only. |
-| `args` | The call's arguments, **whole**, as the app expressed them. |
+| `args` | The call's arguments, **whole**, as the app expressed them — unless they would make the action too large to send (a Codex patch deleting a large file carries all of it). Then `args` is `null`, `argsDigest` is their `sha256` and `argsOmitted` is `too_large`. |
 | `command` / `mcp` / `url` / `query` | The one thing a reader needs without parsing `args`: the command line an `exec` ran, the `{server, tool}` an `mcp` call reached, what a `fetch` asked for. |
 | `exitCode` | Present **only when the app reported one**. |
-| `isError` | The app's own verdict. Absent only when nobody knows: an `incomplete` call, or an end event this build could not read. |
-| `resultType` / `resultDigest` | The result's inferred JSON type and `sha256`. Text that is JSON is typed by what it parses as. |
+| `isError` | The app's own verdict. Absent when nobody knows: an `incomplete` call, an end event this build could not read, or a call the app gives no verdict on (a Codex web search, image view or sleep). |
+| `resultType` / `resultDigest` | The result's inferred JSON type and `sha256`. Text that is JSON is typed by what it parses as. Absent when the app reported no result — a Codex file change answers nothing, and a declined command never ran. |
 | `contents` | The files the call read or wrote — see below. |
 | `incomplete` | The app started this call and the session never saw it finish: the process died, the turn was cancelled, or the result was too large to read. Recorded, never dropped, never assumed. |
 
@@ -440,7 +442,13 @@ The same for a command sent to the background, and for a refusal.
 | `fetch` | `WebFetch`, `WebSearch` | `webSearch` | `web_search_*` |
 | `mcp` | `mcp__<server>__<tool>` | `mcpToolCall` | `mcp_tool_call_*` |
 | `agent` | `Task`, `ToolSearch`, `TodoWrite`, `Skill`, `StructuredOutput`, … | `collabAgentToolCall`, `sleep` | — |
-| `other` | anything else | `dynamicToolCall`, `imageGeneration` | — |
+| `other` | anything else | `dynamicToolCall`, `imageGeneration`, `functionCallOutput`, and any item type this build has never seen | — |
+
+A Codex item of a type newer than this cockpit is recorded as `other`, with
+the item itself as its `args`, rather than dropped: a replay has to know a call
+happened even when nothing here knows what it did. Only the conversation's own
+items — messages, reasoning, plans, review and compaction markers — are not
+calls.
 
 **Codex reads with its shell.** It has no read tool; it runs `cat` or `sed -n`.
 Its own parse of the command names the file it read, and that is how a Codex
@@ -454,19 +462,46 @@ its bytes leave this machine — the harness never reads a file itself. A file i
 read, at the moment the call completes, only when:
 
 - the call **succeeded** — a refused write wrote nothing;
-- the path resolves, **symlinks followed**, to somewhere **inside the workspace**;
+- the path resolves, **symlinks followed**, to somewhere **inside the workspace**
+  — checked again on the file that actually opened, so a directory swapped for
+  a link in between cannot lead the read outside;
 - it is not the session's own scaffolding: `.mcp.json` with the per-run bearer,
   `.memql-session/` (the transcript, Codex's per-session home and the `auth.json`
-  linked into it), or a configuration moved aside;
+  linked into it), a configuration moved aside, or the temporary file the bearer
+  is written through. These are recognised by **identity**, not only by name,
+  so a hard link to one — or `.MCP.json` on a Mac, where names ignore case — is
+  refused too;
 - it is a **regular file**, checked on the opened descriptor, so a path swapped
   for a named pipe cannot hang the session.
 
+**A read never sends more of a file than the app's own result already did.**
+Every file is digested; whether its bytes travel as well depends on why the file
+is on the action:
+
+- a file the app **read** travels only when the app's own result carried the
+  whole file — Claude Code's `Read` of it, or a Codex `cat` whose output is the
+  file. A read that looked at part of a file (`head -1 .env`) sent that part in
+  its own result, and the recording carries the rest as a digest
+  (`omitted: digest_only`), never as bytes;
+- a file the app **wrote** travels, except inside `.git/`, `node_modules/`,
+  `vendor/` and the other dependency directories the output push skips
+  (`digest_only` there — `.git/config` holds remote URLs and the tokens in
+  them);
+- a file holding this session's own credential travels as **neither bytes nor
+  digest** (`omitted: contains_credential`), wherever it is.
+
 | The file | What travels |
 |---|---|
-| up to 1 MiB | the bytes inline (`utf8`, or `base64` when they are not text), with the digest and size |
-| up to 1 MiB, but the action already carries 4 MiB inline | the digest and size, `omitted: over_budget` |
-| over 1 MiB | the digest and size, `omitted: over_ceiling` |
+| up to 256 KiB | the bytes inline (`utf8`, or `base64` when they are not text), with the digest and size |
+| up to 256 KiB, but the action already carries 1 MiB inline | the digest and size, `omitted: over_budget` |
+| over 256 KiB | the digest and size, `omitted: over_ceiling` |
 | over 64 MiB | the size alone, `omitted: too_large` |
+
+One action is at most **8 MiB** on the wire. The few that would be larger carry
+a file in their own arguments; they drop their inline file bytes first (each
+file keeps its digest, `omitted: over_budget`), then their arguments (see
+`argsOmitted` above), and an action still too large after both is not sent. The
+gap it leaves in `seq` says a call is missing, and the worker log names it.
 
 Anything that was not read carries its path and a reason: `outside_workspace`,
 `session_scaffolding`, `not_found`, `not_regular`, `unreadable`. The digest is
@@ -580,6 +615,10 @@ applied silently:
 | `live transcript truncated at limits.max_transcript_bytes` | the engine's row cap bit. The complete transcript is the pushed artifact |
 | an action's file carries `omitted: outside_workspace` or `session_scaffolding` | the app named a file the recording will not read: outside the session's workspace, or the session's own files. Correct refusal; the path is still recorded |
 | an action carries `incomplete: true` | the app started the call and the turn ended before it finished — a cancel, a crash, or a result line over 1 MiB the harness could not parse |
+| a file the app read carries `omitted: digest_only` and no bytes | the app's own result did not carry the whole file — it read part of it, or the file changed after it was read. By design: the recording sends no more of a file than the app did. A file written inside `.git/` or `node_modules/` gets the same |
+| a file carries `omitted: contains_credential` | the file holds this session's bearer — the app copied it out of its MCP configuration. Neither the bytes nor their digest leave the machine |
+| an action carries `argsOmitted: too_large` | its arguments would have made it larger than the 8 MiB an action may be — usually a Codex patch deleting or rewriting a large file. `argsDigest` identifies them |
+| the action `seq` skips a number | an action could not be sent: too large even without its arguments, or the stream failed. The worker log names the call |
 
 ## Related
 

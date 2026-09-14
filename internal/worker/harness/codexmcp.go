@@ -494,22 +494,20 @@ func (h *codexMCP) recordEvent(params json.RawMessage) {
 		h.rec.begin(call)
 		return
 	}
-	if a, ok := h.rec.complete(call.ID, func(a *Action) {
+	// Sent under the recording's lock, as on the app-server: completions
+	// arrive on the reader and the flush on the turn's goroutine.
+	h.rec.completeAndEmit(call.ID, func(a *Action) {
 		*a = mergeCall(*a, call)
 		if a.Cwd == "" {
 			a.Cwd = h.spec.Workspace
 		}
 		codexCoreFinish(a, envelope.Msg)
-	}); ok {
-		h.conn.record(a)
-	}
+	}, h.conn.record)
 }
 
 // flushRecording records the calls the turn started and never finished.
 func (h *codexMCP) flushRecording() {
-	for _, a := range h.rec.flush() {
-		h.conn.record(a)
-	}
+	h.rec.flushAndEmit(h.conn.record)
 }
 
 // codexMCPTurn is the little this protocol lets a turn accumulate before

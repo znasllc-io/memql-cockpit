@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"reflect"
 	"sort"
+	"sync"
 	"testing"
+	"time"
 )
 
 // record_test.go pins the recording's wire shape and its bookkeeping.
@@ -41,7 +43,8 @@ func TestActionWireContract(t *testing.T) {
 	full := Action{
 		Type: ActionEventType, V: RecordVersion, Seq: 7, Turn: 2,
 		ID: "toolu_1", ParentID: "toolu_0", Tool: ActionExec, AppTool: "Bash",
-		Args: json.RawMessage(`{"command":"ls"}`), Cwd: "/w", Command: "ls",
+		Args: json.RawMessage(`{"command":"ls"}`), ArgsDigest: Digest([]byte(`{"command":"ls"}`)),
+		ArgsOmitted: ArgsTooLarge, Cwd: "/w", Command: "ls",
 		MCP: &MCPTarget{Server: "memql", Tool: "query"}, URL: "https://example.com", Query: "q",
 		ExitCode: &code, IsError: &failed, ResultType: "string", ResultDigest: Digest([]byte("x")),
 		Contents: []Content{{
@@ -51,7 +54,7 @@ func TestActionWireContract(t *testing.T) {
 		Incomplete: true,
 	}
 	want := []string{
-		"appTool", "args", "command", "contents", "cwd", "exitCode", "id", "incomplete",
+		"appTool", "args", "argsDigest", "argsOmitted", "command", "contents", "cwd", "exitCode", "id", "incomplete",
 		"isError", "mcp", "parentId", "query", "resultDigest", "resultType", "seq", "tool",
 		"turn", "type", "url", "v",
 	}
@@ -77,6 +80,11 @@ func TestActionWireContract(t *testing.T) {
 	}
 	if got := jsonKeys(t, Content{Op: ContentRead, Path: "/w/x"}); !reflect.DeepEqual(got, []string{"op", "path"}) {
 		t.Errorf("a path-only Content carries %v", got)
+	}
+	// What the app itself reported of a file is the session's to compare
+	// and never travels.
+	if got := jsonKeys(t, Content{Op: ContentRead, Path: "/w/x", Seen: []byte("secret")}); !reflect.DeepEqual(got, []string{"op", "path"}) {
+		t.Errorf("Seen went on the wire: %v", got)
 	}
 
 	// Zero is a fact when it is one: an empty file has zero bytes and
@@ -290,6 +298,52 @@ func TestRecordingFlushRecordsWhatNeverFinished(t *testing.T) {
 	}
 	if again := r.flush(); len(again) != 0 {
 		t.Errorf("a second flush found %+v", again)
+	}
+}
+
+// TestRecordingSendsInSeqOrderAcrossGoroutines: the Codex clients
+// complete a call on the reader while the turn's flush runs on its own
+// goroutine. A flush must not overtake a completion that holds a lower seq
+// and is still being sent -- the engine drops an action that arrives
+// behind a higher one, so the call would be lost.
+func TestRecordingSendsInSeqOrderAcrossGoroutines(t *testing.T) {
+	r := newRecording()
+	r.startTurn()
+	r.begin(Action{ID: "a", Tool: ActionExec})
+	r.begin(Action{ID: "b", Tool: ActionExec})
+
+	var mu sync.Mutex
+	var sent []uint64
+	send := func(a Action) {
+		mu.Lock()
+		sent = append(sent, a.Seq)
+		mu.Unlock()
+	}
+	sending, release, completed := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(completed)
+		r.completeAndEmit("a", nil, func(a Action) {
+			close(sending)
+			<-release
+			send(a)
+		})
+	}()
+	<-sending
+	flushed := make(chan struct{})
+	go func() {
+		defer close(flushed)
+		r.flushAndEmit(send)
+	}()
+	select {
+	case <-flushed:
+		t.Fatal("the flush sent while seq 1 was still being sent")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	<-completed
+	<-flushed
+	if !reflect.DeepEqual(sent, []uint64{1, 2}) {
+		t.Fatalf("sent %v, want 1 then 2", sent)
 	}
 }
 

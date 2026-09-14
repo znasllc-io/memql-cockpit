@@ -5,12 +5,15 @@ package appsession
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 
@@ -163,11 +166,15 @@ func TestSession_FingerprintDigestsTheInputs(t *testing.T) {
 // whole after the transcript cap has bitten, a file the app wrote travels
 // with its bytes, and a file the app named inside the scaffolding or
 // outside the workspace travels as a path and a reason -- never a byte of
-// it, and never the bearer.
+// it, and never the bearer. A file the app read travels only as far as the
+// app's own report of it went: whole when it read the whole file, as a
+// digest when it read one line.
 func TestSession_ActionsCarryTheirFilesPastTheCap(t *testing.T) {
 	outside := writeFile(t, t.TempDir(), "elsewhere.txt", "not the session's")
 	fakeApp(t, "claude", fmt.Sprintf(`
 printf 'goodbye' > out.txt
+printf 'alpha\nbeta\n' > notes.txt
+printf 'USER=me\nTOKEN=hunter2\n' > .env
 printf '%%s\n' '{"type":"system","subtype":"init","cwd":"'"$PWD"'","session_id":"app-rec"}'
 i=0
 while [ $i -lt 40 ]; do
@@ -180,6 +187,10 @@ printf '%%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","id
 printf '%%s\n' '{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_cfg","type":"tool_result","content":"(the configuration)"}]},"parent_tool_use_id":null,"session_id":"app-rec"}'
 printf '%%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_out","name":"Read","input":{"file_path":"%s"}}]},"parent_tool_use_id":null,"session_id":"app-rec"}'
 printf '%%s\n' '{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_out","type":"tool_result","content":"(elsewhere)"}]},"parent_tool_use_id":null,"session_id":"app-rec"}'
+printf '%%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_r","name":"Read","input":{"file_path":"'"$PWD"'/notes.txt"}}]},"parent_tool_use_id":null,"session_id":"app-rec"}'
+printf '%%s\n' '{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_r","type":"tool_result","content":"1\talpha\n2\tbeta\n3\t"}]},"parent_tool_use_id":null,"session_id":"app-rec","tool_use_result":{"type":"text","file":{"filePath":"'"$PWD"'/notes.txt","content":"alpha\nbeta\n"}}}'
+printf '%%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_env","name":"Read","input":{"file_path":"'"$PWD"'/.env","limit":1}}]},"parent_tool_use_id":null,"session_id":"app-rec"}'
+printf '%%s\n' '{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_env","type":"tool_result","content":"1\tUSER=me"}]},"parent_tool_use_id":null,"session_id":"app-rec","tool_use_result":{"type":"text","file":{"filePath":"'"$PWD"'/.env","content":"USER=me\n"}}}'
 printf '%%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"app-rec","total_cost_usd":0.01,"usage":{"input_tokens":1,"output_tokens":2},"result":"done"}'
 `, outside))
 	h := newRig(t)
@@ -193,8 +204,8 @@ printf '%%s\n' '{"type":"result","subtype":"success","is_error":false,"session_i
 		t.Fatal("the cap never bit, so this test proves nothing about the recording outliving it")
 	}
 	_, actions := recordedEvents(t, h.sender.recorded())
-	if len(actions) != 3 {
-		t.Fatalf("actions = %d past the cap, want all 3: %+v", len(actions), actions)
+	if len(actions) != 5 {
+		t.Fatalf("actions = %d past the cap, want all 5: %+v", len(actions), actions)
 	}
 	for i, a := range actions {
 		if a.Seq != uint64(i+1) || len(a.Contents) != 1 {
@@ -212,12 +223,68 @@ printf '%%s\n' '{"type":"result","subtype":"success","is_error":false,"session_i
 	if got := actions[2].Contents[0]; got.Omitted != harness.OmittedOutsideWorkspace || got.Data != nil {
 		t.Errorf("a file outside the workspace = %+v, want outside_workspace and nothing read", got)
 	}
+	if got := actions[3].Contents[0]; got.Data == nil || *got.Data != "alpha\nbeta\n" || got.Omitted != "" {
+		t.Errorf("a file the app read whole = %+v, want its bytes", got)
+	}
+	if got := actions[4].Contents[0]; got.Data != nil || got.Omitted != harness.OmittedDigestOnly ||
+		got.Digest != harness.Digest([]byte("USER=me\nTOKEN=hunter2\n")) {
+		t.Errorf("a file the app read one line of = %+v, want digest_only with the whole file's digest", got)
+	}
 	for _, c := range h.sender.recorded() {
+		if strings.Contains(c.data, "hunter2") {
+			t.Fatalf("the part of .env the app never read reached a chunk: %s", c.data)
+		}
 		if strings.Contains(c.data, testBearer) {
 			t.Fatalf("the bearer reached a chunk: %s", c.data)
 		}
 		if strings.Contains(c.data, "not the session's") {
 			t.Fatalf("a file outside the workspace reached a chunk: %s", c.data)
 		}
+	}
+}
+
+// gateSender holds the send of chunk seq 1 until released.
+type gateSender struct {
+	*fakeSender
+	entered, release chan struct{}
+	once             sync.Once
+}
+
+func (g *gateSender) SendAppSessionChunk(id, stream string, data []byte, seq uint64) error {
+	if seq == 1 {
+		g.once.Do(func() { close(g.entered) })
+		<-g.release
+	}
+	return g.fakeSender.SendAppSessionChunk(id, stream, data, seq)
+}
+
+// TestSession_ChunksLeaveInTheOrderOfTheirSeq: an action is sent from the
+// harness's goroutine while narration goes out from another. A chunk
+// numbered after one still being sent must not reach the stream before
+// it -- the engine drops a chunk that arrives behind a higher seq, so the
+// lower one would be lost.
+func TestSession_ChunksLeaveInTheOrderOfTheirSeq(t *testing.T) {
+	g := &gateSender{fakeSender: newFakeSender(), entered: make(chan struct{}), release: make(chan struct{})}
+	s := &session{id: "s-order", sender: g, logger: slog.Default()}
+	first := make(chan error, 1)
+	go func() { first <- s.emitRecord([]byte("{\"type\":\"memql.app_session.action\"}\n")) }()
+	<-g.entered
+	second := make(chan error, 1)
+	go func() { second <- s.emitChunk(StreamText, []byte("narration")) }()
+	select {
+	case <-second:
+		t.Fatal("seq 2 was sent while seq 1 was still being sent")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(g.release)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-second; err != nil {
+		t.Fatal(err)
+	}
+	got := g.recorded()
+	if len(got) != 2 || got[0].seq != 1 || got[1].seq != 2 {
+		t.Fatalf("sent %+v, want seq 1 then seq 2", got)
 	}
 }

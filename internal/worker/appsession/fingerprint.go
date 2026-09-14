@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"errors"
 	"io"
 	"io/fs"
 	"os"
@@ -42,6 +42,10 @@ const (
 	// toolVersionTTL is how long a probed version is reused. The binary's
 	// size and mtime are in the cache key too, so an upgrade shows at once.
 	toolVersionTTL = 5 * time.Minute
+
+	// toolProbeWaitDelay is how long a probe that was killed, or that
+	// exited, may still hold its output open (runToolVersion).
+	toolProbeWaitDelay = 500 * time.Millisecond
 )
 
 // sendFingerprint sends the fingerprint as the session's first chunk.
@@ -51,17 +55,22 @@ const (
 // recording that starts at its first action -- worse than a whole one,
 // and far better than refusing to run.
 func (s *session) sendFingerprint(ctx context.Context, spec apps.Spec, workspace string) {
-	body, err := json.Marshal(s.fingerprint(ctx, spec, workspace))
+	body, err := encodeLine(s.fingerprint(ctx, spec, workspace))
 	if err != nil {
 		s.logger.Warn("the session fingerprint could not be encoded", "error", err)
 		return
 	}
-	if err := s.emitRecord(append(body, '\n')); err != nil {
+	if err := s.emitRecord(body); err != nil {
 		s.logger.Warn("the session fingerprint could not be sent", "error", err)
 	}
 }
 
 // fingerprint describes the world the session starts in.
+//
+// Its four slow parts -- the app's version, the tools' versions, the
+// workspace listing and the inputs' digests -- are independent, and all
+// four stand between the session and its app's start, so they run at
+// once: the start waits for the slowest of them rather than their sum.
 func (s *session) fingerprint(ctx context.Context, spec apps.Spec, workspace string) harness.Fingerprint {
 	harnessWord := spec.Harness
 	if s.start.GetKind() == KindOpen {
@@ -69,30 +78,45 @@ func (s *session) fingerprint(ctx context.Context, spec apps.Spec, workspace str
 		harnessWord = ""
 	}
 	fp := harness.Fingerprint{
-		Type:    harness.FingerprintEventType,
-		V:       harness.RecordVersion,
-		Seq:     0,
-		TakenAt: time.Now().UTC().Format(time.RFC3339Nano),
-		App: harness.FingerprintApp{
-			ID:      spec.ID,
-			Version: s.manager.opts.Detector.Version(ctx, spec.ID),
-			Harness: harnessWord,
-		},
+		Type:     harness.FingerprintEventType,
+		V:        harness.RecordVersion,
+		Seq:      0,
+		TakenAt:  time.Now().UTC().Format(time.RFC3339Nano),
+		App:      harness.FingerprintApp{ID: spec.ID, Harness: harnessWord},
 		Platform: harness.Platform{OS: runtime.GOOS, Arch: runtime.GOARCH},
-		Tools:    s.manager.toolVersions(ctx),
 		Cwd:      workspace,
 		// The environment the APP gets: the worker's, with the session's
 		// own additions last, the way startChildStdin builds it.
 		Variables: fingerprintVariables(harness.FingerprintVariables(spec.Harness),
 			append(os.Environ(), s.mcpEnv()...)),
-		Inputs: s.inputDigests(),
 	}
 	config, backup := s.mcpPaths()
-	if l, err := listWorkspace(workspace, config, backup, maxListingEntries); err == nil {
-		entries := l.entries
-		fp.CwdDigest, fp.CwdEntries, fp.CwdTruncated = l.digest, &entries, l.truncated
+	var listing workspaceListing
+	var listErr error
+	var wg sync.WaitGroup
+	wg.Add(4)
+	go func() {
+		defer wg.Done()
+		fp.App.Version = s.manager.opts.Detector.Version(ctx, spec.ID)
+	}()
+	go func() {
+		defer wg.Done()
+		fp.Tools = s.manager.toolVersions(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		listing, listErr = listWorkspace(workspace, config, backup, maxListingEntries)
+	}()
+	go func() {
+		defer wg.Done()
+		fp.Inputs = s.inputDigests()
+	}()
+	wg.Wait()
+	if listErr == nil {
+		entries := listing.entries
+		fp.CwdDigest, fp.CwdEntries, fp.CwdTruncated = listing.digest, &entries, listing.truncated
 	} else {
-		s.logger.Warn("the workspace could not be listed for the session fingerprint", "error", err)
+		s.logger.Warn("the workspace could not be listed for the session fingerprint", "error", listErr)
 	}
 	return fp
 }
@@ -388,10 +412,22 @@ func (t *toolchain) version(ctx context.Context, p toolProbe) (string, bool) {
 
 // runToolVersion runs one version probe in the root directory, with
 // nothing on stdin and stderr thrown away.
+//
+// WaitDelay bounds the wait for the probe's OUTPUT as well as its exit.
+// A context kill reaches only the process it started, and a tool that
+// hands its version question to a child -- a shim, a version manager --
+// can leave that child holding stdout open, so without it Output would
+// wait on the pipe long after the deadline it was given.
 func runToolVersion(ctx context.Context, bin string, args []string) (string, error) {
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = string(filepath.Separator)
+	cmd.WaitDelay = toolProbeWaitDelay
 	out, err := cmd.Output()
+	if errors.Is(err, exec.ErrWaitDelay) {
+		// The probe itself exited cleanly and said what it had to say; a
+		// child it left behind is not part of its answer.
+		err = nil
+	}
 	return string(out), err
 }
 

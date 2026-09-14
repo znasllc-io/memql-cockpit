@@ -222,9 +222,13 @@ func (d *Detector) ResolveSpec(ctx context.Context, id string) (Spec, bool) {
 // Version returns the app's own version string, as Detect reports it and
 // from the same cache, or "" when the app is not on PATH or would not say.
 //
-// The session fingerprint asks this, so the version it records and the
-// version the registration advertised are one probe's answer rather than
-// two that could disagree.
+// The session fingerprint asks this. In the worker that is a Detector of
+// the session manager's own, not the one the inventory reports from, so
+// the fingerprint's version is a second probe of the same binary rather
+// than the registration's own answer. Both caches are keyed on the
+// binary's size and mtime, so the two differ only across an upgrade --
+// and then the fingerprint, taken at the session's start, is the one
+// describing the binary that ran.
 func (d *Detector) Version(ctx context.Context, id string) string {
 	spec, ok := SpecFor(strings.TrimSpace(id))
 	if !ok {

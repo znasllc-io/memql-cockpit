@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -61,6 +62,18 @@ cat <<'CODEX_JSON'
 {"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"THREAD","turnId":"turn_fc","completedAtMs":3,"item":{"type":"fileChange","id":"call_refused","changes":[{"path":"/w/nope.txt","kind":{"type":"add"},"diff":"x"}],"status":"declined"}}}
 {"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"THREAD","turnId":"turn_fc","completedAtMs":4,"item":{"type":"agentMessage","id":"msg_fc","text":"done","phase":"final_answer","memoryCitation":null,"delivery":null,"questions":null}}}
 {"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"THREAD","turn":{"id":"turn_fc","items":[],"itemsView":"notLoaded","status":"completed","error":null,"startedAt":1,"completedAt":2,"durationMs":1}}}
+CODEX_JSON
+`
+
+// codexTurnProgressCalls completes two calls this build routes as
+// progress rather than as tool activity: an image view, and an item of a
+// type it has never seen.
+const codexTurnProgressCalls = `
+printf '{"jsonrpc":"2.0","id":%s,"result":{"turn":{"id":"turn_pc","items":[],"itemsView":"notLoaded","status":"inProgress","error":null,"startedAt":null,"completedAt":null,"durationMs":null}}}\n' "$id"
+cat <<'CODEX_JSON'
+{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"THREAD","turnId":"turn_pc","completedAtMs":1,"item":{"type":"imageView","id":"img_1","path":"/w/shot.png"}}}
+{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"THREAD","turnId":"turn_pc","completedAtMs":2,"item":{"type":"calendarInvite","id":"cal_1","status":"completed","attendees":["a@b.c"]}}}
+{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"THREAD","turn":{"id":"turn_pc","items":[],"itemsView":"notLoaded","status":"completed","error":null,"startedAt":1,"completedAt":2,"durationMs":1}}}
 CODEX_JSON
 `
 
@@ -139,8 +152,8 @@ func TestCodexAppServerRecordsOneActionPerCompletedItem(t *testing.T) {
 		}
 	}
 	cat, printf, mcp := got[0], got[3], got[5]
-	if !reflect.DeepEqual(cat.Contents, []Content{{Op: ContentRead, Path: "/w/notes.txt"}}) {
-		t.Errorf("cat contents = %+v, want Codex's own parse of the read", cat.Contents)
+	if !reflect.DeepEqual(cat.Contents, []Content{{Op: ContentRead, Path: "/w/notes.txt", Seen: []byte("alpha\nbeta\n")}}) {
+		t.Errorf("cat contents = %+v, want Codex's own parse of the read, with what it printed", cat.Contents)
 	}
 	if cat.ResultDigest != Digest([]byte("alpha\nbeta\n")) || cat.Cwd != "/w" || cat.AppTool != "commandExecution" {
 		t.Errorf("cat = %+v", cat)
@@ -165,7 +178,10 @@ func TestCodexAppServerFileChangeIsAWrite(t *testing.T) {
 		t.Fatalf("recorded %d, want the change and the refusal: %+v", len(got), got)
 	}
 	change, refused := got[0], got[1]
-	if change.Tool != ActionFSWrite || change.AppTool != "fileChange" || errOf(change) != "false" || change.ResultType != "null" {
+	// A file change answers nothing, and nothing is recorded for it -- not
+	// the digest of null, which every change would share.
+	if change.Tool != ActionFSWrite || change.AppTool != "fileChange" || errOf(change) != "false" ||
+		change.ResultType != "" || change.ResultDigest != "" {
 		t.Errorf("change = %+v", change)
 	}
 	want := []Content{
@@ -183,6 +199,34 @@ func TestCodexAppServerFileChangeIsAWrite(t *testing.T) {
 	}
 	if refused.ID != "call_refused" || errOf(refused) != "true" || refused.Contents != nil {
 		t.Errorf("a declined change = %+v, want isError and no file read", refused)
+	}
+}
+
+// TestCodexAppServerProgressCallsAreRecordedAfterTheirEventLine: a call
+// routed as progress is still a call, recorded -- and, like a tool call,
+// only after the app's own line for it has gone out.
+func TestCodexAppServerProgressCallsAreRecordedAfterTheirEventLine(t *testing.T) {
+	bin, _ := fakeCodexAppServer(t, codexTurnProgressCalls)
+	h := startCodexAppServer(t, codexSpec(t, bin))
+	rec := &recorder{}
+	if _, err := h.Turn(context.Background(), "look", rec); err != nil {
+		t.Fatalf("turn: %v", err)
+	}
+	got := rec.recorded()
+	if len(got) != 2 {
+		t.Fatalf("recorded %+v, want the image view and the unknown call", got)
+	}
+	img, cal := got[0], got[1]
+	if img.Tool != ActionFSRead || img.IsError != nil || len(img.Contents) != 1 || img.Contents[0].Path != "/w/shot.png" {
+		t.Errorf("image view = %+v, want a read of the image with no verdict", img)
+	}
+	if cal.Tool != ActionOther || cal.AppTool != "calendarInvite" || !strings.Contains(string(cal.Args), "attendees") {
+		t.Errorf("unknown call = %+v, want other with the item as its arguments", cal)
+	}
+	for _, id := range []string{"img_1", "cal_1"} {
+		if prev := rec.before(id); !strings.HasPrefix(prev, StreamEvent+" ") || !strings.Contains(prev, `"id":"`+id+`"`) {
+			t.Errorf("before action %s came %q, want the app's own event line for it", id, prev)
+		}
 	}
 }
 
@@ -215,7 +259,7 @@ func TestCodexMCPFallbackRecordsCoreEvents(t *testing.T) {
 	if exec.Command != "bash -lc 'cat notes.txt'" || exec.Cwd != "/w" || exitOf(exec) != "0" || errOf(exec) != "false" {
 		t.Errorf("exec = %+v", exec)
 	}
-	if !reflect.DeepEqual(exec.Contents, []Content{{Op: ContentRead, Path: "/w/notes.txt"}}) ||
+	if !reflect.DeepEqual(exec.Contents, []Content{{Op: ContentRead, Path: "/w/notes.txt", Seen: []byte("alpha\nbeta\n")}}) ||
 		exec.ResultDigest != Digest([]byte("alpha\nbeta\n")) {
 		t.Errorf("exec read = %+v %s", exec.Contents, exec.ResultDigest)
 	}
@@ -268,7 +312,7 @@ func TestCodexMCPEndThatCarriesNoOutputRecordsNoResult(t *testing.T) {
 // word, the arguments as each app expressed them, and a result each app
 // words its own way (Claude Code's Bash drops the trailing newline Codex
 // keeps; its Write answers in prose where a Codex file change answers
-// nothing).
+// nothing, so only Claude Code's write carries a result at all).
 func TestRecordingIsTheSameShapeFromBothApps(t *testing.T) {
 	cRec, _, err := runClaudeFixture(t, claudeRecordedTurn)
 	if err != nil {
@@ -287,15 +331,24 @@ func TestRecordingIsTheSameShapeFromBothApps(t *testing.T) {
 		name          string
 		claude, codex Action
 		sameResult    bool
+		// codexSilent: Codex reports no result for this call at all.
+		codexSilent bool
 	}{
-		{"a command that succeeded", claude[1], codex[1], false},
-		{"a command that exited 3", claude[2], codex[2], false},
-		{"a file written", claude[3], change[0], false},
-		{"an MCP call", claude[6], codex[5], true},
+		{"a command that succeeded", claude[1], codex[1], false, false},
+		{"a command that exited 3", claude[2], codex[2], false, false},
+		{"a file written", claude[3], change[0], false, true},
+		{"an MCP call", claude[6], codex[5], true, false},
 	}
 	for _, p := range pairs {
 		t.Run(p.name, func(t *testing.T) {
-			if a, b := jsonKeys(t, p.claude), jsonKeys(t, p.codex); !reflect.DeepEqual(a, b) {
+			a, b := jsonKeys(t, p.claude), jsonKeys(t, p.codex)
+			if p.codexSilent {
+				if p.codex.ResultType != "" || p.codex.ResultDigest != "" {
+					t.Errorf("codex reported no result, and recorded %s %s", p.codex.ResultType, p.codex.ResultDigest)
+				}
+				a = slices.DeleteFunc(a, func(k string) bool { return k == "resultType" || k == "resultDigest" })
+			}
+			if !reflect.DeepEqual(a, b) {
 				t.Errorf("keys differ:\n claude %v\n codex  %v", a, b)
 			}
 			if p.claude.Tool != p.codex.Tool || exitOf(p.claude) != exitOf(p.codex) || errOf(p.claude) != errOf(p.codex) {
@@ -336,6 +389,13 @@ func TestCodexItemsThatAreNotCallsAreNotRecorded(t *testing.T) {
 		`{"type":"agentMessage","id":"m","text":"hi","phase":"final_answer"}`,
 		`{"type":"reasoning","id":"r","summary":[],"content":[]}`,
 		`{"type":"userMessage","id":"u","content":[]}`,
+		`{"type":"hookPrompt","id":"h"}`,
+		`{"type":"plan","id":"p","text":"1. read"}`,
+		`{"type":"subAgentActivity","id":"s"}`,
+		`{"type":"enteredReviewMode","id":"e","review":"x"}`,
+		`{"type":"exitedReviewMode","id":"x","review":"x"}`,
+		`{"type":"contextCompaction","id":"c"}`,
+		`{"id":"no-type"}`,
 		`not json`,
 	} {
 		if _, _, ok := codexItemCall(json.RawMessage(raw), "/w"); ok {
@@ -345,6 +405,138 @@ func TestCodexItemsThatAreNotCallsAreNotRecorded(t *testing.T) {
 	a, _, ok := codexItemCall(json.RawMessage(`{"type":"webSearch","id":"w","query":"go","action":{"type":"openPage","url":"https://go.dev"}}`), "/w")
 	if !ok || a.Tool != ActionFetch || a.Query != "go" || a.URL != "https://go.dev" {
 		t.Errorf("web search = %+v", a)
+	}
+}
+
+// TestCodexItemOfATypeThisBuildHasNotSeenIsRecordedAsOther: a newer
+// Codex's new tool is a call whose effects nobody here knows, and it is
+// recorded as exactly that -- `other`, the item whole as its arguments --
+// rather than dropped, which would leave a replay skipping it.
+func TestCodexItemOfATypeThisBuildHasNotSeenIsRecordedAsOther(t *testing.T) {
+	raw := `{"type":"calendarInvite","id":"cal-1","status":"completed","attendees":["a@b.c"]}`
+	a, it, ok := codexItemCall(json.RawMessage(raw), "/w")
+	if !ok || a.Tool != ActionOther || a.AppTool != "calendarInvite" || a.ID != "cal-1" || string(a.Args) != raw {
+		t.Fatalf("= %+v %v, want other with the item as its arguments", a, ok)
+	}
+	codexItemFinish(&a, it)
+	if a.IsError != nil || a.ResultType != "" || a.ResultDigest != "" {
+		t.Errorf("finished = %+v, want no verdict and no result: nothing here reads this type's outcome", a)
+	}
+}
+
+// TestCodexItemFinishRecordsOnlyWhatTheItemReported: a verdict only where
+// the item gives one, a result only where it carries one.
+func TestCodexItemFinishRecordsOnlyWhatTheItemReported(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw            string
+		isError, exit, rtype string
+		contents             int
+	}{
+		{"a declined command never ran",
+			`{"type":"commandExecution","id":"c","command":"rm -rf x","status":"declined","commandActions":[{"type":"read","path":"a.txt"}],"aggregatedOutput":null,"exitCode":null}`,
+			"true", "absent", "", 0},
+		{"a command that printed nothing printed the empty text",
+			`{"type":"commandExecution","id":"c","command":"true","status":"completed","aggregatedOutput":null,"exitCode":0}`,
+			"false", "0", "string", 0},
+		{"a command still running reports no exit and no output",
+			`{"type":"commandExecution","id":"c","command":"sleep 1","status":"inProgress","aggregatedOutput":null,"exitCode":null}`,
+			"true", "absent", "", 0},
+		{"a web search has no verdict and here no results",
+			`{"type":"webSearch","id":"w","query":"go","action":null}`,
+			"absent", "absent", "", 0},
+		{"a web search that carried results",
+			`{"type":"webSearch","id":"w","query":"go","results":[{"url":"https://go.dev"}]}`,
+			"absent", "absent", "array", 0},
+		{"an image view has no verdict and keeps its file",
+			`{"type":"imageView","id":"i","path":"/w/shot.png"}`,
+			"absent", "absent", "", 1},
+		{"a generated image that completed",
+			`{"type":"imageGeneration","id":"g","status":"completed","revisedPrompt":"a cat","result":"iVBORw0KGgo="}`,
+			"false", "absent", "string", 0},
+		{"a generated image that failed",
+			`{"type":"imageGeneration","id":"g","status":"failed","failure":{"message":"blocked"},"result":""}`,
+			"true", "absent", "string", 0},
+		{"a generated image with no status says nothing",
+			`{"type":"imageGeneration","id":"g","revisedPrompt":"a cat","result":null}`,
+			"absent", "absent", "", 0},
+		{"an MCP call that returned null",
+			`{"type":"mcpToolCall","id":"m","server":"s","tool":"t","status":"completed","arguments":{},"result":null,"error":null}`,
+			"false", "absent", "", 0},
+		{"a sleep",
+			`{"type":"sleep","id":"z","durationMs":100}`,
+			"absent", "absent", "", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, it, ok := codexItemCall(json.RawMessage(tc.raw), "/w")
+			if !ok {
+				t.Fatalf("not recorded")
+			}
+			codexItemFinish(&a, it)
+			if errOf(a) != tc.isError || exitOf(a) != tc.exit || a.ResultType != tc.rtype || len(a.Contents) != tc.contents {
+				t.Errorf("isError %s exit %s result %q contents %d, want %s %s %q %d",
+					errOf(a), exitOf(a), a.ResultType, len(a.Contents), tc.isError, tc.exit, tc.rtype, tc.contents)
+			}
+			if tc.rtype == "" && a.ResultDigest != "" {
+				t.Errorf("digest %s for a result nobody reported", a.ResultDigest)
+			}
+		})
+	}
+}
+
+// TestCodexCoreFinishRecordsOnlyWhatTheEventReported is the same rule on
+// the mcp-server fallback's end events.
+func TestCodexCoreFinishRecordsOnlyWhatTheEventReported(t *testing.T) {
+	str := func(s string) *string { return &s }
+	code := func(n int) *int { return &n }
+	ok, notOK := true, false
+	for _, tc := range []struct {
+		name                 string
+		ev                   codexCoreEvent
+		isError, exit, rtype string
+		seen                 string
+		contents             int
+	}{
+		{"a declined exec never ran",
+			codexCoreEvent{Type: "exec_command_end", CallID: "c", Status: "declined", ExitCode: code(-1), Stdout: str(""), Stderr: str("declined"),
+				ParsedCmd: []codexCommandAction{{Type: "read", Path: "a.txt"}}},
+			"true", "absent", "", "", 0},
+		{"a read's stdout is what it saw",
+			codexCoreEvent{Type: "exec_command_end", CallID: "c", Status: "completed", ExitCode: code(0), Stdout: str("alpha\n"), Stderr: str("warn\n"),
+				AggregatedOutput: str("alpha\nwarn\n"), ParsedCmd: []codexCommandAction{{Type: "read", Path: "a.txt"}}},
+			"false", "0", "string", "alpha\n", 1},
+		{"a patch's own report is its result",
+			codexCoreEvent{Type: "patch_apply_end", CallID: "p", Success: &ok, Stdout: str("Success. Updated the following files:\nA out.txt\n"), Stderr: str("")},
+			"false", "absent", "string", "", 0},
+		{"a patch that failed",
+			codexCoreEvent{Type: "patch_apply_end", CallID: "p", Success: &notOK, Stderr: str("patch rejected")},
+			"true", "absent", "string", "", 0},
+		{"a web search has no verdict",
+			codexCoreEvent{Type: "web_search_end", CallID: "w", Query: "go"},
+			"absent", "absent", "", "", 0},
+		{"an image view has no verdict and keeps its file",
+			codexCoreEvent{Type: "view_image_tool_call", CallID: "i", Path: "/w/shot.png"},
+			"absent", "absent", "", "", 1},
+		{"an MCP result of null is no result",
+			codexCoreEvent{Type: "mcp_tool_call_end", CallID: "m", Result: json.RawMessage(`{"Ok":null}`)},
+			"false", "absent", "", "", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, _, recorded := codexCoreCall(tc.ev, "/w")
+			if !recorded {
+				t.Fatalf("not a call")
+			}
+			if a.Cwd == "" {
+				a.Cwd = "/w"
+			}
+			codexCoreFinish(&a, tc.ev)
+			if errOf(a) != tc.isError || exitOf(a) != tc.exit || a.ResultType != tc.rtype || len(a.Contents) != tc.contents {
+				t.Errorf("isError %s exit %s result %q contents %d, want %s %s %q %d",
+					errOf(a), exitOf(a), a.ResultType, len(a.Contents), tc.isError, tc.exit, tc.rtype, tc.contents)
+			}
+			if tc.seen != "" && (len(a.Contents) != 1 || string(a.Contents[0].Seen) != tc.seen) {
+				t.Errorf("contents %+v, want the read to carry %q", a.Contents, tc.seen)
+			}
+		})
 	}
 }
 
@@ -359,6 +551,11 @@ func TestShellJoin(t *testing.T) {
 		{[]string{"printf", ""}, "printf ''"},
 		{[]string{"=cmd", "a=b"}, "'=cmd' a=b"},
 		{[]string{"go", "test", "./..."}, "go test ./..."},
+		// The first word is the command: an assignment or a keyword there
+		// would run something else, so either is quoted; later on, both
+		// are only words.
+		{[]string{"FOO=bar", "BAZ=qux"}, "'FOO=bar' BAZ=qux"},
+		{[]string{"time", "make", "if"}, "'time' make if"},
 	} {
 		if got := shellJoin(tc.argv); got != tc.want {
 			t.Errorf("shellJoin(%q) = %s, want %s", tc.argv, got, tc.want)

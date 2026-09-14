@@ -964,9 +964,11 @@ func (h *codexAppServer) handleNotification(method string, params json.RawMessag
 			return
 		}
 		// A call this build routes as progress rather than as tool
-		// activity -- an image view, a sub-agent, a sleep -- is still a
-		// call, and still recorded; anything else is ignored there.
-		h.recordItem(method, n.Item)
+		// activity -- an image view, a sub-agent, a sleep, a type it has
+		// never seen -- is still a call, and still recorded; anything else
+		// is ignored there. Deferred, so the action follows the app's own
+		// event line as it follows a tool chunk above.
+		defer h.recordItem(method, n.Item)
 		if kind == codexItemAgentMessage && method == codexNotifyItemCompleted {
 			if state != nil && state.match(n.TurnID) {
 				state.addMessage(text, phase)
@@ -1087,20 +1089,19 @@ func (h *codexAppServer) recordItem(method string, raw json.RawMessage) {
 	case codexNotifyItemStarted:
 		h.rec.begin(call)
 	case codexNotifyItemCompleted:
-		if a, ok := h.rec.complete(call.ID, func(a *Action) {
+		// Sent under the recording's lock (completeAndEmit): this runs on
+		// the reader while the turn's flush runs on its own goroutine, and
+		// the order on the wire has to be the order of the seq.
+		h.rec.completeAndEmit(call.ID, func(a *Action) {
 			*a = mergeCall(*a, call)
 			codexItemFinish(a, item)
-		}); ok {
-			h.conn.record(a)
-		}
+		}, h.conn.record)
 	}
 }
 
 // flushRecording records the calls the turn started and never finished.
 func (h *codexAppServer) flushRecording() {
-	for _, a := range h.rec.flush() {
-		h.conn.record(a)
-	}
+	h.rec.flushAndEmit(h.conn.record)
 }
 
 // codexReadItem pulls the four things anything asks of a ThreadItem.

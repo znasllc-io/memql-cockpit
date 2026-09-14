@@ -138,7 +138,10 @@ func TestClaudeRecordsOneActionPerCompletedCall(t *testing.T) {
 	}
 
 	read, ls, write, edit, mcp := got[0], got[1], got[3], got[4], got[6]
-	if !reflect.DeepEqual(read.Contents, []Content{{Op: ContentRead, Path: "/w/notes.txt"}}) {
+	// The Read carries what its record says the app got -- the file's
+	// text without the line numbers the model is shown -- for the session
+	// to compare with the file.
+	if !reflect.DeepEqual(read.Contents, []Content{{Op: ContentRead, Path: "/w/notes.txt", Seen: []byte("alpha\nbeta\n")}}) {
 		t.Errorf("Read contents = %+v", read.Contents)
 	}
 	if read.ResultDigest != Digest([]byte("1\talpha\n2\tbeta\n3\t")) {

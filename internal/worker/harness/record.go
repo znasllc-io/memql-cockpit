@@ -87,13 +87,16 @@ const (
 
 // Why a Content carries no bytes: a closed set, because the engine
 // records it as the file's omission and a replay reads each one
-// differently. The first two still carry the digest, so the file can be
-// compared; the rest could not be read at all.
+// differently. over_ceiling, over_budget and digest_only still carry the
+// digest, so the file can be compared; too_large carries only the size;
+// the rest could not be read at all, or -- contains_credential -- were
+// read and must not leave.
 const (
 	// OmittedOverCeiling: larger than one file may be inline.
 	OmittedOverCeiling = "over_ceiling"
-	// OmittedOverBudget: earlier files in the same action spent the
-	// action's inline budget.
+	// OmittedOverBudget: the action had no room left for these bytes --
+	// earlier files in it spent its inline budget, or its own arguments
+	// left it too large to carry them.
 	OmittedOverBudget = "over_budget"
 	// OmittedTooLarge: too large to hash; the size is still reported.
 	OmittedTooLarge = "too_large"
@@ -108,6 +111,20 @@ const (
 	OmittedNotRegular = "not_regular"
 	// OmittedUnreadable: it could not be opened or read.
 	OmittedUnreadable = "unreadable"
+	// OmittedDigestOnly: the recording carries this file's digest and, by
+	// rule, not its bytes -- a read whose bytes the app did not itself
+	// report whole (`head -1 .env` read one line of a file of secrets), or
+	// a file inside a dependency or version-control directory.
+	OmittedDigestOnly = "digest_only"
+	// OmittedCredential: the file holds this session's own bearer.
+	OmittedCredential = "contains_credential"
+)
+
+// Why an Action carries no arguments.
+const (
+	// ArgsTooLarge: the arguments would have made the action too large
+	// to send; their digest stands in for them.
+	ArgsTooLarge = "too_large"
 )
 
 // How inline bytes are carried.
@@ -123,6 +140,20 @@ const DigestPrefix = "sha256:"
 func Digest(b []byte) string {
 	sum := sha256.Sum256(b)
 	return DigestPrefix + hex.EncodeToString(sum[:])
+}
+
+// ArgsDigest is the digest an Action carries for arguments too large to
+// send: over their canonical JSON, the encoding resultDigest uses for a
+// value, so arguments that differ only in spacing or key order are one
+// set of arguments. Arguments that are not JSON at all are digested as
+// their bytes.
+func ArgsDigest(args json.RawMessage) string {
+	if v, ok := decodeValue(args); ok {
+		if canon, err := canonicalJSON(v); err == nil {
+			return Digest(canon)
+		}
+	}
+	return Digest(args)
 }
 
 // Action is one tool call an app completed, normalised.
@@ -156,8 +187,15 @@ type Action struct {
 	AppTool string `json:"appTool"`
 	// Args is the call's arguments WHOLE, as the app expressed them:
 	// Claude Code's tool input, or the Codex item's own fields for a call
-	// the app-server reports as an item rather than as arguments.
-	Args json.RawMessage `json:"args"`
+	// the app-server reports as an item rather than as arguments. Whole,
+	// except in the one case that cannot travel at all: arguments that
+	// would make the action larger than the stream carries (a Codex patch
+	// deleting a large file carries the whole file) are replaced by null,
+	// with ArgsDigest over them and ArgsOmitted saying why -- as are
+	// Command, URL and Query, which are read out of them.
+	Args        json.RawMessage `json:"args"`
+	ArgsDigest  string          `json:"argsDigest,omitempty"`
+	ArgsOmitted string          `json:"argsOmitted,omitempty"`
 	// Cwd is the directory the call ran in, as far as the app said. Codex
 	// names it on every command. Claude Code names it once, on init, and
 	// its Bash tool keeps a `cd` across calls without reporting one -- so
@@ -173,9 +211,10 @@ type Action struct {
 	// ExitCode is the status the app REPORTED for an exec; absent when it
 	// reported none.
 	ExitCode *int `json:"exitCode,omitempty"`
-	// IsError is the app's own verdict on the call. Absent only when
-	// nobody knows: an Incomplete call, or an end event this build could
-	// not read.
+	// IsError is the app's own verdict on the call. Absent when nobody
+	// knows: an Incomplete call, an end event this build could not read,
+	// or a call the app reports no verdict on at all (a Codex web search
+	// or image view carries no status).
 	IsError *bool `json:"isError,omitempty"`
 	// ResultType is the inferred JSON type of the result -- object,
 	// array, string, number, boolean or null. Text that parses as JSON is
@@ -221,6 +260,14 @@ type Content struct {
 	Data     *string `json:"data,omitempty"`
 	// Omitted says why Data is absent, from the closed set above.
 	Omitted string `json:"omitted,omitempty"`
+
+	// Seen is what the app ITSELF reported of this file's bytes, when it
+	// reported them -- Claude Code's Read record, the output of a Codex
+	// command whose own parse says it read this one file. It never goes on
+	// the wire. A read's bytes travel inline only when the file still holds
+	// exactly these: then they left the machine already, in the app's own
+	// report, and the recording has widened nothing.
+	Seen []byte `json:"-"`
 }
 
 // contentFor names one file for the session to read, made absolute

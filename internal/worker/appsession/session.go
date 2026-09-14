@@ -360,8 +360,15 @@ type session struct {
 	logger  *slog.Logger
 	cancel  context.CancelFunc
 
-	seqMu sync.Mutex
-	seq   uint64
+	// sendMu is held from the moment a chunk is numbered until it is
+	// sent, so chunks reach the stream in the order of their seq. The
+	// engine drops a chunk that arrives behind a higher one, and since
+	// the recording is sent from the harness's goroutines as well as the
+	// narration's, numbering under one lock and sending after it lost
+	// whichever lower chunk came second.
+	sendMu sync.Mutex
+	seqMu  sync.Mutex
+	seq    uint64
 
 	// streamed is how many transcript bytes have been SENT, against
 	// limits.max_transcript_bytes.
@@ -477,7 +484,7 @@ func (s *session) execute(ctx context.Context) (int, error) {
 	s.mcp = mcp
 	// What the recording may read back from this workspace: never the
 	// session's own scaffolding, which from here on holds the bearer.
-	s.policy = newContentPolicy(workspace, filepath.Join(workspace, sessionScaffoldDir), config, backup)
+	s.policy = newContentPolicy(workspace, s.redact, filepath.Join(workspace, sessionScaffoldDir), config, backup)
 	s.mu.Unlock()
 
 	base := s.manager.opts.LibraryBase

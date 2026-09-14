@@ -173,6 +173,7 @@ func FuzzContentPolicyStaysInTheWorkspace(f *testing.F) {
 		".mcp.json", ".memql-session/codex/auth.json", "./.memql-session/../.mcp.json",
 		"sub/../../x", "a/./b", "link-out", "link-out/deeper", "link-in/../notes.txt",
 		".mcp.json.memql-session-backup", "\x00", strings.Repeat("../", 40) + "etc",
+		".memql-mcp-123", "sub/.MEMQL-MCP-x", "A.MCP.JSON.MEMQL-SESSION-BACKUP",
 	} {
 		f.Add(seed)
 	}
@@ -186,7 +187,7 @@ func FuzzContentPolicyStaysInTheWorkspace(f *testing.F) {
 	if err := os.Symlink(ws, filepath.Join(ws, "link-in")); err != nil {
 		f.Fatal(err)
 	}
-	p := newContentPolicy(ws, filepath.Join(ws, sessionScaffoldDir), filepath.Join(ws, ".mcp.json"))
+	p := newContentPolicy(ws, nil, filepath.Join(ws, sessionScaffoldDir), filepath.Join(ws, ".mcp.json"))
 	root := resolvedPath(ws)
 
 	f.Fuzz(func(t *testing.T, path string) {
@@ -206,6 +207,12 @@ func FuzzContentPolicyStaysInTheWorkspace(f *testing.F) {
 			if real == scaffold || strings.HasPrefix(real, scaffold+sep) {
 				t.Fatalf("resolve(%q) = %q, the session's scaffolding", path, real)
 			}
+		}
+		// The bearer's temporary file and a configuration moved aside, in
+		// any case a filesystem might ignore.
+		if base := strings.ToLower(filepath.Base(real)); strings.HasPrefix(base, ".memql-mcp-") ||
+			strings.HasSuffix(base, ".memql-session-backup") {
+			t.Fatalf("resolve(%q) = %q, the session's scaffolding by another spelling", path, real)
 		}
 		if again, err := filepath.EvalSymlinks(real); err == nil && again != real {
 			t.Fatalf("resolve(%q) = %q, which still has a link in it (-> %q)", path, real, again)
