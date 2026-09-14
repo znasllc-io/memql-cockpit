@@ -359,6 +359,10 @@ type session struct {
 	library       *Library
 	child         *child
 	cancelReason_ string
+	// policy decides which files the recording reads back (record.go);
+	// pulled are the Library inputs as they landed, for the fingerprint.
+	policy *contentPolicy
+	pulled []pulledInput
 
 	transcript *os.File
 	// before is the workspace as it stood when the run started, so the
@@ -452,8 +456,12 @@ func (s *session) execute(ctx context.Context) (int, error) {
 	if err != nil {
 		return -1, err
 	}
+	config, backup := mcp.paths()
 	s.mu.Lock()
 	s.mcp = mcp
+	// What the recording may read back from this workspace: never the
+	// session's own scaffolding, which from here on holds the bearer.
+	s.policy = newContentPolicy(workspace, filepath.Join(workspace, sessionScaffoldDir), config, backup)
 	s.mu.Unlock()
 
 	base := s.manager.opts.LibraryBase
@@ -745,11 +753,11 @@ func (s *session) runTurns(ctx context.Context, spec apps.Spec, workspace, resum
 	}
 
 	// Every chunk the app produces arrives here already classified by
-	// the harness, which reads the app's own protocol. This replaces the
-	// "does this line parse as JSON" test that used to stand in for it.
-	sink := harness.SinkFunc(func(stream string, data []byte) {
-		_ = s.emitChunk(stream, data)
-	})
+	// the harness, which reads the app's own protocol -- this replaces the
+	// "does this line parse as JSON" test that used to stand in for it --
+	// and every call the app completes arrives as an Action for the
+	// recording (record.go).
+	sink := sessionSink{s: s}
 
 	s.openFollowUps()
 	prompt := s.start.GetPrompt()

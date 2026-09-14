@@ -61,11 +61,32 @@ func (s *session) openTranscript(workspace string) error {
 // it produces a gap the reader cannot see and a record that no longer
 // matches what the app printed.
 //
-// Every chunk is subject to limits.max_transcript_bytes. There used to be
-// one exemption -- the chunk that carried a turn's structured answer while
-// AppSessionEnd had no field for it -- and it went with that chunk: the
-// answer rides result_json on the End now, which no transcript cap touches.
+// Narration is subject to limits.max_transcript_bytes, and this is the
+// path narration takes. The one exemption is the recording (emitRecord).
+// The structured answer used to be the other, while AppSessionEnd had no
+// field for it; it rides result_json on the End now, which no transcript
+// cap touches.
 func (s *session) emitChunk(stream string, data []byte) error {
+	return s.emit(stream, data, true)
+}
+
+// emitRecord sends one chunk of the RECORDING -- an action or the
+// fingerprint (record.go, fingerprint.go) -- as an `event` chunk that
+// limits.max_transcript_bytes never swallows.
+//
+// The limit bounds the NARRATION the engine keeps on the session row. The
+// recording is what the app DID: dropping the fortieth call because the
+// app was chatty about the first thirty-nine would record a session that
+// stopped doing things halfway through, in the one record a later replay
+// reads. It is still redacted, still written to the transcript artifact,
+// and still numbered once and retried under that number.
+func (s *session) emitRecord(data []byte) error {
+	return s.emit(StreamEvent, data, false)
+}
+
+// emit is the one send path emitChunk and emitRecord share; capped says
+// whether limits.max_transcript_bytes applies.
+func (s *session) emit(stream string, data []byte, capped bool) error {
 	if len(data) == 0 {
 		return nil
 	}
@@ -85,7 +106,7 @@ func (s *session) emitChunk(stream string, data []byte) error {
 		}
 	}
 
-	if s.transcriptCapReached(int64(len(clean))) {
+	if capped && s.transcriptCapReached(int64(len(clean))) {
 		return nil
 	}
 

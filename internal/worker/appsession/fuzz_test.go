@@ -1,12 +1,13 @@
 package appsession
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
-// Fuzz targets for the three appsession surfaces that take input from
+// Fuzz targets for the four appsession surfaces that take input from
 // somewhere other than this machine.
 //
 // EACH ONE ASSERTS A SECURITY PROPERTY RATHER THAN A VALUE. A fuzz
@@ -15,7 +16,8 @@ import (
 // returning something plausible that is wrong. So each property below
 // is the thing that would actually go wrong: a filename that escapes a
 // directory, an id that escapes a directory, a bearer that survives
-// redaction.
+// redaction, a path an app names that the recording reads from outside
+// the workspace.
 
 // FuzzSanitizeFileName. The name comes from a SERVER, in the
 // Content-Disposition header of an artifact download, and it is joined
@@ -154,6 +156,59 @@ func FuzzRedactor(f *testing.F) {
 		// because that is what the chunker holds.
 		if hb := r.holdBack(); hb < len(secret)-1 {
 			t.Fatalf("holdBack() = %d for a %d-byte secret; a split secret could survive", hb, len(secret))
+		}
+	})
+}
+
+// FuzzContentPolicyStaysInTheWorkspace. The path comes from the APP, and
+// a prompt from somewhere else drives the app; the policy decides whether
+// this machine reads the file back into the recording. The property is
+// the one that would actually go wrong: whatever the path -- climbs,
+// links, the scaffolding by another spelling -- the policy either refuses
+// it or names a file inside the workspace, outside the scaffolding, with
+// no link left in the path to follow.
+func FuzzContentPolicyStaysInTheWorkspace(f *testing.F) {
+	for _, seed := range []string{
+		"notes.txt", "/etc/passwd", "../../etc/passwd", "..", ".", "", "/",
+		".mcp.json", ".memql-session/codex/auth.json", "./.memql-session/../.mcp.json",
+		"sub/../../x", "a/./b", "link-out", "link-out/deeper", "link-in/../notes.txt",
+		".mcp.json.memql-session-backup", "\x00", strings.Repeat("../", 40) + "etc",
+	} {
+		f.Add(seed)
+	}
+	ws, outside := f.TempDir(), f.TempDir()
+	if err := os.WriteFile(filepath.Join(ws, "notes.txt"), []byte("x"), 0o600); err != nil {
+		f.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(ws, "link-out")); err != nil {
+		f.Fatal(err)
+	}
+	if err := os.Symlink(ws, filepath.Join(ws, "link-in")); err != nil {
+		f.Fatal(err)
+	}
+	p := newContentPolicy(ws, filepath.Join(ws, sessionScaffoldDir), filepath.Join(ws, ".mcp.json"))
+	root := resolvedPath(ws)
+
+	f.Fuzz(func(t *testing.T, path string) {
+		real, why := p.resolve(path)
+		if why != "" {
+			if real != "" {
+				t.Fatalf("resolve(%q) refused (%s) and still named %q", path, why, real)
+			}
+			return
+		}
+		sep := string(filepath.Separator)
+		if real != root && !strings.HasPrefix(real, root+sep) {
+			t.Fatalf("resolve(%q) = %q, outside the workspace %q", path, real, root)
+		}
+		for _, name := range []string{sessionScaffoldDir, ".mcp.json"} {
+			scaffold := filepath.Join(root, name)
+			if real == scaffold || strings.HasPrefix(real, scaffold+sep) {
+				t.Fatalf("resolve(%q) = %q, the session's scaffolding", path, real)
+			}
+		}
+		if again, err := filepath.EvalSymlinks(real); err == nil && again != real {
+			t.Fatalf("resolve(%q) = %q, which still has a link in it (-> %q)", path, real, again)
 		}
 	})
 }
