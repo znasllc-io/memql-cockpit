@@ -406,6 +406,57 @@ func TestCodexMCPWithoutSessionConfiguredReportsNothing(t *testing.T) {
 	}
 }
 
+// AN ATTACH CANNOT TAKE A LEVEL ON THIS PROTOCOL, so it is refused rather
+// than run at settings nobody chose. The first call of an attach is a
+// codex-reply -- the thread already exists -- and codex-reply declares no
+// configuration, so the level's knobs would never be sent while the session
+// told its transcript they had been. With no level, an attach is fine.
+func TestCodexMCPRefusesALevelOnAnAttach(t *testing.T) {
+	bin, log := fakeCodexMCP(t, codexMCPToolOK)
+	spec := codexSpec(t, bin)
+	spec.ResumeRef = codexMCPThread
+	spec.Level = "strong"
+
+	h := &codexMCP{}
+	err := h.Start(context.Background(), spec)
+	if err == nil || !strings.Contains(err.Error(), "codex-reply takes no configuration") {
+		t.Fatalf("Start = %v, want a refusal that names why the level cannot reach the app", err)
+	}
+	_ = h.Close()
+	if _, statErr := os.Stat(log); !os.IsNotExist(statErr) {
+		t.Errorf("an mcp-server was launched for an attach that could never run at its level (%v)", statErr)
+	}
+
+	spec.Level = ""
+	resumed := startCodexMCP(t, spec)
+	if _, err := resumed.Turn(context.Background(), "carry on", &recorder{}); err != nil {
+		t.Fatalf("an attach with no level must still run: %v", err)
+	}
+	if calls := codexToolCalls(t, log); len(calls) != 1 || calls[0].Name != mcpToolCodexReply {
+		t.Errorf("want the attach to continue with codex-reply, got %+v", calls)
+	}
+}
+
+// The other two harnesses DO apply a level to a session they resume --
+// Claude Code passes the knobs to every process, --resume included, and the
+// app-server's thread/resume takes the same overrides as thread/start -- so
+// the refusal above is the fallback's alone.
+func TestCheckResume(t *testing.T) {
+	knobs := Knobs{Effort: "high"}
+	if err := CheckResume(HarnessClaudeHeadless, knobs); err != nil {
+		t.Errorf("claude-headless resume: %v", err)
+	}
+	if err := CheckResume(HarnessCodexAppServer, knobs); err != nil {
+		t.Errorf("codex-app-server resume: %v", err)
+	}
+	if err := CheckResume(HarnessCodexMCP, knobs); err == nil {
+		t.Error("codex-mcp resume with knobs must refuse")
+	}
+	if err := CheckResume(HarnessCodexMCP, Knobs{}); err != nil {
+		t.Errorf("codex-mcp resume with no knobs must not refuse: %v", err)
+	}
+}
+
 func TestCodexMCPRefusesAnUnknownLevelBeforeLaunching(t *testing.T) {
 	bin, log := fakeCodexMCP(t, codexMCPToolOK)
 	spec := codexSpec(t, bin)
@@ -418,6 +469,77 @@ func TestCodexMCPRefusesAnUnknownLevelBeforeLaunching(t *testing.T) {
 	_ = h.Close()
 	if _, statErr := os.Stat(log); !os.IsNotExist(statErr) {
 		t.Errorf("an mcp-server was launched for a session that could never run (%v)", statErr)
+	}
+}
+
+// A REROUTE BELONGS TO THE TURN IT NAMES. ModelReroutedNotification carries
+// a turnId and its one reason (highRiskCyberActivity) is about a request,
+// so a later turn that was not rerouted ran on the thread's own model again
+// and must say so.
+func TestCodexAppServerRerouteStaysWithItsTurn(t *testing.T) {
+	body := `
+if [ "$turn" = "1" ]; then
+printf '{"jsonrpc":"2.0","method":"model/rerouted","params":{"threadId":"THREAD","turnId":"turn_%s","fromModel":"gpt-6-astra","toModel":"gpt-5.5","reason":"highRiskCyberActivity"}}\n' "$turn"
+fi
+` + codexTurnOK
+	bin, _ := fakeCodexAppServerSettings(t, codexStatedSettings, body)
+	h := startCodexAppServer(t, codexSpec(t, bin))
+
+	first, err := h.Turn(context.Background(), "first", &recorder{})
+	if err != nil {
+		t.Fatalf("first turn: %v", err)
+	}
+	second, err := h.Turn(context.Background(), "second", &recorder{})
+	if err != nil {
+		t.Fatalf("second turn: %v", err)
+	}
+	if first.Model != "gpt-5.5" {
+		t.Errorf("first turn Model = %q, want the model it was rerouted to", first.Model)
+	}
+	if second.Model != "gpt-6-astra" {
+		t.Errorf("second turn Model = %q, want the thread's own model: it was not rerouted", second.Model)
+	}
+}
+
+// thread/settings/updated is the app restating the thread's settings
+// (ThreadSettings.model and .effort, 0.153.4) after they change, so a turn
+// after it reports the new ones.
+func TestCodexAppServerSettingsUpdateIsTheNewStatement(t *testing.T) {
+	body := `
+printf '{"jsonrpc":"2.0","method":"thread/settings/updated","params":{"threadId":"THREAD","threadSettings":{"cwd":"/w","model":"gpt-5.6-sol","modelProvider":"openai","serviceTier":null,"effort":"xhigh","summary":null}}}\n'
+` + codexTurnOK
+	bin, _ := fakeCodexAppServerSettings(t, codexStatedSettings, body)
+	h := startCodexAppServer(t, codexSpec(t, bin))
+
+	res, err := h.Turn(context.Background(), "do the thing", &recorder{})
+	if err != nil {
+		t.Fatalf("turn: %v", err)
+	}
+	if res.Model != "gpt-5.6-sol" || res.Effort != "xhigh" {
+		t.Errorf("Model/Effort = %q/%q, want the settings the app restated", res.Model, res.Effort)
+	}
+}
+
+// The answer rides a failure too, as for Claude Code: a turn Codex marked
+// failed after its final answer still hands that answer back beside the
+// error.
+func TestCodexAppServerStructuredAnswerSurvivesAFailedTurn(t *testing.T) {
+	body := `
+printf '{"jsonrpc":"2.0","id":%s,"result":{"turn":{"id":"turn_%s","items":[],"itemsView":"full","status":"inProgress","error":null,"startedAt":1,"completedAt":null,"durationMs":null}}}\n' "$id" "$turn"
+printf '{"jsonrpc":"2.0","method":"item/completed","params":{"threadId":"THREAD","turnId":"turn_%s","completedAtMs":1500,"item":{"type":"agentMessage","id":"item_msg","text":"{\\"answer\\":\\"42\\"}","phase":"final_answer","memoryCitation":null,"delivery":null,"questions":null}}}\n' "$turn"
+printf '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"THREAD","turn":{"id":"turn_%s","items":[],"itemsView":"full","status":"failed","error":{"message":"the stream was cut","codexErrorInfo":null,"additionalDetails":null,"misalignment":null},"startedAt":1,"completedAt":2,"durationMs":1000}}}\n' "$turn"
+`
+	bin, _ := fakeCodexAppServer(t, body)
+	spec := codexSpec(t, bin)
+	spec.ResponseSchema = `{"type":"object","properties":{"answer":{"type":"string"}}}`
+	h := startCodexAppServer(t, spec)
+
+	res, err := h.Turn(context.Background(), "the question", &recorder{})
+	if err == nil {
+		t.Fatal("a failed turn reported success")
+	}
+	if string(res.ResultJSON) != `{"answer":"42"}` {
+		t.Errorf("ResultJSON = %s, want the final answer beside the failure", res.ResultJSON)
 	}
 }
 

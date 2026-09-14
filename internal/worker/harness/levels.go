@@ -258,9 +258,29 @@ func DescribeKnobs(harnessWord string, k Knobs) string {
 	return "model " + k.Model + ", model_reasoning_effort=" + k.Effort
 }
 
+// CheckResume refuses knobs a harness cannot apply to a session it RESUMES
+// rather than starts -- an attach.
+//
+// Only the Codex MCP fallback has the problem. Claude Code passes the knobs
+// to every process, --resume included, and the app-server's thread/resume
+// takes the same overrides thread/start does. But an attach through the
+// mcp-server continues with codex-reply from its very first call, and
+// codex-reply declares prompt and threadId and nothing else: the knobs would
+// never be sent, while the session said in its transcript that they had
+// been. That is a level neither translated nor refused, which levels.go
+// promises never to produce -- so it is refused, with the two ways out.
+func CheckResume(harnessWord string, k Knobs) error {
+	if harnessWord == HarnessCodexMCP && k != (Knobs{}) {
+		return errors.New("codex mcp-server cannot set a level on a thread it resumes: codex-reply takes no configuration, " +
+			"so the thread would keep the settings it started with -- attach without a level, or upgrade Codex to a version with `codex app-server`")
+	}
+	return nil
+}
+
 // knobs settles a spec's level into knobs for one harness: the spec's table
 // when the caller passed one, the harness's built-in table otherwise, and
-// never a value the harness's app would misread.
+// never a value the harness's app would misread -- nor one it would never
+// receive, on a resume the harness cannot configure.
 //
 // Every harness calls it FIRST in Start, before anything forks, so a level
 // that cannot run costs a sentence and not a process.
@@ -275,6 +295,11 @@ func (s Spec) knobs(harnessWord string) (Knobs, error) {
 	}
 	if err := CheckKnobs(harnessWord, knobs); err != nil {
 		return Knobs{}, err
+	}
+	if strings.TrimSpace(s.ResumeRef) != "" {
+		if err := CheckResume(harnessWord, knobs); err != nil {
+			return Knobs{}, err
+		}
 	}
 	return knobs, nil
 }

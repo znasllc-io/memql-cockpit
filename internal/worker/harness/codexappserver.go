@@ -74,6 +74,10 @@ const (
 	// (ModelReroutedNotification, 0.153.4: fromModel, toModel, reason) --
 	// the one execution-time statement of a model the app-server makes.
 	codexNotifyModelRerouted = "model/rerouted"
+	// codexNotifyThreadSettings is the app restating the thread's settings
+	// after they change (ThreadSettingsUpdatedNotification, 0.153.4:
+	// threadSettings.model and .effort).
+	codexNotifyThreadSettings = "thread/settings/updated"
 )
 
 // Item types worth telling apart.
@@ -723,6 +727,17 @@ func (h *codexAppServer) Turn(ctx context.Context, prompt string, sink Sink) (Tu
 	if reason == "" {
 		reason = "the app gave no reason"
 	}
+	// The schema'd answer is read before the status decides the outcome,
+	// because it rides a failure too: AppSessionEnd keeps result_json apart
+	// from the error so a turn that produced its final answer and was then
+	// marked failed still hands the answer back. The outputSchema makes the
+	// final message the answer or nothing (strict json_schema upstream), so
+	// text that parses is the answer rather than a fragment of one.
+	schema := strings.TrimSpace(h.spec.ResponseSchema) != ""
+	structured, parsed := codexJSONValue(out.Text)
+	if schema && parsed {
+		out.ResultJSON = structured
+	}
 	switch status {
 	case codexTurnCompleted:
 		// The only status that reaches the structured check below.
@@ -736,12 +751,8 @@ func (h *codexAppServer) Turn(ctx context.Context, prompt string, sink Sink) (Tu
 		// nobody here understood as a finished answer.
 		return out, fmt.Errorf("codex app-server: the turn ended as %q: %s", status, reason)
 	}
-	if strings.TrimSpace(h.spec.ResponseSchema) != "" {
-		structured, ok := codexJSONValue(out.Text)
-		if !ok {
-			return out, ErrNoStructuredResult
-		}
-		out.ResultJSON = structured
+	if schema && !parsed {
+		return out, ErrNoStructuredResult
 	}
 	return out, nil
 }
@@ -820,8 +831,12 @@ func (h *codexAppServer) ensureThread(ctx context.Context) error {
 // NOT as turn/start's `effort`, because the THREAD is where the app states
 // what it runs at: its answer carries `reasoningEffort`, and an effort sent
 // per turn would leave that statement describing a setting the turns no
-// longer use. A knob left empty is left out, so the operator's own
-// CODEX_HOME config decides it exactly as before.
+// longer use. A knob left empty is left out, and Codex decides it exactly
+// as it did before levels existed -- from its OWN defaults, not the
+// operator's ~/.codex/config.toml: the session runs under a per-session
+// CODEX_HOME that holds only MemQL's MCP server and a link to auth.json
+// (appsession/mcpconfig.go, layoutCodex), so "unset" here means the
+// account's default model at that model's default effort.
 func (h *codexAppServer) applyKnobs(params map[string]any) {
 	if h.knobs.Model != "" {
 		params["model"] = h.knobs.Model
@@ -858,8 +873,13 @@ func (h *codexAppServer) result(state *codexTurnState) TurnResult {
 		// shows the model ran. Before that they are what the thread was
 		// configured with -- and a configured model that failed the turn
 		// before answering (a name no model answers to, say) served nothing.
+		// A reroute this turn announced replaces the model for this turn
+		// alone.
 		if state.ranTheModel() {
 			out.Model, out.Effort = h.served()
+			if to := state.reroutedTo(); to != "" {
+				out.Model = to
+			}
 		}
 	}
 	return out
@@ -972,18 +992,38 @@ func (h *codexAppServer) handleNotification(method string, params json.RawMessag
 
 	case codexNotifyModelRerouted:
 		var n struct {
+			TurnID  string `json:"turnId"`
 			ToModel string `json:"toModel"`
 		}
-		// The app moved this turn to another model, so from here on the
-		// model that serves is the one it moved to, whatever the thread was
-		// configured with. The thread's effort is not restated and stays as
-		// the app last gave it. The notification still reaches the
-		// transcript below: a person reading a session run on a model it
-		// did not start on should see that it moved.
+		// The app moved THIS turn to another model. The notification names
+		// the turn and its one reason on 0.153.4 (highRiskCyberActivity) is
+		// about a request, so the reroute is kept on the turn rather than
+		// the thread: a later turn that was not rerouted ran on the thread's
+		// own model again. The thread's effort is not restated. The
+		// notification still reaches the transcript below -- a person
+		// reading a session that moved models should see that it moved.
+		if json.Unmarshal(params, &n) == nil && state != nil && state.match(n.TurnID) {
+			state.noteReroute(n.ToModel)
+		}
+
+	case codexNotifyThreadSettings:
+		var n struct {
+			ThreadSettings struct {
+				Model  string  `json:"model"`
+				Effort *string `json:"effort"`
+			} `json:"threadSettings"`
+		}
+		// The app restating the thread's settings after they changed
+		// (ThreadSettingsUpdatedNotification, 0.153.4) -- a newer statement
+		// of the same thing thread/start answered, so it replaces it.
 		if json.Unmarshal(params, &n) == nil {
-			if to := strings.TrimSpace(n.ToModel); to != "" {
+			if m := strings.TrimSpace(n.ThreadSettings.Model); m != "" {
+				effort := ""
+				if n.ThreadSettings.Effort != nil {
+					effort = strings.TrimSpace(*n.ThreadSettings.Effort)
+				}
 				h.mu.Lock()
-				h.servedModel = to
+				h.servedModel, h.servedEffort = m, effort
 				h.mu.Unlock()
 			}
 		}
@@ -1049,6 +1089,8 @@ type codexTurnState struct {
 	reason    string
 	items     []json.RawMessage
 	completed bool
+	// rerouted is the model a model/rerouted moved this turn to.
+	rerouted string
 	// pendingID holds a completion that arrived before the turn had a
 	// name, so it can be matched once it does.
 	pendingID string
@@ -1196,6 +1238,22 @@ func (t *codexTurnState) ranTheModel() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return (t.completed && t.status == codexTurnCompleted) || t.usage.Known
+}
+
+// noteReroute records the model the app moved this turn to.
+func (t *codexTurnState) noteReroute(model string) {
+	if m := strings.TrimSpace(model); m != "" {
+		t.mu.Lock()
+		t.rerouted = m
+		t.mu.Unlock()
+	}
+}
+
+// reroutedTo is the model this turn was moved to, or "" when it was not.
+func (t *codexTurnState) reroutedTo() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.rerouted
 }
 
 // finalText picks the assistant message that is the ANSWER.

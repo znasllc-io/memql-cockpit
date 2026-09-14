@@ -253,9 +253,19 @@ func (h *claudeHeadless) Turn(ctx context.Context, prompt string, sink Sink) (Tu
 	// --effort this client passed, and a request is not a report.
 	res.Model = turn.servedModel()
 
-	// The exit status is the first question: a process that died has
-	// nothing to say about whether its answer was structured.
+	// The exit status is the first question -- but a failed turn can still
+	// carry the structured answer the schema asked for, and it goes back
+	// beside the failure rather than being dropped with it: Claude Code can
+	// answer and still exit non-zero, and AppSessionEnd keeps result_json
+	// apart from the error precisely so the one readable part of such a run
+	// survives. structured() accepts only a JSON object or array, so an
+	// error message in `result` is never mistaken for one.
 	if code != 0 || waitErr != nil || (ev != nil && ev.IsError) {
+		if ev != nil && strings.TrimSpace(spec.ResponseSchema) != "" {
+			if structured, ok := ev.structured(); ok {
+				res.ResultJSON = structured
+			}
+		}
 		return res, turn.failure(spec, code, waitErr)
 	}
 	if ev == nil {
@@ -429,9 +439,12 @@ func (t *claudeTurn) route(line []byte) {
 	if id := strings.TrimSpace(ev.SessionID); id != "" {
 		t.sessionID = id
 	}
-	if ev.Type == claudeTypeSystem && ev.Subtype == claudeSubtypeInit {
-		if m := strings.TrimSpace(ev.Model); m != "" {
-			t.initModel = m
+	if ev.Type == claudeTypeSystem {
+		var init claudeInitEvent
+		if json.Unmarshal(trimmed, &init) == nil && init.Subtype == claudeSubtypeInit {
+			if m := strings.TrimSpace(init.Model); m != "" {
+				t.initModel = m
+			}
 		}
 	}
 
@@ -585,21 +598,29 @@ func readClaudeLines(src io.Reader, onLine, onOversize func([]byte)) {
 
 // claudeEvent is the envelope every stream-json line shares.
 //
-// Only the fields this client routes on are declared -- the three every
-// line carries, plus the init event's subtype and model. The rest is
+// Only the three fields this client routes on are declared. The rest is
 // forwarded verbatim rather than modelled, so a Claude Code release that
 // adds a field costs this package nothing.
 //
 // `message` stays RAW so that an unfamiliar shape inside it cannot fail
 // the whole envelope: a decode error on the outer object would send a
 // perfectly good event to stdout as unrecognised narration, which is the
-// one classification an operator cannot tell from a crash.
+// one classification an operator cannot tell from a crash. The init
+// event's model is read in a second pass (claudeInitEvent) for the same
+// reason: declaring it here would put every line at the mercy of a later
+// release that gave some other event a `model` that is not a string.
 type claudeEvent struct {
 	Type      string          `json:"type"`
-	Subtype   string          `json:"subtype"`
 	SessionID string          `json:"session_id"`
-	Model     string          `json:"model"`
 	Message   json.RawMessage `json:"message"`
+}
+
+// claudeInitEvent is the init event's statement of the model the session
+// runs on (2.1.270: `{"type":"system","subtype":"init","model":...}`),
+// decoded only from system lines.
+type claudeInitEvent struct {
+	Subtype string `json:"subtype"`
+	Model   string `json:"model"`
 }
 
 // claudeMessage keeps `content` raw for the same reason one level down:
@@ -665,8 +686,14 @@ func (t *claudeTurn) servedModel() string {
 	if t.result == nil || len(t.result.ModelUsage) == 0 {
 		return ""
 	}
-	if _, ok := t.result.ModelUsage[t.initModel]; ok && t.initModel != "" {
-		return t.initModel
+	// The init event may name the model with the context suffix it was
+	// asked for (`claude-sonnet-5[1m]`) where modelUsage keys the model
+	// itself, so the bare name is tried too -- and what is reported is the
+	// key, the name the app used for the tokens.
+	for _, own := range []string{t.initModel, strings.SplitN(t.initModel, "[", 2)[0]} {
+		if _, ok := t.result.ModelUsage[own]; ok && own != "" {
+			return own
+		}
 	}
 	best, most := "", int64(-1)
 	for id, u := range t.result.ModelUsage {

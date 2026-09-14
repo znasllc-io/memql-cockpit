@@ -255,6 +255,69 @@ func TestClaudeHeadlessResultWithoutModelUsageReportsNone(t *testing.T) {
 	}
 }
 
+// A model named with a context suffix (`sonnet[1m]`, which CheckKnobs
+// accepts) may come back from the init event with the suffix while
+// modelUsage keys the bare id. The session's own model must still win over
+// a housekeeping model that printed more.
+func TestClaudeHeadlessMatchesTheSessionModelAcrossAContextSuffix(t *testing.T) {
+	turn := `{"type":"system","subtype":"init","session_id":"sess-1m","model":"claude-sonnet-5[1m]"}
+{"type":"result","subtype":"success","is_error":false,"session_id":"sess-1m","total_cost_usd":0.2,"modelUsage":{"claude-haiku-4-5-20251001":{"outputTokens":900},"claude-sonnet-5":{"outputTokens":120}},"result":"done","usage":{"input_tokens":20,"output_tokens":1020}}`
+	bin, _ := fakeClaude(t, prints(turn))
+	h := startClaude(t, claudeSpec(t, bin))
+
+	res, err := h.Turn(context.Background(), "do the thing", &recorder{})
+	if err != nil {
+		t.Fatalf("turn: %v", err)
+	}
+	if res.Model != "claude-sonnet-5" {
+		t.Errorf("Model = %q, want the session's own model as modelUsage names it", res.Model)
+	}
+}
+
+// THE ANSWER RIDES A FAILURE TOO, which is the proto's own rule for
+// result_json: Claude Code can produce the structured answer and still exit
+// non-zero, and dropping the answer because the run failed would lose the
+// one part of it that can be read.
+func TestClaudeHeadlessStructuredAnswerSurvivesAFailedExit(t *testing.T) {
+	bin, _ := fakeClaude(t, prints(claudeSchemaTurn)+"exit 2\n")
+	spec := claudeSpec(t, bin)
+	spec.ResponseSchema = `{"type":"object","properties":{"city":{"type":"string"}}}`
+	h := startClaude(t, spec)
+
+	res, err := h.Turn(context.Background(), "capital of France", &recorder{})
+	if err == nil {
+		t.Fatal("a turn whose process exited 2 reported success")
+	}
+	if res.ExitCode != 2 {
+		t.Errorf("ExitCode = %d, want the real 2", res.ExitCode)
+	}
+	if string(res.ResultJSON) != `{"city":"Paris","millions":2.2}` {
+		t.Errorf("ResultJSON = %s, want the structured answer beside the failure", res.ResultJSON)
+	}
+}
+
+// The envelope stays as tolerant as it was: a line whose top-level `model`
+// is not a string (a shape a later Claude Code could emit) is still an
+// event, not unrecognised narration, and its session id is still kept.
+func TestClaudeHeadlessAnUnexpectedModelShapeStaysAnEvent(t *testing.T) {
+	events := `{"type":"stream_event","model":{"id":"claude-sonnet-5"},"session_id":"sess-odd-model"}
+{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.01,"usage":{"input_tokens":1,"output_tokens":2},"result":"fine"}`
+	bin, _ := fakeClaude(t, prints(events))
+	h := startClaude(t, claudeSpec(t, bin))
+
+	rec := &recorder{}
+	res, err := h.Turn(context.Background(), "hello", rec)
+	if err != nil {
+		t.Fatalf("turn: %v", err)
+	}
+	if got := rec.joined(StreamStdout); got != "" {
+		t.Errorf("StreamStdout = %q, want nothing: that line was stream-json", got)
+	}
+	if res.AppSessionRef != "sess-odd-model" {
+		t.Errorf("AppSessionRef = %q, want the id that line carried", res.AppSessionRef)
+	}
+}
+
 // assertKnobsBeforeSeparator pins the argv rule the knobs inherit from
 // claudeArgv: every flag goes before `--`, which is what stops the variadic
 // --mcp-config from swallowing whatever follows it.
