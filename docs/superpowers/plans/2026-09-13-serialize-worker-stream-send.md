@@ -20,7 +20,7 @@
 - Keep `replace github.com/znasllc-io/memql => ../memql` in the cockpit `go.mod`. Do not add a `go.work` to the cockpit (rejected in `go.mod`'s comment block).
 - grpc-go's contract, quoted from `google.golang.org/grpc@v1.83.2/stream.go` (`ClientStream.SendMsg`, `CloseSend`): "it is not safe to call SendMsg on the same stream in different goroutines. It is also not safe to call CloseSend concurrently with SendMsg." and "It is safe to have a goroutine calling SendMsg and another goroutine calling RecvMsg on the same stream at the same time." So `Recv` stays outside the lock.
 - memql branch rules (memql `CLAUDE.md`, "Branch Workflow"): every change through a branch + PR; enqueue with the bare `gh pr merge <n> --repo znasllc-io/memql` (no `--merge`, no `--delete-branch`); stage files by explicit path, never `git add -A`; pre-release means no back-compat shims, so `Stream()` is deleted, not deprecated.
-- memql SDK rules (`sdk/go/CLAUDE.md`): the exported SDK surface must not name `memqlv1.*` types except the declared transport seam; `worker.Connection` is in `protoSeamAllowlist` (root `sdk_proto_leak_test.go`) and the allowlist is checked in both directions, so the entry must keep matching at least one exported symbol (it will: `Send` and `Recv` remain).
+- memql SDK rules (`sdk/go/CLAUDE.md`): the exported SDK surface must not name `memqlv1.*` types except the declared transport seam, `protoSeamAllowlist` in the root `sdk_proto_leak_test.go`. Its keys are per METHOD -- `worker.Connection.Stream`, `worker.Connection.Send` and `worker.Connection.Recv` are three rows (`:42-44`) -- and it is checked in both directions: a row matching no exported symbol fails `TestSDKPublicSurfaceHasNoProtoLeak` as a stale exemption. So deleting `Stream()` (Task 2) deletes its row in the same commit; the `Send` and `Recv` rows stay, re-worded so their reasons stop naming `Stream()`.
 - memql tests: `go test ./...` does not reach the engine, but `sdk/go/worker` is in the root module, so `go test ./sdk/go/worker/...` from the memql root is correct for this package; `make test` (`go test github.com/znasllc-io/memql/...`) is the whole tree.
 - cockpit tests: single module, `go test ./...` is the whole suite (`make test`); `make lint` = `go fmt` + `go vet`.
 - Commit identity `znas <znas@znas.io>` (check `git config user.email` before the first commit). Every commit message ends with:
@@ -54,7 +54,7 @@
 | Pull progress / end | the pull goroutine `go m.run(...)` at `modelpull.go:242`, progress from the `inference.Pull` callback | `modelpull.go:258` `SendModelPullProgress`, `:392` `SendModelPullEnd` | `SendModelPullProgress :222-226`, `SendModelPullEnd :229-233` -> `c.Send` |
 | App-session chunks / end | per-session goroutines started at `loop.go:561` `r.sessions.Start(ctx, conn, ...)` | `appsession/chunks.go:101`, `:143` `SendAppSessionChunk`; `:361` `SendAppSessionEnd` | `SendAppSessionChunk :313-324` -> `c.conn.Send :314`; `SendAppSessionEnd :327-331` -> `c.conn.Send :328` |
 | Register | the `Connect` caller, before any other writer exists (sequential) | `connect.go:150` `c.conn.Send` in `register` | -- |
-| **CloseSend** | `Runner.Close` from the Fleet's goroutine, `loop.go:243-245` `conn.Close()`, while every writer above may be mid-`Send` | `connect.go:373-378` -> SDK `Close :210-220` -> `stream.CloseSend :215` | -- |
+| **CloseSend** | the heartbeat goroutine re-advertising models, `loop.go:444` `conn.Close()` in `maybeReadvertiseModels`, on a LIVE stream while the recv goroutine may be mid-`SendPong` (`busy()` at `:508` defers it only for dispatches, sessions, calls and pulls); and `Run` at `loop.go:215` after `runStream` returns, while the model calls, app sessions and pulls that `StopAll` cancels without waiting for may still be sending their End. (`Runner.Close`, `loop.go:238-248`, is a third by construction; nothing in the repository calls it.) | `connect.go:373-378` -> SDK `Close :210-220` -> `stream.CloseSend :215` | -- |
 
 The `Sender` interfaces the cockpit passes `conn` into are `modelcall.Sender` (`session.go:75-78`), `appsession.Sender` (`appsession/session.go:168-171`) and `pullSender` (`modelpull.go:82-85`); `loop.go:561`, `:568`, `:582` pass the bare `*Connection` for all three.
 
@@ -66,7 +66,7 @@ Callers of the SDK `Connection` methods: the cockpit `connect.go` only (`sdkwork
 - **D2. The lock lives in the SDK; the cockpit relies on it.** The SDK type owns the stream, and grpc's invariant is about that object. A second lock in the cockpit would be taken strictly outside the SDK's (cockpit `Send` -> SDK `Send`), so it could not deadlock, but it would protect nothing the SDK's lock does not and would have to be re-invented by every other worker host (`sdk/go/CLAUDE.md`: "No bespoke wire wrappers in the consumer"). What the cockpit proves instead: all of its writers reach the one seam (Task 3).
 - **D3. Delete `Stream()`.** It is the only way to write the stream around the lock, it has no caller, and memql is pre-release ("fix both MemQL and the consumer at once and delete what is no longer needed"). A reflection test pins that no method or exported field can hand the raw stream out again (Task 2).
 - **D4. Copy the engine's sticky `sendErr`, and add `closed`.** After one failed `Send` the stream is aborted (grpc contract); every later writer gets the first error without touching the stream, as `streamSession.send` does. `closed` is set by `Close` under the lock so a `Send` that lost the race to `Close` answers a named error rather than reaching a half-closed stream.
-- **D5. `Close` keeps its order: `CloseSend` under the lock, then `ClientConn.Close`.** That preserves today's graceful half-close as the server sees it (a clean `io.EOF` on its `Recv`, not a transport reset). A `Close` can now wait for an in-flight `Send`; that wait is bounded by the keepalive (`DefaultKeepaliveTime` 30 s + `DefaultKeepaliveTimeout` 10 s) tearing down a transport whose peer stopped reading, and in the ordinary case is microseconds. Rejected: closing the `ClientConn` first to make `Close` never wait -- it changes the disconnect the engine records for every graceful shutdown.
+- **D5. `Close` keeps its order: `CloseSend` under the lock, then `ClientConn.Close`.** That preserves today's graceful half-close as the server sees it (a clean `io.EOF` on its `Recv`, not a transport reset). A `Close` can now wait for an in-flight `Send`, ordinarily for one frame's write. A `Send` blocked on flow control (grpc-go `internal/transport`, `writeQuota.get` on the stream's `done`) returns only when the peer reads again or the stream ends: its context is cancelled, the server ends it, or the transport fails. Keepalive (`DefaultKeepaliveTime` 30 s + `DefaultKeepaliveTimeout` 10 s) bounds only the last, for a peer that stops answering altogether -- a peer that is alive but has stopped reading this stream still acks pings, so keepalive never fires for it. In the cockpit, `Run`'s close (`loop.go:215`) follows a failed `Recv`, so the stream is already over, and shutdown cancels the context the stream was opened on (`pair.go`, `cancel()`). The re-advertise close (`loop.go:444`, taken only when `busy()` is false, so ordinarily nothing but a `Pong` can be in flight) is the one that can now wait on a stalled peer, where before it tore the transport down beside the in-flight `Send` -- the defect. Rejected: closing the `ClientConn` first to make `Close` never wait -- it changes the disconnect the engine records for every graceful shutdown.
 - **D6. The cockpit test uses the cockpit's own `stream` seam, not a bufconn gRPC server.** A real in-process gRPC server would import `google.golang.org/grpc/test/bufconn` (moving grpc from indirect to direct in the cockpit `go.mod`) and the race detector is not guaranteed to observe grpc's internal races on a given run. The `stream` interface (`connect.go:55-59`) exists exactly so a test can stand where the SDK stands.
 
 ## File structure
@@ -75,6 +75,7 @@ memql:
 - Modify `sdk/go/worker/worker.go` -- the lock, `errClosed`, `Close` under the lock (Task 1); remove `Stream()`, rewrite the package doc (Task 2).
 - Create `sdk/go/worker/send_serialization_test.go` -- the overlap-detecting fake stream and three `-race` tests (Task 1).
 - Create `sdk/go/worker/no_raw_stream_test.go` -- reflection gate: nothing exported hands out a `grpc.ClientStream` (Task 2).
+- Modify `sdk_proto_leak_test.go` (memql root) -- delete the `worker.Connection.Stream` row of `protoSeamAllowlist`, re-word the `Send` / `Recv` rows (Task 2).
 
 memql-cockpit:
 - Modify `internal/worker/connect.go` -- every helper routes through `Send`; compile-time assertion that the SDK type fills the seam (Task 3).
@@ -413,12 +414,16 @@ Replace `Close` (`:208-220`) with:
 // gRPC connection. Safe to call on a nil receiver, idempotent, and safe
 // to call while other goroutines are in Send: CloseSend is taken under
 // sendMu, so it waits for an in-flight Send to return rather than
-// running beside it. That wait is bounded by the transport -- a Send
-// blocked on flow control returns once the keepalive
-// (DefaultKeepaliveTime + DefaultKeepaliveTimeout) tears the transport
-// down -- and in the ordinary case is microseconds. The ClientConn is
-// closed after the half-close, outside the lock, so the server sees a
-// clean end of the send direction before the transport goes.
+// running beside it -- ordinarily one frame's write. A Send blocked on
+// flow control returns only when the peer reads again or the stream
+// ends: the context passed to Dial is cancelled, the server ends the
+// stream, or the transport fails. Keepalive (DefaultKeepaliveTime +
+// DefaultKeepaliveTimeout) catches only a peer that stops answering
+// altogether; one that is alive but has stopped reading this stream
+// still acks pings. A caller that needs Close to return promptly
+// cancels the Dial context first. The ClientConn is closed after the
+// half-close, outside the lock, so the server sees a clean end of the
+// send direction before the transport goes.
 func (c *Connection) Close() {
 	if c == nil {
 		return
@@ -447,7 +452,7 @@ Run (from `/home/znas/projects/memql/memql`):
 gofmt -l sdk/go/worker/ && go vet ./sdk/go/worker/ && go test -race -count=1 ./sdk/go/worker/...
 ```
 
-Expected: `gofmt -l` prints nothing; `go vet` prints nothing; `ok  	github.com/znasllc-io/memql/sdk/go/worker` with no `DATA RACE` output. Then run the root-package SDK surface gate, which walks `sdk/go`:
+Expected: `gofmt -l` prints only `sdk/go/worker/url_test.go`, which has been unformatted on memql `main` since memql#117 and is not touched here (anything else it prints is this change's); `go vet` prints nothing; `ok  	github.com/znasllc-io/memql/sdk/go/worker` with no `DATA RACE` output. Then run the root-package SDK surface gate, which walks `sdk/go`:
 
 ```bash
 go test -count=1 -run TestSDKPublicSurfaceHasNoProtoLeak .
@@ -492,6 +497,7 @@ Claude-Session: https://claude.ai/code/session_01RTCw4Xs3am16N2ujcR56aP"
 
 **Files:**
 - Modify: `/home/znas/projects/memql/memql/sdk/go/worker/worker.go:1-30` (package doc), `:105-114` (`Dial` doc), `:180-188` (delete `Stream()`)
+- Modify: `/home/znas/projects/memql/memql/sdk_proto_leak_test.go:42-44` (`protoSeamAllowlist`: delete the `worker.Connection.Stream` row)
 - Test: `/home/znas/projects/memql/memql/sdk/go/worker/no_raw_stream_test.go` (create)
 
 **Interfaces:**
@@ -618,6 +624,13 @@ func (c *Connection) Stream() memqlv1.WorkerService_StreamClient {
 }
 ```
 
+In `/home/znas/projects/memql/memql/sdk_proto_leak_test.go`, replace the three `worker.Connection.*` rows at the end of `protoSeamAllowlist` (`:42-44`). The allowlist is keyed per method and checked in both directions, so a row left behind for the deleted method fails `TestSDKPublicSurfaceHasNoProtoLeak` with `protoSeamAllowlist has 1 entr(y/ies) matching no exported symbol -- remove them, a stale exemption is an unwatched hole:` and `worker.Connection.Stream` on the next line. The surviving rows' reasons named `Stream()`, so they are re-worded too. The value column stays where gofmt has it, because `client.Dispatcher.RegisterStream` is still the longest key:
+
+```go
+	"worker.Connection.Send":           "writes one wire message on the worker stream, serialized under sendMu -- the message IS the argument",
+	"worker.Connection.Recv":           "returns the next wire message from the worker stream -- the message IS the result",
+```
+
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run (from `/home/znas/projects/memql/memql`):
@@ -626,7 +639,7 @@ Run (from `/home/znas/projects/memql/memql`):
 gofmt -l sdk/go/worker/ && go vet ./sdk/go/worker/ && go test -race -count=1 ./sdk/go/worker/... && go test -count=1 -run TestSDKPublicSurfaceHasNoProtoLeak . && go build ./... && grep -rn "\.Stream()" --include=*.go sdk/ component/identity component/grpc core/grpctls worker_dial_tls_contract_test.go
 ```
 
-Expected: `ok` for both test invocations, `go build` silent, and the `grep` prints nothing (exit 1 from grep is the wanted outcome; the `&&` chain ends there). Then confirm the two sibling consumers still build against the changed SDK:
+Expected: `gofmt -l` prints only the pre-existing `sdk/go/worker/url_test.go` (Task 1 Step 4); `ok` for both test invocations (a `stale exemption` failure from `TestSDKPublicSurfaceHasNoProtoLeak` means the `worker.Connection.Stream` row is still in the allowlist), `go build` silent, and the `grep` prints nothing (exit 1 from grep is the wanted outcome; the `&&` chain ends there). Then confirm the two sibling consumers still build against the changed SDK:
 
 ```bash
 (cd /home/znas/projects/memql/memql-cockpit && go build ./... && go vet ./internal/worker/)
@@ -639,7 +652,7 @@ Expected: silent.
 Run (from `/home/znas/projects/memql/memql`):
 
 ```bash
-git add sdk/go/worker/worker.go sdk/go/worker/no_raw_stream_test.go
+git add sdk/go/worker/worker.go sdk/go/worker/no_raw_stream_test.go sdk_proto_leak_test.go
 git commit -m "fix(sdk): the worker connection hands out no raw stream
 
 Stream() was the one way to SendMsg or CloseSend around the lock
@@ -647,7 +660,9 @@ Connection.Send now holds, and it had no caller in memql,
 memql-cockpit or memql-bff-copresent. Pre-release: deleted, not
 deprecated. A reflection test fails on any exported method or field of
 *Connection that implements grpc.ClientStream, so the escape hatch
-cannot come back under another name.
+cannot come back under another name. Its protoSeamAllowlist row goes
+with it: the list is checked in both directions, and a row for a
+deleted method is a stale exemption.
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01RTCw4Xs3am16N2ujcR56aP"
@@ -662,7 +677,7 @@ grpc-go forbids SendMsg on one stream from two goroutines, and CloseSend beside 
 ## Change
 
 - Connection.Send holds sendMu around stream.Send with the agent's sticky sendErr (component/worker.streamSession.send, the same lock on the other end of the same stream). Close takes CloseSend under the lock and marks the connection closed. Recv stays outside the lock.
-- Stream() is deleted: it was the only way around the lock and had no caller. A reflection test fails on any exported symbol that hands out a grpc.ClientStream.
+- Stream() is deleted: it was the only way around the lock and had no caller. A reflection test fails on any exported symbol that hands out a grpc.ClientStream. Its protoSeamAllowlist row goes with it (the list is checked in both directions).
 - Tests: heartbeat + pong + delta writers at once on an overlap-detecting fake stream under -race; Close during Send; sticky first error.
 
 Wire unchanged. The cockpit PR that follows moves .github/memql-pin to this merge and routes every cockpit helper through the one seam.
@@ -1219,10 +1234,10 @@ gh pr merge <n> --repo znasllc-io/memql-cockpit --merge
 
 | Where | Command | Proves |
 |---|---|---|
-| memql root | `gofmt -l sdk/go/worker/` | formatted |
+| memql root | `gofmt -l sdk/go/worker/` | formatted (only the pre-existing `url_test.go` is listed) |
 | memql root | `go vet ./sdk/go/worker/` | vet-clean (including `copylocks` on the new mutex field) |
 | memql root | `go test -race -count=1 ./sdk/go/worker/...` | heartbeat + pong + delta writers never overlap; Close never overlaps Send; first error is sticky; no exported raw-stream escape |
-| memql root | `go test -count=1 -run TestSDKPublicSurfaceHasNoProtoLeak .` | `worker.Connection` allowlist entry still matches (`Send`, `Recv`) and nothing new leaks |
+| memql root | `go test -count=1 -run TestSDKPublicSurfaceHasNoProtoLeak .` | the `worker.Connection.Send` / `.Recv` rows still match, no `worker.Connection.Stream` row is left stale, and nothing new leaks |
 | memql root | `make test` (before opening the PR; CI runs it) | whole tree |
 | cockpit | `gofmt -l internal/worker/ && go vet ./...` | formatted, vet-clean |
 | cockpit | `go test -race -count=1 ./internal/worker/...` | one seam; nine writer kinds concurrently; existing recv/pong/pull tests still pass |
@@ -1232,7 +1247,7 @@ gh pr merge <n> --repo znasllc-io/memql-cockpit --merge
 
 ## Self-review
 
-**Spec coverage** (the request's five items against the tasks): (1) failing `-race` test on a fake stream with heartbeat + pong + delta writers -- Task 1 Step 1 (`overlapDetectingStream`, `TestSendIsSerializedAcrossWriters`), run with `go test -race` in Step 2. (2) Minimal SDK fix: mutex around `stream.Send`, `CloseSend` under the lock -- Task 1 Step 3; cockpit relies on the SDK lock with a forwarding test rather than a second lock -- D2 and Task 3, no nested locking exists so no double-lock deadlock is possible. (3) No caller bypasses `Send` by holding the raw stream -- Task 2 deletes `Stream()` and pins it by reflection; Task 3's scan test fails on `.Stream()` or a second `.conn.Send(` anywhere in the cockpit; the verification matrix carries the greps. (4) Exact commands: `go test ./...` (cockpit, and `-race` in CI after Task 4), `go test ./sdk/go/worker/...` (engine), `go vet` and `-race` for both -- in every task's Step 4 and the matrix. (5) Commit steps per repo, memql first, pin bump in the cockpit -- Task 1/2 Step 5 and Task 3/4 Step 5; the order dependency is stated at the top of Task 4. Every writer named in the audit (heartbeat `loop.go:254->360`, Ping answer `:618`, dispatch goroutines `:545->657`, modelcall deltas/keepalives `session.go:594` and `deltaStream :808`, the `Sender` passed at `loop.go:568`, pull progress `modelpull.go:246+`, app-session chunks `loop.go:561`) appears in "The defect, verified" with the helper it reaches, and every helper routes through `Connection.Send` after Task 3.
+**Spec coverage** (the request's five items against the tasks): (1) failing `-race` test on a fake stream with heartbeat + pong + delta writers -- Task 1 Step 1 (`overlapDetectingStream`, `TestSendIsSerializedAcrossWriters`), run with `go test -race` in Step 2. (2) Minimal SDK fix: mutex around `stream.Send`, `CloseSend` under the lock -- Task 1 Step 3; cockpit relies on the SDK lock with a forwarding test rather than a second lock -- D2 and Task 3, no nested locking exists so no double-lock deadlock is possible. (3) No caller bypasses `Send` by holding the raw stream -- Task 2 deletes `Stream()` (and its `protoSeamAllowlist` row) and pins it by reflection; Task 3's scan test fails on `.Stream()` or a second `.conn.Send(` anywhere in the cockpit; the verification matrix carries the greps. (4) Exact commands: `go test ./...` (cockpit, and `-race` in CI after Task 4), `go test ./sdk/go/worker/...` (engine), `go vet` and `-race` for both -- in every task's Step 4 and the matrix. (5) Commit steps per repo, memql first, pin bump in the cockpit -- Task 1/2 Step 5 and Task 3/4 Step 5; the order dependency is stated at the top of Task 4. Every writer named in the audit (heartbeat `loop.go:254->360`, Ping answer `:618`, dispatch goroutines `:545->657`, modelcall deltas/keepalives `session.go:594` and `deltaStream :808`, the `Sender` passed at `loop.go:568`, pull progress `modelpull.go:246+`, app-session chunks `loop.go:561`) appears in "The defect, verified" with the helper it reaches, and every helper routes through `Connection.Send` after Task 3.
 
 **Placeholder scan:** the only angle-bracketed tokens are `<n>` (a PR number the executor reads off `gh pr create`'s output) and `<memql-merge-sha>` (recorded in Task 2 Step 5 and consumed in Task 4); both are named where they are produced. No "TBD", no "similar to", no described-but-unshown code.
 
