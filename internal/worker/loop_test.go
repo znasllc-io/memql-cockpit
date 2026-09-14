@@ -389,3 +389,21 @@ func TestAWithdrawalWhileBusyWaitsInsteadOfReconnecting(t *testing.T) {
 		t.Fatal("a withdrawal taken back must end the wait without a reconnect")
 	}
 }
+
+// A connection the runner is already closing to re-register is not
+// evaluated again: the next tick on the same heartbeat loop would
+// otherwise decide -- and log -- the same reconnect twice.
+func TestAConnectionBeingClosedIsNotReEvaluated(t *testing.T) {
+	clock := time.Unix(1_700_000_000, 0)
+	inv := &fakeModelInventory{}
+	inv.serve(oneModel())
+	r := testRunner(inv, &clock)
+	r.serve = func() string { return tools.ServeOwner }
+	conn := consentConnection(tools.ServeCluster)
+	if !r.maybeReadvertiseModels(context.Background(), conn) {
+		t.Fatal("the withdrawal must close the connection to re-register")
+	}
+	if r.maybeReadvertiseModels(context.Background(), conn) {
+		t.Fatal("a connection already being closed must not be closed -- and announced -- again")
+	}
+}

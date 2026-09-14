@@ -708,7 +708,8 @@ refusal made before start.
 **A REFUSAL BY THE CLUSTER IS NOT A BLIP, AND NOT A REASON TO DISABLE A
 HOME.** Unauthenticated, or the engine's exact sentences for an inactive or
 expired token or a revoked registration, get a HOLD once the cluster has
-refused at least three times AND for at least 30 seconds: one error line, a
+refused at least three times IN A ROW (an unreachable attempt starts the
+count over) AND for at least 30 seconds: one error line, a
 retry every minute doubling to fifteen, the `worker_home_refused` gauge, and
 `<home state dir>/refused.json`, which `memql worker config` prints
 (`refusal.go`). The engine maps EVERY token lookup failure to "invalid worker
@@ -730,14 +731,20 @@ second instead of every minute, and re-registers at the first idle second.
 It never cuts work short and never refuses a call to get there (see above).
 Restoring the consent before it lands ends the wait. The heartbeat goroutine
 is joined before `runStream` returns, so a stale one can never act on the
-next stream's state.
+next stream's state. Each stream is opened on its own context, and
+`Connection.Close` cancels it if the graceful half-close is still stuck
+after `closeGrace` -- a Send blocked behind a cluster that stopped reading
+would otherwise hold it indefinitely, since such a peer still acks
+keepalive pings.
 
 **THE WORKERS FILE IS THE WHOLE TRUTH ONCE IT EXISTS.** `worker run` reads
 `worker.yaml` as a home only on a machine that has never had a
 `workers.yaml` (`decideRunMode`). `syncLegacyMirror` keeps the legacy mirror
 naming an enabled home with its current token, or deletes it -- on every
 `unpair` and at every `worker run` start, so a token an older unpair left
-behind does not stay on disk. A registry with nothing enabled makes the
+behind does not stay on disk. It touches ONLY the mirror, the `worker.yaml`
+beside `workers.yaml` (`isMirrorOf`): a `--config` anywhere else is a file
+a person wrote. A registry with nothing enabled makes the
 worker wait, connected to nothing: at a terminal it says so and exits; under
 the LaunchAgent or the user unit it says so once and waits (a SIGHUP does not
 end the wait), because both restart a worker that exits.

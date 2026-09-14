@@ -1,13 +1,17 @@
 package worker
 
 import (
+	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"google.golang.org/protobuf/types/known/timestamppb"
 
@@ -183,5 +187,51 @@ func TestEveryWriterKindReachesTheSeamConcurrently(t *testing.T) {
 	}
 	if got, want := seam.count(func(*memqlv1.WorkerClientMessage) bool { return true }), perWriter*len(writers); got != want {
 		t.Errorf("seam saw %d frames in total, want %d: a helper wrote something it was not asked to", got, want)
+	}
+}
+
+// stuckCloseStream is an SDK connection whose half-close is held by a Send
+// stuck behind a cluster that stopped reading: its Close returns only once
+// the stream's context is cancelled.
+type stuckCloseStream struct {
+	ctx    context.Context
+	closed atomic.Int32
+}
+
+func (s *stuckCloseStream) Send(*memqlv1.WorkerClientMessage) error     { return nil }
+func (s *stuckCloseStream) Recv() (*memqlv1.WorkerServerMessage, error) { return nil, io.EOF }
+func (s *stuckCloseStream) Close() {
+	<-s.ctx.Done()
+	s.closed.Add(1)
+}
+
+// Close is graceful when it can be, and bounded when it cannot: past
+// closeGrace it cancels the stream's context, which is what ends a Send
+// that keepalive never would. And the context is cancelled on the way out
+// either way, so it is never leaked.
+func TestCloseIsBoundedWhenTheHalfCloseIsStuck(t *testing.T) {
+	defer func(g time.Duration) { closeGrace = g }(closeGrace)
+	closeGrace = 20 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stuck := &stuckCloseStream{ctx: ctx}
+	conn := &Connection{conn: stuck, cancel: cancel}
+	began := time.Now()
+	conn.Close()
+	if took := time.Since(began); took < closeGrace || took > 5*time.Second {
+		t.Fatalf("Close took %s; want it to wait the grace (%s) and then cancel", took, closeGrace)
+	}
+	if stuck.closed.Load() != 1 {
+		t.Fatal("the SDK close must have completed once the context was cancelled")
+	}
+
+	// Graceful: returns at once, and still releases the context.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	conn2 := &Connection{conn: &seamStream{}, cancel: cancel2}
+	conn2.Close()
+	select {
+	case <-ctx2.Done():
+	default:
+		t.Fatal("a graceful Close must still cancel the stream's context")
 	}
 }

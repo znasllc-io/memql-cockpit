@@ -143,8 +143,8 @@ func engineRefusal(message string) (refusalKind, bool) {
 
 // refusalHold is the runner's standing with a cluster that refused it.
 type refusalHold struct {
-	// streak counts refusals since the last accepted handshake, and first
-	// is when the first of them came.
+	// streak counts refusals in a row -- an unreachable attempt between
+	// them starts it over -- and first is when the first of them came.
 	streak int
 	first  time.Time
 	// held is set once streak reaches refusalStreak, and cleared only by
@@ -159,12 +159,19 @@ type refusalHold struct {
 // and says so -- once, for a refusal.
 func (r *Runner) afterConnectFailure(err error, backoff *time.Duration) time.Duration {
 	ref, refused := refusalOf(err)
-	if refused {
+	switch {
+	case refused:
 		if r.refused.streak == 0 {
 			r.refused.first = r.clock()
 		}
 		r.refused.streak++
 		r.refused.last = ref
+	case !r.refused.held:
+		// A streak is refusals IN A ROW. An attempt that never reached the
+		// cluster says nothing about whether it still refuses, so the
+		// grace starts over with the next refusal -- otherwise the first
+		// refusals after a long outage would count the outage as grace.
+		r.refused.streak = 0
 	}
 	if r.refused.held {
 		// Every attempt while held waits the hold, whatever it failed

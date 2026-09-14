@@ -245,6 +245,37 @@ func TestRunTheHoldOutlastsANetworkErrorInBetween(t *testing.T) {
 	}
 }
 
+// A streak is refusals IN A ROW: an attempt that never reached the
+// cluster starts it over. Otherwise, after a long outage, the first few
+// refusals would count the outage as grace and hold at once.
+func TestRunAnUnreachableAttemptStartsTheStreakOver(t *testing.T) {
+	script := []answer{
+		refuseToken(), refuseToken(), unreachable(),
+		refuseToken(), refuseToken(), refuseToken(), refuseToken(), accept(),
+	}
+	cluster := newFakeCluster(func(n int) answer {
+		if n < len(script) {
+			return script[n]
+		}
+		return accept()
+	})
+	waits := &waitRecorder{}
+	r := runnerAgainst(t, cluster, Options{Config: testHomeConfig(t, "prod")}, nil, waits)
+	runInBackground(t, r)
+	for range script {
+		cluster.next(t)
+	}
+	awaitRegistered(t, r)
+
+	// The streak restarts at the refusal after the unreachable attempt
+	// (t=7s); the one at t=45s is its fourth, and the first past the
+	// grace. Without the restart the refusal at t=30s would have held.
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 15 * time.Second, 15 * time.Second, time.Minute}
+	if got := waits.got(); durations(got...) != durations(want...) {
+		t.Fatalf("waits = %s, want %s", durations(got...), durations(want...))
+	}
+}
+
 // A machine removed from the fleet (its registration revoked) is a
 // refusal too, and its sentence names BOTH ways out: pair again, or stop
 // asking by unpairing here.

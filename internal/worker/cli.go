@@ -290,10 +290,12 @@ func handleRun(args []string) {
 		logLevelEffective = workers.LogLevel
 	}
 	logger := newLogger(logLevelEffective)
-	if !singleHome {
+	if !singleHome && isMirrorOf(*configPath, *workersPath) {
 		// The mirror names an enabled home, with the token it holds now,
 		// or it goes -- including a token an earlier unpair left behind
-		// (memql-cockpit#429).
+		// (memql-cockpit#429). ONLY the mirror: a --config pointing
+		// anywhere but beside workers.yaml is a file a person wrote, and
+		// this must not rewrite or delete it.
 		switch outcome, home, err := syncLegacyMirror(*configPath, workers); {
 		case err != nil:
 			logger.Warn("could not bring the legacy worker.yaml mirror in line with workers.yaml", "path", *configPath, "error", err)
@@ -714,10 +716,13 @@ func handleConfig(args []string) {
 func handleUnpair(args []string) {
 	fs := flag.NewFlagSet("worker unpair", flag.ExitOnError)
 	workersPath := fs.String("workers", DefaultWorkersPath(), "path to workers.yaml")
-	configPath := fs.String("config", DefaultConfigPath(), "path to the legacy worker.yaml mirror")
+	configPath := fs.String("config", "", "path to the legacy worker.yaml mirror (default: the worker.yaml beside --workers)")
 	cluster := fs.String("cluster", "", "home id to remove (see `memql worker config`)")
 	disable := fs.Bool("disable", false, "disable the home instead of removing it")
 	fs.Parse(args)
+	if strings.TrimSpace(*configPath) == "" {
+		*configPath = mirrorPathFor(*workersPath)
+	}
 	id := strings.TrimSpace(*cluster)
 	if id == "" && fs.NArg() > 0 {
 		id = fs.Arg(0)
@@ -762,7 +767,7 @@ func unpairSentences(res RemoveHomeResult, disabled bool, mirrorPath, goos strin
 	lines = append(lines, fmt.Sprintf("The running worker keeps its stream to %s until it restarts:", res.Removed.ID))
 	lines = append(lines, "  "+restartWorkerCommand(goos))
 	if enabled == 0 {
-		lines = append(lines, "With no cluster enabled it then waits, connected to nothing, until you pair one: memql worker pair <code>")
+		lines = append(lines, "With no cluster enabled it then waits, connected to nothing. After you pair one (memql worker pair <code>), restart it the same way.")
 	}
 	return lines
 }
@@ -842,8 +847,9 @@ func legacyOnly(workersPath string) bool {
 // WAITS: both restart a worker that exits (KeepAlive, Restart=on-failure),
 // and a worker that exits for want of a home would be restarted into the
 // same sentence every few seconds, forever. Connected to nothing and quiet
-// is the honest state for a machine that was unpaired on purpose; the next
-// pairing restarts it.
+// is the honest state for a machine that was unpaired on purpose, until it
+// is restarted after the next pairing (the macOS pair flow reinstalls the
+// LaunchAgent, which does that; elsewhere a person restarts the unit).
 //
 // SIGHUP DOES NOT END THE WAIT. `worker models --allow` and `setup
 // --inference` send it to every running worker to reload its policy, and

@@ -39,7 +39,7 @@ func TestUnpairSentences(t *testing.T) {
 		"Deleted the legacy mirror /home/me/.memql/worker.yaml: no enabled home is left for it to name, so no token stays behind in it.",
 		"The running worker keeps its stream to production until it restarts:",
 		"  systemctl --user restart memql-worker",
-		"With no cluster enabled it then waits, connected to nothing, until you pair one: memql worker pair <code>",
+		"With no cluster enabled it then waits, connected to nothing. After you pair one (memql worker pair <code>), restart it the same way.",
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("got:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
@@ -216,5 +216,27 @@ func TestWaitWithoutHomesUnderAServiceSurvivesSIGHUP(t *testing.T) {
 		if logs.count(want) != 1 {
 			t.Errorf("log missing %q:\n%s", want, logs)
 		}
+	}
+}
+
+// Only the worker.yaml beside workers.yaml is the mirror anything here
+// may rewrite or delete; a --config anywhere else is a person's file.
+func TestIsMirrorOf(t *testing.T) {
+	for _, tc := range []struct {
+		config, workers string
+		want            bool
+	}{
+		{"/home/me/.memql/worker.yaml", "/home/me/.memql/workers.yaml", true},
+		{"/home/me/.memql/./worker.yaml", "/home/me/.memql/workers.yaml", true},
+		{"/home/me/elsewhere/worker.yaml", "/home/me/.memql/workers.yaml", false},
+		{"/home/me/.memql/handmade.yaml", "/home/me/.memql/workers.yaml", false},
+		{"/home/me/.memql/worker.yaml", "/srv/custom/workers.yaml", false},
+	} {
+		if got := isMirrorOf(tc.config, tc.workers); got != tc.want {
+			t.Errorf("isMirrorOf(%q, %q) = %v, want %v", tc.config, tc.workers, got, tc.want)
+		}
+	}
+	if got := mirrorPathFor("/srv/custom/workers.yaml"); got != "/srv/custom/worker.yaml" {
+		t.Errorf("mirrorPathFor = %q", got)
 	}
 }

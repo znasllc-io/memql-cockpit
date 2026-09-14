@@ -231,3 +231,50 @@ func TestNilLimiterHoldsNothing(t *testing.T) {
 		t.Fatal("a nil Limiter holds nothing")
 	}
 }
+
+// failingDeltas is a stream that has gone: every delta fails, and the End
+// is still recorded (as far as this side knows, it was attempted).
+type failingDeltas struct{ *recorder }
+
+func (f failingDeltas) SendModelCallDelta(string, uint64, string, bool) error {
+	return fmt.Errorf("transport is closing")
+}
+
+// A call waiting for a slot ends -- taking no slot -- when its stream goes
+// (the keepalive it sends while it waits fails) and when the stream loss
+// stops every call (StopAll).
+func TestAWaitEndsWhenItsStreamGoes(t *testing.T) {
+	srv, arrived, release := heldRuntime(t)
+	defer release()
+	inv := inventoryWith(ollamaModel(srv.URL, "m", models.Attributes{MaxConcurrent: 1}))
+	shared := NewLimiter()
+	m := NewManager(Options{Inventory: inv, Limiter: shared, Getenv: func(string) string { return "" }})
+	m.Start(context.Background(), newRecorder(), startWithIdle("holder", 30))
+	awaitRequest(t, arrived)
+
+	gone := failingDeltas{newRecorder()}
+	m.Start(context.Background(), gone, startWithIdle("keepalive-fails", 30))
+	end := gone.wait(t)
+	if end.GetErrorCode() != CodeWorkerStopped || end.GetError() != "the stream to the cluster went while this call waited for a concurrency slot" {
+		t.Fatalf("end = %q / %q", end.GetErrorCode(), end.GetError())
+	}
+
+	stopped := newRecorder()
+	m.Start(context.Background(), stopped, startWithIdle("stopped", 30))
+	time.Sleep(50 * time.Millisecond)
+	m.StopAll("the worker's stream to the cluster was lost")
+	end = stopped.wait(t)
+	if end.GetErrorCode() != CodeWorkerStopped || end.GetError() != "the worker's stream to the cluster was lost" {
+		t.Fatalf("StopAll end = %q / %q", end.GetErrorCode(), end.GetError())
+	}
+	if shared.InFlight() != 0 {
+		// StopAll ended the holder too, which gives its slot back.
+		deadline := time.Now().Add(5 * time.Second)
+		for shared.InFlight() != 0 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if shared.InFlight() != 0 {
+			t.Fatalf("InFlight = %d after StopAll, want 0: no waiter may leave a slot behind", shared.InFlight())
+		}
+	}
+}

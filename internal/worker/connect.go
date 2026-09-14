@@ -9,6 +9,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -50,7 +51,22 @@ type Connection struct {
 	// this stream is up reaches the cluster only by registering again.
 	// The runner compares the live policy against it (memql-cockpit#428).
 	AdvertisedServe string
+
+	// cancel ends the context this connection's stream was opened on (the
+	// runner opens each stream on its own); Close uses it when a graceful
+	// close cannot finish.
+	cancel context.CancelFunc
+	// closing is set once the runner has decided to close this connection
+	// to re-register, so a later evaluation on the same heartbeat loop does
+	// not decide -- and say -- it all again.
+	closing atomic.Bool
 }
+
+// closeGrace is how long Close waits for the graceful half-close before it
+// cancels the stream's context. Ordinarily the half-close takes one frame's
+// write; this bound exists for the one case that does not end on its own.
+// A variable only so a test can shorten it.
+var closeGrace = 5 * time.Second
 
 // stream is what Connection needs from the SDK's connection: the three
 // calls the worker protocol makes on it.
@@ -436,12 +452,37 @@ func (c *Connection) SendToolResult(callId string, success *memqlv1.Success, fai
 	})
 }
 
-// Close terminates the stream and the underlying SDK connection.
+// Close ends the stream and the underlying SDK connection.
+//
+// GRACEFULLY WHEN IT CAN: the SDK takes CloseSend under its send lock, so
+// the cluster reads a clean end of the stream rather than a reset -- and
+// that half-close waits for a Send already in flight. A Send blocked on
+// flow control, behind a cluster that is alive but has stopped reading
+// this stream, would hold it for as long as the cluster stays that way:
+// keepalive never fires for a peer that still acks pings. So the wait is
+// bounded by closeGrace, and past it the stream's own context is
+// cancelled, which ends that Send and lets the close finish. The context
+// is cancelled on the way out regardless, so it is never leaked.
 func (c *Connection) Close() {
 	if c == nil || c.conn == nil {
 		return
 	}
-	c.conn.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.conn.Close()
+	}()
+	select {
+	case <-done:
+	case <-time.After(closeGrace):
+		if c.cancel != nil {
+			c.cancel()
+		}
+		<-done
+	}
+	if c.cancel != nil {
+		c.cancel()
+	}
 }
 
 // SetVersion tells the worker which version to register as.

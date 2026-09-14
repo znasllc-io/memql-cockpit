@@ -271,8 +271,12 @@ func (r *Runner) Run(ctx context.Context) error {
 			return err
 		}
 
-		conn, err := r.connect(ctx)
+		// Each stream is opened on a context of its own, so closing ONE
+		// stream can cancel it (Connection.Close) without touching the run.
+		streamCtx, cancelStream := context.WithCancel(ctx)
+		conn, err := r.connect(streamCtx)
 		if err != nil {
+			cancelStream()
 			if err := r.stopErr(ctx); err != nil {
 				return err
 			}
@@ -282,6 +286,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 			continue
 		}
+		conn.cancel = cancelStream
 		r.afterConnect()
 		r.conn.Store(conn)
 		r.metrics.SetConnected(r.home, true)
@@ -622,7 +627,7 @@ func (r *Runner) hardwareInventory(ctx context.Context) hardware.Inventory {
 // to until it is; a worker-side refusal the engine retries elsewhere is
 // the engine change that would let this go further.
 func (r *Runner) maybeReadvertiseModels(ctx context.Context, conn *Connection) bool {
-	if r == nil || conn == nil {
+	if r == nil || conn == nil || conn.closing.Load() {
 		return false
 	}
 	serve := r.inferenceServe()
@@ -682,6 +687,7 @@ func (r *Runner) maybeReadvertiseModels(ctx context.Context, conn *Connection) b
 	// Closing the connection surfaces as a Recv error in runStream,
 	// which returns and lets Run reconnect. There is no lighter way to
 	// re-register: the engine binds the advertisement at the handshake.
+	conn.closing.Store(true)
 	conn.Close()
 	return true
 }

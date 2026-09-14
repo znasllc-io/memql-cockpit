@@ -646,6 +646,21 @@ func RemoveHome(workersPath, legacyPath, id string, disableOnly bool) (RemoveHom
 	return res, nil
 }
 
+// mirrorPathFor is where UpsertHome and the installers keep the legacy
+// mirror of the registry at workersPath: the worker.yaml beside it.
+func mirrorPathFor(workersPath string) string {
+	return filepath.Join(filepath.Dir(workersPath), "worker.yaml")
+}
+
+// isMirrorOf reports whether configPath IS that mirror -- the only
+// worker.yaml anything here may rewrite or delete. A worker.yaml somewhere
+// else was named by a person (`worker run --config`), and it is theirs.
+func isMirrorOf(configPath, workersPath string) bool {
+	a, errA := filepath.Abs(configPath)
+	b, errB := filepath.Abs(mirrorPathFor(workersPath))
+	return errA == nil && errB == nil && a == b
+}
+
 // syncLegacyMirror keeps worker.yaml naming a home that is enabled, with
 // the token that home holds now -- or gone.
 //
