@@ -25,8 +25,9 @@ func setupTestServer(t *testing.T) (*Server, *Manager, *Client) {
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	path := filepath.Join(dir, "w.sock")
 
-	mgr := NewManager()
-	srv := NewServer(mgr, path, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
+	homes := NewHomes()
+	mgr := homes.For("home-a")
+	srv := NewServer(homes, path, slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 

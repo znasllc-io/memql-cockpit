@@ -2,13 +2,16 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 
@@ -252,9 +255,9 @@ func handleRun(args []string) {
 	// Single-home override: any explicit cluster/token on the CLI keeps
 	// the legacy one-stream path (scripts, debugging). Otherwise load
 	// the multi-home registry and run every enabled home.
-	singleHome := *cluster != "" || cliToken != ""
+	forceSingle := *cluster != "" || cliToken != ""
 	var workers WorkersFile
-	if !singleHome {
+	if !forceSingle {
 		workers, err = LoadWorkers(*workersPath, *configPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
@@ -266,37 +269,49 @@ func handleRun(args []string) {
 		if *logLevel != "" {
 			workers.LogLevel = *logLevel
 		}
-		if err := workers.ValidateRun(); err != nil {
-			// Fall back to legacy single-file if it validates — a
-			// machine mid-migration with only worker.yaml still runs.
-			if err2 := legacyCfg.Validate(); err2 == nil {
-				singleHome = true
-			} else {
-				fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-				fmt.Fprintln(os.Stderr, "")
-				fmt.Fprintln(os.Stderr, "Configure the worker with one of:")
-				fmt.Fprintln(os.Stderr, "  - ~/.memql/workers.yaml (one or more homes)")
-				fmt.Fprintln(os.Stderr, "  - ~/.memql/worker.yaml (legacy single home; auto-migrates)")
-				fmt.Fprintln(os.Stderr, "  - --cluster <url> --token-file <path>")
-				os.Exit(1)
-			}
-		}
-	} else if err := legacyCfg.Validate(); err != nil {
+	}
+	mode, err := decideRunMode(forceSingle, !legacyOnly(*workersPath), workers, legacyCfg)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Configure the worker with one of:")
-		fmt.Fprintln(os.Stderr, "  - ~/.memql/workers.yaml")
-		fmt.Fprintln(os.Stderr, "  - ~/.memql/worker.yaml")
+		fmt.Fprintln(os.Stderr, "  - ~/.memql/workers.yaml (one or more homes)")
+		fmt.Fprintln(os.Stderr, "  - ~/.memql/worker.yaml (legacy single home; auto-migrates)")
 		fmt.Fprintln(os.Stderr, "  - --cluster <url> --token-file <path>")
-		fmt.Fprintln(os.Stderr, "  - MEMQL_WORKER_TOKEN env var")
+		if forceSingle {
+			fmt.Fprintln(os.Stderr, "  - MEMQL_WORKER_TOKEN env var")
+		}
 		os.Exit(1)
 	}
+	singleHome := mode == runSingleHome
 
 	logLevelEffective := legacyCfg.LogLevel
 	if !singleHome && workers.LogLevel != "" {
 		logLevelEffective = workers.LogLevel
 	}
 	logger := newLogger(logLevelEffective)
+	if !singleHome {
+		// The mirror names an enabled home, with the token it holds now,
+		// or it goes -- including a token an earlier unpair left behind
+		// (memql-cockpit#429).
+		switch outcome, home, err := syncLegacyMirror(*configPath, workers); {
+		case err != nil:
+			logger.Warn("could not bring the legacy worker.yaml mirror in line with workers.yaml", "path", *configPath, "error", err)
+		case outcome == MirrorRewritten:
+			logger.Info("the legacy worker.yaml mirror named no enabled home; it now names one", "path", *configPath, "home", home)
+		case outcome == MirrorDeleted:
+			logger.Info("deleted the legacy worker.yaml mirror: it named no enabled home, and none is left", "path", *configPath)
+		}
+	}
+	if mode == runNoHomes {
+		interactive := isInteractiveTTY()
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+		if code := waitWithoutHomes(logger, os.Stderr, *workersPath, workers, interactive, signals); code != 0 {
+			os.Exit(code)
+		}
+		return
+	}
 
 	policyDir := filepath.Dir(*configPath)
 	if !singleHome {
@@ -311,9 +326,11 @@ func handleRun(args []string) {
 	logLevelProblems(logger, policy)
 
 	// Consent gate (memql-cockpit#64). ONE socket for the whole
-	// supervisor — multi-home does not multiply consent.
-	consentMgr := consent.NewManager()
-	consentSrv := consent.NewServer(consentMgr, consent.DefaultSocketPath(), logger)
+	// supervisor, and one window PER CLUSTER behind it (memql-cockpit
+	// #433): each home's dispatcher asks its own home's Manager, so a
+	// window opened for one cluster admits nothing another dispatches.
+	consentHomes := consent.NewHomes()
+	consentSrv := consent.NewServer(consentHomes, consent.DefaultSocketPath(), logger)
 	consentCtx, consentCancel := context.WithCancel(context.Background())
 	if err := consentSrv.Listen(consentCtx); err != nil {
 		logger.Warn("consent socket failed to start; running with default-deny gate but no IPC control",
@@ -321,7 +338,7 @@ func handleRun(args []string) {
 	}
 	defer consentCancel()
 
-	dispatcher := tools.NewDispatcher(logger, policy, consentMgr)
+	toolsFor := homeDispatchers(logger, policy, consentHomes)
 
 	var metrics *Metrics
 	if *metricsPort > 0 {
@@ -350,6 +367,7 @@ func handleRun(args []string) {
 	)
 
 	if singleHome {
+		legacyCfg.Home = HomeIDFromURL(legacyCfg.ClusterURL)
 		sessions := appsession.NewManager(appsession.Options{
 			Logger:     logger,
 			StateDir:   legacyCfg.StateDir,
@@ -383,7 +401,7 @@ func handleRun(args []string) {
 		runner, err = NewRunner(Options{
 			Logger:         logger,
 			Config:         legacyCfg,
-			Tools:          dispatcher,
+			Tools:          toolsFor(legacyCfg.Home),
 			Apps:           appInv,
 			Models:         modelInventory,
 			Calls:          calls,
@@ -413,7 +431,7 @@ func handleRun(args []string) {
 			Workers:    workers,
 			Policy:     policy,
 			PolicyPath: policyPath,
-			Tools:      dispatcher,
+			ToolsFor:   toolsFor,
 			Apps:       appInv,
 			Models:     modelInventory,
 			Discoverer: discoverer,
@@ -441,7 +459,11 @@ func handleRun(args []string) {
 					logger.Info("policy reloaded")
 					logLevelProblems(logger, policy)
 					if after := policy.InferenceServe(); after != serveBefore {
-						logger.Info("inference.serve changed; it takes effect on the next reconnect",
+						// The consent rides Register, so every home
+						// re-registers to carry it (memql-cockpit#428) --
+						// as soon as its work in flight allows, and a
+						// withdrawal refuses new model calls meanwhile.
+						logger.Info("inference.serve changed; every cluster stream re-registers to carry it",
 							"from", serveBefore, "to", after)
 					}
 					// Fan out to every home stream.
@@ -634,12 +656,18 @@ func handleConfig(args []string) {
 		os.Exit(1)
 	}
 	fmt.Printf("Workers file: %s\n", *workersPath)
+	fmt.Printf("Machine id:   %s\n", machineIDLine(w))
 	fmt.Printf("Name:         %s\n", emptyOrValue(w.WorkerName))
 	fmt.Printf("Capabilities:%s\n", " "+strings.Join(w.Capabilities, ", "))
 	fmt.Printf("Concurrency:  %v\n", w.Concurrency)
 	fmt.Printf("State dir:    %s\n", w.StateDir)
 	fmt.Printf("Log level:    %s\n", w.LogLevel)
 	fmt.Printf("Homes:        %d (%d enabled)\n", len(w.Homes), len(w.EnabledHomes()))
+	_, duplicates := w.runnableHomes()
+	duplicateOf := make(map[string]string, len(duplicates))
+	for _, d := range duplicates {
+		duplicateOf[d.Home.ID] = d.Connects
+	}
 	if len(w.Homes) == 0 {
 		fmt.Println("\n(no homes enrolled — run `memql worker pair` or the install script)")
 	}
@@ -651,7 +679,28 @@ func handleConfig(args []string) {
 		fmt.Printf("\n  [%s] %s\n", h.ID, en)
 		fmt.Printf("    Cluster URL: %s\n", emptyOrValue(h.ClusterURL))
 		fmt.Printf("    Token:       %s\n", maskToken(h.Token))
-		fmt.Printf("    State dir:   %s\n", w.ConfigForHome(h).StateDir)
+		stateDir := w.ConfigForHome(h).StateDir
+		fmt.Printf("    State dir:   %s\n", stateDir)
+		if connects, dup := duplicateOf[h.ID]; dup {
+			for i, line := range duplicateHomeLines(h.ID, connects) {
+				label := "                 "
+				if i == 0 {
+					label = "    Status:      "
+				}
+				fmt.Printf("%s%s\n", label, line)
+			}
+			continue
+		}
+		// A refusal the running worker recorded (memql-cockpit#427). The
+		// worker is another process; the record is how it tells this one.
+		rec, ok := loadRefusal(stateDir)
+		for i, line := range describeRefusal(rec, ok, h) {
+			label := "                 "
+			if i == 0 {
+				label = "    Status:      "
+			}
+			fmt.Printf("%s%s\n", label, line)
+		}
 	}
 	if err := w.Validate(); err != nil {
 		fmt.Printf("\nValidation: ERROR -- %v\n", err)
@@ -665,6 +714,7 @@ func handleConfig(args []string) {
 func handleUnpair(args []string) {
 	fs := flag.NewFlagSet("worker unpair", flag.ExitOnError)
 	workersPath := fs.String("workers", DefaultWorkersPath(), "path to workers.yaml")
+	configPath := fs.String("config", DefaultConfigPath(), "path to the legacy worker.yaml mirror")
 	cluster := fs.String("cluster", "", "home id to remove (see `memql worker config`)")
 	disable := fs.Bool("disable", false, "disable the home instead of removing it")
 	fs.Parse(args)
@@ -676,18 +726,190 @@ func handleUnpair(args []string) {
 		fmt.Fprintln(os.Stderr, "ERROR: unpair requires --cluster <home-id>")
 		os.Exit(1)
 	}
-	w, err := RemoveHome(*workersPath, id, *disable)
+	res, err := RemoveHome(*workersPath, *configPath, id, *disable)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		if res.Removed.ID != "" {
+			fmt.Fprintf(os.Stderr, "Delete it yourself so nothing can reconnect with that token:\n  rm %s\n", *configPath)
+		}
 		os.Exit(1)
 	}
-	action := "removed"
-	if *disable {
-		action = "disabled"
+	for _, line := range unpairSentences(res, *disable, *configPath, runtime.GOOS) {
+		fmt.Println(line)
 	}
-	fmt.Printf("%s home %q (%d homes remain, %d enabled)\n",
-		action, id, len(w.Homes), len(w.EnabledHomes()))
-	fmt.Println("Restart the worker (launchctl unload/load the LaunchAgent) to drop the stream.")
+}
+
+// unpairSentences is what `worker unpair` prints: what changed in both
+// files, and what the running worker still holds. A pure function of the
+// result, so every path is asserted on its exact words.
+func unpairSentences(res RemoveHomeResult, disabled bool, mirrorPath, goos string) []string {
+	verb := "Removed"
+	if disabled {
+		verb = "Disabled"
+	}
+	remain := len(res.Workers.Homes)
+	enabled := len(res.Workers.EnabledHomes())
+	lines := []string{fmt.Sprintf("%s home %q (%s left, %d enabled).", verb, res.Removed.ID, plural(remain, "home"), enabled)}
+	if remain == 0 {
+		lines[0] = fmt.Sprintf("%s home %q. It was the last one.", verb, res.Removed.ID)
+	}
+	switch res.Mirror {
+	case MirrorRewritten:
+		lines = append(lines, fmt.Sprintf("The legacy mirror %s now names %q.", mirrorPath, res.MirrorHome))
+	case MirrorDeleted:
+		lines = append(lines, fmt.Sprintf("Deleted the legacy mirror %s: no enabled home is left for it to name, so no token stays behind in it.", mirrorPath))
+	}
+	lines = append(lines, fmt.Sprintf("The running worker keeps its stream to %s until it restarts:", res.Removed.ID))
+	lines = append(lines, "  "+restartWorkerCommand(goos))
+	if enabled == 0 {
+		lines = append(lines, "With no cluster enabled it then waits, connected to nothing, until you pair one: memql worker pair <code>")
+	}
+	return lines
+}
+
+// restartWorkerCommand is how a person restarts the installed worker on
+// this platform -- the LaunchAgent on macOS, the user unit on Linux.
+func restartWorkerCommand(goos string) string {
+	if goos == "darwin" {
+		return "launchctl kickstart -k gui/$(id -u)/com.znasllc.memql-worker"
+	}
+	return "systemctl --user restart memql-worker"
+}
+
+func plural(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
+}
+
+// runMode is what `worker run` does with the configuration it found.
+type runMode int
+
+const (
+	// runFleet: every enabled home in workers.yaml, one stream each.
+	runFleet runMode = iota
+	// runSingleHome: one stream, from worker.yaml and the flags.
+	runSingleHome
+	// runNoHomes: a good registry with nothing enabled -- see
+	// waitWithoutHomes.
+	runNoHomes
+)
+
+// decideRunMode is `worker run`'s one decision, as a pure function of
+// what it read -- so the path that brought an unpaired cluster back is
+// pinned by a test rather than by care (memql-cockpit#429).
+//
+// forceSingle is --cluster or a token on the command line.
+// workersExists is whether workers.yaml exists AFTER LoadWorkers, which
+// migrates a legacy-only machine by writing one.
+//
+// THE ONLY FALLBACK to worker.yaml is a machine that has never had a
+// workers.yaml. Once workers.yaml exists it is the whole truth. It used to
+// be enough for workers.yaml to have nothing ENABLED -- which is exactly
+// the state `worker unpair` leaves -- and the worker.yaml mirror then
+// brought the unpaired cluster straight back on the next start.
+func decideRunMode(forceSingle, workersExists bool, workers WorkersFile, legacy Config) (runMode, error) {
+	if forceSingle {
+		return runSingleHome, legacy.Validate()
+	}
+	runErr := workers.ValidateRun()
+	switch {
+	case runErr == nil:
+		return runFleet, nil
+	case !workersExists && legacy.Validate() == nil:
+		return runSingleHome, nil
+	case workers.Validate() == nil:
+		return runNoHomes, nil
+	default:
+		return runFleet, runErr
+	}
+}
+
+// legacyOnly reports whether this machine has never had a workers.yaml --
+// the one situation `worker run` still reads worker.yaml as a home.
+func legacyOnly(workersPath string) bool {
+	_, err := os.Stat(workersPath)
+	return errors.Is(err, os.ErrNotExist)
+}
+
+// waitWithoutHomes is `worker run` with nothing to run: a registry with no
+// home enabled -- the state `worker unpair` leaves behind, or every home
+// switched off. It returns the exit code.
+//
+// At a terminal it says so and exits 1, because a person is waiting for
+// the prompt. Under the LaunchAgent or the user unit it says so ONCE and
+// WAITS: both restart a worker that exits (KeepAlive, Restart=on-failure),
+// and a worker that exits for want of a home would be restarted into the
+// same sentence every few seconds, forever. Connected to nothing and quiet
+// is the honest state for a machine that was unpaired on purpose; the next
+// pairing restarts it.
+//
+// SIGHUP DOES NOT END THE WAIT. `worker models --allow` and `setup
+// --inference` send it to every running worker to reload its policy, and
+// a worker that died of one would not come back under systemd, which
+// counts death by SIGHUP as a clean exit.
+func waitWithoutHomes(logger *slog.Logger, stderr io.Writer, workersPath string, w WorkersFile, interactive bool, signals <-chan os.Signal) int {
+	sentence := noEnabledHomeSentence(workersPath, w)
+	if interactive {
+		fmt.Fprintln(stderr, "ERROR: "+sentence)
+		return 1
+	}
+	logger.Warn("no cluster is enabled on this machine; this worker waits, connected to nothing, until it is restarted",
+		"why", sentence)
+	for sig := range signals {
+		if sig == syscall.SIGHUP {
+			logger.Info("policy reload requested; nothing to reload while no cluster is enabled")
+			continue
+		}
+		logger.Info("worker shutting down", "signal", sig.String())
+		return 0
+	}
+	return 0
+}
+
+// noEnabledHomeSentence names the empty state precisely: never paired,
+// or paired with everything switched off.
+func noEnabledHomeSentence(workersPath string, w WorkersFile) string {
+	if len(w.Homes) == 0 {
+		return fmt.Sprintf("No cluster is paired with this machine (%s has no homes). Pair one with a code from the portal: memql worker pair <code>", workersPath)
+	}
+	ids := make([]string, 0, len(w.Homes))
+	for _, h := range w.Homes {
+		ids = append(ids, h.ID)
+	}
+	return fmt.Sprintf("Every cluster in %s is disabled (%s). Set enabled: true on one, or pair another with memql worker pair <code>, then restart the worker.", workersPath, strings.Join(ids, ", "))
+}
+
+// duplicateHomeLines is the block `worker config` prints under an enabled
+// home that does not connect, because a later one points at the same
+// cluster (runnableHomes).
+func duplicateHomeLines(id, connects string) []string {
+	return []string{
+		fmt.Sprintf("NOT CONNECTED -- %q points at the same cluster, and it connects instead.", connects),
+		"One machine holds one stream per cluster. Remove this home, or set enabled: false on it:",
+		"  memql worker unpair --cluster " + id,
+	}
+}
+
+// machineIDLine is what `worker config` prints for this machine's id: the
+// id every cluster sees it as (memql-cockpit#430), read without minting
+// one -- printing a config must not be what creates an identity.
+func machineIDLine(w WorkersFile) string {
+	if id := peekMachineID(w.machineRoot()); id != "" {
+		return id
+	}
+	return "(none yet; the worker creates one when it first connects)"
+}
+
+// homeDispatchers builds each home's tool dispatcher over its own consent
+// window. The dispatcher is cheap -- a logger, the policy, a gate -- so a
+// home gets its own rather than a shared one that would have to be told
+// which cluster every call came from.
+func homeDispatchers(logger *slog.Logger, policy *tools.Policy, homes *consent.Homes) func(string) ToolDispatcher {
+	return func(id string) ToolDispatcher {
+		return tools.NewDispatcher(logger.With("home", id), policy, homes.For(id))
+	}
 }
 
 func printUsage() {
@@ -726,7 +948,8 @@ func printUsage() {
 	fmt.Println("  memql worker backup        Print the folders this machine backs up into the")
 	fmt.Println("                                     Library, or the reason it backs up none.")
 	fmt.Println("                                     --once runs one sweep now.")
-	fmt.Println("  memql worker consent <op>  Manage the per-call consent gate (grant/revoke/status/watch).")
+	fmt.Println("  memql worker consent <op>  Manage the consent gate, one window per cluster")
+	fmt.Println("                                     (grant/revoke/status/watch; --cluster <id>).")
 	fmt.Println("")
 	fmt.Println("PAIR FLAGS")
 	fmt.Println("  --cluster <name>     Cluster NAME from clusters.yaml (identity lookup).")

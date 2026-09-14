@@ -255,6 +255,12 @@ func SaveWorkers(path string, w WorkersFile) error {
 
 // Validate checks the registry shape. An empty homes list is allowed
 // (fresh machine); ValidateRun refuses to start with zero enabled homes.
+//
+// Two homes on one cluster are NOT a shape error: runnableHomes decides
+// which of them connects. Refusing the file here would refuse it to
+// SaveWorkers too, and then `worker pair` and `worker unpair` -- the two
+// commands that fix it -- would fail on exactly the machines that need
+// them.
 func (w WorkersFile) Validate() error {
 	if w.Version != 1 {
 		return fmt.Errorf("workers config: unsupported version %d (want 1)", w.Version)
@@ -296,6 +302,53 @@ func (w WorkersFile) Validate() error {
 	return nil
 }
 
+// duplicateHome is an enabled home that does not connect, because a later
+// enabled home points at the same cluster.
+type duplicateHome struct {
+	Home     Home
+	Connects string // the id of the home that connects instead
+}
+
+// runnableHomes is the enabled homes this machine connects: ONE PER
+// CLUSTER (memql-cockpit#433).
+//
+// Two streams from one machine to one cluster register the same machine
+// twice, under the same machine id, and the cluster's row for it flaps
+// between them forever. So when two enabled homes point at one cluster
+// (sameClusterURL), one of them connects and the other is reported rather
+// than dialled -- the LATER entry, because UpsertHome and the installers
+// both append a new enrollment at the end, so the later entry holds the
+// token somebody issued most recently. A duplicate comes from a hand edit,
+// or from an installer before it matched on the host, and the sentence the
+// fleet logs and `worker config` prints says which entry to remove.
+func (w WorkersFile) runnableHomes() ([]Home, []duplicateHome) {
+	enabled := w.EnabledHomes()
+	var run []Home
+	var skipped []duplicateHome
+	for i, h := range enabled {
+		winner := i
+		for j := len(enabled) - 1; j > i; j-- {
+			if sameClusterURL(enabled[j].ClusterURL, h.ClusterURL) {
+				winner = j
+				break
+			}
+		}
+		if winner == i {
+			run = append(run, h)
+			continue
+		}
+		skipped = append(skipped, duplicateHome{Home: h, Connects: enabled[winner].ID})
+	}
+	return run, skipped
+}
+
+// duplicateHomeSentence is what the fleet logs, once, for a home it does
+// not connect.
+func duplicateHomeSentence(d duplicateHome) string {
+	return fmt.Sprintf("homes %q and %q both point at %s; one machine holds one stream per cluster, so only %q connects -- remove %q from workers.yaml, or set enabled: false on it",
+		d.Home.ID, d.Connects, d.Home.ClusterURL, d.Connects, d.Home.ID)
+}
+
 // ValidateRun requires at least one enabled home.
 func (w WorkersFile) ValidateRun() error {
 	if err := w.Validate(); err != nil {
@@ -332,7 +385,7 @@ func (w WorkersFile) ConfigForHome(h Home) Config {
 	if stateDir == "" {
 		stateDir = defaultStateDir()
 	}
-	stateDir = filepath.Join(stateDir, "homes", sanitizeHomeID(h.ID))
+	stateDir = filepath.Join(stateDir, homesDirName, sanitizeHomeID(h.ID))
 	return Config{
 		ClusterURL:   h.ClusterURL,
 		Token:        h.Token,
@@ -342,7 +395,17 @@ func (w WorkersFile) ConfigForHome(h Home) Config {
 		StateDir:     stateDir,
 		LogLevel:     w.LogLevel,
 		Capabilities: append([]string(nil), w.Capabilities...),
+		Home:         h.ID,
 	}
+}
+
+// machineRoot is the machine-level state directory every home's own state
+// dir sits under -- where this machine's id lives (machineid.go).
+func (w WorkersFile) machineRoot() string {
+	if strings.TrimSpace(w.StateDir) == "" {
+		return defaultStateDir()
+	}
+	return filepath.Clean(w.StateDir)
 }
 
 // sanitizeHomeID maps a home id to a single path segment. Empty becomes
@@ -502,18 +565,58 @@ func UpsertHome(opts UpsertHomeOptions) (WorkersFile, error) {
 	return w, nil
 }
 
-// RemoveHome deletes a home by id (or disables when disableOnly).
-func RemoveHome(workersPath, id string, disableOnly bool) (WorkersFile, error) {
+// MirrorOutcome is what RemoveHome did to the legacy worker.yaml mirror.
+type MirrorOutcome int
+
+const (
+	// MirrorAbsent: there is no worker.yaml.
+	MirrorAbsent MirrorOutcome = iota
+	// MirrorUntouched: worker.yaml already names an enabled home, with the
+	// token that home holds.
+	MirrorUntouched
+	// MirrorRewritten: worker.yaml named no enabled home, and now names
+	// MirrorHome.
+	MirrorRewritten
+	// MirrorDeleted: worker.yaml named no enabled home, and none is left
+	// for it to name.
+	MirrorDeleted
+)
+
+// RemoveHomeResult is what unpair did, for the sentences the CLI prints.
+type RemoveHomeResult struct {
+	Workers WorkersFile
+	Removed Home
+	Mirror  MirrorOutcome
+	// MirrorHome is the home worker.yaml names after MirrorRewritten.
+	MirrorHome string
+}
+
+// RemoveHome deletes a home by id (or disables when disableOnly), and
+// keeps the legacy worker.yaml mirror from naming it (memql-cockpit#429).
+//
+// THE MIRROR IS PART OF UNPAIRING. UpsertHome copies each paired home's
+// token into worker.yaml for older tooling, so removing a home from
+// workers.yaml alone left its token one file over -- and a worker that
+// fell back to that file brought the cluster straight back after the
+// person had unpaired it. See syncLegacyMirror.
+//
+// legacyPath empty means DefaultConfigPath(). If workers.yaml is saved and
+// the mirror cannot be put right, the error says so: the result is still
+// returned, and the token the person meant to remove is still on disk.
+func RemoveHome(workersPath, legacyPath, id string, disableOnly bool) (RemoveHomeResult, error) {
 	if workersPath == "" {
 		workersPath = DefaultWorkersPath()
 	}
+	if legacyPath == "" {
+		legacyPath = DefaultConfigPath()
+	}
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return WorkersFile{}, errors.New("unpair: home id required")
+		return RemoveHomeResult{}, errors.New("unpair: home id required")
 	}
-	w, err := LoadWorkers(workersPath, "")
+	w, err := LoadWorkers(workersPath, legacyPath)
 	if err != nil {
-		return WorkersFile{}, err
+		return RemoveHomeResult{}, err
 	}
 	idx := -1
 	for i, h := range w.Homes {
@@ -523,8 +626,9 @@ func RemoveHome(workersPath, id string, disableOnly bool) (WorkersFile, error) {
 		}
 	}
 	if idx < 0 {
-		return WorkersFile{}, fmt.Errorf("unpair: home %q not found", id)
+		return RemoveHomeResult{}, fmt.Errorf("unpair: home %q not found", id)
 	}
+	removed := w.Homes[idx]
 	if disableOnly {
 		off := false
 		w.Homes[idx].Enabled = &off
@@ -532,9 +636,53 @@ func RemoveHome(workersPath, id string, disableOnly bool) (WorkersFile, error) {
 		w.Homes = append(w.Homes[:idx], w.Homes[idx+1:]...)
 	}
 	if err := SaveWorkers(workersPath, w); err != nil {
-		return WorkersFile{}, err
+		return RemoveHomeResult{}, err
 	}
-	return w, nil
+	res := RemoveHomeResult{Workers: w, Removed: removed}
+	res.Mirror, res.MirrorHome, err = syncLegacyMirror(legacyPath, w)
+	if err != nil {
+		return res, fmt.Errorf("unpair: %s is out of workers.yaml, but the legacy mirror %s still holds its token: %w", removed.ID, legacyPath, err)
+	}
+	return res, nil
+}
+
+// syncLegacyMirror keeps worker.yaml naming a home that is enabled, with
+// the token that home holds now -- or gone.
+//
+// A mirror that matches an enabled home is left exactly as it is. One that
+// names anything else -- a home just removed or disabled, a home an older
+// build unpaired and left behind, a token since replaced -- is rewritten
+// to the first home that connects, or deleted when none does. Disabling
+// counts as going: a disabled home must not be connectable from a file
+// nobody is looking at. `worker run` calls this at startup too, so a
+// token an earlier unpair left one file over does not stay on disk
+// forever.
+func syncLegacyMirror(legacyPath string, w WorkersFile) (MirrorOutcome, string, error) {
+	if _, err := os.Stat(legacyPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return MirrorAbsent, "", nil
+		}
+		return MirrorUntouched, "", err
+	}
+	mirror, err := LoadFile(legacyPath)
+	if err != nil {
+		return MirrorUntouched, "", err
+	}
+	for _, h := range w.EnabledHomes() {
+		if strings.TrimSpace(mirror.Token) == strings.TrimSpace(h.Token) && sameClusterURL(mirror.ClusterURL, h.ClusterURL) {
+			return MirrorUntouched, "", nil
+		}
+	}
+	if run, _ := w.runnableHomes(); len(run) > 0 {
+		if err := WriteLegacyWorkerYAML(legacyPath, w.ConfigForHome(run[0])); err != nil {
+			return MirrorUntouched, "", err
+		}
+		return MirrorRewritten, run[0].ID, nil
+	}
+	if err := os.Remove(legacyPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return MirrorUntouched, "", err
+	}
+	return MirrorDeleted, "", nil
 }
 
 // WriteLegacyWorkerYAML writes the single-home worker.yaml shape.

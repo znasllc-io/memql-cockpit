@@ -94,6 +94,11 @@ type Options struct {
 	// Getenv resolves a declared runtime's api_key_env. Defaults to
 	// os.Getenv.
 	Getenv func(string) string
+	// Limiter is the machine's concurrency ceiling. A worker serving
+	// several clusters passes ONE to every Manager (see Limiter); nil
+	// builds a private one, which is the whole machine when this Manager
+	// is the only one.
+	Limiter *Limiter
 }
 
 // Manager owns the live model calls on this worker.
@@ -102,10 +107,10 @@ type Manager struct {
 	inventory Inventory
 	http      *http.Client
 	getenv    func(string) string
+	limiter   *Limiter
 
-	mu       sync.Mutex
-	live     map[string]*call
-	perModel map[string]int
+	mu   sync.Mutex
+	live map[string]*call
 }
 
 type call struct {
@@ -113,9 +118,10 @@ type call struct {
 	cancel    context.CancelFunc
 
 	mu sync.Mutex
-	// modelID is set once the model RESOLVES, which is after the call is
-	// already registered -- see Start. Empty means no concurrency slot
-	// was ever taken for a model, so releasing must not decrement one.
+	// modelID is set once the model RESOLVES and its slot is taken in the
+	// Limiter, which is after the call is already registered -- see Start.
+	// Empty means no concurrency slot was ever taken, so releasing must
+	// not give one back.
 	modelID string
 	reason  string // why it was aborted: FinishCancelled / FinishTimeout
 	code    string
@@ -138,13 +144,17 @@ func NewManager(opts Options) *Manager {
 	if getenv == nil {
 		getenv = os.Getenv
 	}
+	limiter := opts.Limiter
+	if limiter == nil {
+		limiter = NewLimiter()
+	}
 	return &Manager{
 		logger:    opts.Logger,
 		inventory: opts.Inventory,
 		http:      client,
 		getenv:    getenv,
+		limiter:   limiter,
 		live:      make(map[string]*call),
-		perModel:  make(map[string]int),
 	}
 }
 
@@ -206,7 +216,16 @@ func (m *Manager) Start(ctx context.Context, sender Sender, start *memqlv1.Model
 	go func() {
 		defer cancel()
 		defer m.release(c)
-		info, refusal := m.resolve(ctx, c, start)
+		info, inv, refusal := m.resolve(ctx, start)
+		// The delta stream exists from here, before the slot: a call that
+		// waits for one keeps the cluster's idle clock alive while it does
+		// (see admit), and the seq it numbered its keepalives with carries
+		// on into the generation.
+		stream := &deltaStream{sender: sender, requestID: requestID}
+		stream.touch()
+		if refusal == nil {
+			refusal = m.admit(callCtx, c, info, inv, limits, stream)
+		}
 		if refusal != nil {
 			refusal.RequestId = requestID
 			if err := sender.SendModelCallEnd(refusal); err != nil {
@@ -214,7 +233,7 @@ func (m *Manager) Start(ctx context.Context, sender Sender, start *memqlv1.Model
 			}
 			return
 		}
-		m.run(callCtx, sender, c, info, limits, start)
+		m.run(callCtx, sender, c, info, limits, start, stream)
 	}()
 }
 
@@ -277,25 +296,20 @@ func (m *Manager) abort(requestID, finish, code, reason string) {
 	c.cancel()
 }
 
-// release drops the call and the per-model slot it took, if it took one.
-// A call refused before its model resolved never incremented anything, so
-// releasing it must not decrement -- that would let the next call past a
-// ceiling this one never occupied.
+// release drops the call and the slot it took, if it took one. A call
+// refused before its model resolved never took anything, so releasing it
+// must not give a slot back -- that would let the next call past a ceiling
+// this one never occupied.
 func (m *Manager) release(c *call) {
 	c.mu.Lock()
 	modelID := c.modelID
 	c.mu.Unlock()
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	delete(m.live, c.requestID)
-	if modelID == "" {
-		return
-	}
-	if n := m.perModel[modelID]; n <= 1 {
-		delete(m.perModel, modelID)
-	} else {
-		m.perModel[modelID] = n - 1
+	m.mu.Unlock()
+	if modelID != "" {
+		m.limiter.release(modelID)
 	}
 }
 
@@ -336,8 +350,8 @@ func limitsFrom(l *memqlv1.ModelCallLimits) callLimits {
 	return out
 }
 
-// resolve finds the model this call names and takes its concurrency slot,
-// or returns the End that refuses the call.
+// resolve finds the model this call names, or returns the End that
+// refuses the call. The slot is admit's to take.
 //
 // It runs AFTER the call is registered (see Start), so a refusal here is a
 // refusal for a call that already exists and is already cancellable. The
@@ -346,11 +360,11 @@ func limitsFrom(l *memqlv1.ModelCallLimits) callLimits {
 // rather than at the next reconnect, because the advertisement is a
 // promise and honouring a call outside it would keep a revoked model
 // running on somebody's hardware.
-func (m *Manager) resolve(ctx context.Context, c *call, start *memqlv1.ModelCallStart) (models.Info, *memqlv1.ModelCallEnd) {
+func (m *Manager) resolve(ctx context.Context, start *memqlv1.ModelCallStart) (models.Info, models.Inventory, *memqlv1.ModelCallEnd) {
 	kind := start.GetKind()
 	modality, isModality := modalityKinds[kind]
 	if kind != KindChat && kind != KindEmbedding && !isModality {
-		return models.Info{}, refuse(CodeUnsupportedKind,
+		return models.Info{}, models.Inventory{}, refuse(CodeUnsupportedKind,
 			fmt.Sprintf("this worker serves %s; the call asked for %q",
 				strings.Join(quoteAll(ServedKinds()), ", "), kind))
 	}
@@ -361,7 +375,7 @@ func (m *Manager) resolve(ctx context.Context, c *call, start *memqlv1.ModelCall
 	}
 	info, ok := inv.Find(start.GetModel())
 	if !ok {
-		return models.Info{}, refuse(CodeModelNotOffered,
+		return models.Info{}, models.Inventory{}, refuse(CodeModelNotOffered,
 			fmt.Sprintf("this machine does not currently offer model %q", start.GetModel()))
 	}
 	// A SCHEMA ONLY MEANS SOMETHING ON A CHAT-SHAPED CALL. Vision is
@@ -371,7 +385,7 @@ func (m *Manager) resolve(ctx context.Context, c *call, start *memqlv1.ModelCall
 	// those is refused rather than dropped, because dropping it would
 	// let a caller believe it had asked for something.
 	if len(start.GetResponseFormatSchema()) > 0 && isModalityKind(kind) && kind != KindVision {
-		return models.Info{}, refuse(CodeSchemaUnsupported,
+		return models.Info{}, models.Inventory{}, refuse(CodeSchemaUnsupported,
 			fmt.Sprintf("a %q call returns no text for a response schema to constrain", kind))
 	}
 	if len(start.GetResponseFormatSchema()) > 0 && !info.StructuredOutput {
@@ -379,14 +393,14 @@ func (m *Manager) resolve(ctx context.Context, c *call, start *memqlv1.ModelCall
 		// the capability, so this is a stale advertisement rather than a
 		// routing bug -- and answering prose instead would defeat the
 		// gating that put the call here.
-		return models.Info{}, refuse(CodeSchemaUnsupported,
+		return models.Info{}, models.Inventory{}, refuse(CodeSchemaUnsupported,
 			fmt.Sprintf("model %q does not advertise structured output on this machine", info.ID))
 	}
 	if end := toolsRefusal(info, toolsFromStart(start)); end != nil {
-		return models.Info{}, end
+		return models.Info{}, models.Inventory{}, end
 	}
 	if kind == KindEmbedding && !info.Embeddings {
-		return models.Info{}, refuse(CodeModelNotOffered,
+		return models.Info{}, models.Inventory{}, refuse(CodeModelNotOffered,
 			fmt.Sprintf("model %q does not advertise embeddings on this machine", info.ID))
 	}
 	if isModality {
@@ -397,40 +411,91 @@ func (m *Manager) resolve(ctx context.Context, c *call, start *memqlv1.ModelCall
 		// serving it anyway would defeat the gating that put the call
 		// here.
 		if !modality.Advertised(info.Attributes) {
-			return models.Info{}, refuse(CodeModalityUnsupported,
+			return models.Info{}, models.Inventory{}, refuse(CodeModalityUnsupported,
 				fmt.Sprintf("model %q does not advertise %s on this machine", info.ID, modality.Word))
 		}
 		// And the payload, which the wire cannot carry yet.
 		if _, ok := payloadFor(start); !ok {
-			return models.Info{}, refuse(CodePayloadUnavailable, modalityUnavailableSentence(modality.Word))
+			return models.Info{}, models.Inventory{}, refuse(CodePayloadUnavailable, modalityUnavailableSentence(modality.Word))
 		}
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	// Both ceilings, and both are this machine's to hold. The engine
-	// rations by the advertised numbers, but the advertisement is a claim
-	// about this hardware and two replicas selecting at the same moment
-	// is an ordinary race rather than a bug to fix upstream.
-	//
-	// This call is already in m.live, so it counts itself against the
-	// machine-wide ceiling -- hence the strict `>`.
-	if info.MaxConcurrent > 0 && m.perModel[info.ID] >= info.MaxConcurrent {
-		return models.Info{}, refuse(CodeConcurrencyExceeded,
-			fmt.Sprintf("model %q is at its concurrency limit of %d on this machine", info.ID, info.MaxConcurrent))
-	}
-	if ceiling := machineCap(inv); ceiling > 0 && len(m.live) > ceiling {
-		return models.Info{}, refuse(CodeConcurrencyExceeded,
-			fmt.Sprintf("this machine is at its model concurrency limit of %d", ceiling))
-	}
+	return info, inv, nil
+}
 
-	// Taking the slot and recording which one was taken happen together;
-	// release reads the same field to know whether to give it back.
+// admit takes this call's concurrency slot, WAITING for one when the
+// machine is full, or returns the End that refuses the call.
+//
+// Both ceilings are this machine's to hold. The engine rations by the
+// advertised numbers, but the advertisement is a claim about this
+// hardware: two replicas selecting at the same moment is an ordinary race
+// rather than a bug to fix upstream, and on a machine serving several
+// clusters every one of them was told the same numbers. The Limiter is
+// shared by every cluster's Manager for that reason (memql-cockpit#432).
+//
+// WAITING, NOT REFUSING, because a refusal is a FAILED call: the engine
+// treats any error a worker ends a call with as the call having run, and
+// does not try another machine. Before the ceiling was shared, a second
+// cluster's call went straight to the runtime and queued there; a call
+// that finds the machine full now queues here instead, where the ceiling
+// can see it. It waits as long as a call queued in the runtime could have
+// -- its own idle ceiling, after which the watchdog would have ended it
+// for silence -- and says it is alive meanwhile, with keepalives on the
+// same cadence the generation will use, so the cluster's copy of that
+// ceiling does not end it first. Only then is it refused.
+func (m *Manager) admit(ctx context.Context, c *call, info models.Info, inv models.Inventory, limits callLimits, stream *deltaStream) *memqlv1.ModelCallEnd {
+	ceiling := machineCap(inv)
+	if m.claim(c, info, ceiling) {
+		return nil
+	}
+	m.logger.Debug("model call waiting for a concurrency slot", "request_id", c.requestID, "model", info.ID)
+	deadline := time.NewTimer(limits.idle)
+	defer deadline.Stop()
+	keepalive := time.NewTicker(limits.keepalive)
+	defer keepalive.Stop()
+	for {
+		freed := m.limiter.changed()
+		// Re-checked AFTER taking the channel, so a release between the
+		// failed claim and the wait is never missed.
+		if m.claim(c, info, ceiling) {
+			return nil
+		}
+		select {
+		case <-freed:
+		case <-keepalive.C:
+			if err := stream.keepalive(); err != nil {
+				return refuse(CodeWorkerStopped, "the stream to the cluster went while this call waited for a concurrency slot")
+			}
+		case <-deadline.C:
+			return refuse(CodeConcurrencyExceeded, concurrencyRefusal(info, ceiling, limits.idle))
+		case <-ctx.Done():
+			finish, code, detail := m.classify(c, ctx.Err())
+			end := refuse(code, detail)
+			end.FinishReason = finish
+			return end
+		}
+	}
+}
+
+// claim takes the slot if one is free. Taking it and recording which one
+// was taken happen together; release reads the same field to know
+// whether to give it back.
+func (m *Manager) claim(c *call, info models.Info, ceiling int) bool {
 	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !m.limiter.tryAcquire(info.ID, info.MaxConcurrent, ceiling) {
+		return false
+	}
 	c.modelID = info.ID
-	c.mu.Unlock()
-	m.perModel[info.ID]++
-	return info, nil
+	return true
+}
+
+// concurrencyRefusal names the ceiling that stayed full, and for how long.
+func concurrencyRefusal(info models.Info, ceiling int, waited time.Duration) string {
+	if info.MaxConcurrent > 0 {
+		return fmt.Sprintf("model %q stayed at its concurrency limit of %d on this machine for %s", info.ID, info.MaxConcurrent, waited)
+	}
+	return fmt.Sprintf("this machine stayed at its model concurrency limit of %d for %s", ceiling, waited)
 }
 
 // machineCap is the machine-wide ceiling, derived from the SAME numbers
@@ -476,7 +541,7 @@ func refuse(code, message string) *memqlv1.ModelCallEnd {
 // Execution
 // -----------------------------------------------------------------------------
 
-func (m *Manager) run(ctx context.Context, sender Sender, c *call, info models.Info, limits callLimits, start *memqlv1.ModelCallStart) {
+func (m *Manager) run(ctx context.Context, sender Sender, c *call, info models.Info, limits callLimits, start *memqlv1.ModelCallStart, stream *deltaStream) {
 	// The level rides along for the owner's own logs (memql#5393). It
 	// steers NOTHING here: the router chose this model from this machine's
 	// advertisement, and a level is translated into knobs only for an app,
@@ -485,7 +550,8 @@ func (m *Manager) run(ctx context.Context, sender Sender, c *call, info models.I
 		"request_id", c.requestID, "model", info.ID, "kind", start.GetKind(),
 		"level", start.GetLevel(), "purpose", start.GetPurpose())
 
-	stream := &deltaStream{sender: sender, requestID: c.requestID}
+	// The idle clock starts with the generation, not with the wait for a
+	// slot: time spent queued is not the runtime going quiet.
 	stream.touch()
 
 	// The watchdog is stopped BEFORE the End is sent, not by a defer that

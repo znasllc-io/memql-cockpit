@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -55,13 +56,30 @@ type Request struct {
 	// on the "grant" op (memql-cockpit#131). Nil = no region.
 	// Ignored on every other op and on non-strict grants.
 	Region *Region `json:"region,omitempty"`
+
+	// Home names the cluster the op is for (memql-cockpit#433): which
+	// window a grant opens, which one a revoke closes, whose state a
+	// status reports, whose events a watch streams. Empty on a grant
+	// means the only cluster there is, and is refused when there are
+	// several; empty on revoke closes EVERY window; empty on status and
+	// watch means all of them.
+	Home string `json:"home,omitempty"`
 }
 
 // Response is the unified reply shape for non-WATCH ops.
 type Response struct {
-	OK     bool   `json:"ok"`
-	Error  string `json:"error,omitempty"`
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+	// Code is set on an error a client may want to phrase itself -- the
+	// Pick codes (CodeHomeRequired, CodeUnknownHome, CodeNoHomes).
+	Code string `json:"code,omitempty"`
+	// Status is the state of Home: the cluster the op named, or the only
+	// one there is. Zero when the op concerned several.
 	Status Status `json:"status,omitempty"`
+	Home   string `json:"home,omitempty"`
+	// Homes is every cluster this worker serves and its state, in the
+	// order the worker registered them.
+	Homes []HomeStatus `json:"homes,omitempty"`
 
 	// Pending is populated on the initial WATCH response so a
 	// reconnecting TUI can re-render its approval queue without
@@ -70,9 +88,9 @@ type Response struct {
 	Pending []PendingApprovalInfo `json:"pending,omitempty"`
 }
 
-// Server wraps a Manager with a Unix-socket interface.
+// Server wraps every home's Manager with one Unix-socket interface.
 type Server struct {
-	mgr    *Manager
+	homes  *Homes
 	logger *slog.Logger
 	path   string
 
@@ -81,15 +99,17 @@ type Server struct {
 	stopped  bool
 }
 
-// NewServer builds a Server bound to the given Manager.
-func NewServer(mgr *Manager, path string, logger *slog.Logger) *Server {
+// NewServer builds a Server over every home's consent. One socket for the
+// whole worker, however many clusters it serves: the operator has one
+// place to go, and the request says which cluster it means.
+func NewServer(homes *Homes, path string, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	if mgr == nil {
-		mgr = NewManager()
+	if homes == nil {
+		homes = NewHomes()
 	}
-	return &Server{mgr: mgr, logger: logger, path: path}
+	return &Server{homes: homes, logger: logger, path: path}
 }
 
 // Path returns the socket file path the server listens at.
@@ -194,11 +214,11 @@ func (s *Server) handle(c net.Conn) {
 	case "grant":
 		s.handleGrant(c, req)
 	case "revoke":
-		s.handleRevoke(c)
+		s.handleRevoke(c, req)
 	case "status":
-		s.handleStatus(c)
+		s.handleStatus(c, req)
 	case "watch":
-		s.handleWatch(c)
+		s.handleWatch(c, req)
 	case "approve":
 		s.handleApprove(c, req)
 	case "deny":
@@ -213,66 +233,176 @@ func (s *Server) handleGrant(c net.Conn, req Request) {
 		s.writeResp(c, Response{OK: false, Error: "window_seconds must be > 0"})
 		return
 	}
-	if _, err := s.mgr.Grant(time.Duration(req.WindowSeconds)*time.Second, req.Strict, req.Region); err != nil {
+	home, mgr, err := s.homes.Pick(req.Home)
+	if err != nil {
+		s.writePickErr(c, err)
+		return
+	}
+	if _, err := mgr.Grant(time.Duration(req.WindowSeconds)*time.Second, req.Strict, req.Region); err != nil {
 		s.writeResp(c, Response{OK: false, Error: err.Error()})
 		return
 	}
-	s.writeResp(c, Response{OK: true, Status: s.mgr.Snapshot()})
+	s.writeResp(c, s.stateOf(home, mgr))
 }
 
-func (s *Server) handleRevoke(c net.Conn) {
-	s.mgr.Revoke()
-	s.writeResp(c, Response{OK: true, Status: s.mgr.Snapshot()})
+// handleRevoke closes one window, or -- with no home named -- every
+// window: the kill switch must never make the person say which.
+func (s *Server) handleRevoke(c net.Conn, req Request) {
+	if strings.TrimSpace(req.Home) == "" {
+		for _, mgr := range s.homes.Managers() {
+			mgr.Revoke()
+		}
+		s.writeResp(c, Response{OK: true, Homes: s.homes.Statuses()})
+		return
+	}
+	home, mgr, err := s.homes.Pick(req.Home)
+	if err != nil {
+		s.writePickErr(c, err)
+		return
+	}
+	mgr.Revoke()
+	s.writeResp(c, s.stateOf(home, mgr))
 }
 
-func (s *Server) handleStatus(c net.Conn) {
-	s.writeResp(c, Response{OK: true, Status: s.mgr.Snapshot()})
+func (s *Server) handleStatus(c net.Conn, req Request) {
+	if strings.TrimSpace(req.Home) != "" {
+		home, mgr, err := s.homes.Pick(req.Home)
+		if err != nil {
+			s.writePickErr(c, err)
+			return
+		}
+		s.writeResp(c, s.stateOf(home, mgr))
+		return
+	}
+	resp := Response{OK: true, Homes: s.homes.Statuses()}
+	if ids := s.homes.IDs(); len(ids) == 1 {
+		home, mgr, _ := s.homes.Pick(ids[0])
+		resp.Home, resp.Status = home, mgr.Snapshot()
+	}
+	s.writeResp(c, resp)
 }
 
+// handleApprove and handleDeny find the home holding the approval: ids
+// are minted per request and unique, so the id alone says whose it is.
 func (s *Server) handleApprove(c net.Conn, req Request) {
-	if req.ApprovalId == "" {
-		s.writeResp(c, Response{OK: false, Error: "approval_id is required"})
-		return
-	}
-	if err := s.mgr.Approve(req.ApprovalId); err != nil {
-		s.writeResp(c, Response{OK: false, Error: err.Error()})
-		return
-	}
-	s.writeResp(c, Response{OK: true, Status: s.mgr.Snapshot()})
+	s.resolveApproval(c, req, (*Manager).Approve)
 }
 
 func (s *Server) handleDeny(c net.Conn, req Request) {
+	s.resolveApproval(c, req, (*Manager).Deny)
+}
+
+func (s *Server) resolveApproval(c net.Conn, req Request, resolve func(*Manager, string) error) {
 	if req.ApprovalId == "" {
 		s.writeResp(c, Response{OK: false, Error: "approval_id is required"})
 		return
 	}
-	if err := s.mgr.Deny(req.ApprovalId); err != nil {
-		s.writeResp(c, Response{OK: false, Error: err.Error()})
-		return
+	var lastErr error
+	for _, mgr := range s.homes.Managers() {
+		err := resolve(mgr, req.ApprovalId)
+		if err == nil {
+			s.writeResp(c, s.stateOf(mgr.Home(), mgr))
+			return
+		}
+		lastErr = err
 	}
-	s.writeResp(c, Response{OK: true, Status: s.mgr.Snapshot()})
+	if lastErr == nil {
+		lastErr = fmt.Errorf("consent: no pending approval with id %q (already resolved, revoked, or timed out)", req.ApprovalId)
+	}
+	s.writeResp(c, Response{OK: false, Error: lastErr.Error()})
 }
 
-func (s *Server) handleWatch(c net.Conn) {
-	ch, cancel := s.mgr.Subscribe()
-	defer cancel()
+func (s *Server) handleWatch(c net.Conn, req Request) {
+	managers := s.homes.Managers()
+	if strings.TrimSpace(req.Home) != "" {
+		_, mgr, err := s.homes.Pick(req.Home)
+		if err != nil {
+			s.writePickErr(c, err)
+			return
+		}
+		managers = []*Manager{mgr}
+	}
+
+	// One subscription per home, merged onto this connection. Each
+	// forwarder exits when its subscription is cancelled or the watch
+	// ends, whichever is first.
+	merged := make(chan Event, 64)
+	done := make(chan struct{})
+	var forwarders sync.WaitGroup
+	cancels := make([]func(), 0, len(managers))
+	for _, mgr := range managers {
+		ch, cancel := mgr.Subscribe()
+		cancels = append(cancels, cancel)
+		forwarders.Add(1)
+		go func() {
+			defer forwarders.Done()
+			for ev := range ch {
+				select {
+				case merged <- ev:
+				case <-done:
+					return
+				}
+			}
+		}()
+	}
+	defer func() {
+		close(done)
+		for _, cancel := range cancels {
+			cancel()
+		}
+		forwarders.Wait()
+	}()
+
 	// Send the initial state first so the client can render its
 	// dashboard before any events arrive. Includes any pending
 	// approvals already in flight so a reconnecting TUI doesn't
 	// drop on-screen modals.
-	if err := s.writeResp(c, Response{
-		OK:      true,
-		Status:  s.mgr.Snapshot(),
-		Pending: s.mgr.PendingApprovals(),
-	}); err != nil {
+	var pending []PendingApprovalInfo
+	for _, mgr := range managers {
+		pending = append(pending, mgr.PendingApprovals()...)
+	}
+	initial := Response{OK: true, Homes: s.homes.Statuses(), Pending: pending}
+	if len(managers) == 1 {
+		initial.Home, initial.Status = managers[0].Home(), managers[0].Snapshot()
+	}
+	if err := s.writeResp(c, initial); err != nil {
 		return
 	}
+	// The client hanging up is noticed at once rather than at the next
+	// event: a watch on a quiet worker would otherwise hold its
+	// subscriptions until something happened to fail a write.
+	gone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, c)
+		close(gone)
+	}()
 	enc := json.NewEncoder(c)
-	for ev := range ch {
-		if err := enc.Encode(ev); err != nil {
+	for {
+		select {
+		case ev := <-merged:
+			if err := enc.Encode(ev); err != nil {
+				return
+			}
+		case <-gone:
 			return
 		}
 	}
+}
+
+// stateOf is the OK response for an op on one home.
+func (s *Server) stateOf(home string, mgr *Manager) Response {
+	return Response{OK: true, Home: home, Status: mgr.Snapshot(), Homes: s.homes.Statuses()}
+}
+
+// writePickErr answers a request whose home could not be resolved, with
+// the code and the list a client needs to phrase its own sentence.
+func (s *Server) writePickErr(c net.Conn, err error) {
+	resp := Response{OK: false, Error: err.Error(), Homes: s.homes.Statuses()}
+	var pe *PickError
+	if errors.As(err, &pe) {
+		resp.Code = pe.Code
+	}
+	s.writeResp(c, resp)
 }
 
 func (s *Server) writeResp(c net.Conn, r Response) error {
@@ -295,6 +425,9 @@ func (s *Server) writeResp(c net.Conn, r Response) error {
 type Client struct {
 	Path    string
 	Timeout time.Duration
+	// Home is the cluster every request names (Request.Home); empty
+	// means what Request.Home's empty means for each op.
+	Home string
 }
 
 // DefaultClient returns a Client wired to DefaultSocketPath() with
@@ -320,11 +453,13 @@ func (c *Client) Grant(window time.Duration, strict bool, region *Region) (Respo
 		WindowSeconds: int(window.Seconds()),
 		Strict:        strict,
 		Region:        region,
+		Home:          c.Home,
 	})
 }
 
-// Revoke closes any active window.
-func (c *Client) Revoke() (Response, error) { return c.exec(Request{Op: "revoke"}) }
+// Revoke closes the active window of c.Home, or every window when c.Home
+// is empty.
+func (c *Client) Revoke() (Response, error) { return c.exec(Request{Op: "revoke", Home: c.Home}) }
 
 // Approve resolves a strict-mode pending approval as ALLOW. The id
 // comes from an EventApprovalRequested broadcast on the Watch
@@ -347,8 +482,8 @@ func (c *Client) Deny(id string) (Response, error) {
 	return c.exec(Request{Op: "deny", ApprovalId: id})
 }
 
-// Status returns the current Manager snapshot.
-func (c *Client) Status() (Response, error) { return c.exec(Request{Op: "status"}) }
+// Status returns the consent state: of c.Home, or of every home.
+func (c *Client) Status() (Response, error) { return c.exec(Request{Op: "status", Home: c.Home}) }
 
 // Watch opens a long-lived connection and yields each event /
 // status update to the supplied callback. Returns when the
@@ -364,7 +499,7 @@ func (c *Client) Watch(ctx context.Context, onEvent func([]byte)) error {
 		<-ctx.Done()
 		_ = conn.Close()
 	}()
-	body, err := json.Marshal(Request{Op: "watch"})
+	body, err := json.Marshal(Request{Op: "watch", Home: c.Home})
 	if err != nil {
 		return err
 	}

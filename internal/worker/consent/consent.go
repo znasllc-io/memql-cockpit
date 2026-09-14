@@ -167,6 +167,29 @@ type Manager struct {
 	// approvalTimeout is the per-action approval wait. Configurable
 	// for tests; production uses DefaultApprovalTimeout.
 	approvalTimeout time.Duration
+
+	// home is the cluster this Manager gates, when it belongs to a Homes
+	// registry (memql-cockpit#433); "" for a standalone Manager. Every
+	// event carries it, and peers says how many homes share the registry,
+	// so a refusal can name the home in the command it suggests exactly
+	// when the command would be ambiguous without it.
+	home  string
+	peers func() int
+}
+
+// Home is the cluster this Manager gates, or "" for a standalone one.
+func (m *Manager) Home() string { return m.home }
+
+// grantCommand is the command a refusal suggests. It names this Manager's
+// home when the machine serves more than one cluster, because a grant
+// without a home is refused there -- a suggestion that does not work is
+// worse than none.
+func (m *Manager) grantCommand() string {
+	cmd := "memql worker consent grant --window=<duration>"
+	if m.home != "" && m.peers != nil && m.peers() > 1 {
+		cmd += " --cluster " + m.home
+	}
+	return cmd
 }
 
 // pendingApproval is the registry entry for a single strict-mode
@@ -320,8 +343,8 @@ func (m *Manager) AllowsAt(tool, action string, cursor CursorPoint) Decision {
 		dec := Decision{
 			Allowed: false,
 			Reason: fmt.Sprintf(
-				"computer-use consent has not been granted -- run `memql worker consent grant --window=<duration>` on this host before retrying (%s.%s, class=%s)",
-				tool, action, class),
+				"computer-use consent has not been granted -- run `%s` on this host before retrying (%s.%s, class=%s)",
+				m.grantCommand(), tool, action, class),
 		}
 		m.recordDispatch(tool, action, class, dec)
 		return dec
@@ -330,8 +353,8 @@ func (m *Manager) AllowsAt(tool, action string, cursor CursorPoint) Decision {
 		dec := Decision{
 			Allowed: false,
 			Reason: fmt.Sprintf(
-				"consent window expired at %s -- run `memql worker consent grant --window=<duration>` to re-open (%s.%s, class=%s)",
-				exp.Format(time.RFC3339), tool, action, class),
+				"consent window expired at %s -- run `%s` to re-open (%s.%s, class=%s)",
+				exp.Format(time.RFC3339), m.grantCommand(), tool, action, class),
 		}
 		m.recordDispatch(tool, action, class, dec)
 		return dec
@@ -420,6 +443,10 @@ type Event struct {
 	// EventGranted events (memql-cockpit#131). Nil when the grant
 	// set no region.
 	Region *Region `json:"region,omitempty"`
+
+	// Home is the cluster the event is about (memql-cockpit#433). Empty
+	// from a standalone Manager.
+	Home string `json:"home,omitempty"`
 }
 
 // Subscribe returns a channel that receives Manager events plus a
@@ -449,6 +476,7 @@ func (m *Manager) Subscribe() (<-chan Event, func()) {
 // see a drop (default branch) rather than blocking the writer.
 // Caller must NOT hold m.mu when calling (we acquire subsMu here).
 func (m *Manager) broadcast(e Event) {
+	e.Home = m.home
 	m.subsMu.Lock()
 	defer m.subsMu.Unlock()
 	for _, ch := range m.subs {
@@ -712,6 +740,7 @@ func (m *Manager) PendingApprovals() []PendingApprovalInfo {
 			Action:      p.action,
 			Class:       p.class,
 			RequestedAt: p.requestedAt,
+			Home:        m.home,
 		})
 	}
 	return out
@@ -726,6 +755,8 @@ type PendingApprovalInfo struct {
 	Action      string    `json:"action"`
 	Class       Class     `json:"class"`
 	RequestedAt time.Time `json:"requested_at"`
+	// Home is the cluster whose call is waiting (memql-cockpit#433).
+	Home string `json:"home,omitempty"`
 }
 
 // newApprovalId mints a fresh approval handle. 8 random bytes

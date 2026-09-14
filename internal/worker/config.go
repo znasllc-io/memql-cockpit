@@ -29,6 +29,25 @@ type Config struct {
 	StateDir     string            `yaml:"state_dir"`
 	LogLevel     string            `yaml:"log_level"`
 	Capabilities []string          `yaml:"capabilities"`
+
+	// Home is the id this cluster is enrolled under in workers.yaml (the
+	// cluster's URL host on the single-home path). It names the stream in
+	// metrics and scopes the consent window. Never written to worker.yaml:
+	// the file's own cluster_url is where a reader derives it from.
+	Home string `yaml:"-"`
+	// MachineID is this machine's id, resolved once for the whole machine
+	// by a caller that runs several homes (see machineIDFor). Empty
+	// resolves it from StateDir's machine root at Register.
+	MachineID string `yaml:"-"`
+}
+
+// homeID is the stream's name: the enrolled home id, else the cluster's
+// URL host, which is what a single-home run would have been enrolled as.
+func (c Config) homeID() string {
+	if id := strings.TrimSpace(c.Home); id != "" {
+		return id
+	}
+	return HomeIDFromURL(c.ClusterURL)
 }
 
 // Defaults returns a Config seeded with sensible defaults for the
