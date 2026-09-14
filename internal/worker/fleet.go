@@ -115,6 +115,10 @@ func (f *Fleet) Run(ctx context.Context) error {
 				}
 				return false
 			},
+			// The owner's apps.levels (memql-cockpit#438). The method
+			// value is safe on a nil policy: AppLevels answers "no
+			// entries", which is the built-in table.
+			Levels:         f.policy.AppLevels,
 			CheckWorkspace: f.policyCheckPath(),
 		})
 		// Per-home Calls so a disconnect on home A does not StopAll

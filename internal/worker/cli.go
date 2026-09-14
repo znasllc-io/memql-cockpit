@@ -33,6 +33,7 @@ import (
 //	memql worker setup             Re-run TCC permissions check (computeruse builds)
 //	memql worker setup --inference Install a model runtime, pull models, allow them
 //	memql worker config            Print effective config (all homes)
+//	memql worker apps              Print the local apps and what each level runs them at
 //	memql worker unpair --cluster  Remove or disable one home
 //
 // `pair` is the primary entry: it walks the user from "I have an
@@ -78,6 +79,8 @@ func dispatchHandleCommand(args []string) {
 		handleBackup(args[1:])
 	case "models":
 		handleModels(args[1:])
+	case "apps":
+		handleApps(args[1:])
 	case "hardware":
 		handleHardware(args[1:])
 	case "probe":
@@ -305,6 +308,7 @@ func handleRun(args []string) {
 		logger.Warn("policy load failed; using defaults", "error", err)
 		policy = tools.DefaultPolicy()
 	}
+	logLevelProblems(logger, policy)
 
 	// Consent gate (memql-cockpit#64). ONE socket for the whole
 	// supervisor — multi-home does not multiply consent.
@@ -358,6 +362,9 @@ func handleRun(args []string) {
 				}
 				return false
 			},
+			// The owner's apps.levels, read per session so a SIGHUP
+			// reaches the next one (memql-cockpit#438).
+			Levels:         policy.AppLevels,
 			CheckWorkspace: policy.CheckPath,
 		})
 		stopSessions = sessions.StopAll
@@ -432,6 +439,7 @@ func handleRun(args []string) {
 					logger.Warn("policy reload failed", "error", err)
 				} else {
 					logger.Info("policy reloaded")
+					logLevelProblems(logger, policy)
 					if after := policy.InferenceServe(); after != serveBefore {
 						logger.Info("inference.serve changed; it takes effect on the next reconnect",
 							"from", serveBefore, "to", after)
@@ -707,6 +715,9 @@ func printUsage() {
 	fmt.Println("  memql worker models        Print the local models this machine would offer,")
 	fmt.Println("                                     or the reason it offers none. --pull <id>")
 	fmt.Println("                                     pulls one; --allow <id> offers one.")
+	fmt.Println("  memql worker apps          Print the local apps (Claude Code, Codex), whether")
+	fmt.Println("                                     the cluster can use them here and why not, and")
+	fmt.Println("                                     the model and effort each level runs them at.")
 	fmt.Println("  memql worker hardware      Print what this machine reports about itself:")
 	fmt.Println("                                     chip, memory, GPU, runtimes, and the class")
 	fmt.Println("                                     that decides which models are recommended.")
@@ -745,6 +756,20 @@ func printUsage() {
 	fmt.Println("                       runtime; the two meanings are never mixed silently.")
 	fmt.Println("  --non-interactive    Never ask. A runtime install it would have asked about")
 	fmt.Println("                       is refused with exit 3 and nothing is installed.")
+}
+
+// logLevelProblems says, each time policy.yaml is read, what is wrong with
+// its apps.levels block (memql-cockpit#438).
+//
+// A refused entry also says so on every session it refuses, on the End the
+// person who asked will read. An entry for an app or a level no session
+// names says so NOWHERE else -- and an owner's entry that silently did
+// nothing reads exactly like one that worked. `memql worker apps` prints the
+// same list for an owner who is not reading this log.
+func logLevelProblems(logger *slog.Logger, policy *tools.Policy) {
+	for _, problem := range policy.AppLevelProblems() {
+		logger.Warn("policy.yaml apps.levels has a problem", "problem", problem)
+	}
 }
 
 func newLogger(level string) *slog.Logger {

@@ -200,6 +200,7 @@ func runConfiguredWorker(clusterURL, token, name string, logger *slog.Logger) er
 		logger.Warn("policy load failed; using defaults", "error", err)
 		policy = tools.DefaultPolicy()
 	}
+	logLevelProblems(logger, policy)
 
 	consentMgr := consent.NewManager()
 	consentSrv := consent.NewServer(consentMgr, consent.DefaultSocketPath(), logger)
@@ -290,6 +291,7 @@ func runConfiguredWorker(clusterURL, token, name string, logger *slog.Logger) er
 					logger.Warn("policy reload failed", "error", err)
 				} else {
 					logger.Info("policy reloaded")
+					logLevelProblems(logger, policy)
 					if fleet != nil {
 						fleet.RequestImmediateReadvertise()
 					} else if runner != nil {
