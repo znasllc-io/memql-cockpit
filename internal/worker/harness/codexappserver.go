@@ -275,6 +275,18 @@ func (c *jsonrpcConn) emit(stream string, data []byte) {
 	}
 }
 
+// record hands one finished call to the turn's sink. Like a chunk, an
+// action that finishes with no turn in flight has nowhere to go -- and
+// its seq is already spent, so the gap it leaves is visible downstream.
+func (c *jsonrpcConn) record(a Action) {
+	c.mu.Lock()
+	s := c.sink
+	c.mu.Unlock()
+	if s != nil {
+		s.Record(a)
+	}
+}
+
 func (c *jsonrpcConn) readStdout() {
 	defer c.deadOnce.Do(func() { close(c.dead) })
 	r := bufio.NewReaderSize(c.proc.Stdout(), 64<<10)
@@ -330,10 +342,8 @@ func (c *jsonrpcConn) route(line []byte) {
 		return
 	}
 	var msg rpcMessage
-	// The `jsonrpc` test is what separates a protocol frame from
-	// anything else the process printed. Requiring it rather than
-	// merely "parses as JSON" is the difference between this package
-	// and the transcript-guessing it replaces.
+	// A protocol frame is decided by its shape (isFrame), not by the
+	// `jsonrpc` header the app-server never sends.
 	if json.Unmarshal(trimmed, &msg) != nil || !msg.isFrame() {
 		c.emit(StreamStdout, line)
 		return
@@ -596,6 +606,9 @@ type codexAppServer struct {
 	// model ran; see result.
 	servedModel  string
 	servedEffort string
+	// rec is the session's recording. It is set before the process starts
+	// because the reader goroutine may deliver an item the moment it does.
+	rec *recording
 }
 
 // Name implements Harness.
@@ -623,6 +636,7 @@ func (h *codexAppServer) Start(ctx context.Context, spec Spec) error {
 	}
 	h.spec = spec
 	h.knobs = knobs
+	h.rec = newRecording()
 
 	proc, err := spec.Launch(ctx, spec.Workspace, []string{spec.Binary, "app-server"}, spec.Env, true)
 	if err != nil {
@@ -696,6 +710,11 @@ func (h *codexAppServer) Turn(ctx context.Context, prompt string, sink Sink) (Tu
 		h.turn = nil
 		h.mu.Unlock()
 	}()
+	h.rec.startTurn()
+	// The calls this turn started and never finished are recorded when it
+	// ends, whichever way it ends -- and before the sink is detached, which
+	// is the deferred call registered first and so run last.
+	defer h.flushRecording()
 
 	params := map[string]any{
 		"threadId": h.currentThread(),
@@ -941,8 +960,15 @@ func (h *codexAppServer) handleNotification(method string, params json.RawMessag
 		kind, id, text, phase := codexReadItem(n.Item)
 		if codexToolItems[kind] {
 			h.conn.emit(StreamTool, n.Item)
+			h.recordItem(method, n.Item)
 			return
 		}
+		// A call this build routes as progress rather than as tool
+		// activity -- an image view, a sub-agent, a sleep, a type it has
+		// never seen -- is still a call, and still recorded; anything else
+		// is ignored there. Deferred, so the action follows the app's own
+		// event line as it follows a tool chunk above.
+		defer h.recordItem(method, n.Item)
 		if kind == codexItemAgentMessage && method == codexNotifyItemCompleted {
 			if state != nil && state.match(n.TurnID) {
 				state.addMessage(text, phase)
@@ -1050,6 +1076,32 @@ func (h *codexAppServer) handleNotification(method string, params json.RawMessag
 	}
 
 	h.conn.emit(StreamEvent, raw)
+}
+
+// recordItem feeds one item to the session's recording: a started item
+// opens a call, a completed one closes it.
+func (h *codexAppServer) recordItem(method string, raw json.RawMessage) {
+	call, item, ok := codexItemCall(raw, h.spec.Workspace)
+	if !ok {
+		return
+	}
+	switch method {
+	case codexNotifyItemStarted:
+		h.rec.begin(call)
+	case codexNotifyItemCompleted:
+		// Sent under the recording's lock (completeAndEmit): this runs on
+		// the reader while the turn's flush runs on its own goroutine, and
+		// the order on the wire has to be the order of the seq.
+		h.rec.completeAndEmit(call.ID, func(a *Action) {
+			*a = mergeCall(*a, call)
+			codexItemFinish(a, item)
+		}, h.conn.record)
+	}
+}
+
+// flushRecording records the calls the turn started and never finished.
+func (h *codexAppServer) flushRecording() {
+	h.rec.flushAndEmit(h.conn.record)
 }
 
 // codexReadItem pulls the four things anything asks of a ThreadItem.

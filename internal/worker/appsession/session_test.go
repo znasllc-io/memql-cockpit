@@ -20,6 +20,7 @@ import (
 	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 
 	"github.com/znasllc-io/memql-cockpit/internal/worker/apps"
+	"github.com/znasllc-io/memql-cockpit/internal/worker/harness"
 )
 
 // --- the test rig ----------------------------------------------------
@@ -242,9 +243,22 @@ func newRig(t *testing.T, allow ...string) *rig {
 		LibraryBase: lib.server.URL,
 		HTTPClient:  lib.server.Client(),
 		Allowed:     func(id string) bool { return allowed[id] },
+		// The fingerprint asks the app for its version and the machine for
+		// its tools. Neither is asked for real here: several fake apps fork
+		// a grandchild on EVERY invocation, and a session test must not
+		// run every compiler on the machine running it.
+		Detector: &apps.Detector{RunVersion: func(context.Context, string, []string) (string, error) {
+			return rigAppVersion, nil
+		}},
+		ToolVersions: func(context.Context) []harness.ToolVersion { return rigTools },
 	})
 	return h
 }
+
+// The rig's fixed answers for the fingerprint's app version and tools.
+const rigAppVersion = "9.9.9 (rig)"
+
+var rigTools = []harness.ToolVersion{{Name: "git", Version: "git version 2.43.0"}}
 
 func (h *rig) start(t *testing.T, mutate func(*memqlv1.AppSessionStart)) *memqlv1.AppSessionEnd {
 	t.Helper()
@@ -660,6 +674,36 @@ func TestSession_ProducedFilesAndTranscriptArePushed(t *testing.T) {
 	// Every id comes back on the End so the portal can point at them.
 	if len(end.GetProducedArtifactIds()) != len(names) {
 		t.Errorf("produced_artifact_ids = %d, want %d", len(end.GetProducedArtifactIds()), len(names))
+	}
+}
+
+// TestSession_AFileHoldingTheBearerIsNotPushed: an app that copies its MCP
+// configuration into the workspace has produced a file holding the
+// session's bearer. The bearer cannot be revoked, so the file is not
+// pushed to the Library -- and the transcript says so, as it does for any
+// file left behind.
+func TestSession_AFileHoldingTheBearerIsNotPushed(t *testing.T) {
+	fakeApp(t, "claude", "cp .mcp.json leaked.json\necho fine > ok.txt\n"+quietClaude)
+	h := newRig(t)
+	end := h.start(t, nil)
+	if end.GetExitCode() != 0 || end.GetError() != "" {
+		t.Fatalf("end = %d %q", end.GetExitCode(), end.GetError())
+	}
+	sawOK := false
+	for name, body := range h.library.uploaded() {
+		if strings.Contains(string(body), testBearer) {
+			t.Errorf("%s carried the bearer to the Library", name)
+		}
+		if strings.Contains(name, "leaked") {
+			t.Errorf("%s was pushed", name)
+		}
+		sawOK = sawOK || strings.HasSuffix(name, "ok.txt")
+	}
+	if !sawOK {
+		t.Error("the file without the bearer was not pushed")
+	}
+	if !strings.Contains(h.sender.transcript(), "not pushed to the Library: leaked.json (it holds this session's credential)") {
+		t.Error("the transcript does not say the file was held back")
 	}
 }
 

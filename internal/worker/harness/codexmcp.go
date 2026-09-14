@@ -154,6 +154,8 @@ type codexMCP struct {
 	// settings and restates nothing.
 	servedModel  string
 	servedEffort string
+	// rec is the session's recording, set before the server starts.
+	rec *recording
 }
 
 // Name implements Harness.
@@ -177,6 +179,7 @@ func (h *codexMCP) Start(ctx context.Context, spec Spec) error {
 	}
 	h.spec = spec
 	h.knobs = knobs
+	h.rec = newRecording()
 	h.threadID = strings.TrimSpace(spec.ResumeRef)
 
 	proc, err := spec.Launch(ctx, spec.Workspace, []string{spec.Binary, "mcp-server"}, spec.Env, true)
@@ -241,6 +244,8 @@ func (h *codexMCP) Turn(ctx context.Context, prompt string, sink Sink) (TurnResu
 		h.turn = nil
 		h.mu.Unlock()
 	}()
+	h.rec.startTurn()
+	defer h.flushRecording()
 
 	name, args := mcpToolCodex, map[string]any{
 		"prompt": prompt,
@@ -448,6 +453,7 @@ func (h *codexMCP) handleNotification(method string, params json.RawMessage, raw
 
 	case codexMCPToolEvents[event.Msg.Type]:
 		h.conn.emit(StreamTool, raw)
+		h.recordEvent(params)
 		return
 
 	case event.Msg.Type == codexEventSessionConfigured:
@@ -465,6 +471,43 @@ func (h *codexMCP) handleNotification(method string, params json.RawMessage, raw
 	}
 
 	h.conn.emit(StreamEvent, raw)
+}
+
+// recordEvent feeds one core event to the session's recording: a begin
+// opens a call, an end closes it, and an event that is a whole call on
+// its own does both.
+func (h *codexMCP) recordEvent(params json.RawMessage) {
+	var envelope struct {
+		Msg codexCoreEvent `json:"msg"`
+	}
+	if !decodeTolerant(params, &envelope) {
+		return
+	}
+	call, phase, ok := codexCoreCall(envelope.Msg, h.spec.Workspace)
+	if !ok {
+		return
+	}
+	if phase == corePhaseBegin {
+		if call.Cwd == "" {
+			call.Cwd = h.spec.Workspace
+		}
+		h.rec.begin(call)
+		return
+	}
+	// Sent under the recording's lock, as on the app-server: completions
+	// arrive on the reader and the flush on the turn's goroutine.
+	h.rec.completeAndEmit(call.ID, func(a *Action) {
+		*a = mergeCall(*a, call)
+		if a.Cwd == "" {
+			a.Cwd = h.spec.Workspace
+		}
+		codexCoreFinish(a, envelope.Msg)
+	}, h.conn.record)
+}
+
+// flushRecording records the calls the turn started and never finished.
+func (h *codexMCP) flushRecording() {
+	h.rec.flushAndEmit(h.conn.record)
 }
 
 // codexMCPTurn is the little this protocol lets a turn accumulate before

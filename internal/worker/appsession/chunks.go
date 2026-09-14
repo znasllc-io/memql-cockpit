@@ -61,15 +61,44 @@ func (s *session) openTranscript(workspace string) error {
 // it produces a gap the reader cannot see and a record that no longer
 // matches what the app printed.
 //
-// Every chunk is subject to limits.max_transcript_bytes. There used to be
-// one exemption -- the chunk that carried a turn's structured answer while
-// AppSessionEnd had no field for it -- and it went with that chunk: the
-// answer rides result_json on the End now, which no transcript cap touches.
+// Narration is subject to limits.max_transcript_bytes, and this is the
+// path narration takes. The one exemption is the recording (emitRecord).
+// The structured answer used to be the other, while AppSessionEnd had no
+// field for it; it rides result_json on the End now, which no transcript
+// cap touches.
 func (s *session) emitChunk(stream string, data []byte) error {
+	return s.emit(stream, data, true)
+}
+
+// emitRecord sends one chunk of the RECORDING -- an action or the
+// fingerprint (record.go, fingerprint.go) -- as an `event` chunk that
+// limits.max_transcript_bytes never swallows.
+//
+// The limit bounds the NARRATION the engine keeps on the session row. The
+// recording is what the app DID: dropping the fortieth call because the
+// app was chatty about the first thirty-nine would record a session that
+// stopped doing things halfway through, in the one record a later replay
+// reads. It is still redacted, still written to the transcript artifact,
+// and still numbered once and retried under that number.
+func (s *session) emitRecord(data []byte) error {
+	return s.emit(StreamEvent, data, false)
+}
+
+// emit is the one send path emitChunk and emitRecord share; capped says
+// whether limits.max_transcript_bytes applies.
+//
+// ONE CHUNK AT A TIME, numbered and sent under sendMu -- the transcript
+// line included, so the artifact reads in the order the stream does. The
+// cost is that a send retrying holds the others back, which is the point:
+// a chunk that overtook it would make the engine drop it.
+func (s *session) emit(stream string, data []byte, capped bool) error {
 	if len(data) == 0 {
 		return nil
 	}
 	clean := s.redact.apply(data)
+
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
 
 	// The transcript artifact carries the FULL output, whatever the
 	// engine's row-level cap is. That is the division of labour the
@@ -85,7 +114,7 @@ func (s *session) emitChunk(stream string, data []byte) error {
 		}
 	}
 
-	if s.transcriptCapReached(int64(len(clean))) {
+	if capped && s.transcriptCapReached(int64(len(clean))) {
 		return nil
 	}
 
@@ -115,7 +144,8 @@ func (s *session) emitChunk(stream string, data []byte) error {
 // sending past it spends bandwidth on bytes that get dropped. Stopping
 // silently, though, would leave a reader believing the run went quiet --
 // so the cap emits one notice naming itself and pointing at the artifact
-// that does have the rest.
+// that does have the rest. The caller holds sendMu, so the notice is sent
+// here directly and in its turn, never through emit.
 func (s *session) transcriptCapReached(n int64) bool {
 	max := s.start.GetLimits().GetMaxTranscriptBytes()
 	if max <= 0 {
@@ -255,6 +285,22 @@ func (s *session) pushOutputs(ctx context.Context) ([]string, error) {
 			_ = s.emitChunk(StreamStderr, []byte("[memql] not pushed to the Library: "+note+"\n"))
 		}
 		for _, f := range produced {
+			// A file holding this session's credential is not output: the
+			// app copied the bearer out of its configuration, and a Library
+			// artifact would keep a credential nothing can revoke long after
+			// the session that held it. A file that cannot be checked is not
+			// pushed either, and counts as a failed push.
+			held, err := s.redact.holdsFile(f.path)
+			if err != nil {
+				failures = append(failures, fmt.Sprintf("%s could not be read: %v", f.rel, err))
+				continue
+			}
+			if held {
+				note := f.rel + " (it holds this session's credential)"
+				s.logger.Warn("app session output not pushed", "file", note)
+				_ = s.emitChunk(StreamStderr, []byte("[memql] not pushed to the Library: "+note+"\n"))
+				continue
+			}
 			id, err := library.Push(pushCtx, f.path, artifactName(f.rel))
 			if err != nil {
 				failures = append(failures, err.Error())

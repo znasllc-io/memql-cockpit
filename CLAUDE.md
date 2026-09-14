@@ -108,7 +108,9 @@ memql-cockpit/
 │   │                       mouse / keyboard / window via RobotGo);
 │   │                       apps/ (local-app detection) + appsession/
 │   │                       (the app-session runner) + harness/ (the
-│   │                       per-app protocol clients) -- see Local apps;
+│   │                       per-app protocol clients; record.go is the
+│   │                       one shape every completed tool call leaves
+│   │                       in) -- see Local apps, App-session recording;
 │   │                       models/ (runtime discovery + the hardware
 │   │                       floor) + modelcall/ (the ModelCall server)
 │   │                       -- see Local models; inference/ (runtime
@@ -213,6 +215,14 @@ Four rules here are load-bearing, and each is the kind that fails silently:
    so deletion is the security control, not housekeeping. A `defer` is not
    enough: every write is recorded in a ledger under the state dir, and
    `appsession.Sweep` clears what a SIGKILL left behind at the next start.
+
+**The app-server's frames carry no `"jsonrpc"` header** -- its README
+says so, and none of a real 0.153.4 turn's lines has one -- so
+`jsonrpcConn.route` recognises a frame by its shape (`rpcMessage.isFrame`:
+the header, or a method, or an id with a result or an error). Requiring the
+header dropped the answer to `initialize` as stray output and hung every
+app-server session at Start while fakes that added it passed: a fake here
+must print what the real binary prints, header included or not.
 
 `usage.known=false` when the app reported nothing, and `exit_code` passes
 through unnormalised -- the engine records the first as billing "unknown" and
@@ -604,6 +614,127 @@ an `errors` array, so a client that only checked the status would read "you may
 not see these rows" as "you are watching nothing" -- and a backup with nothing
 to do looks exactly like one that is up to date. Every call reads `errors`
 first.
+
+## App-session recording (memql-cockpit#440)
+
+Every tool call an app completes leaves the session as ONE normalized
+`event` chunk, and the session's first event is the environment
+fingerprint. Engine half: epic memql#5396, **not merged**; the record is
+the ENGINE repository's
+`docs/superpowers/specs/2026-09-13-app-session-recording-and-learning-program-design.md`
+(epic B; D2, D5, D12, D16), and this repository has no separate record.
+`internal/worker/harness/record.go` is the wire shape;
+`claudeactions.go` / `codexactions.go` translate each app;
+`internal/worker/appsession/record.go` and `fingerprint.go` are the
+machine's side. Operator doc: [docs/local-apps.md](docs/local-apps.md).
+
+**One shape, normalized HERE, so the engine never parses a vendor
+format.** `memql.app_session.action` carries `seq, turn, id, parentId?,
+tool, appTool, args, argsDigest?, argsOmitted?, cwd, command?, mcp?, url?,
+query?, exitCode?, isError?, resultType?, resultDigest?, contents?,
+incomplete?`; `tool` is the closed set exec / fs_read / fs_write / fetch /
+mcp / agent / other.
+`agent` is the app's own bookkeeping (known to touch nothing); `other` is
+unclassified and its effects are UNKNOWN -- guessing `agent` for a tool
+that sent a notification would let a replay skip it. No proto change:
+the type words are namespaced because the same stream carries the apps'
+own events verbatim. `TestActionWireContract` pins the names; the engine
+has not written its decoder, so this repository DEFINES them.
+
+**`seq` counts ACTIONS, densely, from 1, across every turn; the
+fingerprint is 0.** It is not the chunk seq: a gap in it says exactly one
+call is missing, which a chunk gap cannot.
+
+**Every unknown stays unknown.** `exitCode` is present only when the app
+reported one. Claude Code has no exit-code field: a failed Bash result's
+text opens "Exit code N", and a succeeded one exited 0 ONLY when
+`tool_use_result` says it ran to the end in the foreground with no
+`returnCodeInterpretation` -- `grep` finding nothing exits 1 and comes
+back as a success. A call the app started and never finished is flushed
+at the end of its turn with `incomplete: true` and no result: never
+dropped, never assumed. A result line over the 1 MiB parse bound is one
+way that happens. The same rule reaches every field: an item with no
+status (a Codex web search, image view, sleep) records NO `isError`; a
+result nobody reported is ABSENT, never the digest of null (every file
+change would share it); a declined command never ran and has neither an
+exit code nor a result; and a Codex item of a type this build has never
+seen is recorded as `other` with the item as its arguments -- an extra
+`other` costs a replay a fallback, a missing call costs it a skipped one.
+Only the conversation's own item types are left out (`codexNonCallItems`).
+
+**The harness names files; the SESSION decides what leaves the machine.**
+Contents are read when the call completes, only if it succeeded, only if
+the path resolves (symlinks followed) inside the workspace and outside
+the scaffolding (`.mcp.json` with the per-run bearer, `.memql-session/`,
+a moved-aside config, the `.memql-mcp-*` temp file the bearer is written
+through), and only a regular file checked on the OPEN descriptor
+(`O_NONBLOCK|O_NOFOLLOW`, so a pipe cannot hang the session). The check
+is repeated on the file that OPENED -- `/proc/self/fd` on Linux,
+re-resolve plus `os.SameFile` elsewhere -- because a directory swapped for
+a link between the check and the open is followed. The configuration files
+and every directory up to the workspace are also matched BY IDENTITY,
+because a hard link to the bearer's file or a Mac's case-insensitive
+`.MCP.json` is a second name no string compare sees. (A hard link to some
+other file under `.memql-session/` is an ordinary file; the credential scan
+still applies to it.) The write rule and the digest cache use the path that
+OPENED, not the one checked.
+
+**A READ NEVER SENDS MORE OF A FILE THAN THE APP ALREADY DID.** A READ's
+bytes travel only when they equal what the app's own result already carried
+(`Content.Seen`, `json:"-"`: Claude Code's Read record, a Codex command's
+output when its parse names exactly one read). `head -1 .env` reported one
+line, so the rest travels as a digest (`digest_only`). A WRITE's bytes are
+the app's own output and travel, except under a `pushExcludedDirs`
+directory (`.git/config` holds remote URLs and their tokens). A file
+holding any credential the session was given travels as neither data nor
+digest (`contains_credential`), at any size -- it is scanned in the pass
+that hashes it -- and the end-of-session push skips it too
+(`redactor.holdsFile`): the redactor rewrites text on its way out, but it
+never sees inside base64 or a file pushed whole, and the bearer cannot be
+revoked. A remembered digest is trusted only while the redactor holds no
+new credential. 256 KiB per file and 1 MiB per action travel inline; up to 64 MiB
+is digested (remembered by identity, size and mtime once the mtime is 2s
+old, so forty reads of one large file hash it once); the rest carries a
+closed `omitted` reason. The digest is over the whole file, not the window
+the app read. Codex reads with its shell, so its reads come from its own
+command parse (`commandActions` / `parsed_cmd`) and nothing else.
+
+**ONE ACTION IS AT MOST 8 MiB ON THE WIRE** (`maxActionBytes`, under the
+stream's 32 MiB). Arguments travel whole and can carry a file (a Write, a
+Codex patch deleting one), so an oversize action sheds its inline bytes
+first, then its arguments (`args: null`, `argsDigest`, `argsOmitted:
+too_large`, and the command / url / query read out of them), and is not
+sent at all past that -- the hole in the dense seq says so.
+
+**The recording is uncapped.** `limits.max_transcript_bytes` bounds the
+narration the engine keeps on the row; an action is not narration, so
+`Sink.Record` is a method of its own (never a stream word a typo could
+turn into narration) and the session sends it past the cap.
+
+**ORDER ON THE WIRE IS THE ORDER OF THE SEQ, and two locks keep it.** The
+engine DROPS a chunk that arrives behind a higher seq. The session numbers
+and sends every chunk under `sendMu`, because the recording is sent from
+the harness's goroutines while narration goes out from others; and the
+Codex clients complete calls on the reader but flush a turn's open ones
+on the turn's goroutine, so they number and send under the recording's
+own lock (`completeAndEmit` / `flushAndEmit`). Numbering under a lock and
+sending after it loses whichever lower chunk came second. A call routed
+as progress rather than tool activity is recorded after the app's own
+line for it, as a tool call is.
+
+**The fingerprint is facts to compare, so values are digests.** App id,
+version (the session manager's own Detector -- a second probe of the
+binary, not the registration's answer) and harness; platform; a fixed
+toolchain asked `--version` in `/`, cached by binary stamp -- on darwin a
+`/usr/bin` shim is never run without the developer tools, because it
+answers by opening an install dialog from a LaunchAgent; the workspace
+LISTING digest (names and kinds, dependency directories listed but not
+entered, scaffolding left out, a moved-aside config listed under its own
+name); the harness-named variables as set-or-not plus digest; the Library
+inputs. `CODEX_HOME` is deliberately not a named variable: it is fresh
+for every session and would match nothing. The four slow parts run at
+once, in front of the app's start, and a version probe that leaves a
+child holding its stdout is released by `cmd.WaitDelay`.
 
 ## The role is a slug with a rank (memql-cockpit#403)
 

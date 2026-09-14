@@ -349,6 +349,27 @@ func TestDetect_VersionIsCachedButAuthIsNot(t *testing.T) {
 	}
 }
 
+// TestVersion_IsTheInventorysAnswer: the fingerprint's app version comes
+// from the same probe and the same cache the inventory reports from.
+func TestVersion_IsTheInventorysAnswer(t *testing.T) {
+	env := newFakeEnv(t)
+	env.install(t, "claude", "2.1.4 (Claude Code)")
+	d := env.detector()
+	if got := d.Version(context.Background(), IDClaudeCode); got != "2.1.4 (Claude Code)" {
+		t.Errorf("Version = %q", got)
+	}
+	d.Detect(context.Background(), nil)
+	if got := env.calls.Load(); got != 1 {
+		t.Errorf("the version was probed %d times for one binary, want once", got)
+	}
+	if got := d.Version(context.Background(), IDCodex); got != "" {
+		t.Errorf("an app not on PATH has version %q", got)
+	}
+	if got := d.Version(context.Background(), "not-an-app"); got != "" {
+		t.Errorf("an id outside the closed set has version %q", got)
+	}
+}
+
 // TestDetect_UpgradeInPlaceInvalidatesTheCache: replacing the binary must
 // not leave a stale version on the wire until the TTL expires. The cache
 // key carries the binary's size and mtime for exactly this.
