@@ -94,7 +94,8 @@ final class CockpitApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSearc
         NSApp.setActivationPolicy(.accessory)
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.image = MarkParser.image()
-        if item.button?.image == nil { item.button?.title = "MemQL" }
+        item.button?.title = ""
+        item.button?.imagePosition = .imageOnly
         item.button?.setAccessibilityLabel("MemQL Cockpit")
         installApplicationMenu()
         rebuildMenu()
@@ -326,6 +327,29 @@ final class CockpitApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSearc
         else { logText.enclosingScrollView?.contentView.scroll(to: oldPosition) }
         logSummary.stringValue = logFailure ?? "\(visible.count) entries · latest 300 · \(following ? "following" : "follow paused") · local only · credentials redacted"
     }
+}
+
+// Packaging checks the real bundled resource and rasterization, not merely
+// whether an SVG file was copied. A malformed icon must fail the build.
+if CommandLine.arguments.contains("--check-icon") {
+    guard let icon = MarkParser.image(), icon.isTemplate,
+          let tiff = icon.tiffRepresentation,
+          let bitmap = NSBitmapImageRep(data: tiff) else {
+        fputs("MemQL menu icon could not be parsed or rendered.\n", stderr)
+        exit(1)
+    }
+    var visiblePixels = 0
+    for y in 0..<bitmap.pixelsHigh {
+        for x in 0..<bitmap.pixelsWide {
+            if (bitmap.colorAt(x: x, y: y)?.alphaComponent ?? 0) > 0 { visiblePixels += 1 }
+        }
+    }
+    guard visiblePixels > 0, icon.size == NSSize(width: 20, height: 20) else {
+        fputs("MemQL menu icon is empty or has an unexpected size.\n", stderr)
+        exit(1)
+    }
+    print("MemQL icon verified: 20pt template, \(visiblePixels) visible pixels, canonical nine-node mark.")
+    exit(0)
 }
 
 let app = NSApplication.shared

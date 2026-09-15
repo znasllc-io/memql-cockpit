@@ -23,6 +23,7 @@ function main() {
     cp "$REPO_ROOT/native/macos/Info.plist" "$stage/Contents/Info.plist"
     cp "$REPO_ROOT/native/macos/mark.svg" "$stage/Contents/Resources/mark.svg"
     /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$stage/Contents/Info.plist" >&2
+    "$stage/Contents/MacOS/MemQLCockpit" --check-icon >&2 || cap_fail 5 "bundled MemQL menu icon failed rendering validation"
     codesign --force --sign - "$stage" >&2 || cap_fail 5 "menu signing failed"
     mkdir -p "$(dirname "$output")"
     if [[ -d "$output" ]] && diff -qr "$stage" "$output" >/dev/null; then
