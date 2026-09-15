@@ -42,13 +42,23 @@ def local_source(worker, archive, version):
             thread.join()
 
 
+def stop_fixture_process(process):
+    if process.poll() is None:
+        process.terminate()
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=3)
+
+
 def exercise(base, version):
     base = base.rstrip('/')
     with urllib.request.urlopen(base + '/scripts/install/install-mac.sh') as response:
         script = response.read()
     with urllib.request.urlopen(base + '/scripts/install/uninstall-mac.sh') as response:
         uninstaller = response.read()
-    with tempfile.TemporaryDirectory(prefix='memql-full-install-') as temp:
+    with tempfile.TemporaryDirectory(prefix='memql-full-install-') as temp, contextlib.ExitStack() as processes:
         root = pathlib.Path(temp)
         user = root / 'fresh user & space'
         user.mkdir()
@@ -132,15 +142,50 @@ def exercise(base, version):
         for label in [worker_label, menu_label]:
             (state / label).touch()
             (agents / (label + '.plist')).write_bytes(plistlib.dumps({'Label': label, 'ProgramArguments': [str(cli), 'worker', 'run']}))
-        env.update(MEMQL_TEST_STATE=str(state))
+        # Two harmless native wait processes: only the one at the exact
+        # fixture app's embedded path is owned by this uninstall. No AppKit
+        # application is launched and no live user process is targeted. Build
+        # a tiny executable instead of relocating an Apple platform binary.
+        sleeper = root / 'wait-fixture'
+        subprocess.run(['xcrun', 'clang', '-x', 'c', '-o', str(sleeper), '-'],
+                       input=b'#include <unistd.h>\nint main(void) { for (;;) pause(); }\n', check=True, capture_output=True)
+        helper = app / 'Contents/Library/LoginItems/MemQL Menu.app/Contents/MacOS/MemQLCockpit'
+        shutil.copyfile(sleeper, helper)
+        helper.chmod(0o755)
+        menu_process = subprocess.Popen([str(helper), '120'])
+        processes.callback(stop_fixture_process, menu_process)
+        unrelated = root / 'unrelated/MemQLCockpit'
+        unrelated.parent.mkdir()
+        shutil.copyfile(sleeper, unrelated)
+        unrelated.chmod(0o755)
+        unrelated_process = subprocess.Popen([str(unrelated), '120'])
+        processes.callback(stop_fixture_process, unrelated_process)
+        env.update(MEMQL_TEST_STATE=str(state), MEMQL_TEST_CALLS=str(root / 'service-calls'))
         launch.write_text('''#!/bin/bash
 function main() {
-    local label
+    local label pending remaining
+    printf '%s\\n' "$*" >> "$MEMQL_TEST_CALLS"
     case "$1" in
-        print) test -f "$MEMQL_TEST_STATE/${2##*/}" ;;
+        print)
+            label="${2##*/}"
+            pending="$MEMQL_TEST_STATE/$label.pending"
+            if [[ -f "$pending" ]]; then
+                remaining="$(cat "$pending")"
+                if [[ "$remaining" -gt 0 ]]; then
+                    printf '%s\\n' "$((remaining - 1))" > "$pending"
+                    return 0
+                fi
+                rm -f "$pending" "$MEMQL_TEST_STATE/$label"
+            fi
+            test -f "$MEMQL_TEST_STATE/$label" ;;
         bootout)
             [[ "${MEMQL_TEST_FAIL_STOP:-}" != 1 ]] || return 5
-            rm -f "$MEMQL_TEST_STATE/${2##*/}" ;;
+            [[ "${MEMQL_TEST_STUBBORN_STOP:-}" != 1 ]] || return 0
+            if [[ "${MEMQL_TEST_DELAY_STOP:-}" == 1 ]]; then
+                printf '3\\n' > "$MEMQL_TEST_STATE/${2##*/}.pending"
+            else
+                rm -f "$MEMQL_TEST_STATE/${2##*/}"
+            fi ;;
         bootstrap)
             label="$(/usr/libexec/PlistBuddy -c 'Print :Label' "$3")"
             touch "$MEMQL_TEST_STATE/$label" ;;
@@ -149,9 +194,15 @@ function main() {
 }
 main "$@"
 ''')
+        env['MEMQL_TEST_DELAY_STOP'] = '1'
         uninstall('--cluster=https://fixture.invalid')
+        del env['MEMQL_TEST_DELAY_STOP']
+        calls = (root / 'service-calls').read_text().splitlines()
+        stop_index = next(i for i, line in enumerate(calls) if line.startswith('bootout '))
+        assert all(line.startswith('print ') for line in calls[stop_index + 1:stop_index + 5]), 'delayed removal was not rechecked'
         assert cli.exists() and app.exists()
         assert (state / worker_label).exists() and (state / menu_label).exists()
+        assert menu_process.poll() is None and unrelated_process.poll() is None
         registry = (private / 'workers.yaml').read_text()
         mirror = (private / 'worker.yaml').read_text()
         assert token not in registry and token not in mirror
@@ -162,8 +213,18 @@ main "$@"
         uninstall('--cluster=https://other.invalid', expected=5)
         assert cli.exists() and app.exists() and 'mql_wkr_other_fixture' in (private / 'workers.yaml').read_text()
         del env['MEMQL_TEST_FAIL_STOP']
+        env['MEMQL_TEST_STUBBORN_STOP'] = '1'
+        stubborn = uninstall('--cluster=https://other.invalid', expected=5)
+        assert b'still loaded after 10s' in stubborn.stderr
+        assert cli.exists() and app.exists() and (agents / (worker_label + '.plist')).exists()
+        assert 'mql_wkr_other_fixture' in (private / 'workers.yaml').read_text()
+        del env['MEMQL_TEST_STUBBORN_STOP']
+        env['MEMQL_TEST_DELAY_STOP'] = '1'
         uninstall('--cluster=https://other.invalid')
+        del env['MEMQL_TEST_DELAY_STOP']
         assert not app.exists() and not cli.is_symlink()
+        assert menu_process.wait(timeout=3) != 0, 'embedded helper was not terminated'
+        assert unrelated_process.poll() is None, 'unrelated same-name process was stopped'
         assert not list(agents.glob('*.plist')) and not list(state.iterdir())
         assert not (private / 'worker.yaml').exists() and not (private / 'workers.yaml').exists()
         assert all(path.read_bytes() == value for path, value in protected.items())
@@ -189,7 +250,7 @@ main "$@"
         (private / 'worker.yaml').write_text('state_dir: ' + str(private / 'alias/state') + '\n')
         uninstall('--all-homes', '--purge')
         assert (outside / 'state/keep').read_text() == 'untouched'
-        print(json.dumps({'ok': True, 'version': version, 'tested': 'piped HTTP fresh/repeated install; multi-home scoped uninstall and mirror repair; shared purge refusal; failed stop; malformed/missing runtime safety; last-home and repeated cleanup; explicit purge; credentials/backups retained; no OS services or registration; no token output'}))
+        print(json.dumps({'ok': True, 'version': version, 'tested': 'piped HTTP fresh/repeated install; multi-home scoped uninstall and mirror repair; shared purge refusal; delayed bootout and stubborn/failed stop; malformed/missing runtime safety; last-home and repeated cleanup; explicit purge; credentials/backups retained; exact-path embedded helper cleanup with sibling/unrelated process retention; no OS services or registration; no token output'}))
 
 
 def main():

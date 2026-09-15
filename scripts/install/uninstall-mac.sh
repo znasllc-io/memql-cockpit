@@ -133,21 +133,24 @@ function stop_agent() {
     target="gui/$(id -u)/$1"
     if launchctl print "$target" >/dev/null 2>&1; then
         launchctl bootout "$target" >/dev/null 2>&1 || true
-        if launchctl print "$target" >/dev/null 2>&1; then
-            echo "ERROR: could not stop $label; runtime files retained" >&2
-            return 5
-        fi
+        # bootout can return before launchd removes the job. Allow up to ten
+        # seconds for that transition, including a final check at the deadline.
+        # A successful bootout alone never authorizes deleting runtime files.
+        local attempt
+        for ((attempt = 0; attempt <= 40; attempt++)); do
+            if ! launchctl print "$target" >/dev/null 2>&1; then
+                return 0
+            fi
+            [[ "$attempt" -lt 40 ]] || break
+            sleep 0.25
+        done
+        echo "ERROR: could not stop $label (still loaded after 10s); runtime files retained" >&2
+        return 5
     fi
 }
 
-# remove_launch_agent unloads and removes the LaunchAgent, the current
-# label and the pre-rename one. `launchctl unload` is what
-# install-mac.sh's own restart uses, so an agent it could load this can
-# unload; a failed unload (not loaded in this session) is a WARN and
-# the plist still goes, because a KeepAlive plist left on disk is a
-# worker that comes back at the next login. A machine with no launchctl
-# on PATH -- nothing macOS ships, but lib_test.sh runs this script on
-# Linux -- is told, and gets the file removal only.
+# Stop each managed agent before removing its plist. Missing agents are safe
+# to clean up; a still-loaded agent aborts removal so a retry can finish later.
 function remove_launch_agent() {
     local plist_dir="${HOME}/Library/LaunchAgents"
     local label plist
@@ -156,6 +159,53 @@ function remove_launch_agent() {
         stop_agent "$label" || return $?
         remove_path_if_present "$plist"
     done
+}
+
+# A helper opened directly can outlive its LaunchAgent. Match the current
+# user's exact executable and its mapped text file before sending one TERM.
+function menu_process_matches() {
+    local pid="$1" expected="$2" owner="" state="" executable=""
+    read -r owner state executable < <(/bin/ps -ww -p "$pid" -o uid=,stat=,comm=)
+    [[ "$owner" == "$EUID" && "$state" != Z* && "$executable" == "$expected" ]]
+}
+
+function stop_menu_bundle() {
+    local app="$1" expected_id="$2" relative="$3" helper identifier canonical
+    [[ -d "$app" && ! -L "$app" ]] || return 0
+    identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null || true)"
+    [[ "$identifier" == "$expected_id" ]] || return 0
+    helper="$app/$relative"
+    [[ -f "$helper" && ! -L "$helper" ]] || return 0
+    canonical="$(cd -P "$(dirname "$helper")" && pwd)/$(basename "$helper")"
+    local processes pid owner executable attempt
+    processes="$(/bin/ps -awwxo pid=,uid=,comm=)" || return 4
+    while read -r pid owner executable; do
+        [[ "$owner" == "$EUID" && "$executable" == "$helper" ]] || continue
+        menu_process_matches "$pid" "$helper" || continue
+        if ! /usr/sbin/lsof -a -p "$pid" -d txt -Fn 2>/dev/null | grep -Fx -- "n$canonical" >/dev/null; then
+            menu_process_matches "$pid" "$helper" || continue
+            echo "ERROR: could not verify menu executable for PID $pid; app retained" >&2
+            return 3
+        fi
+        kill -TERM "$pid" 2>/dev/null || true
+        for ((attempt = 0; attempt <= 40; attempt++)); do
+            menu_process_matches "$pid" "$helper" || break
+            [[ "$attempt" -lt 40 ]] || break
+            sleep 0.25
+        done
+        if menu_process_matches "$pid" "$helper"; then
+            echo "ERROR: menu PID $pid remains running after 10s; app retained" >&2
+            return 5
+        fi
+        echo "INFO: stopped menu process $pid at $helper"
+    done <<< "$processes"
+}
+
+function stop_remaining_menus() {
+    local app="$HOME/Applications/MemQL.app"
+    [[ "$REMOVE_MODE" != system ]] || app="/Applications/MemQL.app"
+    stop_menu_bundle "$app" com.znasllc.memql-worker 'Contents/Library/LoginItems/MemQL Menu.app/Contents/MacOS/MemQLCockpit' || return $?
+    stop_menu_bundle "$HOME/Applications/MemQL Cockpit.app" com.znasllc.memql-cockpit-menubar 'Contents/MacOS/MemQLCockpit'
 }
 
 # Only the standard companion bundle bearing our identifier is removed.
@@ -263,6 +313,7 @@ function main() {
         [[ "$OTHER_HOMES" -eq 0 ]] || exit 0
     fi
     remove_launch_agent || exit $?
+    stop_remaining_menus || exit $?
     remove_menu_companion
     remove_binaries_with_mode "$REMOVE_MODE" || binary_rc=$?
     remove_worker_app || binary_rc=1

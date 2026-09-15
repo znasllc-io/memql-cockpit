@@ -71,6 +71,10 @@ If another home remains (including a disabled home), the shared app, CLI, menu,
 policy and state stay. A running worker is stopped before the change and reloaded
 for its remaining homes; a stopped worker is not started. The last enrollment
 removes the shared runtime, current and known legacy agents, and standard app.
+Uninstall waits up to ten seconds for launchd to remove each stopped service.
+A directly opened embedded menu is terminated only after its UID, exact executable
+path and mapped executable are verified; a helper that stays running prevents
+app deletion. Other enrollments keep the shared menu running.
 No cluster token files means a repeated removal can finish partial file cleanup.
 If tokens remain but the worker binary is missing or the YAML is invalid, scoped
 removal refuses safely; restore the files or explicitly choose full removal.
