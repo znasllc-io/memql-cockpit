@@ -105,3 +105,14 @@ to be renewed. Replacing the worker must preserve its symlink, configuration,
 policy and service arguments. The menu installer changes only its own app and
 LaunchAgent and leaves a previous app bundle in the staging directory beside
 the destination when replacing one.
+
+## Release inventory
+
+The release workflow attaches a CycloneDX JSON and XML SBOM for each of the
+eight worker binaries after all builds finish. Each inventory is read from the
+actual artifact and includes its binary hashes, build settings, and Go modules.
+The tool does not execute downloaded binaries. Relationships and licenses not
+present in build metadata are not inferred. These files replace the old
+module-wide SBOM job, which failed while resolving unused engine modules at
+unpublished placeholder versions; they do not inventory native system libraries
+or the Swift companion.

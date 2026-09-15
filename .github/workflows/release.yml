@@ -229,3 +229,11 @@ jobs:
             > memql-computeruse-SHA256SUMS
           cat memql-computeruse-SHA256SUMS
           gh release upload "$TAG" memql-computeruse-SHA256SUMS --clobber
+
+  sbom:
+    needs: [build, computeruse, computeruse-checksums]
+    permissions:
+      contents: write
+    uses: ./.github/workflows/sbom.yml
+    with:
+      tag: ${{ github.event.release.tag_name || inputs.tag }}
