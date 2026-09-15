@@ -1,5 +1,62 @@
 # macOS menu bar companion
 
+## Native MemQL app (development; planned for 0.15)
+
+Computer-use installations use a real `MemQL.app`. Its **main executable is
+the Go worker**, with bundle identifier `com.znasllc.memql-worker`, display name
+`MemQL`, and a native `.icns` generated from the canonical nine-node mark.
+The Swift menu helper is embedded at
+`Contents/Library/LoginItems/MemQL Menu.app`. Both appearances use the same mark;
+the permission window groups the two grants and hides PID/path/build details
+behind **Show technical details**.
+
+The worker LaunchAgent targets `MemQL.app/Contents/MacOS/MemQL` directly, and
+the installed `memql` CLI symlink points to that same executable. Status reports
+`bundle_id` and `bundle_path` from the actual worker's Core Foundation main
+bundle, rather than inferring identity from a filename. Finder reveals the app
+reported by that worker. Opening MemQL from Finder opens its embedded menu;
+invoking the `memql` CLI keeps normal command-line behavior.
+
+The menu registers both bundles with Launch Services. The worker plist includes
+`AssociatedBundleIdentifiers`; the active executable remains the app's main
+worker. Registration and labels do not imply TCC grants: macOS must approve the
+actual bundle, and only current-worker preflight results can confirm access.
+Raw executable grants are not silently moved or reset during migration.
+
+The token installer selects this layout for computer-use version 0.15 and
+later, with the exact matching `memql-app-darwin-{arm64,amd64}.tar.gz` and SHA256
+sidecar. Older releases and headless workers retain the standalone companion.
+User-local installs use `~/Applications/MemQL.app`; system installs use the
+root-owned `/Applications/MemQL.app`, preserving the system CLI's ownership
+boundary. `--no-menu` skips the helper service; `--no-service` installs files
+without starting either service.
+
+Installation separates file placement from per-user service activation:
+
+```sh
+scripts/macos/build-app.sh --worker=/absolute/built/worker --version=VERSION
+scripts/macos/install-app-files.sh --app=/absolute/built/MemQL.app \
+  --destination=/absolute/Applications/MemQL.app --cli-path=/absolute/bin/memql
+# Register after placement; this mode opens no window and starts no worker.
+"/absolute/Applications/MemQL.app/Contents/Library/LoginItems/MemQL Menu.app/Contents/MacOS/MemQLCockpit" --register-bundles
+scripts/macos/activate-app.sh --app=/absolute/Applications/MemQL.app
+```
+
+Existing service arguments, environment and log locations are preserved.
+Previous bundles/CLI links and agent plists are retained for rollback. Known
+legacy worker agents and the old standalone menu are retired; unrelated apps,
+enrollments, credentials, policies and models are not modified. Activation
+records the bundle fingerprints and avoids restarting an unchanged install.
+The uninstaller removes only the standard matching bundle for the selected
+prefix; custom destinations and rollback copies remain.
+
+This layout fixes app attribution and presentation; it does **not** turn an
+ad-hoc signature into a stable distribution identity. Developer ID provisioning
+and signed-upgrade validation below remain necessary. The bundle's minimum
+macOS version is read from the actual worker Mach-O build metadata.
+
+## Released 0.14 companion
+
 Cockpit 0.14.0 and later include the companion in the macOS token installer
 used by MemQL OS. Both headless and computer-use installations get the menu;
 `--no-menu` skips it and `--no-service` skips both LaunchAgents. Older explicitly
@@ -103,7 +160,7 @@ and offer **Install or update Cockpit** if the handler is unavailable. Opening
 the URL is never evidence of installation or granted permissions. There is no
 HTTP bridge and no remote grant/restart endpoint.
 
-Local status adds `executable`, `permission_requests` and
+Local status adds `executable`, `bundle_id`, `bundle_path`, `permission_requests` and
 `permission_request_pending`. The explicit CLI equivalent is:
 
 ```sh

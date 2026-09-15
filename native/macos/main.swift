@@ -1,5 +1,13 @@
 import AppKit
 import Foundation
+import CoreServices
+
+func registerContainingBundles() -> Bool {
+    let helper = Bundle.main.bundleURL
+    let outer = helper.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    guard Bundle(url: outer)?.bundleIdentifier == "com.znasllc.memql-worker" else { return false }
+    return LSRegisterURL(outer as CFURL, true) == noErr && LSRegisterURL(helper as CFURL, true) == noErr
+}
 
 struct HomeStatus: Decodable {
     let id: String
@@ -16,6 +24,8 @@ struct WorkerStatus: Decodable {
     let screen_recording: String
     let checked_at: String
     let executable: String?
+    let bundle_id: String?
+    let bundle_path: String?
     let permission_requests: Bool?
     let permission_request_pending: Bool?
 
@@ -41,43 +51,6 @@ struct Reply: Decodable {
     let error: String?
     let status: WorkerStatus?
     let logs: [LogEntry]?
-}
-
-// Read the canonical MemQL SVG geometry. The original mark is bundled,
-// rather than approximating it with a system glyph or redrawing a variant.
-final class MarkParser: NSObject, XMLParserDelegate {
-    var edges: [(CGFloat, CGFloat, CGFloat, CGFloat)] = []
-    var nodes: [(CGFloat, CGFloat, CGFloat)] = []
-    func parser(_ parser: XMLParser, didStartElement name: String, namespaceURI: String?, qualifiedName: String?, attributes: [String: String]) {
-        func n(_ key: String) -> CGFloat { CGFloat(Double(attributes[key] ?? "0") ?? 0) }
-        if name == "line" { edges.append((n("x1"), n("y1"), n("x2"), n("y2"))) }
-        if name == "circle" { nodes.append((n("cx"), n("cy"), n("r"))) }
-    }
-    static func image() -> NSImage? {
-        guard let url = Bundle.main.url(forResource: "mark", withExtension: "svg"),
-              let parser = XMLParser(contentsOf: url) else { return nil }
-        let shape = MarkParser()
-        parser.delegate = shape
-        guard parser.parse(), shape.nodes.count == 9 else { return nil }
-        let image = NSImage(size: NSSize(width: 20, height: 20), flipped: true) { rect in
-            NSColor.black.set()
-            let scale = rect.width / 24
-            let lines = NSBezierPath()
-            lines.lineWidth = 0.78 * scale
-            lines.lineCapStyle = .round
-            for (x1, y1, x2, y2) in shape.edges {
-                lines.move(to: NSPoint(x: x1 * scale, y: y1 * scale))
-                lines.line(to: NSPoint(x: x2 * scale, y: y2 * scale))
-            }
-            lines.stroke()
-            for (x, y, r) in shape.nodes {
-                NSBezierPath(ovalIn: NSRect(x: (x-r)*scale, y: (y-r)*scale, width: 2*r*scale, height: 2*r*scale)).fill()
-            }
-            return true
-        }
-        image.isTemplate = true
-        return image
-    }
 }
 
 final class CockpitApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSearchFieldDelegate, NSWindowDelegate {
@@ -108,12 +81,13 @@ final class CockpitApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSearc
     }()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        _ = registerContainingBundles()
         NSApp.setActivationPolicy(.accessory)
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.image = MarkParser.image()
         item.button?.title = ""
         item.button?.imagePosition = .imageOnly
-        item.button?.setAccessibilityLabel("MemQL Cockpit")
+        item.button?.setAccessibilityLabel("MemQL")
         installApplicationMenu()
         rebuildMenu()
         refresh()
@@ -137,7 +111,7 @@ final class CockpitApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSearc
     private func installApplicationMenu() {
         let main = NSMenu()
         let appItem = NSMenuItem()
-        let appMenu = NSMenu(title: "MemQL Cockpit")
+        let appMenu = NSMenu(title: "MemQL")
         appMenu.addItem(entry("Show Cockpit Menu", action: #selector(showCockpitMenu)))
         appMenu.addItem(entry("Show Logs…", action: #selector(showLogs)))
         appMenu.addItem(entry("Set Up Permissions…", action: #selector(showPermissions)))
@@ -200,12 +174,13 @@ final class CockpitApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSearc
             self.busy = false
             self.snapshot = reply?.ok == true ? reply?.status : nil
             self.workerError = error ?? "Background worker unavailable"
-            self.item.button?.toolTip = self.snapshot.map { "MemQL Cockpit · \($0.homes.filter { $0.state == "Connected" }.count) connected" } ?? "MemQL Cockpit · worker unavailable"
+            self.item.button?.toolTip = self.snapshot.map { "MemQL · \($0.homes.filter { $0.state == "Connected" }.count) connected" } ?? "MemQL · worker unavailable"
             if !self.trackingMenu { self.rebuildMenu() }
             self.permissionWindow?.update(self.snapshot?.permissionReport)
+            let setupKey = "permissionSetupShown.\(self.snapshot?.bundle_id ?? "standalone").\(self.snapshot?.version ?? "unknown")"
             if let report = self.snapshot?.permissionReport, report.fresh(), report.requestsSupported,
-               !report.granted(), !UserDefaults.standard.bool(forKey: "permissionSetupShown") {
-                UserDefaults.standard.set(true, forKey: "permissionSetupShown")
+               !report.granted(), !UserDefaults.standard.bool(forKey: setupKey) {
+                UserDefaults.standard.set(true, forKey: setupKey)
                 self.showPermissions()
             }
         }
@@ -222,7 +197,7 @@ final class CockpitApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSearc
     }
     private func rebuildMenu() {
         let menu = NSMenu(); menu.delegate = self; menu.autoenablesItems = false
-        menu.addItem(heading("MemQL Cockpit"))
+        menu.addItem(heading("MemQL"))
         if let snapshot {
             menu.addItem(heading("Worker running · \(snapshot.homes.filter { $0.state == "Connected" }.count) of \(snapshot.homes.count) servers connected"))
             menu.addItem(.separator())
@@ -280,7 +255,10 @@ final class CockpitApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSearc
     @objc private func openAccessibility() { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!) }
     @objc private func openScreenRecording() { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!) }
     @objc private func revealWorker() {
-        let url = workerExecutableURL().resolvingSymlinksInPath()
+        let url: URL
+        if snapshot?.bundle_id == "com.znasllc.memql-worker", let path = snapshot?.bundle_path {
+            url = URL(fileURLWithPath: path)
+        } else { url = workerExecutableURL().resolvingSymlinksInPath() }
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
     @objc private func quitMenu() { NSApp.terminate(nil) }
@@ -356,7 +334,7 @@ final class CockpitApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSearc
     }
     private func makeLogWindow() {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 580), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = "MemQL Cockpit — Worker Logs"
+        window.title = "MemQL — Worker Logs"
         window.minSize = NSSize(width: 650, height: 360)
         window.isReleasedWhenClosed = false
         window.delegate = self
@@ -434,6 +412,38 @@ final class CockpitApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSearc
         else { logText.enclosingScrollView?.contentView.scroll(to: oldPosition) }
         logSummary.stringValue = logFailure ?? "\(visible.count) entries · latest 300 · \(following ? "following" : "follow paused") · local only · credentials redacted"
     }
+}
+
+// Register both real bundles without showing UI or starting the worker.
+// The app installer invokes this after placing the containing bundle.
+if CommandLine.arguments.contains("--register-bundles") {
+    guard registerContainingBundles() else {
+        fputs("MemQL bundle registration failed.\n", stderr); exit(1)
+    }
+    exit(0)
+}
+
+// Build-time icon generation uses the same canonical vector geometry as the
+// menu mark, rendered at every native icon resolution.
+if let arg = CommandLine.arguments.first(where: { $0.hasPrefix("--write-iconset=") }) {
+    let directory = URL(fileURLWithPath: String(arg.dropFirst("--write-iconset=".count)))
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    for size in [16, 32, 128, 256, 512] {
+        for factor in [1, 2] {
+            let pixels = size * factor
+            guard let mark = MarkParser.image(size: CGFloat(pixels), template: false),
+                  let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: pixels, pixelsHigh: pixels,
+                    bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                    colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
+                  let context = NSGraphicsContext(bitmapImageRep: bitmap) else { exit(1) }
+            NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = context
+            mark.draw(in: NSRect(x: 0, y: 0, width: pixels, height: pixels))
+            NSGraphicsContext.restoreGraphicsState()
+            let name = "icon_\(size)x\(size)\(factor == 2 ? "@2x" : "").png"
+            try bitmap.representation(using: .png, properties: [:])!.write(to: directory.appendingPathComponent(name))
+        }
+    }
+    exit(0)
 }
 
 // Packaging checks the real bundled resource and rasterization, not merely

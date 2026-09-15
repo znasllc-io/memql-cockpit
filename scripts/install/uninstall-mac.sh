@@ -16,8 +16,8 @@
 # Usage:
 #   ./uninstall-mac.sh [--purge] [--user-local]
 #
-# What this never touches: anything outside ~/.memql, the two
-# LaunchAgent plists, and the binary paths under the chosen prefix.
+# Scope: ~/.memql, the managed LaunchAgents, binary paths under the chosen
+# prefix, and the standard MemQL app for that prefix. Rollback copies remain.
 # The machine's registration on the cluster is revoked from MemQL OS
 # (Fleet -> Machines), not from here -- by the time this script could
 # ask, the token that would have spoken for the machine is gone.
@@ -66,8 +66,8 @@ Usage: $(basename "$0") [options]
 
 Removes memql-worker from this machine: the LaunchAgent, the binary
 and its symlink, and ~/.memql/workers.yaml plus the legacy
-worker.yaml (the tokens). Nothing outside ~/.memql, the plist files
-and the binary path is touched.
+worker.yaml (the tokens). Also removes the standard MemQL app and menu helper;
+custom app destinations and rollback copies are retained.
 
 Options:
     --user-local              Remove a --user-local install from
@@ -121,7 +121,7 @@ function remove_launch_agent() {
         echo "INFO: launchctl not found; not unloading the LaunchAgent (the plist files are still removed)"
     fi
     local label plist
-    for label in "$SERVICE_LABEL_DARWIN" "$LEGACY_LABEL_DARWIN" "com.znasllc.memql-cockpit-menubar"; do
+    for label in "$SERVICE_LABEL_DARWIN" "$LEGACY_LABEL_DARWIN" "com.visionarys.memql-cockpit-worker" "com.znasllc.memql-cockpit-menubar"; do
         plist="${plist_dir}/${label}.plist"
         if [[ ! -f "$plist" ]]; then
             # The legacy plist is absent on every machine installed
@@ -164,6 +164,27 @@ function remove_menu_companion() {
     record_removed "$app"
 }
 
+function remove_worker_app() {
+    local app identifier
+    case "$REMOVE_MODE" in system) app="/Applications/MemQL.app" ;; *) app="$HOME/Applications/MemQL.app" ;; esac
+    [[ -e "$app" || -L "$app" ]] || return 0
+    if [[ -L "$app" || ! -d "$app" ]]; then record_kept "$app"; return 1; fi
+    identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null || true)"
+    if [[ "$identifier" != com.znasllc.memql-worker ]]; then
+        echo "WARN: leaving unrelated app at $app"; record_kept "$app"; return 1
+    fi
+    case "$REMOVE_MODE" in
+        system)
+            if ! require_sudo uninstall || ! sudo rm -rf "$app"; then record_kept "$app"; return 1; fi
+            ;;
+        *)
+            if [[ ! -O "$app" ]]; then record_kept "$app"; return 1; fi
+            rm -rf "$app"
+            ;;
+    esac
+    record_removed "$app"
+}
+
 function main() {
     parse_args "$@"
     # Read BEFORE the token files go: --purge deletes the directory the
@@ -182,6 +203,7 @@ function main() {
     # code carries the leftover.
     local binary_rc=0
     remove_binaries_with_mode "$REMOVE_MODE" || binary_rc=$?
+    remove_worker_app || binary_rc=1
     remove_worker_config
     if [[ "$PURGE" == "yes" ]]; then
         purge_worker_state "$state_dir"

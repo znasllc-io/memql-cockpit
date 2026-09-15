@@ -21,7 +21,9 @@ enum PermissionSetupTests {
         precondition(progress.observe(nil, now: now) == nil)
         precondition(!progress.ready(nil, now: now), "Offline cannot mean ready")
         precondition(progress.observe(report(pid: 101, age: 16), now: now) == nil, "Stale report cannot confirm restart")
-        precondition(progress.observe(report(pid: 101, screen: "Not granted"), now: now) != nil)
+        let restartResult = progress.observe(report(pid: 101, screen: "Not granted"), now: now)
+        precondition(restartResult?.hasPrefix("Restart complete.") == true)
+        precondition(restartResult?.contains("Checking") == false, "Completed restart must not leave a transient checking banner")
         precondition(!progress.ready(report(pid: 101, screen: "Not granted"), now: now), "New PID alone cannot grant access")
         precondition(progress.ready(report(pid: 101), now: now))
         progress.begin(pid: 101, now: now)
@@ -40,14 +42,15 @@ enum PermissionSetupTests {
             // request, deep-link registration or service action.
             let app = NSApplication.shared
             app.setActivationPolicy(.prohibited)
-            let setup = PermissionSetupWindow()
+            let setup = PermissionSetupWindow(logoImage: MarkParser.image(size: 48, template: false,
+                resourceURL: URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("native/macos/mark.svg")))
             setup.update(PermissionReport(pid: 57495, version: "preview", executable: "/Users/example/.memql/bin/memql-computeruse-darwin-arm64",
                 accessibility: "Not granted", screenRecording: "Not granted", requestsSupported: true, requestPending: false, checkedAt: Date()))
             let view = setup.window!.contentView!
-            let appearance = NSAppearance(named: .aqua)!
+            let appearance = NSAppearance(named: CommandLine.arguments.contains("--dark") ? .darkAqua : .aqua)!
             view.appearance = appearance
             view.wantsLayer = true
-            view.layer?.backgroundColor = NSColor.white.cgColor
+            appearance.performAsCurrentDrawingAppearance { view.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor }
             view.layoutSubtreeIfNeeded()
             let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds)!
             appearance.performAsCurrentDrawingAppearance { view.cacheDisplay(in: view.bounds, to: bitmap) }

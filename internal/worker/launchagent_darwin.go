@@ -5,9 +5,11 @@ package worker
 import (
 	"errors"
 	"fmt"
+	"html"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 )
 
 const launchAgentLabel = "com.znasllc.memql-worker"
@@ -40,6 +42,11 @@ func InstallLaunchAgent(binaryPath string) error {
 	if abs, err := filepath.Abs(binaryPath); err == nil {
 		binaryPath = abs
 	}
+	association := ""
+	if real, err := filepath.EvalSymlinks(binaryPath); err == nil && strings.HasSuffix(real, "/MemQL.app/Contents/MacOS/MemQL") {
+		binaryPath = real
+		association = "<key>AssociatedBundleIdentifiers</key><array><string>com.znasllc.memql-worker</string></array>"
+	}
 
 	stateDir := filepath.Join(home, ".memql", "state")
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
@@ -64,6 +71,7 @@ func InstallLaunchAgent(binaryPath string) error {
 <dict>
     <key>Label</key>
     <string>%s</string>
+    %s
     <key>ProgramArguments</key>
     <array>
         <string>%s</string>
@@ -87,7 +95,7 @@ func InstallLaunchAgent(binaryPath string) error {
     </dict>
 </dict>
 </plist>
-`, launchAgentLabel, binaryPath, stateDir, stateDir, home)
+`, launchAgentLabel, association, html.EscapeString(binaryPath), html.EscapeString(stateDir), html.EscapeString(stateDir), html.EscapeString(home))
 
 	if err := os.WriteFile(plistPath, []byte(plist), 0o644); err != nil {
 		return fmt.Errorf("launch agent: write plist: %w", err)

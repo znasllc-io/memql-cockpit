@@ -49,6 +49,8 @@ type LocalStatus struct {
 	PermissionDetail         string            `json:"permission_detail"`
 	CheckedAt                time.Time         `json:"checked_at"`
 	Executable               string            `json:"executable,omitempty"`
+	BundleID                 string            `json:"bundle_id,omitempty"`
+	BundlePath               string            `json:"bundle_path,omitempty"`
 	PermissionRequests       bool              `json:"permission_requests"`
 	PermissionRequestPending bool              `json:"permission_request_pending"`
 }
@@ -68,6 +70,7 @@ func (f *Fleet) LocalStatus() LocalStatus {
 	p := currentPermissionSnapshot()
 	status := LocalStatus{Version: cockpitVersion(), PID: os.Getpid(), Homes: []LocalHomeStatus{}, Accessibility: permissionLabel(p.accessibility), ScreenRecording: permissionLabel(p.screenRecording), PermissionDetail: p.detail, CheckedAt: time.Now()}
 	status.Executable, _ = os.Executable()
+	status.BundleID, status.BundlePath = currentWorkerBundle()
 	status.PermissionRequests = permissionRequestsSupported()
 	status.PermissionRequestPending = localPermissionRequests.pending.Load()
 	f.mu.Lock()

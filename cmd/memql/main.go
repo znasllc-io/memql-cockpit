@@ -67,6 +67,9 @@ func main() {
 	// from rather than a second constant somebody has to remember to
 	// bump (memql-cockpit#346's registration row is read by /machines).
 	worker.SetVersion(version)
+	if openBundledApplication() {
+		return
+	}
 
 	if len(os.Args) < 2 {
 		printUsage()

@@ -1266,7 +1266,7 @@ function fetch_macos_menu() {
             'MemQL Cockpit.app/'|'MemQL Cockpit.app/Contents/'|'MemQL Cockpit.app/Contents/MacOS/'|\
             'MemQL Cockpit.app/Contents/Resources/'|'MemQL Cockpit.app/Contents/_CodeSignature/'|\
             'MemQL Cockpit.app/Contents/Info.plist'|'MemQL Cockpit.app/Contents/MacOS/MemQLCockpit'|\
-            'MemQL Cockpit.app/Contents/Resources/mark.svg'|'MemQL Cockpit.app/Contents/_CodeSignature/CodeResources'|\
+            'MemQL Cockpit.app/Contents/Resources/mark.svg'|'MemQL Cockpit.app/Contents/Resources/MemQL.icns'|'MemQL Cockpit.app/Contents/_CodeSignature/CodeResources'|\
             scripts/|scripts/lib/|scripts/macos/|scripts/lib/capability.sh|scripts/macos/install-menubar.sh) ;;
             *) echo "ERROR: unexpected menu archive path: $entry" >&2; return 3 ;;
         esac
@@ -1274,4 +1274,39 @@ function fetch_macos_menu() {
     mkdir -p "$stage/unpacked"
     tar -xzf "$stage/$asset" -C "$stage/unpacked" || return 5
     [[ -x "$stage/unpacked/MemQL Cockpit.app/Contents/MacOS/MemQLCockpit" && -f "$stage/unpacked/scripts/macos/install-menubar.sh" && -f "$stage/unpacked/scripts/lib/capability.sh" ]] || return 3
+}
+
+# The full app carries the permission-bearing worker plus an embedded menu.
+# Keep a closed file list; never extract links, extra tools, or traversal paths.
+function fetch_macos_app() {
+    local base="$1" arch="$2" stage="$3" asset expected actual entry normalized
+    [[ "$arch" == arm64 || "$arch" == amd64 ]] || return 2
+    asset="memql-app-darwin-${arch}.tar.gz"
+    curl -fsSL --max-filesize 120000000 "${base}/${asset}" -o "$stage/$asset" || return 5
+    curl -fsSL --max-filesize 1024 "${base}/${asset}.sha256" -o "$stage/checksum" || return 5
+    expected="$(awk -v asset="$asset" 'NF == 2 && $2 == asset { print $1 }' "$stage/checksum")"
+    [[ "$expected" =~ ^[[:xdigit:]]{64}$ ]] || return 3
+    actual="$(shasum -a 256 "$stage/$asset" | awk '{print $1}')"
+    [[ "$expected" == "$actual" ]] || { echo "ERROR: MemQL app checksum mismatch" >&2; return 3; }
+    tar -tzf "$stage/$asset" > "$stage/entries" || return 3
+    tar -tvzf "$stage/$asset" > "$stage/types" || return 3
+    if grep -qvE '^[-d]' "$stage/types"; then echo "ERROR: app archive contains a link or special file" >&2; return 3; fi
+    while IFS= read -r entry; do
+        normalized="$entry"
+        case "$entry" in
+            'MemQL.app/Contents/Library/LoginItems/MemQL Menu.app/'*) normalized="menu/${entry#MemQL.app/Contents/Library/LoginItems/MemQL Menu.app/}" ;;
+            'MemQL.app/'*) normalized="app/${entry#MemQL.app/}" ;;
+        esac
+        case "$normalized" in
+            app/|app/Contents/|app/Contents/MacOS/|app/Contents/Resources/|app/Contents/Library/|app/Contents/Library/LoginItems/|\
+            app/Contents/Info.plist|app/Contents/MacOS/MemQL|app/Contents/Resources/MemQL.icns|app/Contents/_CodeSignature/|app/Contents/_CodeSignature/CodeResources|\
+            menu/|menu/Contents/|menu/Contents/MacOS/|menu/Contents/Resources/|menu/Contents/Info.plist|menu/Contents/MacOS/MemQLCockpit|\
+            menu/Contents/Resources/mark.svg|menu/Contents/Resources/MemQL.icns|menu/Contents/_CodeSignature/|menu/Contents/_CodeSignature/CodeResources|\
+            scripts/|scripts/lib/|scripts/macos/|scripts/lib/capability.sh|scripts/macos/install-app-files.sh|scripts/macos/activate-app.sh|scripts/macos/install-menubar.sh) ;;
+            *) echo "ERROR: unexpected app archive path: $entry" >&2; return 3 ;;
+        esac
+    done < "$stage/entries"
+    mkdir -p "$stage/unpacked"
+    tar -xzf "$stage/$asset" -C "$stage/unpacked" || return 5
+    [[ -x "$stage/unpacked/MemQL.app/Contents/MacOS/MemQL" && -f "$stage/unpacked/scripts/macos/install-app-files.sh" && -f "$stage/unpacked/scripts/macos/activate-app.sh" && -f "$stage/unpacked/scripts/macos/install-menubar.sh" && -f "$stage/unpacked/scripts/lib/capability.sh" ]] || return 3
 }
