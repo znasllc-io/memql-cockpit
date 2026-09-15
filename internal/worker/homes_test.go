@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -151,17 +152,19 @@ func TestRemoveHome(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	w, err := RemoveHome(workers, "a", false)
+	res, err := RemoveHome(workers, legacy, "a", false)
 	if err != nil {
 		t.Fatal(err)
 	}
+	w := res.Workers
 	if len(w.Homes) != 1 || w.Homes[0].ID != "b" {
 		t.Fatalf("after remove: %+v", w.Homes)
 	}
-	w, err = RemoveHome(workers, "b", true)
+	res, err = RemoveHome(workers, legacy, "b", true)
 	if err != nil {
 		t.Fatal(err)
 	}
+	w = res.Workers
 	if len(w.Homes) != 1 || w.Homes[0].IsEnabled() {
 		t.Fatalf("disableOnly left enabled: %+v", w.Homes[0])
 	}
@@ -337,5 +340,224 @@ func TestUpsertHomeForceRequiredForIDRemap(t *testing.T) {
 	}
 	if len(w.Homes) != 1 || w.Homes[0].ClusterURL != "https://api.other.example" {
 		t.Fatalf("force remap failed: %+v", w.Homes)
+	}
+}
+
+// pairTwo enrolls homes a and b through UpsertHome, which also writes
+// the legacy mirror -- naming b, the one upserted last.
+func pairTwo(t *testing.T) (workers, legacy string) {
+	t.Helper()
+	dir := t.TempDir()
+	workers = filepath.Join(dir, "workers.yaml")
+	legacy = filepath.Join(dir, "worker.yaml")
+	for _, h := range []struct{ id, url, tok string }{
+		{"a", "https://a.example", "mql_wkr_aaaaaaaaaaaaaa"},
+		{"b", "https://b.example", "mql_wkr_bbbbbbbbbbbbbb"},
+	} {
+		if _, err := UpsertHome(UpsertHomeOptions{WorkersPath: workers, LegacyPath: legacy, ID: h.id, ClusterURL: h.url, Token: h.tok}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return workers, legacy
+}
+
+func mirrorToken(t *testing.T, legacy string) string {
+	t.Helper()
+	cfg, err := LoadFile(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg.Token
+}
+
+// TestUnpairingTheMirroredHomeRewritesTheMirror (memql-cockpit#429). The
+// mirror named b; removing b must leave no copy of b's token behind, and
+// point the mirror at a home that is still enabled.
+func TestUnpairingTheMirroredHomeRewritesTheMirror(t *testing.T) {
+	workers, legacy := pairTwo(t)
+	if got := mirrorToken(t, legacy); got != "mql_wkr_bbbbbbbbbbbbbb" {
+		t.Fatalf("precondition: the mirror names %q, want b's token", got)
+	}
+	res, err := RemoveHome(workers, legacy, "b", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Mirror != MirrorRewritten || res.MirrorHome != "a" {
+		t.Fatalf("mirror outcome = %v (%q), want rewritten to a", res.Mirror, res.MirrorHome)
+	}
+	if got := mirrorToken(t, legacy); got != "mql_wkr_aaaaaaaaaaaaaa" {
+		t.Fatalf("the mirror still holds %q after b was unpaired", got)
+	}
+}
+
+// Removing the last home deletes the mirror: there is nothing left for it
+// to name, and anything it kept would be a token the person unpaired.
+func TestUnpairingTheLastHomeDeletesTheMirror(t *testing.T) {
+	workers, legacy := pairTwo(t)
+	if _, err := RemoveHome(workers, legacy, "a", false); err != nil {
+		t.Fatal(err)
+	}
+	res, err := RemoveHome(workers, legacy, "b", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Mirror != MirrorDeleted {
+		t.Fatalf("mirror outcome = %v, want deleted", res.Mirror)
+	}
+	if _, err := os.Stat(legacy); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("worker.yaml must be gone after the last home is unpaired: %v", err)
+	}
+}
+
+// A mirror naming some other, still enabled, home is left exactly as it
+// was.
+func TestUnpairingAnotherHomeLeavesTheMirrorAlone(t *testing.T) {
+	workers, legacy := pairTwo(t)
+	before, _ := os.ReadFile(legacy)
+	res, err := RemoveHome(workers, legacy, "a", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Mirror != MirrorUntouched {
+		t.Fatalf("mirror outcome = %v, want untouched", res.Mirror)
+	}
+	after, _ := os.ReadFile(legacy)
+	if string(before) != string(after) {
+		t.Fatal("a mirror naming a surviving home must not be rewritten")
+	}
+}
+
+// Disabling counts as going: a disabled home must not be connectable
+// from a file nobody is looking at.
+func TestDisablingTheMirroredHomeCountsAsGoing(t *testing.T) {
+	workers, legacy := pairTwo(t)
+	res, err := RemoveHome(workers, legacy, "b", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Mirror != MirrorRewritten || mirrorToken(t, legacy) != "mql_wkr_aaaaaaaaaaaaaa" {
+		t.Fatalf("disabling b left the mirror %v naming %q", res.Mirror, mirrorToken(t, legacy))
+	}
+	if _, err := RemoveHome(workers, legacy, "a", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(legacy); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("with every home disabled the mirror must be gone")
+	}
+}
+
+// TestDecideRunModeNeverResurrectsAnUnpairedCluster is the #429 defect
+// as a table: workers.yaml exists with nothing enabled -- the state
+// `worker unpair` leaves -- and a valid worker.yaml sits beside it. The
+// worker used to run that worker.yaml; now it waits, connected to
+// nothing.
+func TestDecideRunModeNeverResurrectsAnUnpairedCluster(t *testing.T) {
+	on, off := true, false
+	legacy := Config{ClusterURL: "https://prod.example", Token: "mql_wkr_prod_aaaaaaaaaaaa", Name: "m", Capabilities: []string{"HEADLESS"}}
+	base := WorkersFile{Version: 1, WorkerName: "m", Capabilities: []string{"HEADLESS"}}
+	withHomes := func(homes ...Home) WorkersFile { w := base; w.Homes = homes; return w }
+	prod := Home{ID: "prod", ClusterURL: "https://prod.example", Token: "mql_wkr_prod_aaaaaaaaaaaa", Enabled: &on}
+	prodOff := prod
+	prodOff.Enabled = &off
+	bad := Home{ID: "bad", ClusterURL: "https://bad.example", Token: "not-a-worker-token", Enabled: &on}
+
+	cases := []struct {
+		name          string
+		forceSingle   bool
+		workersExists bool
+		workers       WorkersFile
+		legacy        Config
+		want          runMode
+		wantErr       bool
+	}{
+		{"an enabled home runs the fleet", false, true, withHomes(prod), legacy, runFleet, false},
+		{"unpaired: no homes left, mirror beside it", false, true, withHomes(), legacy, runNoHomes, false},
+		{"disabled: every home off, mirror beside it", false, true, withHomes(prodOff), legacy, runFleet, false},
+		{"never had a workers.yaml: its worker.yaml runs", false, false, withHomes(), legacy, runSingleHome, false},
+		{"never had either file", false, false, withHomes(), Config{Name: "m", Capabilities: []string{"HEADLESS"}}, runNoHomes, false},
+		{"a malformed registry is an error, not a fallback", false, true, withHomes(bad), legacy, runFleet, true},
+		{"--cluster/--token runs one home", true, true, withHomes(prod), legacy, runSingleHome, false},
+		{"--cluster with no token is an error", true, true, withHomes(prod), Config{ClusterURL: "https://x", Name: "m", Capabilities: []string{"HEADLESS"}}, runSingleHome, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := decideRunMode(tc.forceSingle, tc.workersExists, tc.workers, tc.legacy)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if got != tc.want {
+				t.Fatalf("mode = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTwoHomesOnOneClusterOpenOneStream (memql-cockpit#433). Two streams
+// from one machine to one cluster register it twice and flap its row. The
+// LATER entry connects -- enrollments are appended, so it holds the
+// newest token -- and the other is reported, not dialled. And the file is
+// still a valid registry: refusing it would refuse `worker pair` and
+// `worker unpair`, the two commands that fix it.
+func TestTwoHomesOnOneClusterOpenOneStream(t *testing.T) {
+	on, off := true, false
+	w := WorkersFile{Version: 1, WorkerName: "m", Capabilities: []string{"HEADLESS"}, Homes: []Home{
+		{ID: "local", ClusterURL: "https://api.example.com", Token: "mql_wkr_old_aaaaaaaaaaaa", Enabled: &on},
+		{ID: "other", ClusterURL: "https://api.other.example", Token: "mql_wkr_oth_aaaaaaaaaaaa", Enabled: &on},
+		{ID: "api.example.com", ClusterURL: "https://api.example.com:443", Token: "mql_wkr_new_aaaaaaaaaaaa", Enabled: &on},
+	}}
+	if err := w.Validate(); err != nil {
+		t.Fatalf("a registry with a duplicate must stay valid, so pair and unpair still work on it: %v", err)
+	}
+	run, skipped := w.runnableHomes()
+	var ids []string
+	for _, h := range run {
+		ids = append(ids, h.ID)
+	}
+	if got := strings.Join(ids, ","); got != "other,api.example.com" {
+		t.Fatalf("connects %q, want other and the LATER of the two api.example.com entries", got)
+	}
+	if len(skipped) != 1 || skipped[0].Home.ID != "local" || skipped[0].Connects != "api.example.com" {
+		t.Fatalf("skipped = %+v, want local, superseded by api.example.com", skipped)
+	}
+	if got, want := duplicateHomeSentence(skipped[0]),
+		`homes "local" and "api.example.com" both point at https://api.example.com; one machine holds one stream per cluster, so only "api.example.com" connects -- remove "local" from workers.yaml, or set enabled: false on it`; got != want {
+		t.Fatalf("sentence:\n got %s\nwant %s", got, want)
+	}
+
+	// A disabled duplicate opens no stream and costs nothing.
+	w.Homes[2].Enabled = &off
+	if _, skipped := w.runnableHomes(); len(skipped) != 0 {
+		t.Fatalf("a disabled duplicate must not be reported: %+v", skipped)
+	}
+}
+
+// A token an earlier build's unpair left in worker.yaml -- naming a home
+// that is no longer in workers.yaml -- is cleared the next time the
+// mirror is synced, rather than staying on disk forever.
+func TestSyncLegacyMirrorClearsAStaleToken(t *testing.T) {
+	dir := t.TempDir()
+	legacy := filepath.Join(dir, "worker.yaml")
+	stale := Config{ClusterURL: "https://gone.example", Token: "mql_wkr_gone_aaaaaaaaaaaa", Name: "m", Capabilities: []string{"HEADLESS"}}
+	if err := WriteLegacyWorkerYAML(legacy, stale); err != nil {
+		t.Fatal(err)
+	}
+	on := true
+	w := WorkersFile{Version: 1, WorkerName: "m", StateDir: dir, Capabilities: []string{"HEADLESS"},
+		Homes: []Home{{ID: "live", ClusterURL: "https://live.example", Token: "mql_wkr_live_aaaaaaaaaaaa", Enabled: &on}}}
+	outcome, home, err := syncLegacyMirror(legacy, w)
+	if err != nil || outcome != MirrorRewritten || home != "live" {
+		t.Fatalf("sync = (%v, %q, %v), want rewritten to live", outcome, home, err)
+	}
+	if got := mirrorToken(t, legacy); got != "mql_wkr_live_aaaaaaaaaaaa" {
+		t.Fatalf("mirror token = %q, want live's", got)
+	}
+	if outcome, _, _ := syncLegacyMirror(legacy, w); outcome != MirrorUntouched {
+		t.Fatalf("a mirror that already names an enabled home must be left alone, got %v", outcome)
+	}
+	if outcome, _, _ := syncLegacyMirror(legacy, WorkersFile{Version: 1, WorkerName: "m", Capabilities: []string{"HEADLESS"}}); outcome != MirrorDeleted {
+		t.Fatalf("with nothing enabled the mirror must go, got %v", outcome)
+	}
+	if outcome, _, _ := syncLegacyMirror(legacy, w); outcome != MirrorAbsent {
+		t.Fatalf("an absent mirror stays absent, got %v", outcome)
 	}
 }

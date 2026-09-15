@@ -20,6 +20,7 @@ import (
 	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
 
 	"github.com/znasllc-io/memql-cockpit/internal/worker/apps"
+	"github.com/znasllc-io/memql-cockpit/internal/worker/harness"
 )
 
 // --- the test rig ----------------------------------------------------
@@ -242,9 +243,22 @@ func newRig(t *testing.T, allow ...string) *rig {
 		LibraryBase: lib.server.URL,
 		HTTPClient:  lib.server.Client(),
 		Allowed:     func(id string) bool { return allowed[id] },
+		// The fingerprint asks the app for its version and the machine for
+		// its tools. Neither is asked for real here: several fake apps fork
+		// a grandchild on EVERY invocation, and a session test must not
+		// run every compiler on the machine running it.
+		Detector: &apps.Detector{RunVersion: func(context.Context, string, []string) (string, error) {
+			return rigAppVersion, nil
+		}},
+		ToolVersions: func(context.Context) []harness.ToolVersion { return rigTools },
 	})
 	return h
 }
+
+// The rig's fixed answers for the fingerprint's app version and tools.
+const rigAppVersion = "9.9.9 (rig)"
+
+var rigTools = []harness.ToolVersion{{Name: "git", Version: "git version 2.43.0"}}
 
 func (h *rig) start(t *testing.T, mutate func(*memqlv1.AppSessionStart)) *memqlv1.AppSessionEnd {
 	t.Helper()
@@ -663,6 +677,36 @@ func TestSession_ProducedFilesAndTranscriptArePushed(t *testing.T) {
 	}
 }
 
+// TestSession_AFileHoldingTheBearerIsNotPushed: an app that copies its MCP
+// configuration into the workspace has produced a file holding the
+// session's bearer. The bearer cannot be revoked, so the file is not
+// pushed to the Library -- and the transcript says so, as it does for any
+// file left behind.
+func TestSession_AFileHoldingTheBearerIsNotPushed(t *testing.T) {
+	fakeApp(t, "claude", "cp .mcp.json leaked.json\necho fine > ok.txt\n"+quietClaude)
+	h := newRig(t)
+	end := h.start(t, nil)
+	if end.GetExitCode() != 0 || end.GetError() != "" {
+		t.Fatalf("end = %d %q", end.GetExitCode(), end.GetError())
+	}
+	sawOK := false
+	for name, body := range h.library.uploaded() {
+		if strings.Contains(string(body), testBearer) {
+			t.Errorf("%s carried the bearer to the Library", name)
+		}
+		if strings.Contains(name, "leaked") {
+			t.Errorf("%s was pushed", name)
+		}
+		sawOK = sawOK || strings.HasSuffix(name, "ok.txt")
+	}
+	if !sawOK {
+		t.Error("the file without the bearer was not pushed")
+	}
+	if !strings.Contains(h.sender.transcript(), "not pushed to the Library: leaked.json (it holds this session's credential)") {
+		t.Error("the transcript does not say the file was held back")
+	}
+}
+
 // TestSession_BearerNeverReachesAChunk. The transcript is persisted on
 // the engine side and rendered in the portal, so a chunk carrying the
 // credential publishes it everywhere that record reaches.
@@ -1026,7 +1070,7 @@ func TestSession_FollowUpRunsAsTheNextTurn(t *testing.T) {
 	h.manager.Control(&memqlv1.AppSessionControl{
 		SessionId: "sess-followup",
 		Action:    ActionMessage,
-		Reason:    "and now the follow-up",
+		Prompt:    "and now the follow-up",
 	})
 	if err := os.WriteFile(filepath.Join(dir, "gate"), nil, 0o600); err != nil {
 		t.Fatalf("release the gate: %v", err)
@@ -1127,7 +1171,7 @@ func TestSession_RenewLandsOnTheNextTurn(t *testing.T) {
 	h.manager.Control(&memqlv1.AppSessionControl{
 		SessionId: "sess-renew-turn",
 		Action:    ActionMessage,
-		Reason:    "carry on",
+		Prompt:    "carry on",
 	})
 	if err := os.WriteFile(filepath.Join(dir, "gate"), nil, 0o600); err != nil {
 		t.Fatalf("release the gate: %v", err)
@@ -1198,17 +1242,16 @@ func TestSession_FollowUpQueueRefusesRatherThanSwallows(t *testing.T) {
 	}
 }
 
-// TestSession_StructuredResultLeavesAsTheFinalEventChunk pins the seam
-// that stands in for AppSessionEnd.result until memql#5096 lands it.
+// TestSession_StructuredResultRidesTheEnd pins AppSessionEnd.result_json
+// (memql-cockpit#444), which the pin has carried since 2026-09-08 and this
+// runner never set -- the answer left as a namespaced `event` chunk that
+// nothing in the engine reads, so a structured answer never arrived.
 //
-// Two properties, and both are about a reader who was not here. The type
-// word is NAMESPACED, because the same stream carries the app's own
-// events and Claude Code's last stream-json line is literally
-// {"type":"result",...}. And the chunk is exempt from
-// limits.max_transcript_bytes, because that limit bounds NARRATION: an
-// answer lost to a chatty run looks exactly like an app that answered
-// nothing.
-func TestSession_StructuredResultLeavesAsTheFinalEventChunk(t *testing.T) {
+// Two properties. The answer is on the End whatever the transcript cap has
+// done, because the cap bounds NARRATION and an answer is not narration.
+// And no chunk carries it any more: pre-release, a field that has landed
+// replaces the stand-in rather than running beside it.
+func TestSession_StructuredResultRidesTheEnd(t *testing.T) {
 	newSession := func(sender *fakeSender, result []byte) *session {
 		return &session{
 			id:     "sess-result",
@@ -1223,52 +1266,115 @@ func TestSession_StructuredResultLeavesAsTheFinalEventChunk(t *testing.T) {
 		}
 	}
 
-	t.Run("the answer is the last chunk before the end", func(t *testing.T) {
+	t.Run("the answer is on the end", func(t *testing.T) {
 		sender := newFakeSender()
 		s := newSession(sender, []byte(`{"answer":42}`))
 		s.sendEnd(0, "", nil)
 
-		chunks := sender.recorded()
-		if len(chunks) != 1 {
-			t.Fatalf("chunks = %d, want the one result chunk past a bitten cap: %+v", len(chunks), chunks)
+		end := sender.wait(t)
+		if end.GetResultJson() != `{"answer":42}` {
+			t.Errorf("result_json = %q, want the app's own answer verbatim", end.GetResultJson())
 		}
-		if chunks[0].stream != StreamEvent {
-			t.Errorf("stream = %q, want %q", chunks[0].stream, StreamEvent)
-		}
-		var body struct {
-			Type      string          `json:"type"`
-			SessionID string          `json:"session_id"`
-			Result    json.RawMessage `json:"result"`
-		}
-		if err := json.Unmarshal([]byte(chunks[0].data), &body); err != nil {
-			t.Fatalf("the result chunk is not JSON the engine can map: %v (%q)", err, chunks[0].data)
-		}
-		if body.Type != resultEventType {
-			t.Errorf("type = %q, want %q", body.Type, resultEventType)
-		}
-		if body.Type == "result" {
-			t.Error("a bare `result` is indistinguishable from Claude Code's own result event")
-		}
-		if body.SessionID != "sess-result" {
-			t.Errorf("session_id = %q", body.SessionID)
-		}
-		if string(body.Result) != `{"answer":42}` {
-			t.Errorf("result = %s, want the app's own answer verbatim", body.Result)
-		}
-		if sender.wait(t) == nil {
-			t.Fatal("no end was sent")
+		for _, c := range sender.recorded() {
+			if strings.Contains(c.data, "memql.app_session.result") {
+				t.Errorf("the answer still left as a chunk as well: %q", c.data)
+			}
 		}
 	})
 
-	t.Run("no result means no chunk, never an empty object", func(t *testing.T) {
+	// IT DOES NOT IMPLY SUCCESS, which is the proto's own rule: a harness
+	// can answer the schema and still exit non-zero, and dropping the
+	// answer because the run failed would lose the one part we can read.
+	t.Run("an answer rides a failed end too", func(t *testing.T) {
+		sender := newFakeSender()
+		s := newSession(sender, []byte(`{"answer":42}`))
+		s.sendEnd(2, "the app exited 2", nil)
+
+		end := sender.wait(t)
+		if end.GetResultJson() != `{"answer":42}` || end.GetExitCode() != 2 || end.GetError() == "" {
+			t.Errorf("end = %+v, want the answer beside the failure, neither folded into the other", end)
+		}
+	})
+
+	t.Run("no result means an empty field, never an empty object", func(t *testing.T) {
 		sender := newFakeSender()
 		s := newSession(sender, nil)
 		s.sendEnd(0, "", nil)
 
+		if got := sender.wait(t).GetResultJson(); got != "" {
+			t.Errorf("result_json = %q, want empty: an empty object reads as \"the app answered nothing\"", got)
+		}
 		if chunks := sender.recorded(); len(chunks) != 0 {
-			t.Errorf("chunks = %+v, want none: an empty object reads as \"the app answered nothing\"", chunks)
+			t.Errorf("chunks = %+v, want none", chunks)
 		}
 	})
+}
+
+// TestSession_ResponseSchemaReachesTheHarness pins
+// AppSessionStart.response_schema_json (memql-cockpit#444). The engine has
+// been sending it since the pin carried it; this runner answered "the
+// engine asked for nothing" to every session, so no app was ever asked for
+// a structured answer.
+func TestSession_ResponseSchemaReachesTheHarness(t *testing.T) {
+	dir := t.TempDir()
+	fakeApp(t, "claude", fmt.Sprintf(`
+printf '%%s\n' "$@" > %q
+echo '{"type":"system","subtype":"init","session_id":"app-schema"}'
+echo '{"type":"result","subtype":"success","is_error":false,"session_id":"app-schema","total_cost_usd":0.1,"usage":{"input_tokens":1,"output_tokens":2},"structured_output":{"city":"Paris"},"result":"{\"city\":\"Paris\"}"}'
+`, filepath.Join(dir, "argv")))
+	const schema = `{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}`
+
+	h := newRig(t)
+	end := h.start(t, func(s *memqlv1.AppSessionStart) {
+		s.ResponseSchemaJson = schema
+	})
+
+	if end.GetError() != "" {
+		t.Fatalf("error = %q; transcript: %s", end.GetError(), h.sender.transcript())
+	}
+	if got := argvValue(readArgv(t, filepath.Join(dir, "argv")), "--json-schema"); got != schema {
+		t.Errorf("--json-schema = %q, want the engine's schema verbatim", got)
+	}
+	if end.GetResultJson() != `{"city":"Paris"}` {
+		t.Errorf("result_json = %q, want the structured answer the app produced", end.GetResultJson())
+	}
+}
+
+// TestSession_AReasonIsNeverAPrompt pins AppSessionControl.prompt
+// (memql-cockpit#444). The engine sends a follow-up in `prompt`, and this
+// runner read `reason` -- which the proto documents as transcript free-text
+// on cancel -- so every follow-up arrived empty and was dropped. The fix
+// reads `prompt` and ONLY `prompt`: one field meaning two things cannot be
+// read without knowing which branch wrote it.
+func TestSession_AReasonIsNeverAPrompt(t *testing.T) {
+	dir := t.TempDir()
+	twoTurnApp(t, dir)
+	h := newRig(t)
+
+	h.manager.Start(context.Background(), h.sender, &memqlv1.AppSessionStart{
+		SessionId:   "sess-reason",
+		App:         apps.IDClaudeCode,
+		Kind:        KindRun,
+		Prompt:      "the first question",
+		Workspace:   h.workspace,
+		Credential:  testBearer,
+		McpEndpoint: "https://mcp.example.com/mcp",
+	})
+	h.waitForChunk(t)
+
+	h.manager.Control(&memqlv1.AppSessionControl{
+		SessionId: "sess-reason",
+		Action:    ActionMessage,
+		Reason:    "free text a cancel would carry",
+	})
+	if err := os.WriteFile(filepath.Join(dir, "gate"), nil, 0o600); err != nil {
+		t.Fatalf("release the gate: %v", err)
+	}
+	h.sender.wait(t)
+
+	if count, _ := os.ReadFile(filepath.Join(dir, "count")); string(count) != "1" {
+		t.Errorf("the app ran %q times, want 1: a message control with no prompt is not a turn", count)
+	}
 }
 
 // TestSession_CodexHarnessComesFromTheMachineNotTheId is the reason the

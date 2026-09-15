@@ -101,17 +101,15 @@ const MaxFieldLen = 200
 // own policy.yaml verdict; SignedIn is the app's auth state as the
 // cockpit can observe it without spending the user's tokens to ask.
 //
-// THE DESCRIPTOR IS NOT ON THE WIRE YET, and that is a fact about the
-// wire rather than an omission here. Register's AppInfo carries five
-// fields -- id, version, signed_in, subscription, allowed -- and no
-// harness descriptor; engine epic memql#5096 adds one. Until
-// .github/memql-pin carries that merge there is no field for
-// appinventory.go's appsToProto to map the three below into, and
-// inventing one would not compile. When the pin moves, the mapping is
-// three assignments in appsToProto beside the five that are already
-// there. The live consumer meanwhile is on this machine: the app-session
-// runner picks the protocol from ResolveSpec's answer, which is the same
-// answer Detect reports here.
+// THE DESCRIPTOR RIDES REGISTER, not AppInfo. Register carries it as
+// app_descriptors (engine epic memql#5096), one per app, and
+// appinventory.go's appDescriptorsToProto maps the three fields below into
+// it. The pin carried that field from 2026-09-08 and nothing set it until
+// memql-cockpit#444 -- an absent descriptor reads as "assume capable" on
+// the engine side, so the gap cost structured answers on every machine
+// that could not give one. The app-session runner reads the same answer
+// here through ResolveSpec, so the protocol a session drives and the one
+// the registration advertised cannot be a probe apart.
 type Info struct {
 	Id           string
 	Version      string

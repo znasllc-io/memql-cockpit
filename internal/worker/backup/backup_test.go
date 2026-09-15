@@ -42,6 +42,13 @@ type fakeEngine struct {
 	// oneShotOnly rejects the session route, so a test can prove which route
 	// a size took.
 	sessionSize int64
+	// holdAfter, when set, makes every one-shot upload after the first
+	// holdAfter hang until the client gives up -- a sweep interrupted in
+	// the middle of a push, with the uploads before it fully answered.
+	// holding is signalled when one starts hanging.
+	holdAfter int
+	holding   chan struct{}
+	served    int
 
 	server *httptest.Server
 }
@@ -80,6 +87,23 @@ func (f *fakeEngine) handleQuery(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *fakeEngine) handleOneShot(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	hold := f.holdAfter > 0 && f.served >= f.holdAfter
+	f.served++
+	f.mu.Unlock()
+	if hold {
+		// The body is read FIRST: Go's server only notices a client that
+		// hung up once the request body is consumed, and a handler parked
+		// on an unread body would outlive the test and hold
+		// httptest.Server.Close forever.
+		_, _ = io.Copy(io.Discard, r.Body)
+		select {
+		case f.holding <- struct{}{}:
+		default:
+		}
+		<-r.Context().Done()
+		return
+	}
 	if f.refuseUpload != 0 {
 		http.Error(w, "the worker registration is not one of your machines", f.refuseUpload)
 		return
@@ -645,25 +669,31 @@ func TestAnInterruptedSweepStillSavesWhatItAlreadySent(t *testing.T) {
 		CheckPath:  allow,
 		HTTPClient: f.server.Client(),
 	})
+	// The first upload is answered in full; the second hangs, and the sweep
+	// is cancelled while it does. Cancelling on "the server has recorded an
+	// upload" instead raced the CLIENT still reading that upload's answer:
+	// cancelled there, it rightly never recorded the file, and the test
+	// failed about one run in thirty under -race.
+	f.holdAfter = 1
+	f.holding = make(chan struct{}, 1)
 	ctx, cancel := context.WithCancel(context.Background())
-	// Cancel as soon as the first upload lands, so the push loop bails partway.
 	go func() {
-		for i := 0; i < 200; i++ {
-			if len(f.uploadedPaths()) > 0 {
-				cancel()
-				return
-			}
-			time.Sleep(2 * time.Millisecond)
+		select {
+		case <-f.holding:
+		case <-time.After(10 * time.Second):
 		}
 		cancel()
 	}()
 	m.SweepOnce(ctx, "wkr-1")
 
-	// Whatever it managed to send is on disk. The deferred save is what makes
+	if got := len(f.uploadedPaths()); got != 1 {
+		t.Fatalf("%d uploads arrived, want exactly the first before the sweep was cut short", got)
+	}
+	// What it managed to send is on disk. The deferred save is what makes
 	// that true; without it the file would not exist at all.
 	back := LoadLedger(stateDir, "w-1")
-	if len(back.Paths()) == 0 && len(f.uploadedPaths()) > 0 {
-		t.Error("a sweep uploaded files and then discarded its whole record of them")
+	if len(back.Paths()) != 1 {
+		t.Errorf("the ledger holds %d paths after an interrupted sweep, want the 1 it sent: a sweep uploaded files and then discarded its record of them", len(back.Paths()))
 	}
 }
 

@@ -425,8 +425,12 @@ func TestAdmission_PerModelCap(t *testing.T) {
 		t.Fatalf("Live() = %d, want 1", m.Live())
 	}
 
+	// The second call waits for the slot (admit), for as long as its own
+	// idle ceiling -- one second here -- and is refused only then.
 	second := newRecorder()
-	m.Start(context.Background(), second, start("two", "m", KindChat))
+	late := start("two", "m", KindChat)
+	late.Limits = &memqlv1.ModelCallLimits{TimeoutSeconds: 10, IdleTimeoutSeconds: 1, KeepaliveSeconds: 1}
+	m.Start(context.Background(), second, late)
 	end := second.wait(t)
 	if end.GetErrorCode() != CodeConcurrencyExceeded {
 		t.Errorf("error_code = %q, want %q", end.GetErrorCode(), CodeConcurrencyExceeded)

@@ -34,14 +34,24 @@ import (
 // actually changed, only when no work is in flight, and never twice in
 // quick succession -- a runtime flapping up and down must not turn into a
 // worker that reconnects forever.
+//
+// The sharing consent is part of the same advertisement (memql-cockpit
+// #428): inference.serve rides Register's capability descriptor and
+// nothing else, so it obeys the same rules -- with the one difference a
+// WITHDRAWN consent needs, described at maybeReadvertiseModels.
 const (
 	// modelRefreshInterval is how often the offered set is re-checked.
 	modelRefreshInterval = 60 * time.Second
 	// modelReadvertiseMinInterval floors the gap between two
 	// model-triggered reconnects. RequestImmediateReadvertise is its one
-	// exception, and the only one: see that method for why a pull
-	// somebody is watching does not wait it out.
+	// exception for a changed model set: see that method for why a pull
+	// somebody is watching does not wait it out. A withdrawn consent does
+	// not wait it out either.
 	modelReadvertiseMinInterval = 2 * time.Minute
+	// withdrawalPoll is how often a runner with a withdrawn consent still to
+	// land re-checks whether it has gone idle. Short, because every second
+	// of it is a second the cluster may route somebody else's prompt here.
+	withdrawalPoll = time.Second
 )
 
 // Runner owns the worker's main loop: reconnect-with-backoff, the
@@ -50,6 +60,7 @@ const (
 type Runner struct {
 	logger    *slog.Logger
 	cfg       Config
+	home      string
 	tools     ToolDispatcher
 	apps      AppInventory
 	modelsInv ModelInventory
@@ -73,13 +84,50 @@ type Runner struct {
 	pendingReadvertise atomic.Bool
 	readvertiseNow     chan struct{}
 
+	// withdrawing is set while a withdrawn sharing consent waits for this
+	// worker to go idle so it can re-register; the heartbeat loop then
+	// re-checks every withdrawalPoll instead of every minute. See
+	// maybeReadvertiseModels.
+	withdrawing atomic.Bool
+
+	// refused is the runner's standing with a cluster that has refused it
+	// (refusal.go). Touched only by the goroutine in Run.
+	refused refusalHold
+
 	// now is the clock the re-advertise guards read. Injectable because
 	// the floor is two minutes of WALL clock, and a test that waited it
 	// out would spend two minutes of every CI run.
 	now func() time.Time
 
-	closeOnce sync.Once
-	closed    chan struct{}
+	// The seams below are what let Run be driven by a test with no
+	// cluster: every one defaults to the production behaviour in
+	// NewRunner, and a test sets the ones it needs on the Runner it
+	// built. They are fields rather than Options because nothing outside
+	// this package has a reason to set them.
+	//
+	// dial opens the stream (dialSDK); the handshake and everything after
+	// it run for real against whatever it returns.
+	dial func(ctx context.Context, cfg Config) (stream, error)
+	// scanHardware reads this machine's inventory for Register and every
+	// tenth beat (hardware.Local, which shells out).
+	scanHardware func(ctx context.Context) hardware.Inventory
+	// backoffMin / backoffMax bound the reconnect backoff against a
+	// cluster that is unreachable; holdMin / holdMax bound the hold
+	// against one that refused this machine.
+	backoffMin, backoffMax time.Duration
+	holdMin, holdMax       time.Duration
+	// pause waits between attempts (sleepWithJitter). A test records the
+	// waits it is asked for instead, which is how the backoff and the hold
+	// are asserted exactly rather than timed.
+	pause func(ctx context.Context, d time.Duration) bool
+	// withdrawalEvery is how often a pending withdrawal re-checks for idle
+	// (withdrawalPoll).
+	withdrawalEvery time.Duration
+
+	stopOnce sync.Once
+	stop     chan struct{}
+	started  atomic.Bool
+	closed   chan struct{}
 }
 
 // ToolDispatcher resolves a ToolDispatch to either a Success or a
@@ -134,6 +182,7 @@ func NewRunner(opts Options) (*Runner, error) {
 	r := &Runner{
 		logger:    opts.Logger,
 		cfg:       opts.Config,
+		home:      opts.Config.homeID(),
 		tools:     opts.Tools,
 		apps:      opts.Apps,
 		modelsInv: opts.Models,
@@ -142,6 +191,7 @@ func NewRunner(opts Options) (*Runner, error) {
 		heartbeat: hb,
 		metrics:   opts.Metrics,
 		serve:     opts.InferenceServe,
+		stop:      make(chan struct{}),
 		closed:    make(chan struct{}),
 		// Room for one. A nil channel would be safe (both the send and
 		// the receive sit in a select), but it would make every request
@@ -157,11 +207,6 @@ func NewRunner(opts Options) (*Runner, error) {
 	return r, nil
 }
 
-// Run blocks until ctx is cancelled or the runner is closed. It
-// reconnects with exponential backoff (1s -> 15s, jitter) on every
-// disconnect. The ceiling is deliberately short: a multi-home fleet must
-// regain availability aggressively after a real network blip; a 60s wait
-// left prod machines looking "gone" long after the laptop was awake.
 // RegistrationId returns this machine's v1:worker:registration id, or "" when
 // no stream is currently up.
 //
@@ -180,78 +225,187 @@ func (r *Runner) RegistrationId() string {
 	return ""
 }
 
+// Run blocks until ctx is cancelled or the runner is closed. It reconnects
+// on every disconnect, and HOW SOON depends on what the last attempt
+// learned:
+//
+//   - The cluster could not be reached: exponential backoff, 1s -> 15s
+//     with jitter. The ceiling is deliberately short: a multi-home fleet
+//     must regain availability aggressively after a real network blip; a
+//     60s wait left prod machines looking "gone" long after the laptop
+//     was awake.
+//   - The cluster answered and REFUSED this machine -- its token, or its
+//     registration: a hold of a minute, doubling to fifteen, and one
+//     error line rather than one warning every fifteen seconds forever
+//     (refusal.go, memql-cockpit#427).
+//   - A stream ended: the backoff resets to 1s only if the stream had
+//     proven itself healthy -- one heartbeat sent (memql-cockpit#431).
+//     A cluster that accepts Register and then drops the stream would
+//     otherwise be re-asked every second, and every ask is a full Register
+//     plus a hardware scan that shells out to nvidia-smi and docker.
 func (r *Runner) Run(ctx context.Context) error {
 	if r == nil {
 		return errors.New("worker.runner: not initialized")
 	}
+	r.started.Store(true)
 	defer close(r.closed)
+	// The home's series exist from the start, reading "not connected",
+	// rather than appearing at the first event -- an alert on a missing
+	// series would otherwise fire for every home that has not flapped yet.
+	r.metrics.SetConnected(r.home, false)
+	r.metrics.SetRefused(r.home, false)
 
-	backoff := time.Second
-	const maxBackoff = DefaultReconnectMaxBackoff
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-r.stop:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	backoff := r.minBackoff()
 	for {
-		if err := ctx.Err(); err != nil {
+		if err := r.stopErr(ctx); err != nil {
 			return err
 		}
 
-		conn, err := Connect(ctx, r.cfg, r.inventory(ctx), r.modelInventory(ctx), r.inferenceServe(), r.logger)
+		// Each stream is opened on a context of its own, so closing ONE
+		// stream can cancel it (Connection.Close) without touching the run.
+		streamCtx, cancelStream := context.WithCancel(ctx)
+		conn, err := r.connect(streamCtx)
 		if err != nil {
-			if r.metrics != nil {
-				r.metrics.RecordReconnect()
+			cancelStream()
+			if err := r.stopErr(ctx); err != nil {
+				return err
 			}
-			r.logger.Warn("worker connect failed; will retry",
-				"error", err,
-				"backoff_seconds", int(backoff.Seconds()),
-			)
-			if !sleepWithJitter(ctx, backoff) {
+			r.metrics.RecordReconnect(r.home)
+			if !r.wait(ctx, r.afterConnectFailure(err, &backoff)) {
 				return ctx.Err()
 			}
-			backoff = nextBackoff(backoff, maxBackoff)
 			continue
 		}
-		backoff = time.Second
+		conn.cancel = cancelStream
+		r.afterConnect()
 		r.conn.Store(conn)
+		r.metrics.SetConnected(r.home, true)
 
-		streamErr := r.runStream(ctx, conn)
+		healthy, streamErr := r.runStream(ctx, conn)
 		conn.Close()
 		r.conn.Store(nil)
+		r.metrics.SetConnected(r.home, false)
 
 		if streamErr == nil {
 			return nil
 		}
+		if err := r.stopErr(ctx); err != nil {
+			return err
+		}
 		if errors.Is(streamErr, context.Canceled) || errors.Is(streamErr, context.DeadlineExceeded) {
 			return streamErr
+		}
+		if healthy {
+			backoff = r.minBackoff()
 		}
 		code, reason := streamEndCodeReason(streamErr)
 		r.logger.Warn("worker stream ended; will reconnect",
 			"error", streamErr,
 			"code", code,
 			"reason", reason,
+			"healthy", healthy,
+			"backoff_seconds", backoff.Seconds(),
 		)
-		if !sleepWithJitter(ctx, backoff) {
+		if !r.wait(ctx, backoff) {
 			return ctx.Err()
 		}
-		backoff = nextBackoff(backoff, maxBackoff)
+		backoff = nextBackoff(backoff, r.maxBackoff())
 	}
 }
 
-// Close requests the runner stop on the next loop iteration.
+// stopErr is why the loop must end now, or nil: its context ended, or
+// Close was called. Close is checked HERE, synchronously, and not only
+// through the context it cancels: Close ends the stream the loop is
+// reading, and a loop that looked only at a context not yet cancelled
+// would read that as an ordinary disconnect and dial again.
+func (r *Runner) stopErr(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-r.stop:
+		return context.Canceled
+	default:
+		return nil
+	}
+}
+
+// wait pauses between attempts through the seam, or with jitter.
+func (r *Runner) wait(ctx context.Context, d time.Duration) bool {
+	if r.pause != nil {
+		return r.pause(ctx, d)
+	}
+	return sleepWithJitter(ctx, d)
+}
+
+// connect opens the stream and runs the handshake with what this machine
+// offers right now.
+//
+// The app and model inventories are taken BEFORE the dial: the app probes
+// are subprocesses with timeouts of their own, and an open stream that
+// sends nothing while they run is a stream the front door may idle out.
+// The hardware scan stays after it, so a cluster that cannot be reached is
+// not also a reason to shell out to nvidia-smi on every attempt.
+func (r *Runner) connect(ctx context.Context) (*Connection, error) {
+	dial := r.dial
+	if dial == nil {
+		dial = func(ctx context.Context, cfg Config) (stream, error) { return dialSDK(ctx, cfg, r.logger) }
+	}
+	inventory, modelInv, serve := r.inventory(ctx), r.modelInventory(ctx), r.inferenceServe()
+	s, err := dial(ctx, r.cfg)
+	if err != nil {
+		return nil, err
+	}
+	return handshake(ctx, s, r.cfg, inventory, modelInv, r.hardwareInventory(ctx), serve, r.logger)
+}
+
+// Close stops the runner: the loop ends at once, and the stream with it.
+// It returns once Run has returned, and at once when Run was never
+// started.
 func (r *Runner) Close() {
 	if r == nil {
 		return
 	}
-	r.closeOnce.Do(func() {
+	r.stopOnce.Do(func() {
+		close(r.stop)
 		if conn := r.conn.Load(); conn != nil {
 			conn.Close()
 		}
 	})
-	<-r.closed
+	if r.started.Load() {
+		<-r.closed
+	}
 }
 
-// runStream handles inbound traffic on an active connection.
-func (r *Runner) runStream(ctx context.Context, conn *Connection) error {
+// runStream handles inbound traffic on an active connection. healthy
+// reports whether the stream proved itself before it ended: at least one
+// heartbeat went out on it.
+//
+// The heartbeat goroutine is JOINED before this returns. It is where the
+// advertisement is re-checked, so one outliving its stream could act on
+// the next stream's runner state with the last stream's connection.
+func (r *Runner) runStream(ctx context.Context, conn *Connection) (healthy bool, err error) {
 	hbCtx, hbCancel := context.WithCancel(ctx)
-	defer hbCancel()
-	go r.heartbeatLoop(hbCtx, conn)
+	var beat atomic.Bool
+	hbDone := make(chan struct{})
+	go func() {
+		defer close(hbDone)
+		r.heartbeatLoop(hbCtx, conn, &beat)
+	}()
+	defer func() {
+		hbCancel()
+		<-hbDone
+	}()
 
 	for {
 		msg, err := conn.Recv()
@@ -278,7 +432,7 @@ func (r *Runner) runStream(ctx context.Context, conn *Connection) error {
 			// pull of the same model to resume.
 			r.pulls.StopAll("the worker's stream to the cluster was lost")
 			r.active.Wait()
-			return err
+			return beat.Load(), err
 		}
 		if err := r.handleMessage(ctx, conn, msg); err != nil {
 			r.logger.Warn("worker message handling failed",
@@ -302,6 +456,10 @@ const DefaultHeartbeat = 15 * time.Second
 // cluster OnlineWindow rather than sitting dark for a minute.
 const DefaultReconnectMaxBackoff = 15 * time.Second
 
+// defaultReconnectMinBackoff is where the backoff starts, and where a
+// healthy stream's end puts it back.
+const defaultReconnectMinBackoff = time.Second
+
 // hardwareRefreshBeats is how often the hardware inventory is re-scanned
 // onto the heartbeat (design record D1: "refreshed on every tenth
 // heartbeat"). At the 15-second default that is a refresh every two and
@@ -318,25 +476,57 @@ const hardwareRefreshBeats = 10
 // connecting.
 func hardwareOnBeat(beat int) bool { return beat > 0 && beat%hardwareRefreshBeats == 0 }
 
-func (r *Runner) heartbeatLoop(ctx context.Context, conn *Connection) {
+// heartbeatLoop beats until ctx ends or a beat fails, and is where the
+// advertisement is re-checked. beat is set once a heartbeat has gone out:
+// the stream has proven itself (see Run).
+func (r *Runner) heartbeatLoop(ctx context.Context, conn *Connection, beat *atomic.Bool) {
 	t := time.NewTicker(r.heartbeat)
 	defer t.Stop()
 	refresh := time.NewTicker(modelRefreshInterval)
 	defer refresh.Stop()
-	beat := 0
+	// The withdrawal poll exists only while a withdrawal is waiting for
+	// idle; the rest of the time it is a nil channel, which a select never
+	// picks.
+	var poll *time.Ticker
+	var pollC <-chan time.Time
+	defer func() {
+		if poll != nil {
+			poll.Stop()
+		}
+	}()
+	evaluate := func() {
+		r.maybeReadvertiseModels(ctx, conn)
+		switch pending := r.withdrawing.Load(); {
+		case pending && poll == nil:
+			every := r.withdrawalEvery
+			if every <= 0 {
+				every = withdrawalPoll
+			}
+			poll = time.NewTicker(every)
+			pollC = poll.C
+		case !pending && poll != nil:
+			poll.Stop()
+			poll, pollC = nil, nil
+		}
+	}
+	beats := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-refresh.C:
-			r.maybeReadvertiseModels(ctx, conn)
+			evaluate()
 		case <-r.readvertiseNow:
-			// A pull just finished with somebody watching. Evaluating
-			// here rather than at the next refresh tick is the
-			// difference between a model that appears now and one that
-			// appears in up to a minute -- and a minute of nothing
-			// happening reads as a pull that failed.
-			r.maybeReadvertiseModels(ctx, conn)
+			// A pull just finished with somebody watching, or the policy
+			// was reloaded. Evaluating here rather than at the next
+			// refresh tick is the difference between a change that
+			// lands now and one that lands in up to a minute -- and a
+			// minute of nothing happening reads as a pull that failed.
+			evaluate()
+		case <-pollC:
+			// A withdrawn consent waiting for idle: the first second
+			// nothing is running is the second to re-register.
+			evaluate()
 		case <-t.C:
 			// The inventory is re-taken on every beat rather than
 			// captured at connect. The engine applies an inventory
@@ -345,7 +535,7 @@ func (r *Runner) heartbeatLoop(ctx context.Context, conn *Connection) {
 			// is a routing change -- so signing into Claude Code makes
 			// this machine selectable on the NEXT BEAT, not the next
 			// reconnect. Sending a snapshot would give that back.
-			beat++
+			beats++
 			// The hardware inventory rides every tenth beat and nothing
 			// in between. It is scanned HERE rather than cached on the
 			// Runner because a scan whose result is held across beats
@@ -353,13 +543,14 @@ func (r *Runner) heartbeatLoop(ctx context.Context, conn *Connection) {
 			// and the whole reason for the refresh is that a machine
 			// changes under the worker.
 			var hw *hardware.Inventory
-			if hardwareOnBeat(beat) {
-				inv := hardware.Local(ctx)
+			if hardwareOnBeat(beats) {
+				inv := r.hardwareInventory(ctx)
 				hw = &inv
 			}
 			if err := conn.SendHeartbeat(0, nil, r.inventory(ctx), hw); err != nil {
 				return
 			}
+			beat.Store(true)
 		}
 	}
 }
@@ -385,14 +576,25 @@ func (r *Runner) modelInventory(ctx context.Context) models.Inventory {
 	return r.modelsInv.Models(ctx)
 }
 
-// maybeReadvertiseModels ends the stream when what this machine offers
-// has changed, so the reconnect re-registers with the new labels. It
-// reports whether it did.
+// hardwareInventory scans this machine for Register and the tenth beats.
+func (r *Runner) hardwareInventory(ctx context.Context) hardware.Inventory {
+	if r.scanHardware != nil {
+		return r.scanHardware(ctx)
+	}
+	return hardware.Local(ctx)
+}
+
+// maybeReadvertiseModels ends the stream when what this machine
+// advertises has changed, so the reconnect re-registers with the new
+// advertisement. It reports whether it did.
 //
-// Three guards, each closing a different failure:
+// The advertisement is two things, both bound at Register: the model
+// labels, and the sharing consent (inference.serve, in the capability
+// descriptor). Three guards, each closing a different failure:
 //
-//   - Nothing happens unless the ADVERTISED labels differ. Discovery
-//     running again is not news; a model appearing is.
+//   - Nothing happens unless the ADVERTISEMENT differs. Discovery
+//     running again is not news; a model appearing is, and so is the
+//     owner changing who may use this machine.
 //   - Nothing happens while work is in flight. A model finishing its pull
 //     must not kill somebody's hour-long app session, a tool call halfway
 //     through, or a sibling pull still downloading -- and the change will
@@ -401,28 +603,63 @@ func (r *Runner) modelInventory(ctx context.Context) models.Inventory {
 //     flapping between up and down would otherwise turn this worker into
 //     one that reconnects forever, which is worse than a stale label.
 //
-// The THIRD guard, and only the third, has an exception: a one-shot
-// request from RequestImmediateReadvertise. It is spent by the reconnect
-// it asks for and by nothing else. An early return leaves it armed --
-// busy, or labels that have not changed YET because the policy reload
-// naming the new model landed a moment after the request -- so the next
-// evaluation still gets the bypass, rather than the machine that was
-// mid-call being the one that waits out the floor.
+// The THIRD guard has two exceptions. A one-shot request from
+// RequestImmediateReadvertise is spent by the reconnect it asks for and by
+// nothing else; an early return leaves it armed -- busy, or labels that
+// have not changed YET because the policy reload naming the new model
+// landed a moment after the request -- so the next evaluation still gets
+// the bypass, rather than the machine that was mid-call being the one
+// that waits out the floor.
+//
+// And a WITHDRAWN consent (cluster -> owner) skips the floor outright
+// (memql-cockpit#428): until the cluster sees it, other people's prompts
+// keep arriving on hardware the owner has taken back. The busy guard
+// still holds -- work in flight is never cut short, the owner's own
+// included -- but while the withdrawal waits the heartbeat loop re-checks
+// every withdrawalPoll rather than every minute, so it lands at the first
+// idle second.
+//
+// The worker does NOT refuse new calls to get idle sooner. The engine
+// treats any error a worker ends a call with as the call having run and
+// does not reroute it, so a refusal would fail the call -- the owner's
+// own planner call among them, for as long as a long app session kept the
+// machine busy. A machine that is never idle therefore keeps being routed
+// to until it is; a worker-side refusal the engine retries elsewhere is
+// the engine change that would let this go further.
 func (r *Runner) maybeReadvertiseModels(ctx context.Context, conn *Connection) bool {
-	if r == nil || r.modelsInv == nil || conn == nil {
+	if r == nil || conn == nil || conn.closing.Load() {
 		return false
 	}
-	current := advertisedFingerprint(r.modelInventory(ctx).Labels())
-	if current == conn.ModelFingerprint {
+	serve := r.inferenceServe()
+	serveChanged := serve != conn.AdvertisedServe
+	labelsChanged := false
+	if r.modelsInv != nil {
+		labelsChanged = advertisedFingerprint(r.modelInventory(ctx).Labels()) != conn.ModelFingerprint
+	}
+	if !serveChanged && !labelsChanged {
+		// A withdrawal the owner took back before it landed: the
+		// advertisement on the wire is right again, so nothing is
+		// refused any longer.
+		r.endWithdrawal("the sharing consent is back to what the cluster already has")
 		return false
 	}
+	withdrawing := serveChanged && conn.AdvertisedServe == tools.ServeCluster
 	if r.busy() {
-		r.logger.Debug("model inventory changed; deferring re-advertisement until this worker is idle")
+		if withdrawing {
+			r.awaitIdleForWithdrawal()
+		}
+		r.logger.Debug("this machine's advertisement changed; deferring re-registration until this worker is idle",
+			"models_changed", labelsChanged,
+			"consent_changed", serveChanged,
+		)
 		return false
 	}
 	now := r.clock()
 	last := r.lastReadvertise.Load()
-	if last != 0 && now.Sub(time.Unix(0, last)) < modelReadvertiseMinInterval {
+	switch {
+	case withdrawing:
+		r.pendingReadvertise.Store(false)
+	case last != 0 && now.Sub(time.Unix(0, last)) < modelReadvertiseMinInterval:
 		// Swap rather than Load: the bypass must be consumed by the one
 		// reconnect it paid for. Left armed, it would sit there and let
 		// a flapping runtime through the floor at some unrelated later
@@ -430,19 +667,56 @@ func (r *Runner) maybeReadvertiseModels(ctx context.Context, conn *Connection) b
 		if !r.pendingReadvertise.Swap(false) {
 			return false
 		}
-		r.logger.Info("a watched model pull changed this machine's model set; re-advertising without waiting out the floor")
-	} else {
+		r.logger.Info("re-advertising without waiting out the floor: a model pull or a policy reload asked for it")
+	default:
 		r.pendingReadvertise.Store(false)
 	}
 	r.lastReadvertise.Store(now.UnixNano())
-	r.logger.Info("local model inventory changed; reconnecting to re-advertise",
-		"models_offered", len(r.modelInventory(ctx).Advertised()),
-	)
+	switch {
+	case withdrawing:
+		r.logger.Info("inference.serve withdrew this machine from the cluster; reconnecting so the cluster stops routing other people's calls here",
+			"from", conn.AdvertisedServe, "to", serve)
+	case serveChanged:
+		r.logger.Info("inference.serve changed; reconnecting so the cluster sees it",
+			"from", conn.AdvertisedServe, "to", serve)
+	default:
+		r.logger.Info("local model inventory changed; reconnecting to re-advertise",
+			"models_offered", len(r.modelInventory(ctx).Advertised()),
+		)
+	}
 	// Closing the connection surfaces as a Recv error in runStream,
 	// which returns and lets Run reconnect. There is no lighter way to
-	// re-register: the engine binds labels at the handshake.
+	// re-register: the engine binds the advertisement at the handshake.
+	conn.closing.Store(true)
 	conn.Close()
 	return true
+}
+
+// awaitIdleForWithdrawal marks a withdrawn consent as waiting for this
+// worker to go idle, and says so once.
+func (r *Runner) awaitIdleForWithdrawal() {
+	if r.withdrawing.Swap(true) {
+		return
+	}
+	sessions := 0
+	if r.sessions != nil {
+		sessions = r.sessions.Live()
+	}
+	r.logger.Info("inference.serve no longer shares this machine with the cluster; re-registering at the first moment nothing is running",
+		"model_calls", r.calls.Live(),
+		"app_sessions", sessions,
+		"tool_calls", r.activeCalls.Load(),
+		"pulls", r.pulls.Live(),
+	)
+}
+
+// endWithdrawal stops waiting: the registration that carries the consent
+// landed, or the owner restored the consent before it had to.
+func (r *Runner) endWithdrawal(why string) {
+	if !r.withdrawing.Swap(false) {
+		return
+	}
+	r.logger.Info("the withdrawn consent no longer needs a re-registration", "why", why)
 }
 
 // RequestImmediateReadvertise says the local model set just changed and
@@ -473,7 +747,8 @@ func (r *Runner) maybeReadvertiseModels(ctx context.Context, conn *Connection) b
 // worker through the SIGHUP they already send after writing
 // models.allow, and the handler in cli.go asks for this after reloading
 // the policy -- a reloaded allow list that nobody re-advertised is a
-// model the cluster still cannot see. The cluster's own ModelPullStart
+// model the cluster still cannot see. The same reload is how a changed
+// inference.serve reaches the runner. The cluster's own ModelPullStart
 // arm (modelpull.go) calls it directly, after reloading the policy
 // itself and AFTER sending its End: the reconnect this asks for closes
 // the stream that End rides.
@@ -651,7 +926,7 @@ func (r *Runner) runToolDispatch(ctx context.Context, conn *Connection, dispatch
 				outcome = "failure"
 			}
 		}
-		r.metrics.RecordCall(outcome, durationMs)
+		r.metrics.RecordCall(r.home, outcome, durationMs)
 	}
 
 	if err := conn.SendToolResult(dispatch.GetCallId(), success, failure); err != nil {
@@ -660,6 +935,20 @@ func (r *Runner) runToolDispatch(ctx context.Context, conn *Connection, dispatch
 			"error", err,
 		)
 	}
+}
+
+func (r *Runner) minBackoff() time.Duration {
+	if r.backoffMin > 0 {
+		return r.backoffMin
+	}
+	return defaultReconnectMinBackoff
+}
+
+func (r *Runner) maxBackoff() time.Duration {
+	if r.backoffMax > 0 {
+		return r.backoffMax
+	}
+	return DefaultReconnectMaxBackoff
 }
 
 func nextBackoff(current, max time.Duration) time.Duration {
@@ -671,7 +960,10 @@ func nextBackoff(current, max time.Duration) time.Duration {
 }
 
 func sleepWithJitter(ctx context.Context, base time.Duration) bool {
-	jitter := time.Duration(rand.Int63n(int64(base / 4)))
+	var jitter time.Duration
+	if quarter := int64(base / 4); quarter > 0 {
+		jitter = time.Duration(rand.Int63n(quarter))
+	}
 	t := time.NewTimer(base + jitter)
 	defer t.Stop()
 	select {

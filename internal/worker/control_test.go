@@ -14,6 +14,7 @@ import (
 
 func controlFixture(t *testing.T) (*Fleet, string) {
 	t.Helper()
+	t.Setenv("HOME", t.TempDir())
 	path := filepath.Join(t.TempDir(), "workers.yaml")
 	body := `version: 1
 worker_name: fixture
@@ -263,5 +264,33 @@ func TestHomeOSURLRequiresExplicitOrKnownLocalAddress(t *testing.T) {
 		if got := homeOSURL(tc.home); got != tc.want {
 			t.Fatalf("OS URL %q want %q", got, tc.want)
 		}
+	}
+}
+
+// Older registries may contain duplicate enrollments. A menu pause must
+// never make a previously suppressed enrollment reconnect after relaunch.
+func TestLocalControlRefusesDuplicateEnrollmentPolicyChanges(t *testing.T) {
+	f, path := controlFixture(t)
+	f.workers.Homes[1].ClusterURL = "https://a.example:443"
+	f.workers.Homes[1].ID = "newer"
+	f.runHome = func(ctx context.Context, h *managedHome) error { <-ctx.Done(); return ctx.Err() }
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { f.Run(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+	eventuallyControl(t, func() bool { f.mu.Lock(); defer f.mu.Unlock(); return len(f.managed) == 2 })
+	before, _ := os.ReadFile(path)
+	for _, id := range []string{"a", "newer"} {
+		if err := f.SetHomeEnabled(id, false); err == nil {
+			t.Fatalf("ambiguous pause %s accepted", id)
+		}
+	}
+	after, _ := os.ReadFile(path)
+	if string(before) != string(after) {
+		t.Fatal("refused pause changed disk")
+	}
+	status := f.LocalStatus()
+	if status.Homes[0].State != "Duplicate of newer" {
+		t.Fatalf("duplicate status: %+v", status.Homes)
 	}
 }

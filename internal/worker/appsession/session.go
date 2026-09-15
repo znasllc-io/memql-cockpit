@@ -92,9 +92,8 @@ const (
 	ActionCancel          = "cancel"
 	ActionRenewCredential = "renew_credential"
 	// ActionMessage starts the NEXT turn of a session that is already
-	// running one (design D7). The action is a plain string on the wire,
-	// so this word needs no proto change at all -- only the prompt it
-	// carries does, which is what controlPrompt is for.
+	// running one (design D7). The prompt it carries has a field of its
+	// own, read by controlPrompt.
 	ActionMessage = "message"
 )
 
@@ -111,58 +110,44 @@ const transcriptRel = ".memql-session/transcript.log"
 // indistinguishable to the person who typed it from one the app ignored.
 const maxQueuedFollowUps = 8
 
-// --- what memql#5096 adds to the wire, and what stands in until it lands
+// --- the memql#5096 fields, read in one place each
 //
-// Three fields of this feature do not exist on the proto at the pinned
-// engine sha, and each has exactly ONE accessor below rather than a
-// fallback scattered across the call sites. The day the pin carries
-// memql#5096, each becomes a one-line change here and nothing else
-// moves; a fallback written out in two places is how half of it survives
-// the upgrade.
+// The follow-up prompt, the response schema and the structured result
+// each have ONE accessor rather than reads scattered across the call
+// sites. That was the design while the fields did not exist yet -- a
+// stand-in in one place is a one-line change on the day the field lands
+// -- and it is why the day came and went unnoticed: the 2026-09-08 pin
+// bump carried all three and none of the one-line changes was made, so
+// every follow-up arrived empty, no session was asked for a schema, and
+// no structured answer reached the engine (memql-cockpit#444). The
+// accessors stay single for the same reason they were: a field read in
+// one place is a field one test can pin.
 
-// controlPrompt is the follow-up prompt on AppSessionControl{message}.
+// controlPrompt is the follow-up prompt on AppSessionControl{message}:
+// its `prompt` field, and nothing else.
 //
-// A WIRE FACT: AppSessionControl carries session_id, action, credential
-// and reason, and nothing else. `action` is a plain string, so the
-// cockpit can honour "message" today -- only the prompt has nowhere to
-// come from. memql#5096 adds `prompt`; until then the text travels in
-// `reason`, which is already free text the engine fills in and the
-// cockpit already carries into the transcript.
+// `reason` is NOT a fallback. The proto documents it as transcript
+// free-text on cancel, and the engine gives the follow-up its own field
+// precisely because one field meaning two things cannot be read without
+// knowing which branch wrote it. A message control with no prompt is
+// refused by followUp, loudly.
 func controlPrompt(c *memqlv1.AppSessionControl) string {
-	return strings.TrimSpace(c.GetReason())
+	return strings.TrimSpace(c.GetPrompt())
 }
 
 // startResponseSchema is the JSON Schema the engine asked this session's
-// final answer to satisfy.
+// final answer to satisfy -- AppSessionStart.response_schema_json.
 //
-// A WIRE FACT of the same kind: AppSessionStart carries session_id, app,
-// kind, prompt, inputs, workspace, credential, mcp_endpoint, limits,
-// run_id, step_id and app_session_ref -- and no schema. memql#5096 adds
-// `response_schema` (design 4.1). Until then every turn runs
-// unconstrained, which is the honest reading of "the engine asked for
-// nothing": a harness that invented a schema would change what the app
-// says, and the answer would be structured because the COCKPIT decided
-// it should be.
-func startResponseSchema(_ *memqlv1.AppSessionStart) string {
-	return ""
+// EMPTY MEANS THE ENGINE ASKED FOR NONE, and a harness must then not
+// invent one: a schema the caller did not ask for changes what the app
+// says, and the answer would be structured because the COCKPIT decided it
+// should be. Whether this machine's harness can honour one is the app
+// descriptor's business (Register.app_descriptors): a harness that cannot
+// constrain an answer reports structured_result=false, and the engine does
+// not send it a schema.
+func startResponseSchema(s *memqlv1.AppSessionStart) string {
+	return strings.TrimSpace(s.GetResponseSchemaJson())
 }
-
-// resultEventType names the final `event` chunk that carries a turn's
-// structured answer.
-//
-// A WIRE FACT again: AppSessionEnd carries session_id, exit_code, usage,
-// app_session_ref, produced_artifact_ids and error -- there is no
-// `result` field, and memql#5096 adds one. Until then the answer leaves
-// as an event chunk, which is inside the existing contract rather than
-// invented wire: `stream` is "stdout"/"stderr"/"event" and an event
-// chunk is DEFINED as a JSON body the engine maps to a progress event.
-//
-// The type word is NAMESPACED because that same stream carries the APP's
-// own events verbatim, and Claude Code's last stream-json line is
-// literally {"type":"result",...}. A bare "result" here would be
-// indistinguishable from the app's own, to every later reader of a
-// transcript nobody can re-derive.
-const resultEventType = "memql.app_session.result"
 
 // Sender is the worker's side of the stream, as this package needs it.
 type Sender interface {
@@ -189,6 +174,16 @@ type Options struct {
 	// Nil means nothing is allowed, which is the default-deny posture
 	// the rest of the worker has.
 	Allowed func(appID string) bool
+	// Levels returns the machine owner's policy.yaml apps.levels entries
+	// for one app, and the levels those entries refuse, each with the
+	// sentence saying why (tools.Policy.AppLevels). The session lays the
+	// entries over the harness's built-in table.
+	//
+	// Nil means no entries, and every app runs the built-in table
+	// (harness.BuiltinLevels) -- which is also what an absent block
+	// means. Unlike Allowed, silence here grants nothing: it decides how
+	// an allowed app runs, not whether it may.
+	Levels func(appID string) (harness.Table, map[string]string)
 	// CheckWorkspace vetoes a workspace path. The delegation policy
 	// picks the workspace root, but the cockpit still gets to refuse a
 	// path outside its own -- the engine is naming a directory on
@@ -205,12 +200,19 @@ type Options struct {
 	// drives and the harness word the registration advertised come from
 	// one cache and cannot be a probe apart.
 	Detector *apps.Detector
+	// ToolVersions reports the developer tools the session fingerprint
+	// lists. Nil probes this machine (fingerprint.go); tests set it, so a
+	// session test does not fork every compiler on the machine running it.
+	ToolVersions func(ctx context.Context) []harness.ToolVersion
 }
 
 // Manager owns every live session on this machine.
 type Manager struct {
 	opts   Options
 	logger *slog.Logger
+	// tools is the fingerprint's toolchain probe, shared by every session
+	// so its cache is too.
+	tools *toolchain
 
 	mu       sync.Mutex
 	sessions map[string]*session
@@ -229,7 +231,7 @@ func NewManager(opts Options) *Manager {
 	if opts.Detector == nil {
 		opts.Detector = &apps.Detector{}
 	}
-	m := &Manager{opts: opts, logger: logger, sessions: map[string]*session{}}
+	m := &Manager{opts: opts, logger: logger, sessions: map[string]*session{}, tools: newToolchain()}
 	if swept := Sweep(opts.StateDir); swept > 0 {
 		// Worth a line at boot: it means a previous process died with a
 		// live session, and a bearer sat on disk until now.
@@ -334,6 +336,15 @@ func (m *Manager) Live() int {
 	return len(m.sessions)
 }
 
+// toolVersions is the fingerprint's toolchain: Options.ToolVersions when
+// a caller supplied one, this machine's probe otherwise.
+func (m *Manager) toolVersions(ctx context.Context) []harness.ToolVersion {
+	if m.opts.ToolVersions != nil {
+		return m.opts.ToolVersions(ctx)
+	}
+	return m.tools.versions(ctx)
+}
+
 func (m *Manager) forget(id string) {
 	m.mu.Lock()
 	delete(m.sessions, id)
@@ -349,8 +360,15 @@ type session struct {
 	logger  *slog.Logger
 	cancel  context.CancelFunc
 
-	seqMu sync.Mutex
-	seq   uint64
+	// sendMu is held from the moment a chunk is numbered until it is
+	// sent, so chunks reach the stream in the order of their seq. The
+	// engine drops a chunk that arrives behind a higher one, and since
+	// the recording is sent from the harness's goroutines as well as the
+	// narration's, numbering under one lock and sending after it lost
+	// whichever lower chunk came second.
+	sendMu sync.Mutex
+	seqMu  sync.Mutex
+	seq    uint64
 
 	// streamed is how many transcript bytes have been SENT, against
 	// limits.max_transcript_bytes.
@@ -364,6 +382,10 @@ type session struct {
 	library       *Library
 	child         *child
 	cancelReason_ string
+	// policy decides which files the recording reads back (record.go);
+	// pulled are the Library inputs as they landed, for the fingerprint.
+	policy *contentPolicy
+	pulled []pulledInput
 
 	transcript *os.File
 	// before is the workspace as it stood when the run started, so the
@@ -388,6 +410,10 @@ type session struct {
 	appRef    string
 	// result is the LAST turn's structured answer, when it produced one.
 	result []byte
+	// servedModel and servedEffort are what the app REPORTED serving the
+	// last turn that reported a model, kept as a pair -- see recordTurn.
+	servedModel  string
+	servedEffort string
 }
 
 // run drives the whole session and is the only place End is sent.
@@ -428,6 +454,17 @@ func (s *session) execute(ctx context.Context) (int, error) {
 	if err != nil {
 		return -1, err
 	}
+	// The level is settled here, before anything is written or fetched: a
+	// session this machine will not run at its level costs the refusal and
+	// nothing else -- no bearer on disk, no inputs pulled, no transcript
+	// pushed. The open kind hands the app to a PERSON, who picks their own
+	// model, so it reads no level at all.
+	var plan levelPlan
+	if s.start.GetKind() != KindOpen {
+		if plan, err = s.resolveLevel(spec); err != nil {
+			return -1, err
+		}
+	}
 	workspace, err := s.resolveWorkspace()
 	if err != nil {
 		return -1, err
@@ -442,8 +479,12 @@ func (s *session) execute(ctx context.Context) (int, error) {
 	if err != nil {
 		return -1, err
 	}
+	config, backup := mcp.paths()
 	s.mu.Lock()
 	s.mcp = mcp
+	// What the recording may read back from this workspace: never the
+	// session's own scaffolding, which from here on holds the bearer.
+	s.policy = newContentPolicy(workspace, s.redact, filepath.Join(workspace, sessionScaffoldDir), config, backup)
 	s.mu.Unlock()
 
 	base := s.manager.opts.LibraryBase
@@ -481,6 +522,11 @@ func (s *session) execute(ctx context.Context) (int, error) {
 	before := snapshotWorkspace(workspace)
 	s.before = before
 
+	// THE FINGERPRINT IS THE SESSION'S FIRST EVENT (fingerprint.go): the
+	// world as the app is about to find it -- inputs landed, scaffolding
+	// written and left out -- sent before any kind starts anything.
+	s.sendFingerprint(ctx, spec, workspace)
+
 	switch s.start.GetKind() {
 	case KindOpen:
 		return s.runOpen(ctx, spec, workspace)
@@ -500,9 +546,9 @@ func (s *session) execute(ctx context.Context) (int, error) {
 				"so it needs a prompt; there is no way to stream a run already in flight",
 				s.start.GetAppSessionRef())
 		}
-		return s.runTurns(ctx, spec, workspace, ref)
+		return s.runTurns(ctx, spec, workspace, ref, plan)
 	case KindRun, "":
-		return s.runTurns(ctx, spec, workspace, "")
+		return s.runTurns(ctx, spec, workspace, "", plan)
 	default:
 		return -1, fmt.Errorf("app session: unknown kind %q", s.start.GetKind())
 	}
@@ -549,6 +595,88 @@ func (s *session) resolveApp(ctx context.Context) (apps.Spec, error) {
 	return spec, nil
 }
 
+// levelPlan is what a session's LEVEL became on this machine
+// (memql-cockpit#437): the table the harness resolves it through, the
+// knobs that produced, and whose entry they were.
+type levelPlan struct {
+	level string
+	table harness.Table
+	knobs harness.Knobs
+	// owner is true when the level's entry came from the machine owner's
+	// policy.yaml rather than the built-in table -- the first thing a
+	// person reading the transcript needs when the model is not the one
+	// they expected.
+	owner bool
+}
+
+// resolveLevel settles the knobs this session runs at.
+//
+// The table is the built-in one for the harness THIS machine drives the
+// app through (so both Codex harnesses share Codex's), with the owner's
+// apps.levels entries laid over it level by level. The harness resolves the
+// level through the same table again in its own Start, with the same
+// function, so the two cannot disagree; resolving it here as well is what
+// lets the refusal come before the session has written or fetched anything.
+//
+// An owner's entry the app would misread REFUSES its level, in the
+// policy's own sentence naming the line to fix, rather than falling back to
+// the built-in entry it was written to replace (tools.Policy.AppLevels says
+// why). The refusal names the app and the level either way, because the
+// person reading it is the one deciding whether to fix a policy file or a
+// call site.
+func (s *session) resolveLevel(spec apps.Spec) (levelPlan, error) {
+	level := s.start.GetLevel()
+	var override harness.Table
+	var refused map[string]string
+	if f := s.manager.opts.Levels; f != nil {
+		override, refused = f(spec.ID)
+	}
+	if reason, ok := refused[level]; ok && level != "" {
+		return levelPlan{}, fmt.Errorf("app session: %s", reason)
+	}
+	table := harness.MergeLevels(harness.BuiltinLevels(spec.Harness), override)
+	// A refused level leaves the table too, not only this session: the
+	// harness resolves the level again through this table, and a built-in
+	// row left standing under a refused entry is the default the owner's
+	// entry was written to replace -- one skipped check away from running.
+	for level := range refused {
+		delete(table, level)
+	}
+	knobs, err := harness.ResolveLevel(level, table)
+	if err == nil {
+		err = harness.CheckKnobs(spec.Harness, knobs)
+	}
+	// An attach resumes a session rather than starting one, and the Codex
+	// MCP fallback cannot configure a session it resumes. The harness
+	// refuses that too, in Start; asking here is what makes the refusal
+	// come before the bearer and the inputs.
+	if err == nil && s.start.GetKind() == KindAttach {
+		err = harness.CheckResume(spec.Harness, knobs)
+	}
+	if err != nil {
+		return levelPlan{}, fmt.Errorf("app session: %s cannot run at level %q: %w", spec.ID, level, err)
+	}
+	_, owner := override[level]
+	return levelPlan{level: level, table: table, knobs: knobs, owner: owner}, nil
+}
+
+// levelNote is the line a session writes into its transcript saying what
+// its level became here and where that came from, e.g.
+//
+//	[memql] level reasoning runs claude-code with --model opus --effort xhigh (the cockpit's built-in table)
+//
+// It is the one place a person reading a session can see that "reasoning"
+// meant Opus on this machine -- the End reports what the app SAID it ran,
+// and when the two differ, both halves are what explains it.
+func levelNote(spec apps.Spec, p levelPlan) string {
+	source := "the cockpit's built-in table"
+	if p.owner {
+		source = "this machine's policy.yaml apps.levels"
+	}
+	return fmt.Sprintf("[memql] level %s runs %s with %s (%s)\n",
+		p.level, spec.ID, harness.DescribeKnobs(spec.Harness, p.knobs), source)
+}
+
 // resolveWorkspace validates the directory the engine named.
 func (s *session) resolveWorkspace() (string, error) {
 	workspace := strings.TrimSpace(s.start.GetWorkspace())
@@ -580,11 +708,17 @@ func (s *session) pullInputs(ctx context.Context, workspace string) error {
 	s.mu.Unlock()
 
 	for _, id := range inputs {
-		if _, err := library.Pull(ctx, id, workspace); err != nil {
+		path, err := library.Pull(ctx, id, workspace)
+		if err != nil {
 			// Name the id that failed. "an input could not be fetched"
 			// sends whoever reads this to check all of them.
 			return err
 		}
+		// Where it landed, for the fingerprint's digest of what the app
+		// was handed.
+		s.mu.Lock()
+		s.pulled = append(s.pulled, pulledInput{artifact: id, path: path})
+		s.mu.Unlock()
 	}
 	s.logger.Info("app session inputs landed", "count", len(inputs))
 	return nil
@@ -609,7 +743,7 @@ func (s *session) pullInputs(ctx context.Context, workspace string) error {
 // the behaviour a session had before follow-ups existed: the engine
 // waits on an End, and a cockpit that held every session open until it
 // was cancelled would park every run for its whole wall-clock ceiling.
-func (s *session) runTurns(ctx context.Context, spec apps.Spec, workspace, resumeRef string) (int, error) {
+func (s *session) runTurns(ctx context.Context, spec apps.Spec, workspace, resumeRef string, plan levelPlan) (int, error) {
 	h, err := harness.New(spec.Harness)
 	if err != nil {
 		// The set of harness words is closed; this is a descriptor and a
@@ -631,6 +765,8 @@ func (s *session) runTurns(ctx context.Context, spec apps.Spec, workspace, resum
 		MCPConfigPath:  s.mcpConfigPath(),
 		ResponseSchema: startResponseSchema(s.start),
 		ResumeRef:      resumeRef,
+		Level:          plan.level,
+		Levels:         plan.table,
 		Launch:         s.launcher(),
 	}
 	if err := h.Start(ctx, hspec); err != nil {
@@ -642,12 +778,20 @@ func (s *session) runTurns(ctx context.Context, spec apps.Spec, workspace, resum
 	}
 	defer func() { _ = h.Close() }()
 
+	// Said once the harness has taken the level, so the line never
+	// describes a session that did not start at it.
+	if plan.level != "" {
+		s.logger.Info("app session running at its level",
+			"level", plan.level, "model", plan.knobs.Model, "effort", plan.knobs.Effort, "owner_entry", plan.owner)
+		_ = s.emitChunk(StreamStderr, []byte(levelNote(spec, plan)))
+	}
+
 	// Every chunk the app produces arrives here already classified by
-	// the harness, which reads the app's own protocol. This replaces the
-	// "does this line parse as JSON" test that used to stand in for it.
-	sink := harness.SinkFunc(func(stream string, data []byte) {
-		_ = s.emitChunk(stream, data)
-	})
+	// the harness, which reads the app's own protocol -- this replaces the
+	// "does this line parse as JSON" test that used to stand in for it --
+	// and every call the app completes arrives as an Action for the
+	// recording (record.go).
+	sink := sessionSink{s: s}
 
 	s.openFollowUps()
 	prompt := s.start.GetPrompt()
@@ -699,7 +843,12 @@ func (s *session) turnFailure(ctx context.Context, err error) error {
 // followUp queues a `message` control's prompt as the next turn.
 func (s *session) followUp(prompt string) {
 	if prompt == "" {
+		// Into the transcript as well as the log, for the reason a refused
+		// queue says so there: an empty follow-up is exactly what every
+		// follow-up looked like while this runner read the wrong field, and
+		// a person reading the session is the one who would have to notice.
 		s.logger.Warn("app session message control carried no prompt; ignoring")
+		_ = s.emitChunk(StreamStderr, []byte("[memql] a follow-up arrived with no prompt, so no turn was started\n"))
 		return
 	}
 	if err := s.queueFollowUp(prompt); err != nil {

@@ -108,7 +108,9 @@ memql-cockpit/
 │   │                       mouse / keyboard / window via RobotGo);
 │   │                       apps/ (local-app detection) + appsession/
 │   │                       (the app-session runner) + harness/ (the
-│   │                       per-app protocol clients) -- see Local apps;
+│   │                       per-app protocol clients; record.go is the
+│   │                       one shape every completed tool call leaves
+│   │                       in) -- see Local apps, App-session recording;
 │   │                       models/ (runtime discovery + the hardware
 │   │                       floor) + modelcall/ (the ModelCall server)
 │   │                       -- see Local models; inference/ (runtime
@@ -214,9 +216,69 @@ Four rules here are load-bearing, and each is the kind that fails silently:
    enough: every write is recorded in a ledger under the state dir, and
    `appsession.Sweep` clears what a SIGKILL left behind at the next start.
 
+**The app-server's frames carry no `"jsonrpc"` header** -- its README
+says so, and none of a real 0.153.4 turn's lines has one -- so
+`jsonrpcConn.route` recognises a frame by its shape (`rpcMessage.isFrame`:
+the header, or a method, or an id with a result or an error). Requiring the
+header dropped the answer to `initialize` as stray output and hung every
+app-server session at Start while fakes that added it passed: a fake here
+must print what the real binary prints, header included or not.
+
 `usage.known=false` when the app reported nothing, and `exit_code` passes
 through unnormalised -- the engine records the first as billing "unknown" and
 reads the second as a failed run.
+
+**A LEVEL IS TRANSLATED ON THE MACHINE** (epic memql-cockpit#436, the cockpit
+half of the engine's 2026-09-13 recording-and-learning record, epic A, D8/D9).
+`AppSessionStart.level` carries core/airoute's word -- `fast`, `strong`,
+`reasoning`, `embeddings` -- and `internal/worker/harness/levels.go` turns it
+into the app's own knobs: Claude Code `--model`/`--effort` by alias (haiku /
+sonnet high / opus xhigh), Codex `model_reasoning_effort` only (low / medium /
+high; no model, because Codex has no tier aliases and its catalogue is per
+account). `policy.yaml apps.levels` overrides a row. `memql worker apps`
+prints the effective table. Five rules, each of which fails silently:
+
+1. **The vocabulary is the engine's package, not a copy.** `harness` imports
+   `core/airoute` (stdlib-only), so a rename fails at the pin bump instead of
+   refusing every session afterwards. `embeddings` NEVER runs through an app
+   (D10), an undefined word refuses, and an empty level is the app's own
+   defaults -- nothing else falls back to defaults.
+2. **Report, never request.** `AppSessionEnd.model/effort` are what the APP
+   stated (Claude Code: `modelUsage`; Codex: the thread's settings, a
+   `model/rerouted`, `session_configured`), and empty when it said nothing.
+   Claude Code states NO effort anywhere (verified 2.1.270), so its effort is
+   always empty -- copying `--effort` there would record the request as a
+   measurement. Codex echoes even a model nothing answers to, so its settings
+   are reported only for a turn that completed or reported spend.
+3. **`CheckKnobs` exists because Claude Code IGNORES an effort it does not
+   know** (a stderr warning, exit 0). The check runs on the built-in table (a
+   test), on every `apps.levels` entry when the file is read, and in every
+   harness's `Start` before anything forks.
+4. **`apps.levels` is NOT default-deny.** Absent means the built-in table; an
+   entry replaces its row WHOLE; the block REPLACES on SIGHUP. An entry the
+   app would misread REFUSES its level with the policy's sentence -- never a
+   fallback to the built-in row it was written to replace, and the refused
+   row leaves the table the harness sees. Entries no session can reach
+   (unknown app, `fastt`, `embeddings`) are logged, not refused. The block is
+   read from its `yaml.Node`, NOT a typed decode: a typed decode drops an
+   unknown key (`efort`) silently and fails the WHOLE file on a shorthand
+   (`reasoning: opus`) -- and a worker that cannot parse policy.yaml runs on
+   defaults that allow no app. Keep it a node walk.
+5. **The level is resolved before any side effect.** The session refuses it
+   before writing the bearer, pulling inputs or opening a transcript, and the
+   harness resolves the same table again in `Start` with the same function.
+   The `open` kind reads no level: a person picks their own model. An
+   attach through `codex-mcp` cannot take one at all (`codex-reply` declares
+   no configuration), so `harness.CheckResume` refuses it rather than let
+   the transcript claim a level the app never received.
+
+**The memql#5096 app-session fields are mapped** (memql-cockpit#444): the
+follow-up is `AppSessionControl.prompt` (never `reason`), the schema is
+`AppSessionStart.response_schema_json`, the answer is
+`AppSessionEnd.result_json` (the `memql.app_session.result` chunk is gone),
+and `Register.app_descriptors` says which harness drives each app. The pin
+carried all four for a week before anything read them -- when a pin bump
+lands a field, grep for the stand-in the same commit.
 
 ## Local models on the fleet
 
@@ -553,6 +615,127 @@ not see these rows" as "you are watching nothing" -- and a backup with nothing
 to do looks exactly like one that is up to date. Every call reads `errors`
 first.
 
+## App-session recording (memql-cockpit#440)
+
+Every tool call an app completes leaves the session as ONE normalized
+`event` chunk, and the session's first event is the environment
+fingerprint. Engine half: epic memql#5396, **not merged**; the record is
+the ENGINE repository's
+`docs/superpowers/specs/2026-09-13-app-session-recording-and-learning-program-design.md`
+(epic B; D2, D5, D12, D16), and this repository has no separate record.
+`internal/worker/harness/record.go` is the wire shape;
+`claudeactions.go` / `codexactions.go` translate each app;
+`internal/worker/appsession/record.go` and `fingerprint.go` are the
+machine's side. Operator doc: [docs/local-apps.md](docs/local-apps.md).
+
+**One shape, normalized HERE, so the engine never parses a vendor
+format.** `memql.app_session.action` carries `seq, turn, id, parentId?,
+tool, appTool, args, argsDigest?, argsOmitted?, cwd, command?, mcp?, url?,
+query?, exitCode?, isError?, resultType?, resultDigest?, contents?,
+incomplete?`; `tool` is the closed set exec / fs_read / fs_write / fetch /
+mcp / agent / other.
+`agent` is the app's own bookkeeping (known to touch nothing); `other` is
+unclassified and its effects are UNKNOWN -- guessing `agent` for a tool
+that sent a notification would let a replay skip it. No proto change:
+the type words are namespaced because the same stream carries the apps'
+own events verbatim. `TestActionWireContract` pins the names; the engine
+has not written its decoder, so this repository DEFINES them.
+
+**`seq` counts ACTIONS, densely, from 1, across every turn; the
+fingerprint is 0.** It is not the chunk seq: a gap in it says exactly one
+call is missing, which a chunk gap cannot.
+
+**Every unknown stays unknown.** `exitCode` is present only when the app
+reported one. Claude Code has no exit-code field: a failed Bash result's
+text opens "Exit code N", and a succeeded one exited 0 ONLY when
+`tool_use_result` says it ran to the end in the foreground with no
+`returnCodeInterpretation` -- `grep` finding nothing exits 1 and comes
+back as a success. A call the app started and never finished is flushed
+at the end of its turn with `incomplete: true` and no result: never
+dropped, never assumed. A result line over the 1 MiB parse bound is one
+way that happens. The same rule reaches every field: an item with no
+status (a Codex web search, image view, sleep) records NO `isError`; a
+result nobody reported is ABSENT, never the digest of null (every file
+change would share it); a declined command never ran and has neither an
+exit code nor a result; and a Codex item of a type this build has never
+seen is recorded as `other` with the item as its arguments -- an extra
+`other` costs a replay a fallback, a missing call costs it a skipped one.
+Only the conversation's own item types are left out (`codexNonCallItems`).
+
+**The harness names files; the SESSION decides what leaves the machine.**
+Contents are read when the call completes, only if it succeeded, only if
+the path resolves (symlinks followed) inside the workspace and outside
+the scaffolding (`.mcp.json` with the per-run bearer, `.memql-session/`,
+a moved-aside config, the `.memql-mcp-*` temp file the bearer is written
+through), and only a regular file checked on the OPEN descriptor
+(`O_NONBLOCK|O_NOFOLLOW`, so a pipe cannot hang the session). The check
+is repeated on the file that OPENED -- `/proc/self/fd` on Linux,
+re-resolve plus `os.SameFile` elsewhere -- because a directory swapped for
+a link between the check and the open is followed. The configuration files
+and every directory up to the workspace are also matched BY IDENTITY,
+because a hard link to the bearer's file or a Mac's case-insensitive
+`.MCP.json` is a second name no string compare sees. (A hard link to some
+other file under `.memql-session/` is an ordinary file; the credential scan
+still applies to it.) The write rule and the digest cache use the path that
+OPENED, not the one checked.
+
+**A READ NEVER SENDS MORE OF A FILE THAN THE APP ALREADY DID.** A READ's
+bytes travel only when they equal what the app's own result already carried
+(`Content.Seen`, `json:"-"`: Claude Code's Read record, a Codex command's
+output when its parse names exactly one read). `head -1 .env` reported one
+line, so the rest travels as a digest (`digest_only`). A WRITE's bytes are
+the app's own output and travel, except under a `pushExcludedDirs`
+directory (`.git/config` holds remote URLs and their tokens). A file
+holding any credential the session was given travels as neither data nor
+digest (`contains_credential`), at any size -- it is scanned in the pass
+that hashes it -- and the end-of-session push skips it too
+(`redactor.holdsFile`): the redactor rewrites text on its way out, but it
+never sees inside base64 or a file pushed whole, and the bearer cannot be
+revoked. A remembered digest is trusted only while the redactor holds no
+new credential. 256 KiB per file and 1 MiB per action travel inline; up to 64 MiB
+is digested (remembered by identity, size and mtime once the mtime is 2s
+old, so forty reads of one large file hash it once); the rest carries a
+closed `omitted` reason. The digest is over the whole file, not the window
+the app read. Codex reads with its shell, so its reads come from its own
+command parse (`commandActions` / `parsed_cmd`) and nothing else.
+
+**ONE ACTION IS AT MOST 8 MiB ON THE WIRE** (`maxActionBytes`, under the
+stream's 32 MiB). Arguments travel whole and can carry a file (a Write, a
+Codex patch deleting one), so an oversize action sheds its inline bytes
+first, then its arguments (`args: null`, `argsDigest`, `argsOmitted:
+too_large`, and the command / url / query read out of them), and is not
+sent at all past that -- the hole in the dense seq says so.
+
+**The recording is uncapped.** `limits.max_transcript_bytes` bounds the
+narration the engine keeps on the row; an action is not narration, so
+`Sink.Record` is a method of its own (never a stream word a typo could
+turn into narration) and the session sends it past the cap.
+
+**ORDER ON THE WIRE IS THE ORDER OF THE SEQ, and two locks keep it.** The
+engine DROPS a chunk that arrives behind a higher seq. The session numbers
+and sends every chunk under `sendMu`, because the recording is sent from
+the harness's goroutines while narration goes out from others; and the
+Codex clients complete calls on the reader but flush a turn's open ones
+on the turn's goroutine, so they number and send under the recording's
+own lock (`completeAndEmit` / `flushAndEmit`). Numbering under a lock and
+sending after it loses whichever lower chunk came second. A call routed
+as progress rather than tool activity is recorded after the app's own
+line for it, as a tool call is.
+
+**The fingerprint is facts to compare, so values are digests.** App id,
+version (the session manager's own Detector -- a second probe of the
+binary, not the registration's answer) and harness; platform; a fixed
+toolchain asked `--version` in `/`, cached by binary stamp -- on darwin a
+`/usr/bin` shim is never run without the developer tools, because it
+answers by opening an install dialog from a LaunchAgent; the workspace
+LISTING digest (names and kinds, dependency directories listed but not
+entered, scaffolding left out, a moved-aside config listed under its own
+name); the harness-named variables as set-or-not plus digest; the Library
+inputs. `CODEX_HOME` is deliberately not a named variable: it is fresh
+for every session and would match nothing. The four slow parts run at
+once, in front of the app's start, and a version probe that leaves a
+child holding its stdout is released by `cmd.WaitDelay`.
+
 ## The role is a slug with a rank (memql-cockpit#403)
 
 `memql access` prints what a cluster says about the credential on THIS
@@ -628,6 +811,94 @@ records describe, at field numbers DELIBERATELY not the ones they
 illustrate, and runs the real decode against it; that is the only way to
 test a wire this repository cannot yet see.
 
+## The stream, hardened (epic memql-cockpit#425)
+
+One worker process holds one `WorkerService.Stream` per enrolled cluster, and
+this is what keeps those streams honest. The findings are the cockpit half of
+the 2026-09-13 connection-layer audit (a comment on znasllc-io/memql#5327);
+the engine half is epic memql#5327. There is no separate design record.
+
+**EVERY WRITE REACHES THE SDK'S LOCK THROUGH ONE SEAM.** grpc-go forbids
+`SendMsg` from two goroutines on one stream, and this worker writes from the
+heartbeat, the recv loop (Pong), every tool dispatch, every model call's
+deltas, every pull and every app session at once. The lock lives in
+`sdk/go/worker.Connection.Send` (memql#5351, which also deleted the raw
+`Stream()` accessor); `Connection.Send` in `connect.go` is the ONLY call to it
+here, and `TestEveryWorkerWriteGoesThroughConnectionSend` walks every Go file
+to keep it that way. Do not add a lock in the cockpit "to be safe" -- it
+protects nothing the SDK's does not -- and do not call the SDK connection
+from anywhere else. CI runs the suite under `-race`.
+
+**A WORKER-SIDE REFUSAL IS A FAILED CALL.** At the current pin the engine
+treats any error a worker ends a model call with as the call having run, and
+does not try another machine. So nothing here refuses a call to make itself
+convenient: the model ceiling WAITS, and a consent withdrawal waits for idle
+rather than refusing its way there. Revisit both once the engine reroutes a
+refusal made before start.
+
+**A REFUSAL BY THE CLUSTER IS NOT A BLIP, AND NOT A REASON TO DISABLE A
+HOME.** Unauthenticated, or the engine's exact sentences for an inactive or
+expired token or a revoked registration, get a HOLD once the cluster has
+refused at least three times IN A ROW (an unreachable attempt starts the
+count over) AND for at least 30 seconds: one error line, a
+retry every minute doubling to fifteen, the `worker_home_refused` gauge, and
+`<home state dir>/refused.json`, which `memql worker config` prints
+(`refusal.go`). The engine maps EVERY token lookup failure to "invalid worker
+token", so a database blip during a deploy looks exactly like a revocation
+from here -- which is why the grace exists and why nothing writes `enabled:
+false`. The first accepted handshake ends all of it. A Send that answers
+io.EOF during the handshake is followed by a Recv, because grpc only reports
+the real status there; without it a refused token read as "send: EOF".
+
+**THE BACKOFF RESETS ONLY FOR A STREAM THAT PROVED ITSELF** -- one heartbeat
+sent. A cluster that accepts Register and drops the stream used to be asked
+again every second, each time a full Register and a hardware scan.
+
+**THE CONSENT IS PART OF THE ADVERTISEMENT.** `inference.serve` rides
+Register's descriptor and nothing else, so a changed consent re-registers
+(`Connection.AdvertisedServe` beside `ModelFingerprint`). A WITHDRAWAL skips
+the two-minute floor; if work is in flight it waits, re-checking every
+second instead of every minute, and re-registers at the first idle second.
+It never cuts work short and never refuses a call to get there (see above).
+Restoring the consent before it lands ends the wait. The heartbeat goroutine
+is joined before `runStream` returns, so a stale one can never act on the
+next stream's state. Each stream is opened on its own context, and
+`Connection.Close` cancels it if the graceful half-close is still stuck
+after `closeGrace` -- a Send blocked behind a cluster that stopped reading
+would otherwise hold it indefinitely, since such a peer still acks
+keepalive pings.
+
+**THE WORKERS FILE IS THE WHOLE TRUTH ONCE IT EXISTS.** `worker run` reads
+`worker.yaml` as a home only on a machine that has never had a
+`workers.yaml` (`decideRunMode`). `syncLegacyMirror` keeps the legacy mirror
+naming an enabled home with its current token, or deletes it -- on every
+`unpair` and at every `worker run` start, so a token an older unpair left
+behind does not stay on disk. It touches ONLY the mirror, the `worker.yaml`
+beside `workers.yaml` (`isMirrorOf`): a `--config` anywhere else is a file
+a person wrote. A registry with nothing enabled makes the
+worker wait, connected to nothing: at a terminal it says so and exits; under
+the LaunchAgent or the user unit it says so once and waits (a SIGHUP does not
+end the wait), because both restart a worker that exits.
+
+**ONE MACHINE ID, AT THE STATE ROOT.** `machineStateRoot` maps a per-home
+state dir (`<root>/homes/<id>`, which the legacy mirror carries too) to
+`<root>`, where `machine-id` lives; the fleet resolves it once before any home
+connects, resolution is serialized in-process, and a per-home id from an
+earlier build is ADOPTED, not replaced.
+
+**PER CLUSTER: CONSENT, METRICS, STREAMS. PER MACHINE: THE MODEL CEILING.**
+`consent.Homes` holds one window per home and each home's dispatcher asks its
+own; `consent revoke` with no `--cluster` closes every window. Every
+per-stream metric carries `home`, and each home's series exist from startup.
+Two enabled homes on one cluster open ONE stream (`runnableHomes`: the later
+entry, which holds the newer token); the file stays valid so pair and unpair
+still work on it, and the installer matches clusters by host as Go does so it
+no longer produces one. The model concurrency ceiling is one
+`modelcall.Limiter` shared by every home -- a semaphore: a call that finds
+the machine full waits, with keepalives, for up to its own idle ceiling.
+`Fleet.Run` builds every home before it starts any, and joins every
+goroutine it starts.
+
 ## Worker + auth notes
 
 - **Enrollment:** `memql cluster add <domain>` fetches
@@ -639,6 +910,10 @@ test a wire this repository cannot yet see.
 - **Services:** macOS LaunchAgent label `com.znasllc.memql-worker`; Linux
   user-systemd `memql-worker.service`. Installers retire the pre-rename
   `memql-cockpit-worker` agent/unit and binaries in place.
+- **Unpairing:** `memql worker unpair --cluster <id>` removes (or
+  `--disable`s) one home and keeps the legacy mirror honest; the running
+  worker keeps that stream until it restarts, and the command prints the
+  restart for the platform.
 - **Credential stores:** OS keyring preferred, file fallback
   (`~/.memql/credentials/`, 0600). `MEMQL_COCKPIT_CRED_STORE` forces one.
   The keyring service name stays `com.znasllc.memql-cockpit` on purpose —

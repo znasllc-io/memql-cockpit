@@ -70,6 +70,14 @@ const (
 	codexNotifyTokenUsage        = "thread/tokenUsage/updated"
 	codexNotifyTurnCompleted     = "turn/completed"
 	codexNotifyError             = "error"
+	// codexNotifyModelRerouted is the app moving a turn to another model
+	// (ModelReroutedNotification, 0.153.4: fromModel, toModel, reason) --
+	// the one execution-time statement of a model the app-server makes.
+	codexNotifyModelRerouted = "model/rerouted"
+	// codexNotifyThreadSettings is the app restating the thread's settings
+	// after they change (ThreadSettingsUpdatedNotification, 0.153.4:
+	// threadSettings.model and .effort).
+	codexNotifyThreadSettings = "thread/settings/updated"
 )
 
 // Item types worth telling apart.
@@ -163,6 +171,26 @@ func (e *rpcError) Error() string {
 	return fmt.Sprintf("%s (code %d)", e.Message, e.Code)
 }
 
+// isFrame reports whether a decoded line is a JSON-RPC message at all.
+//
+// THE `jsonrpc` HEADER IS NOT THE TEST, because codex app-server does not
+// send it. Its README says so ("with the "jsonrpc":"2.0" header omitted on
+// the wire"), and the real codex-cli 0.153.4 omits it on every frame
+// (recorded 2026-09-13: `{"id":1,"result":{"userAgent":...}}`,
+// `{"method":"remoteControl/status/changed","params":{...}}`), while the
+// mcp-server fallback does send it. Requiring the header filed the
+// initialize answer as stdout, so every app-server session hung at Start
+// until its deadline -- and the fakes all sent the header, so no test saw
+// it (the #440 session found it by driving the real binary).
+//
+// So a frame is what JSON-RPC 2.0 makes one: the header, a method (a
+// request or a notification), or an id carrying a result or an error (a
+// response). A JSON line that is none of those -- a structured log line
+// the process printed, say -- is still narration and stays on stdout.
+func (m rpcMessage) isFrame() bool {
+	return m.JSONRPC != "" || m.Method != "" || (m.ID != nil && (len(m.Result) > 0 || m.Error != nil))
+}
+
 // rpcMethodNotFound is what this client answers a server request with.
 //
 // Source: JSON-RPC 2.0, section 5.1.
@@ -247,6 +275,18 @@ func (c *jsonrpcConn) emit(stream string, data []byte) {
 	}
 }
 
+// record hands one finished call to the turn's sink. Like a chunk, an
+// action that finishes with no turn in flight has nowhere to go -- and
+// its seq is already spent, so the gap it leaves is visible downstream.
+func (c *jsonrpcConn) record(a Action) {
+	c.mu.Lock()
+	s := c.sink
+	c.mu.Unlock()
+	if s != nil {
+		s.Record(a)
+	}
+}
+
 func (c *jsonrpcConn) readStdout() {
 	defer c.deadOnce.Do(func() { close(c.dead) })
 	r := bufio.NewReaderSize(c.proc.Stdout(), 64<<10)
@@ -302,11 +342,9 @@ func (c *jsonrpcConn) route(line []byte) {
 		return
 	}
 	var msg rpcMessage
-	// The `jsonrpc` test is what separates a protocol frame from
-	// anything else the process printed. Requiring it rather than
-	// merely "parses as JSON" is the difference between this package
-	// and the transcript-guessing it replaces.
-	if json.Unmarshal(trimmed, &msg) != nil || msg.JSONRPC == "" {
+	// A protocol frame is decided by its shape (isFrame), not by the
+	// `jsonrpc` header the app-server never sends.
+	if json.Unmarshal(trimmed, &msg) != nil || !msg.isFrame() {
 		c.emit(StreamStdout, line)
 		return
 	}
@@ -551,6 +589,9 @@ func marshalParams(params any) (json.RawMessage, error) {
 type codexAppServer struct {
 	spec Spec
 	conn *jsonrpcConn
+	// knobs are the session's level in Codex's words, settled in Start
+	// before the process exists and put on the thread when it opens.
+	knobs Knobs
 
 	mu sync.Mutex
 	// started is guarded because Close is the cancel path's job and can
@@ -559,6 +600,15 @@ type codexAppServer struct {
 	started  bool
 	threadID string
 	turn     *codexTurnState
+	// servedModel and servedEffort are what the APP STATED the thread
+	// runs at -- its thread/start or thread/resume answer, and a
+	// model/rerouted since. A turn reports them only once it has shown the
+	// model ran; see result.
+	servedModel  string
+	servedEffort string
+	// rec is the session's recording. It is set before the process starts
+	// because the reader goroutine may deliver an item the moment it does.
+	rec *recording
 }
 
 // Name implements Harness.
@@ -577,7 +627,16 @@ func (h *codexAppServer) Start(ctx context.Context, spec Spec) error {
 	if err := checkCodexSpec("codex app-server", spec); err != nil {
 		return err
 	}
+	// The level is settled BEFORE the process exists: a level Codex cannot
+	// run at is a sentence, and must not also be an app-server started and
+	// torn down on somebody's machine for a session that could never run.
+	knobs, err := spec.knobs(HarnessCodexAppServer)
+	if err != nil {
+		return fmt.Errorf("codex app-server: %w", err)
+	}
 	h.spec = spec
+	h.knobs = knobs
+	h.rec = newRecording()
 
 	proc, err := spec.Launch(ctx, spec.Workspace, []string{spec.Binary, "app-server"}, spec.Env, true)
 	if err != nil {
@@ -651,6 +710,11 @@ func (h *codexAppServer) Turn(ctx context.Context, prompt string, sink Sink) (Tu
 		h.turn = nil
 		h.mu.Unlock()
 	}()
+	h.rec.startTurn()
+	// The calls this turn started and never finished are recorded when it
+	// ends, whichever way it ends -- and before the sink is detached, which
+	// is the deferred call registered first and so run last.
+	defer h.flushRecording()
 
 	params := map[string]any{
 		"threadId": h.currentThread(),
@@ -702,6 +766,17 @@ func (h *codexAppServer) Turn(ctx context.Context, prompt string, sink Sink) (Tu
 	if reason == "" {
 		reason = "the app gave no reason"
 	}
+	// The schema'd answer is read before the status decides the outcome,
+	// because it rides a failure too: AppSessionEnd keeps result_json apart
+	// from the error so a turn that produced its final answer and was then
+	// marked failed still hands the answer back. The outputSchema makes the
+	// final message the answer or nothing (strict json_schema upstream), so
+	// text that parses is the answer rather than a fragment of one.
+	schema := strings.TrimSpace(h.spec.ResponseSchema) != ""
+	structured, parsed := codexJSONValue(out.Text)
+	if schema && parsed {
+		out.ResultJSON = structured
+	}
 	switch status {
 	case codexTurnCompleted:
 		// The only status that reaches the structured check below.
@@ -715,12 +790,8 @@ func (h *codexAppServer) Turn(ctx context.Context, prompt string, sink Sink) (Tu
 		// nobody here understood as a finished answer.
 		return out, fmt.Errorf("codex app-server: the turn ended as %q: %s", status, reason)
 	}
-	if strings.TrimSpace(h.spec.ResponseSchema) != "" {
-		structured, ok := codexJSONValue(out.Text)
-		if !ok {
-			return out, ErrNoStructuredResult
-		}
-		out.ResultJSON = structured
+	if schema && !parsed {
+		return out, ErrNoStructuredResult
 	}
 	return out, nil
 }
@@ -749,15 +820,27 @@ func (h *codexAppServer) ensureThread(ctx context.Context) error {
 		method = codexMethodThreadResume
 		params = map[string]any{"threadId": ref, "cwd": h.spec.Workspace}
 	}
+	h.applyKnobs(params)
 
 	res, err := h.conn.call(ctx, "codex app-server: opening the thread", method, params)
 	if err != nil {
 		return err
 	}
+	// WHAT THE APP STATES, NOT WHAT WAS SENT. Both methods answer the
+	// thread's settings beside the thread -- `model` and `reasoningEffort`
+	// (ThreadStartResponse / ThreadResumeResponse, 0.153.4) -- and those
+	// are what a turn reports. They are the app's statement of its
+	// configuration rather than per-turn telemetry (Codex's own Thread
+	// docs say so, and it echoes even a name no model answers to), which
+	// is why result reports them only for a turn that showed the model
+	// ran. reasoningEffort is null when the thread has none set, and null
+	// stays empty.
 	var out struct {
 		Thread struct {
 			ID string `json:"id"`
 		} `json:"thread"`
+		Model           string  `json:"model"`
+		ReasoningEffort *string `json:"reasoningEffort"`
 	}
 	if err := json.Unmarshal(res, &out); err != nil {
 		return fmt.Errorf("codex app-server: %s answered with something this build cannot read: %w", method, err)
@@ -770,8 +853,43 @@ func (h *codexAppServer) ensureThread(ctx context.Context) error {
 	}
 	h.mu.Lock()
 	h.threadID = out.Thread.ID
+	h.servedModel = strings.TrimSpace(out.Model)
+	h.servedEffort = ""
+	if out.ReasoningEffort != nil {
+		h.servedEffort = strings.TrimSpace(*out.ReasoningEffort)
+	}
 	h.mu.Unlock()
 	return nil
+}
+
+// applyKnobs puts the session's level on a thread/start or thread/resume.
+//
+// The model is the typed `model` both methods take. The effort rides
+// `config` as model_reasoning_effort -- the configuration key the design
+// record names, spelled as Codex 0.153.4 reads it from config.toml -- and
+// NOT as turn/start's `effort`, because the THREAD is where the app states
+// what it runs at: its answer carries `reasoningEffort`, and an effort sent
+// per turn would leave that statement describing a setting the turns no
+// longer use. A knob left empty is left out, and Codex decides it exactly
+// as it did before levels existed -- from its OWN defaults, not the
+// operator's ~/.codex/config.toml: the session runs under a per-session
+// CODEX_HOME that holds only MemQL's MCP server and a link to auth.json
+// (appsession/mcpconfig.go, layoutCodex), so "unset" here means the
+// account's default model at that model's default effort.
+func (h *codexAppServer) applyKnobs(params map[string]any) {
+	if h.knobs.Model != "" {
+		params["model"] = h.knobs.Model
+	}
+	if h.knobs.Effort != "" {
+		params["config"] = map[string]any{"model_reasoning_effort": h.knobs.Effort}
+	}
+}
+
+// served is the thread's model and effort as the app last stated them.
+func (h *codexAppServer) served() (model, effort string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.servedModel, h.servedEffort
 }
 
 func (h *codexAppServer) currentThread() string {
@@ -790,6 +908,18 @@ func (h *codexAppServer) result(state *codexTurnState) TurnResult {
 	if state != nil {
 		out.Text = state.finalText()
 		out.Usage = state.spend()
+		// The thread's stated settings are what SERVED only once the turn
+		// shows the model ran. Before that they are what the thread was
+		// configured with -- and a configured model that failed the turn
+		// before answering (a name no model answers to, say) served nothing.
+		// A reroute this turn announced replaces the model for this turn
+		// alone.
+		if state.ranTheModel() {
+			out.Model, out.Effort = h.served()
+			if to := state.reroutedTo(); to != "" {
+				out.Model = to
+			}
+		}
 	}
 	return out
 }
@@ -830,8 +960,15 @@ func (h *codexAppServer) handleNotification(method string, params json.RawMessag
 		kind, id, text, phase := codexReadItem(n.Item)
 		if codexToolItems[kind] {
 			h.conn.emit(StreamTool, n.Item)
+			h.recordItem(method, n.Item)
 			return
 		}
+		// A call this build routes as progress rather than as tool
+		// activity -- an image view, a sub-agent, a sleep, a type it has
+		// never seen -- is still a call, and still recorded; anything else
+		// is ignored there. Deferred, so the action follows the app's own
+		// event line as it follows a tool chunk above.
+		defer h.recordItem(method, n.Item)
 		if kind == codexItemAgentMessage && method == codexNotifyItemCompleted {
 			if state != nil && state.match(n.TurnID) {
 				state.addMessage(text, phase)
@@ -898,9 +1035,73 @@ func (h *codexAppServer) handleNotification(method string, params json.RawMessag
 		if json.Unmarshal(params, &n) == nil && !n.WillRetry && state != nil {
 			state.noteError(n.Error.Message)
 		}
+
+	case codexNotifyModelRerouted:
+		var n struct {
+			TurnID  string `json:"turnId"`
+			ToModel string `json:"toModel"`
+		}
+		// The app moved THIS turn to another model. The notification names
+		// the turn and its one reason on 0.153.4 (highRiskCyberActivity) is
+		// about a request, so the reroute is kept on the turn rather than
+		// the thread: a later turn that was not rerouted ran on the thread's
+		// own model again. The thread's effort is not restated. The
+		// notification still reaches the transcript below -- a person
+		// reading a session that moved models should see that it moved.
+		if json.Unmarshal(params, &n) == nil && state != nil && state.match(n.TurnID) {
+			state.noteReroute(n.ToModel)
+		}
+
+	case codexNotifyThreadSettings:
+		var n struct {
+			ThreadSettings struct {
+				Model  string  `json:"model"`
+				Effort *string `json:"effort"`
+			} `json:"threadSettings"`
+		}
+		// The app restating the thread's settings after they changed
+		// (ThreadSettingsUpdatedNotification, 0.153.4) -- a newer statement
+		// of the same thing thread/start answered, so it replaces it.
+		if json.Unmarshal(params, &n) == nil {
+			if m := strings.TrimSpace(n.ThreadSettings.Model); m != "" {
+				effort := ""
+				if n.ThreadSettings.Effort != nil {
+					effort = strings.TrimSpace(*n.ThreadSettings.Effort)
+				}
+				h.mu.Lock()
+				h.servedModel, h.servedEffort = m, effort
+				h.mu.Unlock()
+			}
+		}
 	}
 
 	h.conn.emit(StreamEvent, raw)
+}
+
+// recordItem feeds one item to the session's recording: a started item
+// opens a call, a completed one closes it.
+func (h *codexAppServer) recordItem(method string, raw json.RawMessage) {
+	call, item, ok := codexItemCall(raw, h.spec.Workspace)
+	if !ok {
+		return
+	}
+	switch method {
+	case codexNotifyItemStarted:
+		h.rec.begin(call)
+	case codexNotifyItemCompleted:
+		// Sent under the recording's lock (completeAndEmit): this runs on
+		// the reader while the turn's flush runs on its own goroutine, and
+		// the order on the wire has to be the order of the seq.
+		h.rec.completeAndEmit(call.ID, func(a *Action) {
+			*a = mergeCall(*a, call)
+			codexItemFinish(a, item)
+		}, h.conn.record)
+	}
+}
+
+// flushRecording records the calls the turn started and never finished.
+func (h *codexAppServer) flushRecording() {
+	h.rec.flushAndEmit(h.conn.record)
 }
 
 // codexReadItem pulls the four things anything asks of a ThreadItem.
@@ -960,6 +1161,8 @@ type codexTurnState struct {
 	reason    string
 	items     []json.RawMessage
 	completed bool
+	// rerouted is the model a model/rerouted moved this turn to.
+	rerouted string
 	// pendingID holds a completion that arrived before the turn had a
 	// name, so it can be matched once it does.
 	pendingID string
@@ -1096,6 +1299,33 @@ func (t *codexTurnState) spend() Usage {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.usage
+}
+
+// ranTheModel reports whether this turn shows the model actually ran: it
+// completed, or it reported spend. Tokens spent are tokens a model produced,
+// so an interrupted or failed turn that reported usage still ran on the
+// thread's model; one that did neither may have failed before any model
+// answered, and names none.
+func (t *codexTurnState) ranTheModel() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return (t.completed && t.status == codexTurnCompleted) || t.usage.Known
+}
+
+// noteReroute records the model the app moved this turn to.
+func (t *codexTurnState) noteReroute(model string) {
+	if m := strings.TrimSpace(model); m != "" {
+		t.mu.Lock()
+		t.rerouted = m
+		t.mu.Unlock()
+	}
+}
+
+// reroutedTo is the model this turn was moved to, or "" when it was not.
+func (t *codexTurnState) reroutedTo() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.rerouted
 }
 
 // finalText picks the assistant message that is the ANSWER.

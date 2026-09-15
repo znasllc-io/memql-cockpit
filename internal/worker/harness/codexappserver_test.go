@@ -139,6 +139,21 @@ printf '{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"THREAD"
 // protocol is a contract rather than a guess.
 func fakeCodexAppServer(t *testing.T, turnBody string) (binary, log string) {
 	t.Helper()
+	return fakeCodexAppServerSettings(t, codexFakeSettings, turnBody)
+}
+
+// codexFakeSettings is what the fake states beside the thread on
+// thread/start and thread/resume, in ThreadStartResponse's own shape: the
+// model and provider, and no reasoningEffort -- the recorded 2026-09-07
+// answer. The level tests pass their own, because what the app STATES here
+// is what a turn reports as having served it.
+const codexFakeSettings = `"model":"gpt-5.1-codex","modelProvider":"openai","serviceTier":null`
+
+// fakeCodexAppServerSettings is fakeCodexAppServer with the thread's stated
+// settings chosen by the test. settings is spliced into a shell printf
+// format, so it must hold no `%` and no `'`.
+func fakeCodexAppServerSettings(t *testing.T, settings, turnBody string) (binary, log string) {
+	t.Helper()
 	log = codexWireLogPath(t)
 	body := strings.ReplaceAll(turnBody, "THREAD", codexFakeThread)
 	script := "#!/bin/sh\n" +
@@ -156,11 +171,11 @@ func fakeCodexAppServer(t *testing.T, turnBody string) (binary, log string) {
 		"      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"userAgent\":\"codex-fake/1.0.0\",\"codexHome\":\"/tmp/codex-home\",\"platformFamily\":\"unix\",\"platformOs\":\"linux\"}}\\n' \"$id\"\n" +
 		"      ;;\n" +
 		"    *'\"method\":\"thread/start\"'*)\n" +
-		"      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"thread\":{\"id\":\"" + codexFakeThread + "\",\"preview\":\"\",\"modelProvider\":\"openai\",\"createdAt\":1730910000},\"model\":\"gpt-5.1-codex\",\"modelProvider\":\"openai\",\"serviceTier\":null}}\\n' \"$id\"\n" +
+		"      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"thread\":{\"id\":\"" + codexFakeThread + "\",\"preview\":\"\",\"modelProvider\":\"openai\",\"createdAt\":1730910000}," + settings + "}}\\n' \"$id\"\n" +
 		"      printf '{\"jsonrpc\":\"2.0\",\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\"" + codexFakeThread + "\",\"status\":{\"type\":\"active\"}}}}\\n'\n" +
 		"      ;;\n" +
 		"    *'\"method\":\"thread/resume\"'*)\n" +
-		"      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"thread\":{\"id\":\"" + codexFakeResumed + "\",\"preview\":\"\",\"modelProvider\":\"openai\",\"createdAt\":1730910000},\"model\":\"gpt-5.1-codex\",\"modelProvider\":\"openai\"}}\\n' \"$id\"\n" +
+		"      printf '{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{\"thread\":{\"id\":\"" + codexFakeResumed + "\",\"preview\":\"\",\"modelProvider\":\"openai\",\"createdAt\":1730910000}," + settings + "}}\\n' \"$id\"\n" +
 		"      ;;\n" +
 		"    *'\"method\":\"turn/start\"'*)\n" +
 		"      turn=$((turn + 1))\n" +

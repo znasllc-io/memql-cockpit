@@ -94,6 +94,17 @@ func (m *mcpConfig) Env() []string {
 	return append([]string(nil), m.env...)
 }
 
+// paths is where this configuration's bearer lives and, when a person's
+// own configuration was moved aside for it, where theirs went.
+func (m *mcpConfig) paths() (config, backup string) {
+	if m == nil {
+		return "", ""
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.configPath, m.backupPath
+}
+
 // writeMCPConfig lays down the app's MCP configuration for one session.
 //
 // stateDir is the worker's state directory; the ledger lives under it so

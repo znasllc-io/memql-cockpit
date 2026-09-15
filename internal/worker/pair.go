@@ -200,9 +200,12 @@ func runConfiguredWorker(clusterURL, token, name string, logger *slog.Logger) er
 		logger.Warn("policy load failed; using defaults", "error", err)
 		policy = tools.DefaultPolicy()
 	}
+	logLevelProblems(logger, policy)
 
-	consentMgr := consent.NewManager()
-	consentSrv := consent.NewServer(consentMgr, consent.DefaultSocketPath(), logger)
+	// One consent window per cluster, as `worker run` has (memql-cockpit
+	// #433).
+	consentHomes := consent.NewHomes()
+	consentSrv := consent.NewServer(consentHomes, consent.DefaultSocketPath(), logger)
 	consentCtx, consentCancel := context.WithCancel(context.Background())
 	if err := consentSrv.Listen(consentCtx); err != nil {
 		logger.Warn("consent socket failed to start; running with default-deny gate but no IPC control",
@@ -210,7 +213,7 @@ func runConfiguredWorker(clusterURL, token, name string, logger *slog.Logger) er
 	}
 	defer consentCancel()
 
-	dispatcher := tools.NewDispatcher(logger, policy, consentMgr)
+	toolsFor := homeDispatchers(logger, policy, consentHomes)
 
 	metrics := NewMetrics()
 	if err := metrics.Listen(9100); err != nil {
@@ -246,7 +249,7 @@ func runConfiguredWorker(clusterURL, token, name string, logger *slog.Logger) er
 			Workers:    workers,
 			Policy:     policy,
 			PolicyPath: policyPath,
-			Tools:      dispatcher,
+			ToolsFor:   toolsFor,
 			Apps:       appInv,
 			Models:     modelInventory,
 			Discoverer: discoverer,
@@ -263,13 +266,14 @@ func runConfiguredWorker(clusterURL, token, name string, logger *slog.Logger) er
 			cfg.Name = name
 		}
 		cfg.Capabilities = capabilitiesForBuildTag()
+		cfg.Home = HomeIDFromURL(clusterURL)
 		if err := cfg.Validate(); err != nil {
 			return fmt.Errorf("pair-run: %w", err)
 		}
 		runner, err = NewRunner(Options{
 			Logger:         logger,
 			Config:         cfg,
-			Tools:          dispatcher,
+			Tools:          toolsFor(cfg.Home),
 			Apps:           appInv,
 			Models:         modelInventory,
 			Metrics:        metrics,
@@ -290,6 +294,7 @@ func runConfiguredWorker(clusterURL, token, name string, logger *slog.Logger) er
 					logger.Warn("policy reload failed", "error", err)
 				} else {
 					logger.Info("policy reloaded")
+					logLevelProblems(logger, policy)
 					if fleet != nil {
 						fleet.RequestImmediateReadvertise()
 					} else if runner != nil {

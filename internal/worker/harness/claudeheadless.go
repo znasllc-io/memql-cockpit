@@ -69,12 +69,20 @@ const (
 	claudeTypeAssistant = "assistant"
 	claudeTypeUser      = "user"
 	claudeTypeResult    = "result"
+	// claudeTypeSystem with subtype init opens every turn and names the
+	// model the session runs on (2.1.270: `"model":"claude-haiku-4-5-..."`)
+	// and the working directory it runs in, which the recording uses.
+	claudeTypeSystem  = "system"
+	claudeSubtypeInit = "init"
 )
 
-// Content block types inside an assistant or user message.
+// Content block types inside an assistant or user message. The last two
+// are the recording's (claudeactions.go): a call, and its result.
 const (
-	claudeBlockText     = "text"
-	claudeBlockThinking = "thinking"
+	claudeBlockText       = "text"
+	claudeBlockThinking   = "thinking"
+	claudeBlockToolUse    = "tool_use"
+	claudeBlockToolResult = "tool_result"
 )
 
 // claudeHeadless is the Harness for `claude -p`.
@@ -84,12 +92,19 @@ const (
 // mutable state lives in claudeTurn instead, so two turns cannot see
 // each other's half-parsed stream.
 type claudeHeadless struct {
-	mu      sync.Mutex
-	spec    Spec
+	mu   sync.Mutex
+	spec Spec
+	// knobs are the session's level as this app spells it, settled once in
+	// Start and passed to every turn's process -- a resumed turn included,
+	// because each turn is a fresh process that knows only its own argv.
+	knobs   Knobs
 	ref     string
 	started bool
 	closed  bool
 	running bool
+	// rec is the session's recording. It outlives every turn's process,
+	// because the action seq runs across the whole session.
+	rec *recording
 }
 
 // Name implements Harness.
@@ -125,11 +140,20 @@ func (h *claudeHeadless) Start(_ context.Context, spec Spec) error {
 	if strings.TrimSpace(spec.Binary) == "" {
 		return errors.New("harness: claude-headless was given no binary to run")
 	}
+	// The level is settled here rather than at the first turn, so a level
+	// this app cannot run at fails while the session is still starting --
+	// before a process, and before a turn that would read as a bad prompt.
+	knobs, err := spec.knobs(HarnessClaudeHeadless)
+	if err != nil {
+		return fmt.Errorf("harness: claude-headless: %w", err)
+	}
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.spec = spec
+	h.knobs = knobs
 	h.ref = strings.TrimSpace(spec.ResumeRef)
+	h.rec = newRecording()
 	h.started = true
 	h.closed = false
 	return nil
@@ -161,7 +185,7 @@ func (h *claudeHeadless) Close() error {
 // conversation that silently forgot half of itself.
 func (h *claudeHeadless) Turn(ctx context.Context, prompt string, sink Sink) (TurnResult, error) {
 	h.mu.Lock()
-	spec, ref, started, closed, running := h.spec, h.ref, h.started, h.closed, h.running
+	spec, knobs, ref, started, closed, running, rec := h.spec, h.knobs, h.ref, h.started, h.closed, h.running, h.rec
 	if started && !closed && !running {
 		h.running = true
 	}
@@ -182,15 +206,16 @@ func (h *claudeHeadless) Turn(ctx context.Context, prompt string, sink Sink) (Tu
 		h.running = false
 		h.mu.Unlock()
 	}()
+	rec.startTurn()
 
-	argv := claudeArgv(spec, prompt, ref)
+	argv := claudeArgv(spec, knobs, prompt, ref)
 	proc, err := spec.Launch(ctx, spec.Workspace, argv, spec.Env, false)
 	if err != nil {
 		return TurnResult{ExitCode: -1, AppSessionRef: ref},
 			fmt.Errorf("harness: could not start %s: %w", spec.Binary, err)
 	}
 
-	turn := &claudeTurn{sink: sink}
+	turn := &claudeTurn{sink: sink, rec: rec, cwd: spec.Workspace}
 
 	// The context is watched here as well as by the launcher because
 	// Process.Terminate is the seam that stops the whole process GROUP.
@@ -215,6 +240,13 @@ func (h *claudeHeadless) Turn(ctx context.Context, prompt string, sink Sink) (Tu
 	turn.pumpStdout(proc.Stdout())
 	pumps.Wait()
 
+	// A call begun in this turn and never answered never will be: the next
+	// turn is a new process with no memory of this one's ids. It is
+	// recorded as incomplete rather than dropped (recording.flush).
+	for _, a := range rec.flush() {
+		turn.record(a)
+	}
+
 	waitErr := proc.Wait()
 	close(watchDone)
 
@@ -230,10 +262,26 @@ func (h *claudeHeadless) Turn(ctx context.Context, prompt string, sink Sink) (Tu
 		res.Text = ev.Result
 		res.Usage = ev.usage()
 	}
+	// What the app says served this turn -- for a failed turn too, since a
+	// run that spent tokens on a model before it failed still ran on it.
+	// Effort is left empty on purpose: Claude Code states none anywhere in
+	// its stream (2.1.270), so the only value that could go here is the
+	// --effort this client passed, and a request is not a report.
+	res.Model = turn.servedModel()
 
-	// The exit status is the first question: a process that died has
-	// nothing to say about whether its answer was structured.
+	// The exit status is the first question -- but a failed turn can still
+	// carry the structured answer the schema asked for, and it goes back
+	// beside the failure rather than being dropped with it: Claude Code can
+	// answer and still exit non-zero, and AppSessionEnd keeps result_json
+	// apart from the error precisely so the one readable part of such a run
+	// survives. structured() accepts only a JSON object or array, so an
+	// error message in `result` is never mistaken for one.
 	if code != 0 || waitErr != nil || (ev != nil && ev.IsError) {
+		if ev != nil && strings.TrimSpace(spec.ResponseSchema) != "" {
+			if structured, ok := ev.structured(); ok {
+				res.ResultJSON = structured
+			}
+		}
 		return res, turn.failure(spec, code, waitErr)
 	}
 	if ev == nil {
@@ -284,8 +332,20 @@ func (h *claudeHeadless) rememberRef(ref string) {
 // `--output-format=stream-json` is REFUSED without it ("When using
 // --print, --output-format=stream-json requires --verbose"), so
 // dropping it turns every turn into an immediate failure.
-func claudeArgv(spec Spec, prompt, ref string) []string {
+//
+// The level's knobs go straight after it, before --mcp-config, and each
+// is a single-value option (`--model <model>`, `--effort <level>` on
+// 2.1.270), so neither can swallow a following argument the way the
+// variadic can. CheckKnobs has already refused a value that begins with
+// a dash, which is the one value that would read as a flag of its own.
+func claudeArgv(spec Spec, knobs Knobs, prompt, ref string) []string {
 	argv := []string{spec.Binary, "-p", "--output-format", "stream-json", "--verbose"}
+	if knobs.Model != "" {
+		argv = append(argv, "--model", knobs.Model)
+	}
+	if knobs.Effort != "" {
+		argv = append(argv, "--effort", knobs.Effort)
+	}
 	if path := strings.TrimSpace(spec.MCPConfigPath); path != "" {
 		argv = append(argv, "--mcp-config", path)
 	}
@@ -311,10 +371,20 @@ func claudeArgv(spec Spec, prompt, ref string) []string {
 type claudeTurn struct {
 	sink   Sink
 	sinkMu sync.Mutex
+	// rec is the session's recording, shared by every turn.
+	rec *recording
 
 	// Written by the stdout pump only.
 	sessionID string
 	result    *claudeResultEvent
+	// initModel is the model the turn's init event says the session runs
+	// on. It is not a report on its own -- it is a setting, printed before
+	// anything has run -- and servedModel uses it only to pick the
+	// session's own model out of a result that names several.
+	initModel string
+	// cwd is the working directory every call this turn makes is recorded
+	// in: the workspace, until the app's own init event names it.
+	cwd string
 
 	// Written by the stderr pump only.
 	stderrTail []byte
@@ -327,6 +397,17 @@ func (t *claudeTurn) emit(stream string, data []byte) {
 	t.sinkMu.Lock()
 	defer t.sinkMu.Unlock()
 	t.sink.Chunk(stream, data)
+}
+
+// record hands one finished call to the sink, under the lock every chunk
+// takes, so an action never lands between two halves of something else.
+func (t *claudeTurn) record(a Action) {
+	if t.sink == nil {
+		return
+	}
+	t.sinkMu.Lock()
+	defer t.sinkMu.Unlock()
+	t.sink.Record(a)
 }
 
 // pumpStdout reads the stream-json protocol to EOF.
@@ -390,10 +471,27 @@ func (t *claudeTurn) route(line []byte) {
 	if id := strings.TrimSpace(ev.SessionID); id != "" {
 		t.sessionID = id
 	}
+	if ev.Type == claudeTypeSystem {
+		var init claudeInitEvent
+		if json.Unmarshal(trimmed, &init) == nil && init.Subtype == claudeSubtypeInit {
+			if m := strings.TrimSpace(init.Model); m != "" {
+				t.initModel = m
+			}
+		}
+		// The app names its working directory once, on init, and every
+		// call it makes is recorded there (see Action.Cwd for what that
+		// does and does not promise).
+		var env claudeRecordEnvelope
+		if decodeTolerant(trimmed, &env) && env.Subtype == claudeSubtypeInit && strings.TrimSpace(env.Cwd) != "" {
+			t.cwd = env.Cwd
+		}
+	}
 
 	switch ev.Type {
 	case claudeTypeAssistant, claudeTypeUser:
-		if t.routeBlocks(ev.Message, line) {
+		var env claudeRecordEnvelope
+		_ = decodeTolerant(trimmed, &env)
+		if t.routeBlocks(ev.Message, env, line) {
 			return
 		}
 		t.emit(StreamEvent, line)
@@ -415,7 +513,11 @@ func (t *claudeTurn) route(line []byte) {
 // `content` is a plain string in some message shapes, and guessing a
 // stream for a shape this client does not recognise is how a chunk ends
 // up on the wrong side of the text / structure split.
-func (t *claudeTurn) routeBlocks(msg json.RawMessage, line []byte) bool {
+//
+// It is also where the RECORDING is fed: a tool_use block opens a call, a
+// tool_result block closes it, and a call that closed goes to the sink as
+// an Action right after the envelope that reported it.
+func (t *claudeTurn) routeBlocks(msg json.RawMessage, env claudeRecordEnvelope, line []byte) bool {
 	if len(msg) == 0 {
 		return false
 	}
@@ -423,14 +525,39 @@ func (t *claudeTurn) routeBlocks(msg json.RawMessage, line []byte) bool {
 	if err := json.Unmarshal(msg, &message); err != nil || len(message.Content) == 0 {
 		return false
 	}
-	var blocks []json.RawMessage
-	if err := json.Unmarshal(message.Content, &blocks); err != nil || len(blocks) == 0 {
+	var raws []json.RawMessage
+	if err := json.Unmarshal(message.Content, &raws); err != nil || len(raws) == 0 {
 		return false
 	}
-	structural := false
-	for _, raw := range blocks {
+	blocks := make([]*claudeContentBlock, len(raws))
+	results := 0
+	for i, raw := range raws {
 		var b claudeContentBlock
-		if err := json.Unmarshal(raw, &b); err != nil {
+		if !decodeTolerant(raw, &b) {
+			continue
+		}
+		blocks[i] = &b
+		if b.Type == claudeBlockToolResult {
+			results++
+		}
+	}
+	parent := ""
+	if env.ParentToolUseID != nil {
+		parent = strings.TrimSpace(*env.ParentToolUseID)
+	}
+	// The envelope's structured record belongs to ONE result. With several
+	// on one message nothing says which it describes, so none of them
+	// reads it -- which costs a Bash call its exit status of 0 and never
+	// invents one.
+	var record json.RawMessage
+	if results == 1 {
+		record = env.ToolUseResult
+	}
+
+	structural := false
+	var finished []Action
+	for _, b := range blocks {
+		if b == nil {
 			structural = true
 			continue
 		}
@@ -442,12 +569,33 @@ func (t *claudeTurn) routeBlocks(msg json.RawMessage, line []byte) bool {
 			// on this side and a length that would dominate a
 			// transcript, so only the prose leaves.
 			t.emit(StreamText, []byte(b.Thinking))
+		case claudeBlockToolUse:
+			structural = true
+			t.rec.begin(claudeCall(b.ID, b.Name, b.Input, parent, t.cwd))
+		case claudeBlockToolResult:
+			structural = true
+			if a, ok := t.rec.complete(b.ToolUseID, func(a *Action) {
+				if a.ParentID == "" {
+					a.ParentID = parent
+				}
+				if a.Cwd == "" {
+					a.Cwd = t.cwd
+				}
+				claudeFinish(a, b.Content, b.IsError, record)
+			}); ok {
+				finished = append(finished, a)
+			}
 		default:
 			structural = true
 		}
 	}
 	if structural {
 		t.emit(StreamTool, line)
+	}
+	// After the app's own report of the call, never before: a reader of
+	// the transcript sees the call, then what the recording made of it.
+	for _, a := range finished {
+		t.record(a)
 	}
 	return true
 }
@@ -548,11 +696,22 @@ func readClaudeLines(src io.Reader, onLine, onOversize func([]byte)) {
 // `message` stays RAW so that an unfamiliar shape inside it cannot fail
 // the whole envelope: a decode error on the outer object would send a
 // perfectly good event to stdout as unrecognised narration, which is the
-// one classification an operator cannot tell from a crash.
+// one classification an operator cannot tell from a crash. The init
+// event's model is read in a second pass (claudeInitEvent) for the same
+// reason: declaring it here would put every line at the mercy of a later
+// release that gave some other event a `model` that is not a string.
 type claudeEvent struct {
 	Type      string          `json:"type"`
 	SessionID string          `json:"session_id"`
 	Message   json.RawMessage `json:"message"`
+}
+
+// claudeInitEvent is the init event's statement of the model the session
+// runs on (2.1.270: `{"type":"system","subtype":"init","model":...}`),
+// decoded only from system lines.
+type claudeInitEvent struct {
+	Subtype string `json:"subtype"`
+	Model   string `json:"model"`
 }
 
 // claudeMessage keeps `content` raw for the same reason one level down:
@@ -566,6 +725,23 @@ type claudeContentBlock struct {
 	Type     string `json:"type"`
 	Text     string `json:"text"`
 	Thinking string `json:"thinking"`
+	// A call (tool_use) and its result (tool_result), for the recording.
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Input     json.RawMessage `json:"input"`
+	ToolUseID string          `json:"tool_use_id"`
+	Content   json.RawMessage `json:"content"`
+	IsError   bool            `json:"is_error"`
+}
+
+// claudeRecordEnvelope is what the recording reads off an envelope. It is
+// decoded APART from claudeEvent, so that a field of an unexpected type
+// here can cost the recording a fact but can never cost a line its route.
+type claudeRecordEnvelope struct {
+	Subtype         string          `json:"subtype"`
+	Cwd             string          `json:"cwd"`
+	ParentToolUseID *string         `json:"parent_tool_use_id"`
+	ToolUseResult   json.RawMessage `json:"tool_use_result"`
 }
 
 // claudeResultEvent is the last line of a turn: the app's own statement
@@ -587,6 +763,53 @@ type claudeResultEvent struct {
 		InputTokens  int64 `json:"input_tokens"`
 		OutputTokens int64 `json:"output_tokens"`
 	} `json:"usage"`
+	// ModelUsage is the app's own account of which models SPENT this
+	// turn's tokens, keyed by model id (2.1.270:
+	// `{"claude-haiku-4-5-20251001":{"inputTokens":909,"outputTokens":284,
+	// "costUSD":0.02,...}}`). It is the report servedModel reads: a key here
+	// is a model that ran, where the init event's model is only the one the
+	// session was set up with.
+	ModelUsage map[string]claudeModelUsage `json:"modelUsage"`
+}
+
+// claudeModelUsage is the one figure of a modelUsage entry this client
+// reads: the output that model produced, which decides between several.
+type claudeModelUsage struct {
+	OutputTokens int64 `json:"outputTokens"`
+}
+
+// servedModel is the model the app REPORTED this turn running on.
+//
+// A turn can spend on more than one model -- a subagent, or the small model
+// Claude Code uses for its own housekeeping -- so the session's OWN model,
+// the one the init event names, wins when it is among them. Otherwise the
+// model that produced the most output is the best statement there is, with
+// the name as the tie-break so the answer never depends on map order.
+//
+// No modelUsage, or an empty one, is NO report. The recorded failed resume
+// says `"modelUsage":{}` because no model ran, and naming the init event's
+// model for it would report a model that never did; a result from a Claude
+// Code that printed no modelUsage at all is the same silence.
+func (t *claudeTurn) servedModel() string {
+	if t.result == nil || len(t.result.ModelUsage) == 0 {
+		return ""
+	}
+	// The init event may name the model with the context suffix it was
+	// asked for (`claude-sonnet-5[1m]`) where modelUsage keys the model
+	// itself, so the bare name is tried too -- and what is reported is the
+	// key, the name the app used for the tokens.
+	for _, own := range []string{t.initModel, strings.SplitN(t.initModel, "[", 2)[0]} {
+		if _, ok := t.result.ModelUsage[own]; ok && own != "" {
+			return own
+		}
+	}
+	best, most := "", int64(-1)
+	for id, u := range t.result.ModelUsage {
+		if u.OutputTokens > most || (u.OutputTokens == most && id < best) {
+			best, most = id, u.OutputTokens
+		}
+	}
+	return best
 }
 
 // usage returns what the app STATED about its own spend.

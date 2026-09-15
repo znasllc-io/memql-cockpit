@@ -40,6 +40,7 @@ package harness
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 )
@@ -103,11 +104,23 @@ var ErrNoStructuredResult = errors.New("harness: the turn produced no structured
 // it is already sequenced. An error is not returned because there is
 // nothing a harness could do with one -- the stream to the server dying
 // is the session's problem, and it is watching for it.
+//
+// Record receives the RECORDING: one Action for every tool call the app
+// completed (record.go). It is a method of its own rather than one more
+// stream word because the two are bounded differently -- the session caps
+// narration at limits.max_transcript_bytes and must never cap the
+// recording -- and a stream word is one typo away from being the other.
 type Sink interface {
 	Chunk(stream string, data []byte)
+	Record(a Action)
 }
 
 // SinkFunc adapts a function to Sink.
+//
+// It has no recording of its own to keep apart, so an Action reaches the
+// function as the event chunk it would be on the wire. A caller that
+// wants the recording sent past the transcript cap implements Sink
+// itself, as the app-session runner does.
 type SinkFunc func(stream string, data []byte)
 
 // Chunk implements Sink.
@@ -115,6 +128,18 @@ func (f SinkFunc) Chunk(stream string, data []byte) {
 	if f != nil {
 		f(stream, data)
 	}
+}
+
+// Record implements Sink.
+func (f SinkFunc) Record(a Action) {
+	if f == nil {
+		return
+	}
+	body, err := json.Marshal(a)
+	if err != nil {
+		return
+	}
+	f(StreamEvent, append(body, '\n'))
 }
 
 // Usage is what the app REPORTED about its own spend.
@@ -151,6 +176,18 @@ type TurnResult struct {
 	// harnesses that run a process per turn. The engine reads non-zero
 	// as a FAILED run, so flattening a 2 to a 1 misfiles the outcome.
 	ExitCode int
+	// Model is the model the APP REPORTED this turn running on, and empty
+	// when it said nothing. It is never the model this harness asked for:
+	// a request is not a report, and the engine records this value as the
+	// model that SERVED (design D9), so a copy of the request would be
+	// recorded as a measurement nobody made.
+	Model string
+	// Effort is the reasoning effort the APP REPORTED, under the same
+	// rule. Claude Code's headless output states no effort anywhere
+	// (verified on 2.1.270), so a Claude Code turn leaves this empty even
+	// when --effort was passed -- which is also the answer for an app that
+	// ignored the effort it was given.
+	Effort string
 }
 
 // Spec is everything a harness needs to run a session's turns.
@@ -174,6 +211,16 @@ type Spec struct {
 	// ResumeRef starts the session already attached to the app's own
 	// prior session, for the attach kind. Empty starts fresh.
 	ResumeRef string
+	// Level is the engine's level for this session -- one of core/airoute's
+	// words, from AppSessionStart.level. Empty runs the app at its own
+	// defaults. A harness turns it into the app's knobs through Levels in
+	// Start and refuses a level it cannot translate (levels.go).
+	Level string
+	// Levels translates Level into this app's knobs. Nil means the
+	// harness's built-in table (BuiltinLevels); the session passes the
+	// built-in table with the machine owner's policy.yaml entries laid
+	// over it.
+	Levels Table
 	// Launch forks every process this harness needs. Required: a nil
 	// Launch is a programming error rather than a reason to fall back
 	// to os/exec, because falling back would silently lose the process

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -20,11 +21,13 @@ import (
 )
 
 type managedHome struct {
-	home    Home
-	enabled bool
-	cancel  context.CancelFunc
-	runner  *Runner
-	wake    chan struct{}
+	home        Home
+	enabled     bool
+	cancel      context.CancelFunc
+	runner      *Runner
+	wake        chan struct{}
+	prepared    *homeRun
+	duplicateOf string
 }
 
 type LocalHomeStatus struct {
@@ -68,6 +71,8 @@ func (f *Fleet) LocalStatus() LocalStatus {
 		if h != nil {
 			enabled = h.enabled
 			switch {
+			case h.duplicateOf != "":
+				state = "Duplicate of " + h.duplicateOf
 			case !h.enabled && h.runner != nil:
 				state = "Pausing"
 			case !h.enabled:
@@ -100,6 +105,14 @@ func (f *Fleet) SetHomeEnabled(id string, enabled bool) error {
 	h := f.managed[id]
 	if h == nil {
 		return errors.New("server is not configured or worker is still starting")
+	}
+	// A duplicate enrollment must never silently reconnect a server whose
+	// active home was paused. Refuse ambiguous controls until it is resolved.
+	key := strings.ToLower(hostOf(h.home.ClusterURL))
+	for _, other := range f.managed {
+		if other != h && strings.ToLower(hostOf(other.home.ClusterURL)) == key {
+			return errors.New("multiple enrollments target this server; resolve the duplicate in workers.yaml before changing its connection policy")
+		}
 	}
 	if h.enabled == enabled {
 		return nil

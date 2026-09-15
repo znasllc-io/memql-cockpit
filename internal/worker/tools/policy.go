@@ -6,11 +6,14 @@ import (
 	"net"
 	"net/url"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/znasllc-io/memql-cockpit/internal/worker/apps"
+	"github.com/znasllc-io/memql-cockpit/internal/worker/harness"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/models"
 )
 
@@ -85,8 +88,43 @@ type FSPolicy struct {
 // "present, blocked" instead of rendering it identically to "not
 // installed" -- one of those an operator can fix, the other sends them
 // looking for the wrong problem.
+//
+// LEVELS ARE THE OPPOSITE POSTURE, and on purpose (memql-cockpit#438,
+// design D8). allow decides WHETHER an app may run here, which only the
+// owner can grant; levels decide HOW it runs once it may -- which model and
+// effort a LEVEL the engine names becomes -- and the cockpit ships an
+// answer for that (internal/worker/harness BuiltinLevels). So an absent
+// block is the built-in table, not "nothing":
+//
+//	apps:
+//	  levels:
+//	    claude-code:
+//	      reasoning:
+//	        model: fable
+//	        effort: max
+//	    codex:
+//	      strong:
+//	        model: gpt-5.5
+//	        effort: xhigh
+//
+// An entry replaces its level's built-in entry WHOLE, model and effort
+// together; a level with no entry keeps the built-in one; an entry with
+// neither knob runs that level at the app's own defaults. An entry the app
+// would misread REFUSES its level rather than falling back -- see
+// AppLevels.
 type AppsPolicy struct {
 	Allow []string `yaml:"allow"`
+	// Levels is kept as the YAML node it was written as, and read by
+	// readAppLevels, rather than decoded into Go types here. A typed decode
+	// has two failure modes and both are wrong for this block. A key it
+	// does not know (`efort: max`) is DROPPED without a word -- and since an
+	// entry replaces its row whole, the owner's effort silently becomes the
+	// app's default, the very failure CheckKnobs exists to prevent. A shape
+	// it does not expect (`reasoning: opus`) fails the WHOLE file, and a
+	// worker that cannot parse policy.yaml runs on the defaults, which allow
+	// no app at all. Walking the node turns both into a sentence about the
+	// one entry that is wrong.
+	Levels yaml.Node `yaml:"levels"`
 }
 
 // ModelsPolicy controls which local models this machine will serve, and
@@ -364,6 +402,11 @@ func (p *Policy) reload() error {
 	// app without a worker restart. There is no baseline to merge onto:
 	// DefaultPolicy leaves this empty, which is the default-deny above.
 	p.apps.Allow = mergeUnique(p.apps.Allow, raw.Apps.Allow)
+	// apps.levels REPLACES, for the reason models.runtimes does below: an
+	// entry is a record, and merging two generations of one would run a
+	// model from one file at an effort from another. A SIGHUP that removed
+	// the block returns this machine to the built-in table.
+	p.apps.Levels = raw.Apps.Levels
 	// models.allow merges the way apps.allow does, so SIGHUP makes a
 	// newly pulled model offerable without a worker restart.
 	p.models.Allow = mergeUnique(p.models.Allow, raw.Models.Allow)
@@ -607,6 +650,230 @@ func (p *Policy) AppsAllow() []string {
 	return out
 }
 
+// AppLevels returns the owner's apps.levels entries for one app that
+// stand, and -- per level -- the sentence refusing any entry the app would
+// misread. No entries at all is the built-in table (the session lays these
+// over harness.BuiltinLevels), which is what an absent block means.
+//
+// A REFUSED ENTRY REFUSES ITS LEVEL; it does not fall back to the built-in
+// entry. An owner who pinned a cheaper model for a level did not agree to
+// the expensive default because of a typo, and Claude Code in particular
+// IGNORES an effort word it does not know rather than refusing it -- so the
+// refusal here is the only one anybody would see. It is REPORTED on the
+// session's End, naming the line to fix, where a quiet fallback would be
+// indistinguishable from the owner's entry working.
+//
+// The maps are the caller's own, built fresh on every call, for
+// AppsAllow's reason: a SIGHUP can reload underneath a session that is
+// still deciding.
+func (p *Policy) AppLevels(appID string) (harness.Table, map[string]string) {
+	if p == nil {
+		return nil, nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	read := readAppLevels(p.apps.Levels)
+	id := normalAppID(appID)
+	return read.table[id], read.refused[id]
+}
+
+// AppLevelProblems is every problem apps.levels has, as sentences an owner
+// can act on: the refusals AppLevels reports, and the entries no session can
+// reach -- an app this cockpit does not drive, a word that is not a level,
+// the embeddings level -- which are ignored. The worker logs them when the
+// file is read and `memql worker apps` prints them, because an entry that
+// silently did nothing is indistinguishable from one that worked.
+func (p *Policy) AppLevelProblems() []string {
+	if p == nil {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return readAppLevels(p.apps.Levels).problems
+}
+
+// appLevelsRead is apps.levels read against what this cockpit can drive.
+type appLevelsRead struct {
+	// table holds the entries that stand, per app id.
+	table map[string]harness.Table
+	// refused holds, per app id and level, the sentence refusing sessions
+	// at that level.
+	refused map[string]map[string]string
+	// problems is every sentence, in a stable order.
+	problems []string
+}
+
+// readAppLevels validates apps.levels. It is a pure function of the block
+// as written, run on every read rather than cached, so there is no second
+// copy of the answer for a reload to leave stale -- and it never fails: a
+// shape it cannot read becomes a problem about that entry, never an error
+// that would cost the rest of policy.yaml.
+//
+// Every judgement is borrowed rather than restated: the app ids are
+// apps.Specs', the level words are the engine's (harness.CheckAppLevel), and
+// what an app would misread is the harness's own check (harness.CheckKnobs,
+// the same one every harness runs in Start). The keys are walked in sorted
+// order so a problem list does not shuffle between two reads of one file,
+// which would read as the file changing.
+func readAppLevels(block yaml.Node) appLevelsRead {
+	read := appLevelsRead{
+		table:   map[string]harness.Table{},
+		refused: map[string]map[string]string{},
+	}
+	root := resolveYAML(&block)
+	if yamlAbsent(root) {
+		return read
+	}
+	if root.Kind != yaml.MappingNode {
+		read.problems = append(read.problems,
+			"apps.levels: a mapping of apps belongs here (claude-code:, codex:), not "+describeYAML(root)+", so the block is ignored")
+		return read
+	}
+	byApp := yamlMapping(root)
+	for _, key := range sortedKeys(byApp) {
+		appID := normalAppID(key)
+		spec, ok := apps.SpecFor(appID)
+		if !ok {
+			read.problems = append(read.problems, fmt.Sprintf(
+				"apps.levels.%s: this cockpit drives no app called %q (it drives %s), so the entry is ignored",
+				key, key, knownAppIDs()))
+			continue
+		}
+		levelsNode := byApp[key]
+		if yamlAbsent(levelsNode) {
+			continue
+		}
+		if levelsNode.Kind != yaml.MappingNode {
+			read.problems = append(read.problems, fmt.Sprintf(
+				"apps.levels.%s: a mapping of levels belongs here (fast:, strong:, reasoning:), not %s, so the entry is ignored",
+				key, describeYAML(levelsNode)))
+			continue
+		}
+		levels := yamlMapping(levelsNode)
+		for _, level := range sortedKeys(levels) {
+			where := "apps.levels." + key + "." + level
+			if err := harness.CheckAppLevel(level); err != nil {
+				read.problems = append(read.problems, fmt.Sprintf("%s: %v, so the entry is ignored", where, err))
+				continue
+			}
+			knobs, err := readLevelEntry(levels[level])
+			if err == nil {
+				err = harness.CheckKnobs(spec.Harness, knobs)
+			}
+			if err != nil {
+				sentence := fmt.Sprintf("%s: %v -- this machine refuses %s sessions for %s until the entry is fixed",
+					where, err, level, appID)
+				if read.refused[appID] == nil {
+					read.refused[appID] = map[string]string{}
+				}
+				read.refused[appID][level] = sentence
+				read.problems = append(read.problems, sentence)
+				continue
+			}
+			if read.table[appID] == nil {
+				read.table[appID] = harness.Table{}
+			}
+			read.table[appID][level] = knobs
+		}
+	}
+	return read
+}
+
+// readLevelEntry reads one apps.levels entry: a mapping of `model` and
+// `effort`, each a single word, either one optional. Null -- `fast:` with
+// nothing after it -- reads as `fast: {}`, an entry with no knobs.
+//
+// Anything else is an error NAMING what was wrong: a scalar or a list where
+// the mapping belongs (`reasoning: opus`), a key that is neither knob
+// (`efort`), a knob that is not a single word. The caller refuses the level
+// with it, because dropping the key and running the rest of the entry would
+// replace the whole row with half of what the owner wrote.
+func readLevelEntry(n *yaml.Node) (harness.Knobs, error) {
+	n = resolveYAML(n)
+	if yamlAbsent(n) {
+		return harness.Knobs{}, nil
+	}
+	if n.Kind != yaml.MappingNode {
+		return harness.Knobs{}, fmt.Errorf("an entry is a mapping of model and effort (for example {model: opus, effort: high}), not %s",
+			describeYAML(n))
+	}
+	var k harness.Knobs
+	entry := yamlMapping(n)
+	for _, key := range sortedKeys(entry) {
+		v := resolveYAML(entry[key])
+		if key != "model" && key != "effort" {
+			return harness.Knobs{}, fmt.Errorf("an entry takes model and effort, and %q is neither", key)
+		}
+		if v.Kind != yaml.ScalarNode {
+			return harness.Knobs{}, fmt.Errorf("%s is %s, where a single word belongs", key, describeYAML(v))
+		}
+		word := strings.TrimSpace(v.Value)
+		if yamlAbsent(v) {
+			word = ""
+		}
+		if key == "model" {
+			k.Model = word
+		} else {
+			k.Effort = word
+		}
+	}
+	return k, nil
+}
+
+// yamlMapping returns a mapping node's pairs by key. yaml.v3 has already
+// refused a duplicate key when it parsed the file, so a key appears once.
+func yamlMapping(n *yaml.Node) map[string]*yaml.Node {
+	out := make(map[string]*yaml.Node, len(n.Content)/2)
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		out[n.Content[i].Value] = n.Content[i+1]
+	}
+	return out
+}
+
+// resolveYAML follows an alias (`*name`) to the node it names.
+func resolveYAML(n *yaml.Node) *yaml.Node {
+	for n != nil && n.Kind == yaml.AliasNode && n.Alias != nil {
+		n = n.Alias
+	}
+	return n
+}
+
+// yamlAbsent is a key that is not there, or one written with nothing after
+// it -- which YAML reads as null.
+func yamlAbsent(n *yaml.Node) bool {
+	return n == nil || n.Kind == 0 || (n.Kind == yaml.ScalarNode && n.Tag == "!!null")
+}
+
+// describeYAML names a node's shape for a sentence, quoting a scalar so the
+// owner sees the very word they wrote.
+func describeYAML(n *yaml.Node) string {
+	switch n.Kind {
+	case yaml.ScalarNode:
+		return fmt.Sprintf("the single word %q", n.Value)
+	case yaml.SequenceNode:
+		return "a list"
+	case yaml.MappingNode:
+		return "a mapping"
+	}
+	return "something else"
+}
+
+// normalAppID reads an app id the way the detector reads apps.allow:
+// without regard to case or surrounding space, so the two keys an owner
+// writes side by side agree about what they name.
+func normalAppID(id string) string {
+	return strings.ToLower(strings.TrimSpace(id))
+}
+
+// knownAppIDs names the apps this cockpit drives, for a sentence.
+func knownAppIDs() string {
+	var ids []string
+	for _, s := range apps.Specs() {
+		ids = append(ids, s.ID)
+	}
+	return strings.Join(ids, ", ")
+}
+
 // ModelsAllow returns a copy of the allowed model ids. Empty is
 // default-deny, not "all".
 func (p *Policy) ModelsAllow() []string {
@@ -730,6 +997,17 @@ func firstToken(cmd string) string {
 		}
 	}
 	return cmd
+}
+
+// sortedKeys returns a map's keys in order, for the walks whose output a
+// person reads.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func mergeUnique(a, b []string) []string {
