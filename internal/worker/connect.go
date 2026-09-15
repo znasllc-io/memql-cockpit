@@ -262,6 +262,7 @@ func buildHeartbeat(active uint32, perCap map[string]uint32, inventory []apps.In
 		AppsPresent:              true,
 	}
 	heartbeatHardware(beat, hw)
+	heartbeatPermissions(beat, probePermissions())
 	return beat
 }
 
@@ -415,12 +416,3 @@ func cockpitBuildTag() string {
 // platform layer to "computeruse". The default build leaves it empty so
 // cockpitBuildTag() reports "headless".
 var buildTagOverride string
-
-// probePermissions performs the platform-specific permissions
-// probe. The MVP no-op returns "unknown" everywhere; Phase 4 wires
-// macOS TCC + Linux X11 detection.
-func probePermissions() *memqlv1.PermissionStatus {
-	return &memqlv1.PermissionStatus{
-		Detail: "permission probe not yet implemented (MVP)",
-	}
-}

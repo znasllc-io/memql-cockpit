@@ -151,7 +151,9 @@ func runSetupMacOS() error {
 	fmt.Printf("  display:   %dx%d\n", width, height)
 	fmt.Printf("  cursor:    (%d,%d)\n", x, y)
 	fmt.Println()
-	fmt.Println("SUCCESS: memql worker permissions look good.")
+	fmt.Println("SUCCESS: permission checks passed for this setup process.")
+	fmt.Println("This does not verify the background worker's permissions.")
+	fmt.Println("Fleet reports the running worker's own passive checks every 15 seconds.")
 	fmt.Println()
 	fmt.Println("Next steps:")
 	fmt.Println("  1. Enroll a home in ~/.memql/workers.yaml (cluster_url + token).")
@@ -159,10 +161,10 @@ func runSetupMacOS() error {
 	fmt.Println()
 	fmt.Println("If you'll run this as a LaunchAgent: install via")
 	fmt.Println("`scripts/install/install-mac.sh` -- it loads the agent and")
-	fmt.Println("the FIRST time the LaunchAgent process tries Accessibility")
-	fmt.Println("or Screen Recording, macOS will prompt you separately for")
-	fmt.Println("the memql binary itself (a different TCC entry from")
-	fmt.Println("Terminal). Approve that prompt to make the agent work at login.")
+	fmt.Println("approve the installed memql binary in System Settings ->")
+	fmt.Println("Privacy & Security -> Accessibility and Screen Recording.")
+	fmt.Println("The background worker checks silently; it does not request grants.")
+	fmt.Println("Restart the worker if macOS requires it after a permission change.")
 	return nil
 }
 
