@@ -96,6 +96,7 @@ final class CockpitApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSearc
         item.button?.image = MarkParser.image()
         if item.button?.image == nil { item.button?.title = "MemQL" }
         item.button?.setAccessibilityLabel("MemQL Cockpit")
+        installApplicationMenu()
         rebuildMenu()
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
@@ -103,6 +104,31 @@ final class CockpitApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSearc
             if self?.following == true, self?.logWindow?.isVisible == true { self?.refreshLogs() }
         }
     }
+
+    // Opening the installed app again should reveal a useful window even
+    // though its normal login presence is only in the menu bar.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showLogs()
+        return true
+    }
+    private func installApplicationMenu() {
+        let main = NSMenu()
+        let appItem = NSMenuItem()
+        let appMenu = NSMenu(title: "MemQL Cockpit")
+        appMenu.addItem(entry("Show Cockpit Menu", action: #selector(showCockpitMenu)))
+        appMenu.addItem(entry("Show Logs…", action: #selector(showLogs)))
+        appMenu.addItem(.separator())
+        appMenu.addItem(entry("Quit menu bar — worker keeps running", action: #selector(quitMenu)))
+        appItem.submenu = appMenu
+        main.addItem(appItem)
+        let editItem = NSMenuItem()
+        let edit = NSMenu(title: "Edit")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = edit; main.addItem(editItem)
+        NSApp.mainMenu = main
+    }
+    @objc private func showCockpitMenu() { item.button?.performClick(nil) }
 
     // This CLI only speaks the owner-only Unix socket. It never starts a
     // worker, loads credentials into the app, or grants macOS permissions.
