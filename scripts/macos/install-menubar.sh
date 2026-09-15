@@ -20,7 +20,7 @@ function main() {
     destination="$(cap_param destination "$HOME/Applications/MemQL Cockpit.app")"
     label="com.znasllc.memql-cockpit-menubar"
     uid_value="$(id -u)"
-    [[ "$destination" == "$HOME/"* && "$destination" == *.app ]] || cap_fail 2 "destination must be a .app under the current user's home"
+    [[ "$destination" == "$HOME/"* && "$destination" == *.app || "$destination" == "/Applications/MemQL.app/Contents/Library/LoginItems/MemQL Menu.app" && "$app" == "$destination" ]] || cap_fail 2 "destination must be a user app or the installed system MemQL helper"
     [[ -x "$app/Contents/MacOS/MemQLCockpit" ]] || cap_fail 4 "build the menu bundle first"
     command -v launchctl >/dev/null || cap_fail 4 "launchctl is required on macOS"
     command -v plutil >/dev/null || cap_fail 4 "plutil is required for plist serialization"

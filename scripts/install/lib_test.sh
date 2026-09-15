@@ -350,6 +350,10 @@ printf '%s\n' '#!/bin/sh' 'echo "memql 0.12.1 (headless)"' > "$_verdir/memql-sam
 chmod +x "$_verdir/memql-same"
 expect_eq "read_binary_version" "$(read_binary_version "$_verdir/memql-same")" "0.12.1"
 
+expect_eq "stable designated requirement preserves grants" "$(macos_signing_transition 'anchor apple generic and identifier MemQL and TEAM' 'anchor apple generic and identifier MemQL and TEAM')" "unchanged"
+expect_eq "different ad-hoc requirements require recovery guidance" "$(macos_signing_transition 'cdhash old' 'cdhash new')" "changed"
+expect_eq "missing signing evidence never means stable" "$(macos_signing_transition '' 'cdhash new')" "unknown"
+
 # resolve_target_version from download-base tag path. Run from a copy of
 # lib.sh with no VERSION file beside it: in a repository checkout the
 # sibling VERSION wins over the URL (as it should for a cloned-repo
@@ -860,6 +864,7 @@ function run_uninstaller() {
     shift 2
     local tool_path="$_nobin"
     if [[ "$script" == uninstall-linux.sh ]]; then tool_path="${_uninstall_systemctl_dir}:$_nobin"; fi
+    if [[ "$script" == uninstall-mac.sh ]]; then set -- --all-homes "$@"; fi
     (cd "$_script_dir" && HOME="$home" PATH="$tool_path" bash "./${script}" "$@" 2>&1)
 }
 

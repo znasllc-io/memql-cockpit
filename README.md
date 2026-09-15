@@ -89,9 +89,16 @@ holds the token:
 # Linux
 curl -fsSL https://raw.githubusercontent.com/znasllc-io/memql-cockpit/main/scripts/install/uninstall-linux.sh | bash -s -- [--purge] [--user-local]
 
-# macOS
-curl -fsSL https://raw.githubusercontent.com/znasllc-io/memql-cockpit/main/scripts/install/uninstall-mac.sh | bash -s -- [--purge] [--user-local]
+# macOS: remove one enrollment (shared runtime stays while other homes remain)
+curl -fsSL https://raw.githubusercontent.com/znasllc-io/memql-cockpit/main/scripts/install/uninstall-mac.sh | bash -s -- --cluster=https://api.example.com [--user-local]
+# For whole-machine worker removal, use --all-homes instead of --cluster=URL.
 ```
+
+On macOS, last-home or full removal resets only the installed MemQL apps’
+Accessibility and Screen Recording decisions; shared sibling enrollments keep
+their permissions. Reset failures are reported, and cached Settings rows may
+need manual removal. `--purge` is refused while another enrollment remains. CLI credentials,
+cluster settings, certificates and backups are retained even with a purge.
 
 Without `--purge`, `~/.memql/policy.yaml` and the state directory (logs,
 ledgers) stay, and the script says so; `--user-local` removes a `--user-local`

@@ -1,5 +1,134 @@
 # macOS menu bar companion
 
+## Native MemQL app (development; planned for 0.15)
+
+Computer-use installations use a real `MemQL.app`. Its **main executable is
+the Go worker**, with bundle identifier `com.znasllc.memql-worker`, display name
+`MemQL`, and a native `.icns` generated from the canonical nine-node mark.
+The Swift menu helper is embedded at
+`Contents/Library/LoginItems/MemQL Menu.app`. Both appearances use the same mark;
+the permission window groups the two grants and hides PID/path/build details
+behind **Show technical details**.
+
+The worker LaunchAgent targets `MemQL.app/Contents/MacOS/MemQL` directly, and
+the installed `memql` CLI symlink points to that same executable. Status reports
+`bundle_id` and `bundle_path` from the actual worker's Core Foundation main
+bundle, rather than inferring identity from a filename. Finder reveals the app
+reported by that worker. Opening MemQL from Finder opens its embedded menu;
+invoking the `memql` CLI keeps normal command-line behavior.
+
+The menu registers both bundles with Launch Services. The worker plist includes
+`AssociatedBundleIdentifiers`; the active executable remains the app's main
+worker. Registration and labels do not imply TCC grants: macOS must approve the
+actual bundle, and only current-worker preflight results can confirm access.
+Raw executable grants are not silently moved or reset during migration.
+
+The token installer selects this layout for computer-use version 0.15 and
+later, with the exact matching `memql-app-darwin-{arm64,amd64}.tar.gz` and SHA256
+sidecar. Older releases and headless workers retain the standalone companion.
+User-local installs use `~/Applications/MemQL.app`; system installs use the
+root-owned `/Applications/MemQL.app`, preserving the system CLI's ownership
+boundary. `--no-menu` skips the helper service; `--no-service` installs files
+without starting either service.
+
+Installation separates file placement from per-user service activation:
+
+```sh
+scripts/macos/build-app.sh --worker=/absolute/built/worker --version=VERSION
+scripts/macos/install-app-files.sh --app=/absolute/built/MemQL.app \
+  --destination=/absolute/Applications/MemQL.app --cli-path=/absolute/bin/memql
+# Register after placement; this mode opens no window and starts no worker.
+"/absolute/Applications/MemQL.app/Contents/Library/LoginItems/MemQL Menu.app/Contents/MacOS/MemQLCockpit" --register-bundles
+scripts/macos/activate-app.sh --app=/absolute/Applications/MemQL.app
+```
+
+Existing service arguments, environment and log locations are preserved.
+Previous bundles/CLI links and agent plists are retained for rollback. Known
+legacy worker agents and the old standalone menu are retired; unrelated apps,
+enrollments, credentials, policies and models are not modified. Activation
+records the bundle fingerprints and avoids restarting an unchanged install.
+The uninstaller removes only the standard matching bundle for the selected
+prefix; custom destinations and rollback copies remain.
+
+This layout fixes app attribution and presentation; it does **not** turn an
+ad-hoc signature into a stable distribution identity. Developer ID provisioning
+and signed-upgrade validation below remain necessary. The bundle's minimum
+macOS version is read from the actual worker Mach-O build metadata.
+
+## Uninstall and local lifecycle testing
+
+Fleet must pass the selected cluster URL to the current macOS uninstaller:
+
+```sh
+scripts/install/uninstall-mac.sh --cluster=https://api.example.com --user-local
+# Explicit whole-machine worker removal:
+scripts/install/uninstall-mac.sh --all-homes --user-local
+```
+
+A cluster removal uses the worker's YAML decoder and enrollment identity rules.
+It removes duplicate homes for that cluster and repairs the legacy token mirror.
+If another home remains (including a disabled home), the shared app, CLI, menu,
+policy and state stay. A running worker is stopped before the change and reloaded
+for its remaining homes; a stopped worker is not started. The last enrollment
+removes the shared runtime, current and known legacy agents, and standard app.
+Uninstall waits up to ten seconds for launchd to remove each stopped service.
+A directly opened embedded menu is terminated only after its UID, exact executable
+path and mapped executable are verified; a helper that stays running prevents
+app deletion. Other enrollments keep the shared menu running.
+No cluster token files means a repeated removal can finish partial file cleanup.
+Before deleting an installed bundle, full/last-home removal uses `tccutil reset`
+for only Accessibility and ScreenCapture and the known installed worker/menu
+bundle IDs. Failure retains the resolvable app and reports partial cleanup.
+Another standard MemQL installation sharing those IDs blocks the reset. Run the
+uninstaller as the current user, without sudo; privileged file deletion is separate.
+If tokens remain but the worker binary is missing or the YAML is invalid, scoped
+removal refuses safely; restore the files or explicitly choose full removal.
+
+Default removal keeps policy, state/logs, CLI credentials, cluster settings,
+certificates, models and rollback backups. `--purge` additionally removes worker
+policy, owned state and model runtime files, and refuses when another home remains.
+Credential and backup directories, unrelated apps and custom app locations are
+preserved. A successful `tccutil` call resets authorization decisions; it does
+not promise that every Settings display row disappears. Refresh Settings and
+remove only any remaining MemQL row manually. If the app was already deleted,
+its bundle ID may no longer resolve: remove residual rows through Settings.
+Uninstall never uses a service-wide reset, modifies another app’s approvals, or
+edits a privacy database directly. Sibling-home removal never resets permissions.
+
+Updates compare the installed and incoming designated signing requirements.
+An unchanged requirement preserves existing authorization decisions. A changed
+requirement prints recovery instructions; no update silently resets grants.
+Explicit prerelease versions are compared exactly for download idempotence so a
+new local build is not mistaken for an already-installed build with the same
+numeric version. Only fresh worker OS preflight results can establish readiness.
+
+For the current installed app, the supported user-run recovery is:
+
+```sh
+/usr/bin/tccutil reset Accessibility com.znasllc.memql-worker
+/usr/bin/tccutil reset ScreenCapture com.znasllc.memql-worker
+```
+
+Then use MemQL’s Request access buttons, approve the current app, and restart
+once if needed for a fresh process. The GUI alternative is to remove MemQL’s
+old row in each category and add the exact current app from Show MemQL in Finder.
+These actions revoke/reset old approvals; they do not grant access themselves.
+See Apple’s [app-scoped reset documentation](https://developer.apple.com/documentation/xcode/resetting-access-to-protected-resources-in-macos).
+Stable continuity across different builds still requires a real signing identity.
+
+For a local Fleet test, freeze the current installer, `lib.sh`, uninstaller,
+computer-use binary, app archive and SHA sidecar behind a loopback-only server.
+Set `MEMQL_INSTALL_RAW_BASE` to its `/scripts/install` directory,
+`MEMQL_INSTALL_VERSION` to the exact dev version, and
+`MEMQL_INSTALL_ALLOW_LOOPBACK_HTTP=1`; supply `--download-base` for its versioned
+release directory. Raw binary HTTP downloads require that explicit opt-in and a
+literal loopback address; redirects are refused. Published defaults remain HTTPS.
+`python3 scripts/macos/local_install_test.py --base-url URL --version VERSION`
+exercises the piped command in disposable homes, without services or OS bundle
+registration. Run app package tests separately for simulated agent activation.
+
+## Released 0.14 companion
+
 Cockpit 0.14.0 and later include the companion in the macOS token installer
 used by MemQL OS. Both headless and computer-use installations get the menu;
 `--no-menu` skips it and `--no-service` skips both LaunchAgents. Older explicitly
@@ -71,6 +200,72 @@ Linux computer-use builds report X11 granted only after a bounded passive
 Wayland, missing `xdpyinfo`, or a timed-out probe report unknown. macOS TCC checks
 are unknown on Linux. No input event or screenshot is part of reporting.
 Linux semantics have fixture tests; live Linux validation is separate.
+
+## Guided permission setup (development; not in 0.14.0)
+
+**Set Up Permissions…** opens a native window with separate Accessibility and
+Screen Recording requests. It opens once automatically when a supported worker
+first reports missing access; opening the window does not request any grant.
+The user's explicit request invokes `AXIsProcessTrustedWithOptions` or
+`CGRequestScreenCaptureAccess` **inside the running worker** through its private
+control socket. Acknowledgment means the request was queued, not approved.
+Only one OS request may be pending at a time.
+
+**Open Settings** opens the relevant Privacy & Security pane. **Show Worker in
+Finder** reveals the installed executable with symlinks resolved. macOS can
+retain an entry for an older binary after an upgrade; inspect the file instead
+of trusting its display name. Recovery changes to existing grants remain
+explicit actions in System Settings; Cockpit does not reset TCC records.
+
+**Restart Worker…** asks for confirmation because it interrupts active work
+and every server connection. It checks the service's loaded PID and program,
+then uses `launchctl kickstart -k` for the current user's worker label. It does
+not rewrite enrollments or connection policy. The window waits for a fresh
+report from a different PID; a new process with denied access remains denied.
+Reports older than 15 seconds, unavailable workers, and unsupported probes
+cannot confirm readiness. Headless and older workers show an update hint.
+
+The browser bridge is **`memql-cockpit://permissions`**, optionally ending in
+`/`, with no credentials, port, query, fragment, or action path. It only opens
+the window. Fleet must gate this link on a future released companion version
+and offer **Install or update Cockpit** if the handler is unavailable. Opening
+the URL is never evidence of installation or granted permissions. There is no
+HTTP bridge and no remote grant/restart endpoint.
+
+Local status adds `executable`, `bundle_id`, `bundle_path`, `permission_requests` and
+`permission_request_pending`. The explicit CLI equivalent is:
+
+```sh
+# Read PID from the actual service status first; substitute that PID below.
+memql worker control --action=status
+memql worker control --action=request-permission --permission=accessibility --pid=123
+memql worker control --action=request-permission --permission=screen_recording --pid=123
+```
+
+The server rejects unknown permissions, missing/stale PIDs, unsupported builds,
+and overlapping OS requests. Passive status and heartbeat paths never prompt.
+
+### Signing and upgrades
+
+The current release binaries are ad-hoc signed. Their designated requirements
+can contain the build's code hash, so an unchanged path or filename does not
+establish continuity across upgrades. A fixed identifier added to another
+ad-hoc signature does not solve this. See Apple's
+[code-signing requirements](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements)
+and [DTS confirmation of permission loss with ad-hoc builds](https://developer.apple.com/forums/thread/819406).
+
+Distribution signing needs a provisioned **Developer ID Application** identity
+and a stable worker signing identifier (planned: `com.znasllc.memql-worker`).
+The menu retains `com.znasllc.memql-cockpit-menubar`. Before enabling signed
+releases, provision the certificate/private key securely in CI, sign both native
+architectures before hashing and packaging, verify the designated requirement
+and Team ID, and validate notarization and upgrade behavior on a test Mac.
+Release signing must fail if requested credentials or signature verification
+are missing; it must not fall back silently to ad-hoc signing. The initial
+migration from ad-hoc to Developer ID can require user approval again.
+
+This change does not provision signing credentials or promise grant retention.
+No certificate or workflow-signing configuration is modified by onboarding.
 
 ## Logs and local control
 

@@ -431,9 +431,10 @@ TCC grants are per signed-binary identity, and a command-line binary
 launched from Terminal INHERITS Terminal's grants. That means a probe
 can succeed from your shell while the same binary, launched detached
 as a LaunchAgent at login, is denied -- the LaunchAgent needs the
-`memql` binary's OWN entry in System Settings. The
-setup wizard reports both the active probe result and the per-binary
-`tccutil check` status (macOS 14.4+) so you can tell the cases apart.
+`memql` binary's OWN entry in System Settings. Check the background process
+with `memql worker control --action=status`. A Terminal setup result cannot
+prove that the service has access. The [native permission window](macos-menu.md#guided-permission-setup-development-not-in-0140)
+guides requests and verifies the running worker in development builds.
 
 ### Linux
 
