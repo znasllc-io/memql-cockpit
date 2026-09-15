@@ -120,7 +120,7 @@ final class PermissionSetupWindow: NSWindowController {
         let reveal = NSButton(title: "Show MemQL in Finder", target: self, action: #selector(showWorker))
         restartButton = NSButton(title: "Restart Worker…", target: self, action: #selector(confirmRestart))
         let recovery = NSStackView(views: [reveal, restartButton]); recovery.spacing = 12
-        let tip = NSTextField(wrappingLabelWithString: "If Settings already shows MemQL enabled, remove its old entry and add this app again. After approving access, restart the worker once to verify.")
+        let tip = NSTextField(wrappingLabelWithString: "If access stays denied while Settings shows MemQL enabled, remove its old entry and add this app again. After approval, restart once to verify.")
         tip.font = .systemFont(ofSize: 12); tip.textColor = .secondaryLabelColor
         detailsButton = NSButton(title: "Show technical details", target: self, action: #selector(toggleDetails))
         detailsButton.bezelStyle = .rounded; detailsButton.controlSize = .small; detailsButton.font = .systemFont(ofSize: 11)
