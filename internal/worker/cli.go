@@ -82,6 +82,8 @@ func dispatchHandleCommand(args []string) {
 		handleHardware(args[1:])
 	case "probe":
 		handleProbe(args[1:])
+	case "control":
+		handleControl(args[1:])
 	case "consent":
 		handleConsentCmd(args[1:])
 	case "-h", "--help", "help":
@@ -402,15 +404,16 @@ func handleRun(args []string) {
 		)
 	} else {
 		fleet, err = NewFleet(FleetOptions{
-			Logger:     logger,
-			Workers:    workers,
-			Policy:     policy,
-			PolicyPath: policyPath,
-			Tools:      dispatcher,
-			Apps:       appInv,
-			Models:     modelInventory,
-			Discoverer: discoverer,
-			Metrics:    metrics,
+			Logger:      logger,
+			Workers:     workers,
+			WorkersPath: *workersPath,
+			Policy:      policy,
+			PolicyPath:  policyPath,
+			Tools:       dispatcher,
+			Apps:        appInv,
+			Models:      modelInventory,
+			Discoverer:  discoverer,
+			Metrics:     metrics,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
@@ -421,6 +424,16 @@ func handleRun(args []string) {
 			"name", workers.WorkerName,
 			"capabilities", workers.Capabilities,
 		)
+	}
+
+	if fleet != nil {
+		controlListener, err := listenControl(ctx, defaultControlPath(), fleet)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: worker control: %v\n", err)
+			cancel()
+			os.Exit(1)
+		}
+		defer controlListener.Close()
 	}
 
 	go func() {
@@ -715,6 +728,7 @@ func printUsage() {
 	fmt.Println("  memql worker backup        Print the folders this machine backs up into the")
 	fmt.Println("                                     Library, or the reason it backs up none.")
 	fmt.Println("                                     --once runs one sweep now.")
+	fmt.Println("  memql worker control       Local status/logs and per-server pause/resume (current OS user).")
 	fmt.Println("  memql worker consent <op>  Manage the per-call consent gate (grant/revoke/status/watch).")
 	fmt.Println("")
 	fmt.Println("PAIR FLAGS")

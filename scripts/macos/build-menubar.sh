@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Native menu companion only. The worker stays a separate LaunchAgent.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$REPO_ROOT/../memql/scripts/lib/capability.sh"
+cap_init "cockpit.menubar.build" "Build the native macOS menu companion."
+cap_spec_param "output" "Output .app bundle (default: bin/MemQL Cockpit.app)"
+cap_spec_param "version" "Display version (default: repository VERSION)"
+
+function main() {
+    cap_handle_meta "$@"
+    cap_parse_flags "$@"
+    local output version stage
+    output="$(cap_param output "$REPO_ROOT/bin/MemQL Cockpit.app")"
+    version="$(cap_param version "$(cat "$REPO_ROOT/VERSION")")"
+    [[ "$output" == /* && "$output" == *.app ]] || cap_fail 2 "output must be an absolute .app path"
+    command -v swiftc >/dev/null || cap_fail 4 "swiftc is required (Xcode command line tools)"
+    command -v codesign >/dev/null || cap_fail 4 "codesign is required on macOS"
+    stage="$(mktemp -d "${TMPDIR:-/tmp}/memql-menubar.XXXXXX")/MemQL Cockpit.app"
+    mkdir -p "$stage/Contents/MacOS" "$stage/Contents/Resources"
+    swiftc -O -framework AppKit "$REPO_ROOT/native/macos/main.swift" -o "$stage/Contents/MacOS/MemQLCockpit" >&2 || cap_fail 5 "native menu build failed"
+    cp "$REPO_ROOT/native/macos/Info.plist" "$stage/Contents/Info.plist"
+    cp "$REPO_ROOT/native/macos/mark.svg" "$stage/Contents/Resources/mark.svg"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$stage/Contents/Info.plist" >&2
+    codesign --force --sign - "$stage" >&2 || cap_fail 5 "menu signing failed"
+    mkdir -p "$(dirname "$output")"
+    if [[ -d "$output" ]] && diff -qr "$stage" "$output" >/dev/null; then
+        cap_info "Menu bundle already current"
+    else
+        ditto "$stage" "$output" >&2 || cap_fail 5 "could not write menu bundle"
+        cap_changed
+    fi
+    rm -rf "$(dirname "$stage")"
+    cap_result_set app "$output"
+    cap_ok
+}
+main "$@"

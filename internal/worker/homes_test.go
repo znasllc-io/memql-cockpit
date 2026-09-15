@@ -165,8 +165,8 @@ func TestRemoveHome(t *testing.T) {
 	if len(w.Homes) != 1 || w.Homes[0].IsEnabled() {
 		t.Fatalf("disableOnly left enabled: %+v", w.Homes[0])
 	}
-	if err := w.ValidateRun(); err == nil {
-		t.Fatal("ValidateRun should fail with no enabled homes")
+	if err := w.ValidateRun(); err != nil {
+		t.Fatal("all-paused supervisor must remain available for local resume", err)
 	}
 }
 

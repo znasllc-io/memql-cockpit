@@ -1,0 +1,308 @@
+import AppKit
+import Foundation
+
+struct HomeStatus: Decodable {
+    let id: String
+    let server: String
+    let enabled: Bool
+    let state: String
+    let os_url: String?
+}
+struct WorkerStatus: Decodable {
+    let version: String
+    let pid: Int
+    let homes: [HomeStatus]
+    let accessibility: String
+    let screen_recording: String
+    let checked_at: String
+}
+struct LogEntry: Decodable {
+    let time: String
+    let level: String
+    let home: String
+    let message: String
+}
+struct Reply: Decodable {
+    let ok: Bool
+    let error: String?
+    let status: WorkerStatus?
+    let logs: [LogEntry]?
+}
+
+// Read the canonical MemQL SVG geometry. The original mark is bundled,
+// rather than approximating it with a system glyph or redrawing a variant.
+final class MarkParser: NSObject, XMLParserDelegate {
+    var edges: [(CGFloat, CGFloat, CGFloat, CGFloat)] = []
+    var nodes: [(CGFloat, CGFloat, CGFloat)] = []
+    func parser(_ parser: XMLParser, didStartElement name: String, namespaceURI: String?, qualifiedName: String?, attributes: [String: String]) {
+        func n(_ key: String) -> CGFloat { CGFloat(Double(attributes[key] ?? "0") ?? 0) }
+        if name == "line" { edges.append((n("x1"), n("y1"), n("x2"), n("y2"))) }
+        if name == "circle" { nodes.append((n("cx"), n("cy"), n("r"))) }
+    }
+    static func image() -> NSImage? {
+        guard let url = Bundle.main.url(forResource: "mark", withExtension: "svg"),
+              let parser = XMLParser(contentsOf: url) else { return nil }
+        let shape = MarkParser()
+        parser.delegate = shape
+        guard parser.parse(), shape.nodes.count == 9 else { return nil }
+        let image = NSImage(size: NSSize(width: 20, height: 20), flipped: true) { rect in
+            NSColor.black.set()
+            let scale = rect.width / 24
+            let lines = NSBezierPath()
+            lines.lineWidth = 0.78 * scale
+            lines.lineCapStyle = .round
+            for (x1, y1, x2, y2) in shape.edges {
+                lines.move(to: NSPoint(x: x1 * scale, y: y1 * scale))
+                lines.line(to: NSPoint(x: x2 * scale, y: y2 * scale))
+            }
+            lines.stroke()
+            for (x, y, r) in shape.nodes {
+                NSBezierPath(ovalIn: NSRect(x: (x-r)*scale, y: (y-r)*scale, width: 2*r*scale, height: 2*r*scale)).fill()
+            }
+            return true
+        }
+        image.isTemplate = true
+        return image
+    }
+}
+
+final class CockpitApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSearchFieldDelegate, NSWindowDelegate {
+    private var item: NSStatusItem!
+    private var snapshot: WorkerStatus?
+    private var workerError = "Connecting to background worker…"
+    private var busy = false
+    private var logsBusy = false
+    private var trackingMenu = false
+    private var pendingHomes: Set<String> = []
+    private var timer: Timer?
+    private var logWindow: NSWindow?
+    private var logText: NSTextView!
+    private var search: NSSearchField!
+    private var levelFilter: NSPopUpButton!
+    private var homeFilter: NSPopUpButton!
+    private var follow: NSButton!
+    private var logSummary: NSTextField!
+    private var logs: [LogEntry] = []
+    private var logFailure: String?
+    private var following = true
+    private let timeParser = ISO8601DateFormatter()
+    private let timeDisplay: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "MMM d HH:mm:ss"; return f
+    }()
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+        item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.image = MarkParser.image()
+        if item.button?.image == nil { item.button?.title = "MemQL" }
+        item.button?.setAccessibilityLabel("MemQL Cockpit")
+        rebuildMenu()
+        refresh()
+        timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            self?.refresh()
+            if self?.following == true, self?.logWindow?.isVisible == true { self?.refreshLogs() }
+        }
+    }
+
+    // This CLI only speaks the owner-only Unix socket. It never starts a
+    // worker, loads credentials into the app, or grants macOS permissions.
+    private func request(_ args: [String], done: @escaping (Reply?, String?) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let process = Process()
+            let pipe = Pipe()
+            process.executableURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".memql/bin/memql")
+            process.arguments = ["worker", "control"] + args
+            process.standardOutput = pipe
+            process.standardError = FileHandle.nullDevice
+            do {
+                try process.run()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                let reply = try JSONDecoder().decode(Reply.self, from: data)
+                DispatchQueue.main.async { done(reply, reply.error) }
+            } catch {
+                DispatchQueue.main.async { done(nil, "Background worker unavailable. Check that the MemQL worker service is running.") }
+            }
+        }
+    }
+
+    private func refresh() {
+        if busy { return }
+        busy = true
+        request(["--action=status"]) { [weak self] reply, error in
+            guard let self else { return }
+            self.busy = false
+            self.snapshot = reply?.ok == true ? reply?.status : nil
+            self.workerError = error ?? "Background worker unavailable"
+            self.item.button?.toolTip = self.snapshot.map { "MemQL Cockpit · \($0.homes.filter { $0.state == "Connected" }.count) connected" } ?? "MemQL Cockpit · worker unavailable"
+            if !self.trackingMenu { self.rebuildMenu() }
+        }
+    }
+    func menuWillOpen(_ menu: NSMenu) { trackingMenu = true; refresh() }
+    func menuDidClose(_ menu: NSMenu) { trackingMenu = false; rebuildMenu() }
+    private func entry(_ title: String, action: Selector? = nil, payload: Any? = nil) -> NSMenuItem {
+        let entry = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        entry.target = self; entry.representedObject = payload
+        return entry
+    }
+    private func heading(_ title: String) -> NSMenuItem {
+        let item = entry(title); item.isEnabled = false; return item
+    }
+    private func rebuildMenu() {
+        let menu = NSMenu(); menu.delegate = self; menu.autoenablesItems = false
+        menu.addItem(heading("MemQL Cockpit"))
+        if let snapshot {
+            menu.addItem(heading("Worker running · \(snapshot.homes.filter { $0.state == "Connected" }.count) of \(snapshot.homes.count) servers connected"))
+            menu.addItem(.separator())
+            for home in snapshot.homes {
+                let server = entry("\(home.server) — \(home.state)")
+                let submenu = NSMenu(); submenu.autoenablesItems = false
+                submenu.addItem(heading(home.state == "Paused" ? "Connections paused on this Mac" : "\(home.state) · this Mac"))
+                let toggle = entry(home.enabled ? "Pause connection" : "Allow connecting", action: #selector(toggleHome(_:)), payload: home.id)
+                toggle.isEnabled = !pendingHomes.contains(home.id)
+                submenu.addItem(toggle)
+                if let osURL = home.os_url, !osURL.isEmpty {
+                    submenu.addItem(entry("Open MemQL OS", action: #selector(openOS(_:)), payload: osURL))
+                }
+                server.submenu = submenu; menu.addItem(server)
+            }
+            menu.addItem(.separator())
+            let permissions = entry("macOS permissions")
+            let sub = NSMenu(); sub.autoenablesItems = false
+            sub.addItem(heading("Background worker · current process"))
+            sub.addItem(entry("Accessibility: \(snapshot.accessibility)", action: #selector(openAccessibility)))
+            sub.addItem(entry("Screen Recording: \(snapshot.screen_recording)", action: #selector(openScreenRecording)))
+            sub.addItem(entry("Show installed worker in Finder", action: #selector(revealWorker)))
+            sub.addItem(heading("Rechecks automatically; macOS may require a worker restart."))
+            permissions.submenu = sub; menu.addItem(permissions)
+            menu.addItem(entry("Show Logs…", action: #selector(showLogs)))
+            menu.addItem(heading("Worker \(snapshot.version) · PID \(snapshot.pid)"))
+        } else {
+            menu.addItem(heading(workerError))
+            menu.addItem(entry("Retry worker connection", action: #selector(retry)))
+            menu.addItem(entry("Show Logs…", action: #selector(showLogs)))
+        }
+        menu.addItem(.separator())
+        menu.addItem(entry("Quit menu bar — worker keeps running", action: #selector(quitMenu)))
+        item.menu = menu
+    }
+    @objc private func retry() { refresh(); refreshLogs() }
+    @objc private func toggleHome(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let home = snapshot?.homes.first(where: { $0.id == id }) else { return }
+        pendingHomes.insert(id)
+        request(["--action=home", "--home=\(id)", "--enabled=\(!home.enabled)"]) { [weak self] reply, error in
+            guard let self else { return }
+            self.pendingHomes.remove(id)
+            if reply?.ok == true { self.snapshot = reply?.status }
+            else { self.alert("Connection policy was not changed", error ?? "The worker did not accept the change.") }
+            self.refresh()
+        }
+    }
+    @objc private func openOS(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let url = URL(string: raw), ["https", "http"].contains(url.scheme ?? "") else { return }
+        NSWorkspace.shared.open(url)
+    }
+    @objc private func openAccessibility() { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!) }
+    @objc private func openScreenRecording() { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!) }
+    @objc private func revealWorker() {
+        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".memql/bin/memql").resolvingSymlinksInPath()
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+    @objc private func quitMenu() { NSApp.terminate(nil) }
+    private func alert(_ title: String, _ message: String) {
+        let alert = NSAlert(); alert.messageText = title; alert.informativeText = message; alert.runModal()
+    }
+
+    @objc private func showLogs() {
+        if logWindow == nil { makeLogWindow() }
+        logWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        refreshLogs()
+    }
+    private func makeLogWindow() {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 580), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        window.title = "MemQL Cockpit — Worker Logs"
+        window.minSize = NSSize(width: 650, height: 360)
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+        let content = window.contentView!
+        search = NSSearchField(); search.placeholderString = "Search worker logs"; search.delegate = self
+        levelFilter = NSPopUpButton(); levelFilter.addItems(withTitles: ["All levels", "INFO", "WARN", "ERROR", "DEBUG"])
+        levelFilter.target = self; levelFilter.action = #selector(filtersChanged)
+        homeFilter = NSPopUpButton(); homeFilter.addItem(withTitle: "All servers")
+        homeFilter.target = self; homeFilter.action = #selector(filtersChanged)
+        follow = NSButton(title: "Pause follow", target: self, action: #selector(toggleFollow))
+        follow.bezelStyle = .rounded
+        let refreshButton = NSButton(title: "Refresh", target: self, action: #selector(refreshLogs)); refreshButton.bezelStyle = .rounded
+        let toolbar = NSStackView(views: [search, homeFilter, levelFilter, follow, refreshButton])
+        toolbar.orientation = .horizontal; toolbar.spacing = 8
+        let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.hasHorizontalScroller = false; scroll.borderType = .bezelBorder
+        logText = NSTextView(frame: NSRect(x: 0, y: 0, width: 900, height: 480))
+        logText.isEditable = false; logText.isSelectable = true
+        logText.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        logText.textContainerInset = NSSize(width: 12, height: 10)
+        logText.isHorizontallyResizable = false; logText.isVerticallyResizable = true
+        logText.autoresizingMask = [.width]
+        logText.textContainer?.widthTracksTextView = true
+        scroll.documentView = logText
+        logSummary = NSTextField(labelWithString: "Local worker diagnostics · credentials redacted · no uploads")
+        logSummary.font = NSFont.systemFont(ofSize: 11); logSummary.textColor = .secondaryLabelColor
+        for view in [toolbar, scroll, logSummary!] { view.translatesAutoresizingMaskIntoConstraints = false; content.addSubview(view) }
+        NSLayoutConstraint.activate([
+            toolbar.topAnchor.constraint(equalTo: content.topAnchor, constant: 16), toolbar.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16), toolbar.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16),
+            search.widthAnchor.constraint(greaterThanOrEqualToConstant: 180), homeFilter.widthAnchor.constraint(lessThanOrEqualToConstant: 220),
+            scroll.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 12), scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16), scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -16), scroll.bottomAnchor.constraint(equalTo: logSummary.topAnchor, constant: -12),
+            logSummary.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 16), logSummary.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12)
+        ])
+        window.center(); logWindow = window
+    }
+    @objc private func refreshLogs() {
+        if logWindow == nil || logsBusy { return }
+        logsBusy = true
+        request(["--action=logs"]) { [weak self] reply, error in
+            guard let self else { return }
+            self.logsBusy = false
+            if reply?.ok == true { self.logs = reply?.logs ?? []; self.logFailure = nil }
+            else { self.logFailure = error ?? "Worker log unavailable" }
+            let selected = self.homeFilter.titleOfSelectedItem
+            let homes = Array(Set(self.logs.map(\.home).filter { !$0.isEmpty })).sorted()
+            self.homeFilter.removeAllItems(); self.homeFilter.addItems(withTitles: ["All servers"] + homes)
+            if let selected, self.homeFilter.itemTitles.contains(selected) { self.homeFilter.selectItem(withTitle: selected) }
+            self.renderLogs()
+        }
+    }
+    @objc private func toggleFollow() { following.toggle(); follow.title = following ? "Pause follow" : "Resume follow"; if following { refreshLogs() }; renderLogs() }
+    @objc private func filtersChanged() { renderLogs() }
+    func controlTextDidChange(_ notification: Notification) { renderLogs() }
+    private func renderLogs() {
+        guard logText != nil else { return }
+        let needle = search.stringValue.lowercased()
+        let level = levelFilter.titleOfSelectedItem ?? "All levels"
+        let home = homeFilter.titleOfSelectedItem ?? "All servers"
+        let visible = logs.filter { entry in
+            (level == "All levels" || entry.level == level) && (home == "All servers" || entry.home == home) && (needle.isEmpty || "\(entry.time) \(entry.level) \(entry.home) \(entry.message)".lowercased().contains(needle))
+        }
+        let text = NSMutableAttributedString(string: "")
+        for entry in visible {
+            timeParser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            var date = timeParser.date(from: entry.time)
+            if date == nil { timeParser.formatOptions = [.withInternetDateTime]; date = timeParser.date(from: entry.time) }
+            let stamp = date.map(timeDisplay.string) ?? entry.time
+            let color: NSColor = entry.level == "ERROR" ? .systemRed : entry.level == "WARN" ? .systemOrange : .labelColor
+            let line = "\(stamp)  \(entry.level.padding(toLength: 5, withPad: " ", startingAt: 0))  \(entry.home.isEmpty ? "worker" : entry.home)\n\(entry.message)\n\n"
+            text.append(NSAttributedString(string: line, attributes: [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular), .foregroundColor: color]))
+        }
+        if visible.isEmpty { text.append(NSAttributedString(string: logFailure ?? "No matching worker log entries.")) }
+        let oldPosition = logText.enclosingScrollView?.contentView.bounds.origin ?? .zero
+        logText.textStorage?.setAttributedString(text)
+        if following { logText.scrollToEndOfDocument(nil) }
+        else { logText.enclosingScrollView?.contentView.scroll(to: oldPosition) }
+        logSummary.stringValue = logFailure ?? "\(visible.count) entries · latest 300 · \(following ? "following" : "follow paused") · local only · credentials redacted"
+    }
+}
+
+let app = NSApplication.shared
+let delegate = CockpitApp()
+app.delegate = delegate
+app.run()

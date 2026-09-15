@@ -37,6 +37,7 @@ type WorkersFile struct {
 type Home struct {
 	ID         string `yaml:"id"`
 	ClusterURL string `yaml:"cluster_url"`
+	OSURL      string `yaml:"os_url,omitempty"`
 	Token      string `yaml:"token"`
 	Enabled    *bool  `yaml:"enabled,omitempty"`
 }
@@ -296,13 +297,14 @@ func (w WorkersFile) Validate() error {
 	return nil
 }
 
-// ValidateRun requires at least one enabled home.
+// ValidateRun requires an enrollment. All homes may be paused so the local
+// control service remains available to resume them after a process restart.
 func (w WorkersFile) ValidateRun() error {
 	if err := w.Validate(); err != nil {
 		return err
 	}
-	if len(w.EnabledHomes()) == 0 {
-		return errors.New("workers config: no enabled homes (pair a cluster or enable one in workers.yaml)")
+	if len(w.Homes) == 0 {
+		return errors.New("workers config: no homes (pair a cluster)")
 	}
 	return nil
 }

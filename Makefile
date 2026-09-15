@@ -213,3 +213,11 @@ help: ## Show this help (auto-generated from target comments)
 	@awk 'BEGIN {FS = ":.*?## "} \
 		/^##@/ {printf "\n\033[1m%s\033[0m\n", substr($$0, 5); next} \
 		/^[a-zA-Z0-9_%-]+:.*?## / {printf "  \033[36m%-34s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+
+# Native macOS companion (does not start a second worker).
+.PHONY: menubar menubar-install
+menubar: ## Build native macOS menu app in bin/MemQL Cockpit.app
+	@./scripts/macos/build-menubar.sh --version="$(VERSION)"
+
+menubar-install: menubar ## Install/start the current user's menu companion
+	@./scripts/macos/install-menubar.sh
