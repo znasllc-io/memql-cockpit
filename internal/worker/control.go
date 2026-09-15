@@ -28,6 +28,7 @@ type managedHome struct {
 	wake        chan struct{}
 	prepared    *homeRun
 	duplicateOf string
+	retrying    bool
 }
 
 type LocalHomeStatus struct {
@@ -81,6 +82,8 @@ func (f *Fleet) LocalStatus() LocalStatus {
 				state = "Connected"
 			case h.runner != nil:
 				state = "Connecting / retrying"
+			case h.retrying:
+				state = "Disconnected / retrying"
 			default:
 				state = "Starting"
 			}

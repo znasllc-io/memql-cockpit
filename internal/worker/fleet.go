@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/znasllc-io/memql-cockpit/internal/worker/appsession"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/backup"
@@ -195,6 +196,7 @@ func (f *Fleet) runManagedHome(ctx context.Context, h *managedHome) {
 		}
 		homeCtx, cancel := context.WithCancel(ctx)
 		h.cancel = cancel
+		h.retrying = false
 		f.mu.Unlock()
 		run := f.runHome
 		if run == nil {
@@ -206,12 +208,21 @@ func (f *Fleet) runManagedHome(ctx context.Context, h *managedHome) {
 		f.mu.Lock()
 		h.cancel = nil
 		h.runner = nil
+		h.retrying = !wasCanceled
 		f.mu.Unlock()
 		if !wasCanceled {
 			if err != nil {
 				f.logger.Error("home stream exited", "home", h.home.ID, "error", err)
 			}
-			return
+			// Keep this home's supervisor controllable when its runner ends.
+			// A bounded retry avoids stranding it while siblings keep running.
+			timer := time.NewTimer(time.Second)
+			select {
+			case <-ctx.Done():
+			case <-h.wake:
+			case <-timer.C:
+			}
+			timer.Stop()
 		}
 	}
 }

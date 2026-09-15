@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -292,5 +293,33 @@ func TestLocalControlRefusesDuplicateEnrollmentPolicyChanges(t *testing.T) {
 	status := f.LocalStatus()
 	if status.Homes[0].State != "Duplicate of newer" {
 		t.Fatalf("duplicate status: %+v", status.Homes)
+	}
+}
+
+func TestLocalSupervisorRecoversAnExitedHomeWithoutRestartingSibling(t *testing.T) {
+	f, _ := controlFixture(t)
+	var mu sync.Mutex
+	starts := map[string]int{}
+	f.runHome = func(ctx context.Context, h *managedHome) error {
+		mu.Lock()
+		starts[h.home.ID]++
+		n := starts[h.home.ID]
+		mu.Unlock()
+		if h.home.ID == "a" && n == 1 {
+			return errors.New("runner ended")
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { f.Run(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+	eventuallyControl(t, func() bool { return f.LocalStatus().Homes[0].State == "Disconnected / retrying" })
+	eventuallyControl(t, func() bool { mu.Lock(); defer mu.Unlock(); return starts["a"] == 2 })
+	mu.Lock()
+	defer mu.Unlock()
+	if starts["b"] != 1 {
+		t.Fatalf("sibling restarted %d times", starts["b"])
 	}
 }
