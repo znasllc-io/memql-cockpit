@@ -171,7 +171,7 @@ function install_native_app() {
     NATIVE_APP=""; NATIVE_STAGE=""
     [[ "$FLAVOUR" == computeruse ]] || return 0
     local version base source_app app_version
-    version="$(read_binary_version "$INSTALLED_BINARY")"
+    version="$(read_binary_version_exact "$INSTALLED_BINARY")"
     [[ -n "$version" && "$(compare_semver "$version" 0.15.0)" != -1 ]] || return 0
     base="$DOWNLOAD_BASE"
     [[ "$base" != "$DEFAULT_DOWNLOAD_BASE" ]] || base="https://github.com/znasllc-io/memql-cockpit/releases/download/v${version}"
@@ -190,7 +190,9 @@ function install_native_app() {
             bash "$NATIVE_STAGE/unpacked/scripts/macos/install-app-files.sh" --app="$source_app" --destination="$NATIVE_APP" --cli-path="$INSTALLED_BINARY"
             ;;
     esac
-    "$NATIVE_APP/Contents/Library/LoginItems/MemQL Menu.app/Contents/MacOS/MemQLCockpit" --register-bundles
+    if [[ "$INSTALL_SERVICE" == yes ]]; then
+        "$NATIVE_APP/Contents/Library/LoginItems/MemQL Menu.app/Contents/MacOS/MemQLCockpit" --register-bundles
+    fi
 }
 
 function cleanup_native_stage() {

@@ -138,6 +138,15 @@ function read_binary_version() {
     parse_memql_version_line "$out"
 }
 
+# Keep prerelease/build suffixes when matching a worker with its app archive.
+# Numeric normalization is only appropriate for upgrade ordering.
+function read_binary_version_exact() {
+    local bin="$1" exact
+    [[ -x "$bin" ]] || { echo ""; return 0; }
+    exact="$("$bin" --version 2>/dev/null | awk '$1 == "memql" {print $2; exit}')" || exact=""
+    if [[ "$exact" =~ ^[0-9]+(\.[0-9]+){1,3}([-+][[:alnum:].-]+)*$ ]]; then printf '%s\n' "$exact"; else echo ""; fi
+}
+
 # compare_semver prints -1 / 0 / 1 for a<b / a==b / a>b (numeric dotted).
 # Non-numeric segments compare as 0. Empty either side → treat as 0.0.0.
 function compare_semver() {
@@ -426,6 +435,11 @@ function download_binary() {
     echo "INFO: downloading $url"
     # Progress bar when stdout is a TTY; silent -sS for CI / pipes.
     local curl_flags=(-fL --proto '=https')
+    # Explicit local recovery testing only. Keep published/default downloads
+    # HTTPS-only, and refuse redirects from a loopback HTTP asset.
+    if [[ "${MEMQL_INSTALL_ALLOW_LOOPBACK_HTTP:-}" == 1 && "$url" =~ ^http://(127\.0\.0\.1|\[::1\])(:[0-9]+)?/ ]]; then
+        curl_flags=(-fL --proto '=http' --max-redirs 0)
+    fi
     if [[ -t 1 ]]; then
         curl_flags+=(--progress-bar)
     else
@@ -1025,6 +1039,25 @@ function remove_tree_if_present() {
         record_kept "$dir (outside ${HOME}/.memql; not touched)"
         return 0
     fi
+    # Never allow a state_dir alias or ancestor to sweep credentials/backups.
+    local cursor="$dir" protected
+    while [[ "$cursor" != "$HOME/.memql" && "$cursor" != / ]]; do
+        if [[ -L "$cursor" && "$cursor" != "$dir" ]]; then
+            echo "WARN: kept $dir (symlinked ancestor)"
+            record_kept "$dir (symlinked ancestor)"
+            return 0
+        fi
+        cursor="$(dirname "$cursor")"
+    done
+    case "$dir" in
+        "$HOME/.memql"|*/./*|*/.) record_kept "$dir (unsafe purge target)"; return 0 ;;
+    esac
+    for protected in backups credentials certs certificates; do
+        case "$dir" in
+            "$HOME/.memql/$protected"|"$HOME/.memql/$protected/"*)
+                echo "WARN: kept $dir (protected data)"; record_kept "$dir (protected data)"; return 0 ;;
+        esac
+    done
     rm -rf "$dir"
     echo "INFO: removed $dir"
     record_removed "$dir"

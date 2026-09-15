@@ -860,6 +860,7 @@ function run_uninstaller() {
     shift 2
     local tool_path="$_nobin"
     if [[ "$script" == uninstall-linux.sh ]]; then tool_path="${_uninstall_systemctl_dir}:$_nobin"; fi
+    if [[ "$script" == uninstall-mac.sh ]]; then set -- --all-homes "$@"; fi
     (cd "$_script_dir" && HOME="$home" PATH="$tool_path" bash "./${script}" "$@" 2>&1)
 }
 

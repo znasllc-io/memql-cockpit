@@ -55,6 +55,44 @@ ad-hoc signature into a stable distribution identity. Developer ID provisioning
 and signed-upgrade validation below remain necessary. The bundle's minimum
 macOS version is read from the actual worker Mach-O build metadata.
 
+## Uninstall and local lifecycle testing
+
+Fleet must pass the selected cluster URL to the current macOS uninstaller:
+
+```sh
+scripts/install/uninstall-mac.sh --cluster=https://api.example.com --user-local
+# Explicit whole-machine worker removal:
+scripts/install/uninstall-mac.sh --all-homes --user-local
+```
+
+A cluster removal uses the worker's YAML decoder and enrollment identity rules.
+It removes duplicate homes for that cluster and repairs the legacy token mirror.
+If another home remains (including a disabled home), the shared app, CLI, menu,
+policy and state stay. A running worker is stopped before the change and reloaded
+for its remaining homes; a stopped worker is not started. The last enrollment
+removes the shared runtime, current and known legacy agents, and standard app.
+No cluster token files means a repeated removal can finish partial file cleanup.
+If tokens remain but the worker binary is missing or the YAML is invalid, scoped
+removal refuses safely; restore the files or explicitly choose full removal.
+
+Default removal keeps policy, state/logs, CLI credentials, cluster settings,
+certificates, models and rollback backups. `--purge` additionally removes worker
+policy, owned state and model runtime files, and refuses when another home remains.
+Credential and backup directories, unrelated apps and custom app locations are
+preserved. macOS privacy entries may remain: only the user can remove those in
+System Settings. Uninstall never edits TCC databases or resets grants.
+
+For a local Fleet test, freeze the current installer, `lib.sh`, uninstaller,
+computer-use binary, app archive and SHA sidecar behind a loopback-only server.
+Set `MEMQL_INSTALL_RAW_BASE` to its `/scripts/install` directory,
+`MEMQL_INSTALL_VERSION` to the exact dev version, and
+`MEMQL_INSTALL_ALLOW_LOOPBACK_HTTP=1`; supply `--download-base` for its versioned
+release directory. Raw binary HTTP downloads require that explicit opt-in and a
+literal loopback address; redirects are refused. Published defaults remain HTTPS.
+`python3 scripts/macos/local_install_test.py --base-url URL --version VERSION`
+exercises the piped command in disposable homes, without services or OS bundle
+registration. Run app package tests separately for simulated agent activation.
+
 ## Released 0.14 companion
 
 Cockpit 0.14.0 and later include the companion in the macOS token installer

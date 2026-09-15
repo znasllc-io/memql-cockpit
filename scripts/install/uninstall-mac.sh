@@ -14,7 +14,7 @@
 # nothing here prompts except sudo.
 #
 # Usage:
-#   ./uninstall-mac.sh [--purge] [--user-local]
+#   ./uninstall-mac.sh --cluster=URL|--all-homes [--purge] [--user-local]
 #
 # Scope: ~/.memql, the managed LaunchAgents, binary paths under the chosen
 # prefix, and the standard MemQL app for that prefix. Rollback copies remain.
@@ -70,6 +70,10 @@ worker.yaml (the tokens). Also removes the standard MemQL app and menu helper;
 custom app destinations and rollback copies are retained.
 
 Options:
+    --cluster=URL             Remove this cluster enrollment. Keep the app and
+                              services if any other enrollment remains.
+    --all-homes               Remove every worker enrollment and shared runtime.
+                              Required unless --cluster is supplied.
     --user-local              Remove a --user-local install from
                               \$HOME/.memql/bin instead of the default
                               /usr/local/bin (which needs sudo).
@@ -87,11 +91,16 @@ EOF
 function parse_args() {
     REMOVE_MODE="system"  # default: the sudo-gated /usr/local/bin, as the install's
     PURGE="no"
+    CLUSTER_URL=""
+    ALL_HOMES="no"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --user-local) REMOVE_MODE="user-local"; shift ;;
             --purge)      PURGE="yes"; shift ;;
+            --cluster=*)  CLUSTER_URL="${1#*=}"; shift ;;
+            --cluster)    [[ $# -gt 1 ]] || { echo "ERROR: --cluster needs a URL" >&2; exit 2; }; CLUSTER_URL="$2"; shift 2 ;;
+            --all-homes)  ALL_HOMES="yes"; shift ;;
             --help|-h)    show_help; exit 0 ;;
             *)
                 # 2 is "bad parameter" in the capability-script exit
@@ -103,6 +112,32 @@ function parse_args() {
                 ;;
         esac
     done
+    if [[ -z "$CLUSTER_URL" && "$ALL_HOMES" != yes ]] || [[ -n "$CLUSTER_URL" && "$ALL_HOMES" == yes ]]; then
+        echo "ERROR: choose --cluster=URL or --all-homes" >&2
+        exit 2
+    fi
+    if [[ -L "$HOME/.memql" ]]; then
+        echo "ERROR: refusing an aliased ~/.memql directory" >&2
+        exit 3
+    fi
+}
+
+# Stop by service label even when a partially removed install lost its plist.
+# A failed stop of a still-loaded agent is an error; never delete its executable.
+function stop_agent() {
+    local label="$1" target
+    if ! command -v launchctl >/dev/null 2>&1; then
+        echo "INFO: launchctl not found; removing service files only"
+        return 0
+    fi
+    target="gui/$(id -u)/$1"
+    if launchctl print "$target" >/dev/null 2>&1; then
+        launchctl bootout "$target" >/dev/null 2>&1 || true
+        if launchctl print "$target" >/dev/null 2>&1; then
+            echo "ERROR: could not stop $label; runtime files retained" >&2
+            return 5
+        fi
+    fi
 }
 
 # remove_launch_agent unloads and removes the LaunchAgent, the current
@@ -115,32 +150,11 @@ function parse_args() {
 # Linux -- is told, and gets the file removal only.
 function remove_launch_agent() {
     local plist_dir="${HOME}/Library/LaunchAgents"
-    local have_launchctl="yes"
-    if ! command -v launchctl >/dev/null 2>&1; then
-        have_launchctl="no"
-        echo "INFO: launchctl not found; not unloading the LaunchAgent (the plist files are still removed)"
-    fi
     local label plist
     for label in "$SERVICE_LABEL_DARWIN" "$LEGACY_LABEL_DARWIN" "com.visionarys.memql-cockpit-worker" "com.znasllc.memql-cockpit-menubar"; do
         plist="${plist_dir}/${label}.plist"
-        if [[ ! -f "$plist" ]]; then
-            # The legacy plist is absent on every machine installed
-            # after the rename; only the current one is worth a line.
-            if [[ "$label" == "$SERVICE_LABEL_DARWIN" ]]; then
-                echo "INFO: ${plist} not present; no LaunchAgent to stop"
-            fi
-            continue
-        fi
-        if [[ "$have_launchctl" == "yes" ]]; then
-            if launchctl unload "$plist" >/dev/null 2>&1; then
-                echo "INFO: unloaded the ${label} LaunchAgent"
-            else
-                echo "WARN: launchctl unload ${plist} failed (not loaded?); removing the plist anyway"
-            fi
-        fi
-        rm -f "$plist"
-        echo "INFO: removed ${plist}"
-        record_removed "$plist"
+        stop_agent "$label" || return $?
+        remove_path_if_present "$plist"
     done
 }
 
@@ -185,23 +199,71 @@ function remove_worker_app() {
     record_removed "$app"
 }
 
+# Use the worker's YAML decoder and identity rules, never a text approximation
+# of workers.yaml. A partially missing CLI may still have the real app worker.
+function scoped_unpair() {
+    local binary="$HOME/Applications/MemQL.app/Contents/MacOS/MemQL"
+    [[ "$REMOVE_MODE" != system ]] || binary="/Applications/MemQL.app/Contents/MacOS/MemQL"
+    [[ -x "$binary" ]] || binary="$(install_mode_dir "$REMOVE_MODE")/memql"
+    if [[ ! -f "$HOME/.memql/workers.yaml" && ! -f "$HOME/.memql/worker.yaml" && ! -L "$HOME/.memql/workers.yaml" && ! -L "$HOME/.memql/worker.yaml" ]]; then
+        OTHER_HOMES=0
+        return 0
+    fi
+    if [[ ! -x "$binary" ]]; then
+        echo "ERROR: cluster-scoped removal needs the installed MemQL binary to parse enrollment safely. Restore its files, or explicitly use --all-homes for complete removal." >&2
+        return 4
+    fi
+    local result remaining plist target was_loaded=no
+    result="$(mktemp)"
+    if ! "$binary" worker unpair --cluster-url "$CLUSTER_URL" --dry-run --json > "$result"; then
+        rm -f "$result"; return 5
+    fi
+    remaining="$(/usr/bin/plutil -extract remaining raw -o - "$result")" || { rm -f "$result"; return 5; }
+    if [[ "$PURGE" == yes && "$remaining" -gt 0 ]]; then
+        rm -f "$result"
+        echo "ERROR: --purge would erase state shared with other enrollments; no enrollment was removed. Omit --purge or explicitly use --all-homes." >&2
+        return 3
+    fi
+    plist="$HOME/Library/LaunchAgents/$SERVICE_LABEL_DARWIN.plist"
+    target="gui/$(id -u)/$SERVICE_LABEL_DARWIN"
+    if command -v launchctl >/dev/null 2>&1 && launchctl print "$target" >/dev/null 2>&1; then
+        # Reload only a service that was running and has a retained plist.
+        if [[ "$remaining" -gt 0 && ( ! -f "$plist" || -L "$plist" ) ]]; then
+            rm -f "$result"; echo "ERROR: running worker has no regular service plist to reload safely" >&2; return 3
+        fi
+        was_loaded=yes
+    fi
+    stop_agent "$SERVICE_LABEL_DARWIN" || { rm -f "$result"; return 5; }
+    if ! "$binary" worker unpair --cluster-url "$CLUSTER_URL" --json > "$result"; then
+        rm -f "$result"
+        echo "ERROR: removal did not complete; worker remains stopped so a removed token cannot reconnect. Repair enrollment before restarting." >&2
+        return 5
+    fi
+    OTHER_HOMES="$(/usr/bin/plutil -extract remaining raw -o - "$result")" || { rm -f "$result"; return 5; }
+    rm -f "$result"
+    if [[ "$OTHER_HOMES" -gt 0 ]]; then
+        local legacy
+        for legacy in "$LEGACY_LABEL_DARWIN" "com.visionarys.memql-cockpit-worker"; do
+            stop_agent "$legacy" || return $?
+            remove_path_if_present "$HOME/Library/LaunchAgents/$legacy.plist"
+        done
+        if [[ "$was_loaded" == yes ]]; then
+            launchctl bootstrap "gui/$(id -u)" "$plist" || { echo "ERROR: enrollment removed but remaining-home worker could not reload" >&2; return 5; }
+        fi
+        echo "SUCCESS: selected cluster enrollment removed; $OTHER_HOMES other enrollment(s) and the shared app, CLI, menu, policy and state retained."
+    fi
+}
+
 function main() {
     parse_args "$@"
-    # Read BEFORE the token files go: --purge deletes the directory the
-    # worker actually used, and the default is only where that usually
-    # is.
-    local state_dir
+    local state_dir binary_rc=0
     state_dir="$(worker_state_dir_from_yaml "${HOME}/.memql/worker.yaml")"
-    # Service, binary, tokens: the install in reverse, and the order that
-    # leaves the least behind if a step is interrupted -- a KeepAlive
-    # agent still running would re-exec a binary that is about to go,
-    # with a token that is about to go.
-    remove_launch_agent
+    if [[ -n "$CLUSTER_URL" ]]; then
+        scoped_unpair || exit $?
+        [[ "$OTHER_HOMES" -eq 0 ]] || exit 0
+    fi
+    remove_launch_agent || exit $?
     remove_menu_companion
-    # A binary that needs sudo this run cannot get is reported and
-    # left; the tokens still go, because they matter more, and the exit
-    # code carries the leftover.
-    local binary_rc=0
     remove_binaries_with_mode "$REMOVE_MODE" || binary_rc=$?
     remove_worker_app || binary_rc=1
     remove_worker_config
@@ -210,6 +272,8 @@ function main() {
     else
         report_kept_state "$state_dir"
     fi
+    echo "INFO: CLI credentials, cluster settings, certificates and rollback backups are retained."
+    echo "INFO: macOS privacy entries may remain in System Settings; remove them there if desired. No privacy database or grants were reset."
     print_uninstall_summary "$binary_rc"
     exit "$binary_rc"
 }

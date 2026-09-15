@@ -155,7 +155,7 @@ main "$@"
         assert fresh['EnvironmentVariables'] == {'HOME': str(user)}
         assert fresh['AssociatedBundleIdentifiers'] == ['com.znasllc.memql-worker']
         # Full uninstall is tested only in this disposable fixture home.
-        run(['bash', str(repo / 'scripts/install/uninstall-mac.sh'), '--user-local'], env)
+        run(['bash', str(repo / 'scripts/install/uninstall-mac.sh'), '--user-local', '--all-homes'], env)
         assert not destination.exists() and not cli.exists()
         assert not (private / 'worker.yaml').exists() and not (private / 'workers.yaml').exists()
         assert (private / 'policy.yaml').read_bytes() == protected[private / 'policy.yaml']
