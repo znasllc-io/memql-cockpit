@@ -431,7 +431,7 @@ if let arg = CommandLine.arguments.first(where: { $0.hasPrefix("--write-iconset=
     for size in [16, 32, 128, 256, 512] {
         for factor in [1, 2] {
             let pixels = size * factor
-            guard let mark = MarkParser.image(size: CGFloat(pixels), template: false),
+            guard let mark = MemQLAppIcon.image(pixels: pixels, points: size),
                   let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: pixels, pixelsHigh: pixels,
                     bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
                     colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0),
