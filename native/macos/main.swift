@@ -15,6 +15,20 @@ struct WorkerStatus: Decodable {
     let accessibility: String
     let screen_recording: String
     let checked_at: String
+    let executable: String?
+    let permission_requests: Bool?
+    let permission_request_pending: Bool?
+
+    var permissionReport: PermissionReport {
+        let parser = ISO8601DateFormatter()
+        parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        var checked = parser.date(from: checked_at)
+        if checked == nil { parser.formatOptions = [.withInternetDateTime]; checked = parser.date(from: checked_at) }
+        return PermissionReport(pid: pid, version: version, executable: executable,
+                                accessibility: accessibility, screenRecording: screen_recording,
+                                requestsSupported: permission_requests == true,
+                                requestPending: permission_request_pending == true, checkedAt: checked)
+    }
 }
 struct LogEntry: Decodable {
     let time: String
@@ -75,6 +89,9 @@ final class CockpitApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSearc
     private var trackingMenu = false
     private var pendingHomes: Set<String> = []
     private var timer: Timer?
+    private var permissionWindow: PermissionSetupWindow?
+    private var restartBusy = false
+    private var openPermissionsAfterLaunch = false
     private var logWindow: NSWindow?
     private var logText: NSTextView!
     private var search: NSSearchField!
@@ -104,13 +121,18 @@ final class CockpitApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSearc
             self?.refresh()
             if self?.following == true, self?.logWindow?.isVisible == true { self?.refreshLogs() }
         }
+        if openPermissionsAfterLaunch { showPermissions() }
     }
 
     // Opening the installed app again should reveal a useful window even
     // though its normal login presence is only in the menu bar.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        showLogs()
+        if snapshot?.permissionReport.granted() == true { showLogs() } else { showPermissions() }
         return true
+    }
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard urls.contains(where: PermissionBridge.accepts) else { return }
+        if item == nil { openPermissionsAfterLaunch = true } else { showPermissions() }
     }
     private func installApplicationMenu() {
         let main = NSMenu()
@@ -118,6 +140,7 @@ final class CockpitApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSearc
         let appMenu = NSMenu(title: "MemQL Cockpit")
         appMenu.addItem(entry("Show Cockpit Menu", action: #selector(showCockpitMenu)))
         appMenu.addItem(entry("Show Logs…", action: #selector(showLogs)))
+        appMenu.addItem(entry("Set Up Permissions…", action: #selector(showPermissions)))
         appMenu.addItem(.separator())
         appMenu.addItem(entry("Quit menu bar — worker keeps running", action: #selector(quitMenu)))
         appItem.submenu = appMenu
@@ -146,7 +169,8 @@ final class CockpitApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSearc
     }
 
     // This CLI only speaks the owner-only Unix socket. It never starts a
-    // worker, loads credentials into the app, or grants macOS permissions.
+    // worker or loads credentials into the app. Explicit permission requests
+    // ask the existing worker to invoke macOS; this CLI does not probe grants.
     private func request(_ args: [String], done: @escaping (Reply?, String?) -> Void) {
         let executable = workerExecutableURL()
         DispatchQueue.global(qos: .userInitiated).async {
@@ -178,6 +202,12 @@ final class CockpitApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSearc
             self.workerError = error ?? "Background worker unavailable"
             self.item.button?.toolTip = self.snapshot.map { "MemQL Cockpit · \($0.homes.filter { $0.state == "Connected" }.count) connected" } ?? "MemQL Cockpit · worker unavailable"
             if !self.trackingMenu { self.rebuildMenu() }
+            self.permissionWindow?.update(self.snapshot?.permissionReport)
+            if let report = self.snapshot?.permissionReport, report.fresh(), report.requestsSupported,
+               !report.granted(), !UserDefaults.standard.bool(forKey: "permissionSetupShown") {
+                UserDefaults.standard.set(true, forKey: "permissionSetupShown")
+                self.showPermissions()
+            }
         }
     }
     func menuWillOpen(_ menu: NSMenu) { trackingMenu = true; refresh() }
@@ -212,6 +242,7 @@ final class CockpitApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSearc
             let permissions = entry("macOS permissions")
             let sub = NSMenu(); sub.autoenablesItems = false
             sub.addItem(heading("Background worker · current process"))
+            sub.addItem(entry("Set Up Permissions…", action: #selector(showPermissions)))
             sub.addItem(entry("Accessibility: \(snapshot.accessibility)", action: #selector(openAccessibility)))
             sub.addItem(entry("Screen Recording: \(snapshot.screen_recording)", action: #selector(openScreenRecording)))
             sub.addItem(entry("Show installed worker in Finder", action: #selector(revealWorker)))
@@ -222,6 +253,7 @@ final class CockpitApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSearc
         } else {
             menu.addItem(heading(workerError))
             menu.addItem(entry("Retry worker connection", action: #selector(retry)))
+            menu.addItem(entry("Set Up Permissions…", action: #selector(showPermissions)))
             menu.addItem(entry("Show Logs…", action: #selector(showLogs)))
         }
         menu.addItem(.separator())
@@ -252,6 +284,66 @@ final class CockpitApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSearc
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
     @objc private func quitMenu() { NSApp.terminate(nil) }
+
+    @objc private func showPermissions() {
+        if permissionWindow == nil {
+            let window = PermissionSetupWindow()
+            window.request = { [weak self] permission, pid in
+                self?.request(["--action=request-permission", "--permission=\(permission)", "--pid=\(pid)"]) { reply, error in
+                    self?.permissionWindow?.actionFinished(reply?.ok == true ? nil : (error ?? "The worker did not accept the request."))
+                    self?.refresh()
+                }
+            }
+            window.reveal = { [weak self] in self?.revealWorker() }
+            window.restart = { [weak self] pid in self?.restartWorker(expectedPID: pid) }
+            permissionWindow = window
+        }
+        permissionWindow?.update(snapshot?.permissionReport)
+        permissionWindow?.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        refresh()
+    }
+
+    // Only the confirmed button reaches this method. Resolve the installed
+    // service and verify its loaded PID/program before targeting its label.
+    private func restartWorker(expectedPID: Int) {
+        guard !restartBusy, let report = snapshot?.permissionReport, report.fresh(),
+              report.pid == expectedPID, let actualPath = report.executable else {
+            permissionWindow?.restartFinished("The worker changed. Wait for its current status and try again.")
+            return
+        }
+        let executable = workerExecutableURL()
+        guard executable.resolvingSymlinksInPath() == URL(fileURLWithPath: actualPath).resolvingSymlinksInPath() else {
+            permissionWindow?.restartFinished("The running worker differs from the installed service. Reinstall Cockpit to repair the service.")
+            return
+        }
+        restartBusy = true
+        DispatchQueue.global(qos: .userInitiated).async {
+            func launchctl(_ arguments: [String]) throws -> (Int32, String) {
+                let task = Process(); let pipe = Pipe()
+                task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+                task.arguments = arguments; task.standardOutput = pipe; task.standardError = FileHandle.nullDevice
+                try task.run()
+                let bytes = pipe.fileHandleForReading.readDataToEndOfFile(); task.waitUntilExit()
+                return (task.terminationStatus, String(data: bytes, encoding: .utf8) ?? "")
+            }
+            var failure: String?
+            do {
+                let service = "gui/\(getuid())/com.znasllc.memql-worker"
+                let (status, description) = try launchctl(["print", service])
+                if status != 0 || !PermissionBridge.serviceMatches(description, pid: expectedPID, executable: executable.path) {
+                    failure = "The managed worker changed or is unavailable. Refresh its status before restarting."
+                } else if try launchctl(["kickstart", "-k", service]).0 != 0 {
+                    failure = "macOS could not restart the worker. Open Cockpit Logs to check the service."
+                }
+            } catch { failure = "Unable to contact the macOS worker service." }
+            DispatchQueue.main.async {
+                self.restartBusy = false
+                self.permissionWindow?.restartFinished(failure)
+                self.refresh()
+            }
+        }
+    }
     private func alert(_ title: String, _ message: String) {
         let alert = NSAlert(); alert.messageText = title; alert.informativeText = message; alert.runModal()
     }

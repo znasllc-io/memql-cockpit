@@ -41,13 +41,16 @@ type LocalHomeStatus struct {
 }
 
 type LocalStatus struct {
-	Version          string            `json:"version"`
-	PID              int               `json:"pid"`
-	Homes            []LocalHomeStatus `json:"homes"`
-	Accessibility    string            `json:"accessibility"`
-	ScreenRecording  string            `json:"screen_recording"`
-	PermissionDetail string            `json:"permission_detail"`
-	CheckedAt        time.Time         `json:"checked_at"`
+	Version                  string            `json:"version"`
+	PID                      int               `json:"pid"`
+	Homes                    []LocalHomeStatus `json:"homes"`
+	Accessibility            string            `json:"accessibility"`
+	ScreenRecording          string            `json:"screen_recording"`
+	PermissionDetail         string            `json:"permission_detail"`
+	CheckedAt                time.Time         `json:"checked_at"`
+	Executable               string            `json:"executable,omitempty"`
+	PermissionRequests       bool              `json:"permission_requests"`
+	PermissionRequestPending bool              `json:"permission_request_pending"`
 }
 
 func permissionLabel(d permissionDecision) string {
@@ -64,6 +67,9 @@ func permissionLabel(d permissionDecision) string {
 func (f *Fleet) LocalStatus() LocalStatus {
 	p := currentPermissionSnapshot()
 	status := LocalStatus{Version: cockpitVersion(), PID: os.Getpid(), Homes: []LocalHomeStatus{}, Accessibility: permissionLabel(p.accessibility), ScreenRecording: permissionLabel(p.screenRecording), PermissionDetail: p.detail, CheckedAt: time.Now()}
+	status.Executable, _ = os.Executable()
+	status.PermissionRequests = permissionRequestsSupported()
+	status.PermissionRequestPending = localPermissionRequests.pending.Load()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, home := range f.workers.Homes {
@@ -231,9 +237,11 @@ func saveHomeEnabled(path, id string, enabled bool) error {
 func defaultControlPath() string { return filepath.Join(homeDir(), ".memql", "control", "worker.sock") }
 
 type controlRequest struct {
-	Action  string `json:"action"`
-	Home    string `json:"home,omitempty"`
-	Enabled *bool  `json:"enabled,omitempty"`
+	Action     string `json:"action"`
+	Home       string `json:"home,omitempty"`
+	Enabled    *bool  `json:"enabled,omitempty"`
+	Permission string `json:"permission,omitempty"`
+	PID        int    `json:"pid,omitempty"`
 }
 type controlResponse struct {
 	OK     bool            `json:"ok"`
@@ -318,6 +326,11 @@ func serveControlConnection(conn net.Conn, fleet *Fleet) {
 	}
 	response := controlResponse{OK: true}
 	switch request.Action {
+	case "request-permission":
+		if err := localPermissionRequests.request(request.Permission, request.PID, permissionRequestsSupported(), promptForPermission); err != nil {
+			response.OK = false
+			response.Error = err.Error()
+		}
 	case "status":
 		status := fleet.LocalStatus()
 		response.Status = &status
@@ -377,7 +390,9 @@ func callControl(path string, request controlRequest) (controlResponse, error) {
 
 func handleControl(args []string) {
 	fs := flag.NewFlagSet("worker control", flag.ContinueOnError)
-	action := fs.String("action", "status", "status, logs, or home (set connection permission)")
+	action := fs.String("action", "status", "status, logs, home, or request-permission (explicit local macOS prompt)")
+	permission := fs.String("permission", "", "accessibility or screen_recording, for request-permission")
+	pid := fs.Int("pid", 0, "expected worker process ID, required for request-permission")
 	home := fs.String("home", "", "configured server ID")
 	enabled := fs.String("enabled", "", "true to allow connecting, false to pause")
 	if err := fs.Parse(args); err != nil {
@@ -386,7 +401,7 @@ func handleControl(args []string) {
 		}
 		os.Exit(2)
 	}
-	request := controlRequest{Action: *action, Home: *home}
+	request := controlRequest{Action: *action, Home: *home, Permission: *permission, PID: *pid}
 	if *enabled != "" {
 		if *enabled != "true" && *enabled != "false" {
 			fmt.Fprintln(os.Stderr, "enabled must be true or false")

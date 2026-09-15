@@ -11,4 +11,8 @@
 <key>LSUIElement</key><true/>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>NSHighResolutionCapable</key><true/>
+<key>CFBundleURLTypes</key><array><dict>
+<key>CFBundleURLName</key><string>com.znasllc.memql-cockpit.permissions</string>
+<key>CFBundleURLSchemes</key><array><string>memql-cockpit</string></array>
+</dict></array>
 </dict></plist>

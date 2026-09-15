@@ -72,6 +72,72 @@ Wayland, missing `xdpyinfo`, or a timed-out probe report unknown. macOS TCC chec
 are unknown on Linux. No input event or screenshot is part of reporting.
 Linux semantics have fixture tests; live Linux validation is separate.
 
+## Guided permission setup (development; not in 0.14.0)
+
+**Set Up Permissions…** opens a native window with separate Accessibility and
+Screen Recording requests. It opens once automatically when a supported worker
+first reports missing access; opening the window does not request any grant.
+The user's explicit request invokes `AXIsProcessTrustedWithOptions` or
+`CGRequestScreenCaptureAccess` **inside the running worker** through its private
+control socket. Acknowledgment means the request was queued, not approved.
+Only one OS request may be pending at a time.
+
+**Open Settings** opens the relevant Privacy & Security pane. **Show Worker in
+Finder** reveals the installed executable with symlinks resolved. macOS can
+retain an entry for an older binary after an upgrade; inspect the file instead
+of trusting its display name. Recovery changes to existing grants remain
+explicit actions in System Settings; Cockpit does not reset TCC records.
+
+**Restart Worker…** asks for confirmation because it interrupts active work
+and every server connection. It checks the service's loaded PID and program,
+then uses `launchctl kickstart -k` for the current user's worker label. It does
+not rewrite enrollments or connection policy. The window waits for a fresh
+report from a different PID; a new process with denied access remains denied.
+Reports older than 15 seconds, unavailable workers, and unsupported probes
+cannot confirm readiness. Headless and older workers show an update hint.
+
+The browser bridge is **`memql-cockpit://permissions`**, optionally ending in
+`/`, with no credentials, port, query, fragment, or action path. It only opens
+the window. Fleet must gate this link on a future released companion version
+and offer **Install or update Cockpit** if the handler is unavailable. Opening
+the URL is never evidence of installation or granted permissions. There is no
+HTTP bridge and no remote grant/restart endpoint.
+
+Local status adds `executable`, `permission_requests` and
+`permission_request_pending`. The explicit CLI equivalent is:
+
+```sh
+# Read PID from the actual service status first; substitute that PID below.
+memql worker control --action=status
+memql worker control --action=request-permission --permission=accessibility --pid=123
+memql worker control --action=request-permission --permission=screen_recording --pid=123
+```
+
+The server rejects unknown permissions, missing/stale PIDs, unsupported builds,
+and overlapping OS requests. Passive status and heartbeat paths never prompt.
+
+### Signing and upgrades
+
+The current release binaries are ad-hoc signed. Their designated requirements
+can contain the build's code hash, so an unchanged path or filename does not
+establish continuity across upgrades. A fixed identifier added to another
+ad-hoc signature does not solve this. See Apple's
+[code-signing requirements](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements)
+and [DTS confirmation of permission loss with ad-hoc builds](https://developer.apple.com/forums/thread/819406).
+
+Distribution signing needs a provisioned **Developer ID Application** identity
+and a stable worker signing identifier (planned: `com.znasllc.memql-worker`).
+The menu retains `com.znasllc.memql-cockpit-menubar`. Before enabling signed
+releases, provision the certificate/private key securely in CI, sign both native
+architectures before hashing and packaging, verify the designated requirement
+and Team ID, and validate notarization and upgrade behavior on a test Mac.
+Release signing must fail if requested credentials or signature verification
+are missing; it must not fall back silently to ad-hoc signing. The initial
+migration from ad-hoc to Developer ID can require user approval again.
+
+This change does not provision signing credentials or promise grant retention.
+No certificate or workflow-signing configuration is modified by onboarding.
+
 ## Logs and local control
 
 **Show Logs** opens a native window with text search, server and severity
