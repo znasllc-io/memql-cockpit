@@ -1,6 +1,21 @@
 # macOS menu bar companion
 
-Build the worker with `make cockpit-computeruse-host`, then build and install
+Cockpit 0.14.0 and later include the companion in the macOS token installer
+used by MemQL OS. Both headless and computer-use installations get the menu;
+`--no-menu` skips it and `--no-service` skips both LaunchAgents. Older explicitly
+selected worker releases skip the companion. The menu reads the worker
+LaunchAgent's executable path, supporting both `/usr/local/bin` and user-local
+installs without adding a second worker.
+
+Each release publishes `memql-menubar-darwin-arm64.tar.gz` and
+`memql-menubar-darwin-amd64.tar.gz`, each with a `.sha256` sidecar. The installer
+verifies the digest, allowed archive paths, code signature, and matching worker
+version. Packages contain the app, its installer, and the pinned capability
+runtime; a user machine does not need Swift, Python, or a source checkout.
+The ordinary macOS uninstall script also removes the companion and its agent;
+custom destinations and previous app backups are kept.
+
+For development, build the worker with `make cockpit-computeruse-host`, then build and install
 the current user's menu companion with `make menubar-install`. Xcode command
 line tools and the repository's pinned `../memql` sibling are required. The
 build/install scripts use that sibling's shared capability-script runtime.
@@ -18,7 +33,9 @@ only that home's stream and in-flight work; other homes keep running. The
 worker writes that home's `enabled` setting atomically to `workers.yaml`,
 retaining its enrollment token, other settings and comments. A paused home
 stays paused across worker relaunch; a supervisor with every home paused stays
-available to receive local resume commands. Menu status distinguishes paused,
+available to receive local resume commands. Duplicate enrollments for one server must be resolved in `workers.yaml` before
+changing their connection policy; the menu refuses an ambiguous pause.
+Menu status distinguishes paused,
 pausing, connected, connecting/retrying, and an unavailable background worker.
 
 **Quit menu bar — worker keeps running** quits only the companion. It does not

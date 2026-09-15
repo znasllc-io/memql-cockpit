@@ -131,13 +131,28 @@ final class CockpitApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSearc
     }
     @objc private func showCockpitMenu() { item.button?.performClick(nil) }
 
+    // Follow the worker service's selected executable for both system and
+    // user-local installs. Never search PATH or start a second worker.
+    private func workerExecutableURL() -> URL {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let plist = home.appendingPathComponent("Library/LaunchAgents/com.znasllc.memql-worker.plist")
+        if let data = try? Data(contentsOf: plist),
+           let config = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
+           let args = config["ProgramArguments"] as? [String],
+           let path = args.first, path.hasPrefix("/") {
+            return URL(fileURLWithPath: path)
+        }
+        return home.appendingPathComponent(".memql/bin/memql")
+    }
+
     // This CLI only speaks the owner-only Unix socket. It never starts a
     // worker, loads credentials into the app, or grants macOS permissions.
     private func request(_ args: [String], done: @escaping (Reply?, String?) -> Void) {
+        let executable = workerExecutableURL()
         DispatchQueue.global(qos: .userInitiated).async {
             let process = Process()
             let pipe = Pipe()
-            process.executableURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".memql/bin/memql")
+            process.executableURL = executable
             process.arguments = ["worker", "control"] + args
             process.standardOutput = pipe
             process.standardError = FileHandle.nullDevice
@@ -233,7 +248,7 @@ final class CockpitApp: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSearc
     @objc private func openAccessibility() { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!) }
     @objc private func openScreenRecording() { NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!) }
     @objc private func revealWorker() {
-        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".memql/bin/memql").resolvingSymlinksInPath()
+        let url = workerExecutableURL().resolvingSymlinksInPath()
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
     @objc private func quitMenu() { NSApp.terminate(nil) }

@@ -88,7 +88,8 @@ Options:
                               (siblings kept). Not required to refresh the
                               same cluster_url or re-run install; never
                               means "binary exists".
-    --no-service              Skip LaunchAgent installation
+    --no-menu                 Skip the native menu companion
+    --no-service              Skip worker and menu LaunchAgent installation
     --help                    Print this help
 EOF
 }
@@ -101,6 +102,7 @@ function parse_args() {
     DOWNLOAD_BASE="$DEFAULT_DOWNLOAD_BASE"
     FORCE="no"
     INSTALL_SERVICE="yes"
+    INSTALL_MENU="yes"
     INSTALL_MODE="system"  # default: sudo-gated /usr/local/bin (#66)
     INFERENCE="no"
 
@@ -114,6 +116,7 @@ function parse_args() {
             --user-local)    INSTALL_MODE="user-local"; shift ;;
             --download-base) DOWNLOAD_BASE="$2"; shift 2 ;;
             --force)         FORCE="yes"; shift ;;
+            --no-menu)       INSTALL_MENU="no"; shift ;;
             --no-service)    INSTALL_SERVICE="no"; shift ;;
             --help|-h)       show_help; exit 0 ;;
             *)
@@ -214,6 +217,44 @@ PLIST
     echo "INFO: launched memql-worker LaunchAgent"
 }
 
+function install_menu_companion() {
+    if [[ "$INSTALL_SERVICE" != yes || "$INSTALL_MENU" != yes ]]; then
+        echo "INFO: menu companion skipped (--no-service or --no-menu)"
+        return 0
+    fi
+    local version base stage menu_version rc
+    version="$(read_binary_version "$INSTALLED_BINARY")"
+    if [[ -z "$version" ]]; then
+        echo "ERROR: cannot determine installed worker version for menu companion" >&2
+        return 5
+    fi
+    if [[ "$(compare_semver "$version" 0.14.0)" == -1 ]]; then
+        echo "INFO: native menu companion requires Cockpit 0.14.0 or later; selected $version"
+        return 0
+    fi
+    base="$DOWNLOAD_BASE"
+    # Match the actual installed worker, even if latest moves during install.
+    if [[ "$base" == "$DEFAULT_DOWNLOAD_BASE" ]]; then
+        base="https://github.com/znasllc-io/memql-cockpit/releases/download/v${version}"
+    fi
+    stage="$(mktemp -d)"
+    if fetch_macos_menu "$base" "$(detect_arch)" "$stage"; then
+        menu_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$stage/unpacked/MemQL Cockpit.app/Contents/Info.plist")"
+        if [[ "$menu_version" != "$version" ]]; then
+            echo "ERROR: menu version $menu_version differs from installed worker $version" >&2
+            rm -rf "$stage"
+            return 3
+        fi
+        rc=0
+        bash "$stage/unpacked/scripts/macos/install-menubar.sh" --app="$stage/unpacked/MemQL Cockpit.app" || rc=$?
+    else
+        rc=$?
+        echo "ERROR: menu companion could not be prepared from $base; worker installation already completed. Retry this installer to finish the menu installation." >&2
+    fi
+    rm -rf "$stage"
+    return "$rc"
+}
+
 function main() {
     parse_args "$@"
     local target_ver
@@ -252,6 +293,9 @@ function main() {
         install_step 5 "Set up local model serving (--inference)"
         setup_inference "$INSTALLED_BINARY"
     fi
+
+    install_step menu "Install native menu companion"
+    install_menu_companion
 
     install_step finish "Finished"
     cat << EOF

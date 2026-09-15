@@ -25,6 +25,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: memql-cockpit
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
 
       - name: Checkout memql (sibling for the ../memql replace directive, pinned)
         # Pinned via .github/memql-pin -- see that file and go.mod. memql is
@@ -110,6 +111,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: memql-cockpit
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
 
       - name: Checkout memql (sibling for the ../memql replace directive, pinned)
         # Pinned via .github/memql-pin -- see that file and go.mod. memql is
@@ -160,6 +162,21 @@ jobs:
       - name: Build computeruse (native CGO, host-stamped artifact name)
         working-directory: memql-cockpit
         run: make cockpit-computeruse-host
+
+      - name: Package native menu companion (macOS)
+        if: runner.os == 'macOS'
+        working-directory: memql-cockpit
+        run: |
+          ./scripts/macos/package-menubar.sh --arch=${{ matrix.arch }}
+          python3 scripts/macos/package_test.py --archive=dist/memql-menubar-darwin-${{ matrix.arch }}.tar.gz
+
+      - name: Upload native menu companion and checksum
+        if: runner.os == 'macOS'
+        working-directory: memql-cockpit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: gh release upload "$TAG" dist/memql-menubar-*.tar.gz dist/memql-menubar-*.sha256 --clobber
 
       - name: Upload computeruse binary to the release
         working-directory: memql-cockpit

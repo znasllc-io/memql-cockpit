@@ -10,7 +10,8 @@ against a cluster and runs as that machine's **worker** (headless shell / fs /
 http tools everywhere; mouse + keyboard + screenshot on the computer-use
 build). The TUI it once carried is gone (2026-08-25 slim-down — spec in
 `docs/superpowers/specs/2026-08-25-cockpit-slim-rename-design.md`); the portal
-and the VS Code extension own every interactive surface now. The engine lives
+and VS Code extension own cluster interaction, while the native macOS menu
+companion owns local connection controls and troubleshooting logs. The engine lives
 in a separate repo (`github.com/znasllc-io/memql`) and is consumed as a
 **pinned sibling checkout** — see "The memql pin" below, which is the single
 most surprising thing about this repository.
@@ -876,9 +877,11 @@ naming an enabled home with its current token, or deletes it -- on every
 behind does not stay on disk. It touches ONLY the mirror, the `worker.yaml`
 beside `workers.yaml` (`isMirrorOf`): a `--config` anywhere else is a file
 a person wrote. A registry with nothing enabled makes the
-worker wait, connected to nothing: at a terminal it says so and exits; under
-the LaunchAgent or the user unit it says so once and waits (a SIGHUP does not
-end the wait), because both restart a worker that exits.
+worker wait, connected to nothing. Paused enrollments still run the fleet's
+local control socket so the menu can resume them. A registry with no homes left
+uses the empty-registry wait: at a terminal it exits; under the LaunchAgent or
+user unit it waits (SIGHUP does not end the wait), because both restart an exited
+worker. See `docs/macos-menu.md` for the owner-only control socket and native UI.
 
 **ONE MACHINE ID, AT THE STATE ROOT.** `machineStateRoot` maps a per-home
 state dir (`<root>/homes/<id>`, which the legacy mirror carries too) to
