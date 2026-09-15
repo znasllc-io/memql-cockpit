@@ -115,6 +115,7 @@ function parse_args() {
             --inference)     INFERENCE="yes"; shift ;;
             --user-local)    INSTALL_MODE="user-local"; shift ;;
             --download-base) DOWNLOAD_BASE="$2"; shift 2 ;;
+            --download-base=*) DOWNLOAD_BASE="${1#*=}"; shift ;;
             --force)         FORCE="yes"; shift ;;
             --no-menu)       INSTALL_MENU="no"; shift ;;
             --no-service)    INSTALL_SERVICE="no"; shift ;;

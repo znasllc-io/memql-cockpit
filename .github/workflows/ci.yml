@@ -253,9 +253,10 @@ jobs:
         run: |
           ./scripts/macos/package-menubar.sh --arch="$(go env GOARCH)"
           python3 scripts/macos/package_test.py --archive="dist/memql-menubar-darwin-$(go env GOARCH).tar.gz"
-          make cockpit-computeruse-host
-          ./scripts/macos/package-app.sh --worker="$PWD/bin/memql-computeruse-darwin-$(go env GOARCH)" --arch="$(go env GOARCH)"
+          make cockpit-computeruse-host VERSION=0.15.0-dev.ci
+          ./scripts/macos/package-app.sh --worker="$PWD/bin/memql-computeruse-darwin-$(go env GOARCH)" --arch="$(go env GOARCH)" --version=0.15.0-dev.ci
           python3 scripts/macos/app_package_test.py --archive="dist/memql-app-darwin-$(go env GOARCH).tar.gz"
+          python3 scripts/macos/local_install_test.py --worker="bin/memql-computeruse-darwin-$(go env GOARCH)" --archive="dist/memql-app-darwin-$(go env GOARCH).tar.gz" --version=0.15.0-dev.ci
       - name: go vet (computeruse)
         working-directory: memql-cockpit
         run: CGO_ENABLED=1 go vet -tags computeruse ./...
