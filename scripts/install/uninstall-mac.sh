@@ -73,6 +73,8 @@ Options:
     --cluster=URL             Remove this cluster enrollment. Keep the app and
                               services if any other enrollment remains.
     --all-homes               Remove every worker enrollment and shared runtime.
+                              Last/full removal resets MemQL app approvals for
+                              Accessibility and Screen Recording only.
                               Required unless --cluster is supplied.
     --user-local              Remove a --user-local install from
                               \$HOME/.memql/bin instead of the default
@@ -304,6 +306,56 @@ function scoped_unpair() {
     fi
 }
 
+# tccutil is Apple's supported bundle-scoped reset. Reset before deleting the
+# bundle so Launch Services can still resolve its identifier. Its success means
+# decisions were reset, not that every cached Settings row has disappeared.
+function reset_installed_memql_permissions() {
+    local worker_app="$HOME/Applications/MemQL.app" app identifier targets="" service failed=no
+    [[ "$REMOVE_MODE" != system ]] || worker_app="/Applications/MemQL.app"
+    if [[ -L "$worker_app" ]]; then
+        echo "ERROR: refusing permission cleanup through an aliased MemQL app path" >&2
+        return 3
+    fi
+    for app in "$worker_app" "$worker_app/Contents/Library/LoginItems/MemQL Menu.app" "$HOME/Applications/MemQL Cockpit.app"; do
+        [[ -d "$app" && ! -L "$app" ]] || continue
+        identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null || true)"
+        case "$identifier" in
+            com.znasllc.memql-worker|com.znasllc.memql-cockpit-menubar)
+                case " $targets " in *" $identifier "*) ;; *) targets="$targets $identifier" ;; esac ;;
+        esac
+    done
+    if [[ -z "$targets" ]]; then
+        echo "INFO: no installed matching MemQL bundle found; no permission reset attempted. If a MemQL row remains in Settings, remove that row manually."
+        return 0
+    fi
+    if [[ "$EUID" -eq 0 ]]; then
+        echo "ERROR: run this uninstaller without sudo so permission resets stay scoped to your user account; privileged file removal is handled separately" >&2
+        return 3
+    fi
+    local alternate="/Applications/MemQL.app"
+    [[ "$REMOVE_MODE" != system ]] || alternate="$HOME/Applications/MemQL.app"
+    macos_privacy_scope_unique "$alternate" || return $?
+    if ! command -v tccutil >/dev/null 2>&1; then
+        echo "ERROR: tccutil is unavailable; app retained so its scoped permission cleanup can be retried" >&2
+        return 4
+    fi
+    for identifier in $targets; do
+        for service in Accessibility ScreenCapture; do
+            if tccutil reset "$service" "$identifier"; then
+                echo "INFO: reset $service authorization decisions for $identifier"
+            else
+                echo "ERROR: could not reset $service for $identifier; remove only its MemQL row in System Settings or retry the scoped reset" >&2
+                failed=yes
+            fi
+        done
+    done
+    if [[ "$failed" == yes ]]; then
+        echo "PARTIAL: app and remaining runtime files retained; macOS permission cleanup did not fully succeed" >&2
+        return 5
+    fi
+    echo "INFO: MemQL authorization decisions reset. If Settings still displays a MemQL row, refresh Settings and remove that row manually; row disappearance is not guaranteed by tccutil."
+}
+
 function main() {
     parse_args "$@"
     local state_dir binary_rc=0
@@ -314,6 +366,7 @@ function main() {
     fi
     remove_launch_agent || exit $?
     stop_remaining_menus || exit $?
+    reset_installed_memql_permissions || exit $?
     remove_menu_companion
     remove_binaries_with_mode "$REMOVE_MODE" || binary_rc=$?
     remove_worker_app || binary_rc=1
@@ -324,7 +377,7 @@ function main() {
         report_kept_state "$state_dir"
     fi
     echo "INFO: CLI credentials, cluster settings, certificates and rollback backups are retained."
-    echo "INFO: macOS privacy entries may remain in System Settings; remove them there if desired. No privacy database or grants were reset."
+    echo "INFO: shared credentials/backups were not purged, and no service-wide permission reset or direct privacy database edit was performed."
     print_uninstall_summary "$binary_rc"
     exit "$binary_rc"
 }

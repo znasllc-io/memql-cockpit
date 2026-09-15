@@ -151,7 +151,7 @@ function install_binary() {
     # ExecStart, and `memql --version`'s variant line all assume.
     local target_ver
     target_ver="$(resolve_target_version "$DOWNLOAD_BASE")"
-    install_binary_with_mode "$INSTALL_MODE" "$url" "$binary" "$INSTALLED_COMMAND" "$target_ver"
+    install_binary_with_mode "$INSTALL_MODE" "$url" "$binary" "$INSTALLED_COMMAND" "$target_ver" "${MEMQL_INSTALL_VERSION:-}"
     INSTALLED_BINARY="$INSTALL_BINARY_FRIENDLY"
 }
 
@@ -171,7 +171,7 @@ function write_config() {
 function install_native_app() {
     NATIVE_APP=""; NATIVE_STAGE=""
     [[ "$FLAVOUR" == computeruse ]] || return 0
-    local version base source_app app_version
+    local version base source_app app_version old_requirement new_requirement transition
     version="$(read_binary_version_exact "$INSTALLED_BINARY")"
     [[ -n "$version" && "$(compare_semver "$version" 0.15.0)" != -1 ]] || return 0
     base="$DOWNLOAD_BASE"
@@ -181,6 +181,19 @@ function install_native_app() {
     source_app="$NATIVE_STAGE/unpacked/MemQL.app"
     app_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$source_app/Contents/Info.plist")"
     [[ "$app_version" == "$version" ]] || { echo "ERROR: app and worker versions differ" >&2; return 3; }
+    case "$INSTALL_MODE" in system) NATIVE_APP="/Applications/MemQL.app" ;; *) NATIVE_APP="$HOME/Applications/MemQL.app" ;; esac
+    if [[ -d "$NATIVE_APP" ]]; then
+        old_requirement="$(macos_bundle_requirement "$NATIVE_APP" || true)"
+        new_requirement="$(macos_bundle_requirement "$source_app" || true)"
+        transition="$(macos_signing_transition "$old_requirement" "$new_requirement")"
+        if [[ "$transition" != unchanged ]]; then
+            echo "NOTICE: MemQL signing identity $transition; existing enabled privacy entries may not authorize this build."
+            echo "       If access stays denied, remove only MemQL from Accessibility and Screen Recording in Settings, add the current MemQL.app, and approve again."
+            echo "       No permission reset is performed during an update; readiness requires fresh worker evidence."
+        else
+            echo "INFO: MemQL signing requirement unchanged; preserving existing authorization decisions."
+        fi
+    fi
     case "$INSTALL_MODE" in
         system)
             NATIVE_APP="/Applications/MemQL.app"

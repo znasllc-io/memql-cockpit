@@ -94,7 +94,10 @@ curl -fsSL https://raw.githubusercontent.com/znasllc-io/memql-cockpit/main/scrip
 # For whole-machine worker removal, use --all-homes instead of --cluster=URL.
 ```
 
-On macOS, `--purge` is refused while another enrollment remains. CLI credentials,
+On macOS, last-home or full removal resets only the installed MemQL apps’
+Accessibility and Screen Recording decisions; shared sibling enrollments keep
+their permissions. Reset failures are reported, and cached Settings rows may
+need manual removal. `--purge` is refused while another enrollment remains. CLI credentials,
 cluster settings, certificates and backups are retained even with a purge.
 
 Without `--purge`, `~/.memql/policy.yaml` and the state directory (logs,

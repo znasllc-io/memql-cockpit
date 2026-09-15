@@ -541,6 +541,8 @@ function install_binary_with_mode() {
     local friendly_name="$4"
     # Optional 5th arg: target version (empty → resolve / read after download).
     local target_ver="${5:-}"
+    local target_exact="${6:-}" installed_exact=""
+    target_exact="${target_exact#v}"
 
     local dest_dir
     dest_dir="$(install_mode_dir "$mode")"
@@ -556,6 +558,8 @@ function install_binary_with_mode() {
     elif [[ -x "$INSTALL_BINARY_DEST" ]]; then
         installed_ver="$(read_binary_version "$INSTALL_BINARY_DEST")"
     fi
+    installed_exact="$(read_binary_version_exact "$INSTALL_BINARY_FRIENDLY")"
+    [[ -n "$installed_exact" ]] || installed_exact="$(read_binary_version_exact "$INSTALL_BINARY_DEST")"
     INSTALL_BINARY_BEFORE="$installed_ver"
 
     if [[ -z "$target_ver" ]]; then
@@ -566,7 +570,7 @@ function install_binary_with_mode() {
     if [[ -n "$installed_ver" && -n "$target_ver" ]]; then
         local cmp
         cmp="$(compare_semver "$installed_ver" "$target_ver")"
-        if [[ "$cmp" == "0" ]]; then
+        if [[ "$cmp" == "0" && ( -z "$target_exact" || "$installed_exact" == "$target_exact" ) ]]; then
             echo "INFO: already at v${installed_ver}; skipping binary download"
             INSTALL_BINARY_ACTION="skip"
             INSTALL_BINARY_AFTER="$installed_ver"
@@ -606,6 +610,10 @@ function install_binary_with_mode() {
                 return 1
             fi
             local dl_ver
+            if [[ -n "$target_exact" && "$(read_binary_version_exact "$tmp")" != "$target_exact" ]]; then
+                echo "ERROR: downloaded binary does not match the explicitly selected build" >&2
+                rm -f "$tmp"; return 3
+            fi
             dl_ver="$(read_binary_version "$tmp")"
             if [[ -z "$target_ver" && -n "$dl_ver" ]]; then
                 target_ver="$dl_ver"
@@ -613,7 +621,7 @@ function install_binary_with_mode() {
             if [[ -n "$installed_ver" && -n "$dl_ver" ]]; then
                 local cmp2
                 cmp2="$(compare_semver "$installed_ver" "$dl_ver")"
-                if [[ "$cmp2" == "0" ]]; then
+                if [[ "$cmp2" == "0" && ( -z "$target_exact" || "$installed_exact" == "$(read_binary_version_exact "$tmp")" ) ]]; then
                     echo "INFO: already at v${installed_ver}; downloaded asset matches — leaving binary in place"
                     rm -f "$tmp"
                     INSTALL_BINARY_ACTION="skip"
@@ -647,6 +655,10 @@ function install_binary_with_mode() {
                 return 1
             fi
             local dl_ver
+            if [[ -n "$target_exact" && "$(read_binary_version_exact "$tmp")" != "$target_exact" ]]; then
+                echo "ERROR: downloaded binary does not match the explicitly selected build" >&2
+                rm -f "$tmp"; return 3
+            fi
             dl_ver="$(read_binary_version "$tmp")"
             if [[ -z "$target_ver" && -n "$dl_ver" ]]; then
                 target_ver="$dl_ver"
@@ -654,7 +666,7 @@ function install_binary_with_mode() {
             if [[ -n "$installed_ver" && -n "$dl_ver" ]]; then
                 local cmp2
                 cmp2="$(compare_semver "$installed_ver" "$dl_ver")"
-                if [[ "$cmp2" == "0" ]]; then
+                if [[ "$cmp2" == "0" && ( -z "$target_exact" || "$installed_exact" == "$(read_binary_version_exact "$tmp")" ) ]]; then
                     echo "INFO: already at v${installed_ver}; downloaded asset matches — leaving binary in place"
                     rm -f "$tmp"
                     INSTALL_BINARY_ACTION="skip"
@@ -1342,4 +1354,31 @@ function fetch_macos_app() {
     mkdir -p "$stage/unpacked"
     tar -xzf "$stage/$asset" -C "$stage/unpacked" || return 5
     [[ -x "$stage/unpacked/MemQL.app/Contents/MacOS/MemQL" && -f "$stage/unpacked/scripts/macos/install-app-files.sh" && -f "$stage/unpacked/scripts/macos/activate-app.sh" && -f "$stage/unpacked/scripts/macos/install-menubar.sh" && -f "$stage/unpacked/scripts/lib/capability.sh" ]] || return 3
+}
+
+# Compare designated requirements, not paths, display names or version strings.
+# A stable signed update keeps the same requirement and needs no permission reset.
+function macos_signing_transition() {
+    local before="$1" after="$2"
+    if [[ -z "$before" || -z "$after" ]]; then echo unknown
+    elif [[ "$before" == "$after" ]]; then echo unchanged
+    else echo changed
+    fi
+}
+
+function macos_bundle_requirement() {
+    codesign -d -r- "$1" 2>&1 | sed -n -E 's/^#? ?(designated => .*)$/\1/p'
+}
+
+# Privacy decisions are bundle-wide within this user account. An alternate
+# standard installation sharing the identifier prevents scoped grant cleanup.
+function macos_privacy_scope_unique() {
+    local alternate="$1" identifier
+    [[ -d "$alternate" ]] || return 0
+    identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$alternate/Contents/Info.plist" 2>/dev/null || true)"
+    case "$identifier" in
+        com.znasllc.memql-worker|com.znasllc.memql-cockpit-menubar)
+            echo "ERROR: another MemQL installation at $alternate shares app permissions; no reset performed. App files retained for explicit cleanup." >&2
+            return 3 ;;
+    esac
 }

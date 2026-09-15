@@ -4,6 +4,7 @@ import contextlib
 import functools
 import http.server
 import shutil
+import shlex
 import threading
 import json
 import os
@@ -81,6 +82,25 @@ def exercise(base, version):
             output = root / 'refused-download'
             rejected = subprocess.run(['bash', '-c', 'source "$1"; download_binary "$2" "$3"', 'fixture', str(library), url, str(output)], env=rejected_env, capture_output=True)
             assert rejected.returncode != 0 and not output.exists() and not output.with_suffix('.partial').exists()
+        privacy_calls = root / 'privacy-calls'
+        env['MEMQL_TEST_PRIVACY_CALLS'] = str(privacy_calls)
+        tcc = shim / 'tccutil'
+        tcc.write_text('''#!/bin/bash
+function main() {
+    [[ $# == 3 && "$1" == reset ]] || return 99
+    case "$2" in Accessibility|ScreenCapture) ;; *) return 99 ;; esac
+    case "$3" in com.znasllc.memql-worker|com.znasllc.memql-cockpit-menubar) ;; *) return 99 ;; esac
+    printf '%s\\n' "$*" >> "$MEMQL_TEST_PRIVACY_CALLS"
+    [[ "${MEMQL_TEST_TCC_FAIL:-}" != 1 || "$2" != ScreenCapture ]] || return 1
+}
+main "$@"
+''')
+        tcc.chmod(0o755)
+        seed = user / '.memql/bin/memql'
+        seed.parent.mkdir(parents=True)
+        previous = version.split('-')[0] + '-dev.before'
+        seed.write_text('#!/bin/bash\nfunction main() { echo ' + shlex.quote('memql ' + previous + ' (computeruse)') + '; }\nmain "$@"\n')
+        seed.chmod(0o755)
         token = 'mql_wkr_fixture_only_not_a_real_enrollment'
         command = ['bash', '-s', '--', '--token', token, '--cluster', 'https://fixture.invalid',
                    '--name', 'fresh-install-fixture', '--computeruse', '--user-local', '--no-service', '--no-menu',
@@ -104,6 +124,25 @@ def exercise(base, version):
         repeated = subprocess.run(command, input=script, env=env, cwd=root, capture_output=True)
         assert repeated.returncode == 0, repeated.stdout.decode() + repeated.stderr.decode()
         assert (app / 'Contents/MacOS/MemQL').read_bytes() == before
+        assert b'signing requirement unchanged' in repeated.stdout
+        assert not privacy_calls.exists(), 'install/update must not reset permissions'
+        info_path = app / 'Contents/Info.plist'
+        prior_info = plistlib.loads(info_path.read_bytes())
+        prior_info['CFBundleVersion'] = 'prior-local-build'
+        info_path.write_bytes(plistlib.dumps(prior_info))
+        subprocess.run(['codesign', '--force', '--sign', '-', str(app)], check=True, capture_output=True)
+        upgraded = subprocess.run(command, input=script, env=env, cwd=root, capture_output=True)
+        assert upgraded.returncode == 0, upgraded.stdout.decode() + upgraded.stderr.decode()
+        assert b'signing identity changed' in upgraded.stdout
+        assert b'No permission reset is performed during an update' in upgraded.stdout
+        assert not privacy_calls.exists()
+        alternate = root / 'other-install/MemQL.app'
+        (alternate / 'Contents').mkdir(parents=True)
+        (alternate / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier': 'com.znasllc.memql-worker'}))
+        scope = subprocess.run(['bash', '-c', 'source "$1"; macos_privacy_scope_unique "$2"', 'fixture', str(library), str(alternate)], env=env, capture_output=True)
+        assert scope.returncode == 3 and b'no reset performed' in scope.stderr
+        assert not privacy_calls.exists()
+
         private = user / '.memql'
         protected = {}
         for name in ['policy.yaml', 'state/worker.log', 'credentials/token', 'clusters.yaml', 'certs/client.pem', 'backups/previous-worker']:
@@ -203,6 +242,7 @@ main "$@"
         assert cli.exists() and app.exists()
         assert (state / worker_label).exists() and (state / menu_label).exists()
         assert menu_process.poll() is None and unrelated_process.poll() is None
+        assert not privacy_calls.exists(), 'sibling uninstall reset shared permissions'
         registry = (private / 'workers.yaml').read_text()
         mirror = (private / 'worker.yaml').read_text()
         assert token not in registry and token not in mirror
@@ -219,6 +259,12 @@ main "$@"
         assert cli.exists() and app.exists() and (agents / (worker_label + '.plist')).exists()
         assert 'mql_wkr_other_fixture' in (private / 'workers.yaml').read_text()
         del env['MEMQL_TEST_STUBBORN_STOP']
+        assert not privacy_calls.exists(), 'failed stop reset permissions'
+        env['MEMQL_TEST_TCC_FAIL'] = '1'
+        failed_privacy = uninstall('--cluster=https://other.invalid', expected=5)
+        assert b'permission cleanup did not fully succeed' in failed_privacy.stderr
+        assert app.exists() and cli.exists(), 'reset failure deleted the resolvable app'
+        del env['MEMQL_TEST_TCC_FAIL']
         env['MEMQL_TEST_DELAY_STOP'] = '1'
         uninstall('--cluster=https://other.invalid')
         del env['MEMQL_TEST_DELAY_STOP']
@@ -227,6 +273,9 @@ main "$@"
         assert unrelated_process.poll() is None, 'unrelated same-name process was stopped'
         assert not list(agents.glob('*.plist')) and not list(state.iterdir())
         assert not (private / 'worker.yaml').exists() and not (private / 'workers.yaml').exists()
+        expected_resets = {'reset ' + service + ' ' + bundle for service in ['Accessibility', 'ScreenCapture'] for bundle in ['com.znasllc.memql-worker', 'com.znasllc.memql-cockpit-menubar']}
+        assert set(privacy_calls.read_text().splitlines()) == expected_resets
+        assert len(privacy_calls.read_text().splitlines()) == 8
         assert all(path.read_bytes() == value for path, value in protected.items())
         uninstall('--cluster=https://other.invalid')  # Idempotent after complete runtime removal.
         # Missing runtime cannot safely parse remaining homes: preserve and refuse.
@@ -250,7 +299,7 @@ main "$@"
         (private / 'worker.yaml').write_text('state_dir: ' + str(private / 'alias/state') + '\n')
         uninstall('--all-homes', '--purge')
         assert (outside / 'state/keep').read_text() == 'untouched'
-        print(json.dumps({'ok': True, 'version': version, 'tested': 'piped HTTP fresh/repeated install; multi-home scoped uninstall and mirror repair; shared purge refusal; delayed bootout and stubborn/failed stop; malformed/missing runtime safety; last-home and repeated cleanup; explicit purge; credentials/backups retained; exact-path embedded helper cleanup with sibling/unrelated process retention; no OS services or registration; no token output'}))
+        print(json.dumps({'ok': True, 'version': version, 'tested': 'piped HTTP fresh/repeated install; multi-home scoped uninstall and mirror repair; shared purge refusal; delayed bootout and stubborn/failed stop; malformed/missing runtime safety; last-home and repeated cleanup; explicit purge; credentials/backups retained; exact-path embedded helper cleanup with sibling/unrelated process retention; scoped permission resets and failure retention; shared bundle-ID refusal; unchanged/changed signing identity updates; no OS services or registration; no token output'}))
 
 
 def main():

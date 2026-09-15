@@ -76,6 +76,11 @@ A directly opened embedded menu is terminated only after its UID, exact executab
 path and mapped executable are verified; a helper that stays running prevents
 app deletion. Other enrollments keep the shared menu running.
 No cluster token files means a repeated removal can finish partial file cleanup.
+Before deleting an installed bundle, full/last-home removal uses `tccutil reset`
+for only Accessibility and ScreenCapture and the known installed worker/menu
+bundle IDs. Failure retains the resolvable app and reports partial cleanup.
+Another standard MemQL installation sharing those IDs blocks the reset. Run the
+uninstaller as the current user, without sudo; privileged file deletion is separate.
 If tokens remain but the worker binary is missing or the YAML is invalid, scoped
 removal refuses safely; restore the files or explicitly choose full removal.
 
@@ -83,8 +88,33 @@ Default removal keeps policy, state/logs, CLI credentials, cluster settings,
 certificates, models and rollback backups. `--purge` additionally removes worker
 policy, owned state and model runtime files, and refuses when another home remains.
 Credential and backup directories, unrelated apps and custom app locations are
-preserved. macOS privacy entries may remain: only the user can remove those in
-System Settings. Uninstall never edits TCC databases or resets grants.
+preserved. A successful `tccutil` call resets authorization decisions; it does
+not promise that every Settings display row disappears. Refresh Settings and
+remove only any remaining MemQL row manually. If the app was already deleted,
+its bundle ID may no longer resolve: remove residual rows through Settings.
+Uninstall never uses a service-wide reset, modifies another app’s approvals, or
+edits a privacy database directly. Sibling-home removal never resets permissions.
+
+Updates compare the installed and incoming designated signing requirements.
+An unchanged requirement preserves existing authorization decisions. A changed
+requirement prints recovery instructions; no update silently resets grants.
+Explicit prerelease versions are compared exactly for download idempotence so a
+new local build is not mistaken for an already-installed build with the same
+numeric version. Only fresh worker OS preflight results can establish readiness.
+
+For the current installed app, the supported user-run recovery is:
+
+```sh
+/usr/bin/tccutil reset Accessibility com.znasllc.memql-worker
+/usr/bin/tccutil reset ScreenCapture com.znasllc.memql-worker
+```
+
+Then use MemQL’s Request access buttons, approve the current app, and restart
+once if needed for a fresh process. The GUI alternative is to remove MemQL’s
+old row in each category and add the exact current app from Show MemQL in Finder.
+These actions revoke/reset old approvals; they do not grant access themselves.
+See Apple’s [app-scoped reset documentation](https://developer.apple.com/documentation/xcode/resetting-access-to-protected-resources-in-macos).
+Stable continuity across different builds still requires a real signing identity.
 
 For a local Fleet test, freeze the current installer, `lib.sh`, uninstaller,
 computer-use binary, app archive and SHA sidecar behind a loopback-only server.

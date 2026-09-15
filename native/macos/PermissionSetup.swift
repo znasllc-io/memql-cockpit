@@ -120,7 +120,7 @@ final class PermissionSetupWindow: NSWindowController {
         let reveal = NSButton(title: "Show MemQL in Finder", target: self, action: #selector(showWorker))
         restartButton = NSButton(title: "Restart Worker…", target: self, action: #selector(confirmRestart))
         let recovery = NSStackView(views: [reveal, restartButton]); recovery.spacing = 12
-        let tip = NSTextField(wrappingLabelWithString: "After changing access in Settings, restart MemQL to verify it. Finder shows the exact installed app.")
+        let tip = NSTextField(wrappingLabelWithString: "If Settings already shows MemQL enabled, remove its old entry and add this app again. After approving access, restart the worker once to verify.")
         tip.font = .systemFont(ofSize: 12); tip.textColor = .secondaryLabelColor
         detailsButton = NSButton(title: "Show technical details", target: self, action: #selector(toggleDetails))
         detailsButton.bezelStyle = .rounded; detailsButton.controlSize = .small; detailsButton.font = .systemFont(ofSize: 11)
@@ -188,7 +188,7 @@ final class PermissionSetupWindow: NSWindowController {
         identity.stringValue = report.map { "Worker \($0.version) · PID \($0.pid)\n\($0.executable ?? "Executable path unavailable from this worker")" } ?? "Worker unavailable"
     }
     func actionFinished(_ error: String?) {
-        message = error ?? "Request sent. Approve access in macOS; access stays unverified until the worker reports it."
+        message = error ?? "Request sent. Only a fresh worker report can confirm access."
         update(report)
     }
     func restartFinished(_ error: String?) {

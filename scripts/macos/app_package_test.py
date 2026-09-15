@@ -79,6 +79,10 @@ function main() {
 main "$@"
 ''')
         launch.chmod(0o755)
+        tcc = shim / 'tccutil'
+        tcc.write_text('#!/bin/bash\nfunction main() { test "$#" = 3; }\nmain "$@"\n')
+        tcc.chmod(0o755)
+
         env.update(HOME=str(user), PATH=str(shim) + ':' + env['PATH'],
                    MEMQL_TEST_STATE=str(state), MEMQL_TEST_CALLS=str(calls))
         private = user / '.memql'
