@@ -642,8 +642,9 @@ function check_linux_display_config() {
     local output capabilities actual
     output="$(
         eval "$_linux_write_config"
-        # Called by the evaluated driver function, beyond ShellCheck's view.
+        # Called by the evaluated driver function, beyond ShellCheck tracing.
         # shellcheck disable=SC2317
+        # shellcheck disable=SC2329 # installer invokes this stub indirectly
         function write_worker_yaml() { printf 'CAPABILITIES=%s\n' "$6"; }
         # The evaluated write_config reads these installer variables.
         # shellcheck disable=SC2034
@@ -763,7 +764,7 @@ for _installer in install-mac.sh install-linux.sh; do
     # without it), the service next (so there is a running worker for
     # the setup's SIGHUP to reach), setup_inference last.
     _line_cfg="$(grep -nF '    write_config' "${_script_dir}/${_installer}" | head -1 | cut -d: -f1)"
-    _line_inf="$(grep -nF 'setup_inference "' "${_script_dir}/${_installer}" | head -1 | cut -d: -f1)"
+    _line_inf="$(grep -nF '        setup_inference' "${_script_dir}/${_installer}" | head -1 | cut -d: -f1)"
     if [[ -n "$_line_cfg" && -n "$_line_inf" && "$_line_inf" -gt "$_line_cfg" ]]; then
         pass "$_installer runs setup_inference after worker.yaml is written"
     else

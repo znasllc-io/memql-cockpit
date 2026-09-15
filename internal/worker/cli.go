@@ -88,6 +88,8 @@ func dispatchHandleCommand(args []string) {
 		handleHardware(args[1:])
 	case "probe":
 		handleProbe(args[1:])
+	case "control":
+		handleControl(args[1:])
 	case "consent":
 		handleConsentCmd(args[1:])
 	case "-h", "--help", "help":
@@ -429,15 +431,16 @@ func handleRun(args []string) {
 		)
 	} else {
 		fleet, err = NewFleet(FleetOptions{
-			Logger:     logger,
-			Workers:    workers,
-			Policy:     policy,
-			PolicyPath: policyPath,
-			ToolsFor:   toolsFor,
-			Apps:       appInv,
-			Models:     modelInventory,
-			Discoverer: discoverer,
-			Metrics:    metrics,
+			Logger:      logger,
+			Workers:     workers,
+			WorkersPath: *workersPath,
+			Policy:      policy,
+			PolicyPath:  policyPath,
+			ToolsFor:    toolsFor,
+			Apps:        appInv,
+			Models:      modelInventory,
+			Discoverer:  discoverer,
+			Metrics:     metrics,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
@@ -448,6 +451,16 @@ func handleRun(args []string) {
 			"name", workers.WorkerName,
 			"capabilities", workers.Capabilities,
 		)
+	}
+
+	if fleet != nil {
+		controlListener, err := listenControl(ctx, defaultControlPath(), fleet)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: worker control: %v\n", err)
+			cancel()
+			os.Exit(1)
+		}
+		defer controlListener.Close()
 	}
 
 	go func() {
@@ -839,8 +852,8 @@ func legacyOnly(workersPath string) bool {
 }
 
 // waitWithoutHomes is `worker run` with nothing to run: a registry with no
-// home enabled -- the state `worker unpair` leaves behind, or every home
-// switched off. It returns the exit code.
+// homes left -- the state `worker unpair` leaves behind. A registry with
+// paused homes runs the fleet so its local controls can resume them.
 //
 // At a terminal it says so and exits 1, because a person is waiting for
 // the prompt. Under the LaunchAgent or the user unit it says so ONCE and
@@ -954,6 +967,7 @@ func printUsage() {
 	fmt.Println("  memql worker backup        Print the folders this machine backs up into the")
 	fmt.Println("                                     Library, or the reason it backs up none.")
 	fmt.Println("                                     --once runs one sweep now.")
+	fmt.Println("  memql worker control       Local status/logs and per-server pause/resume (current OS user).")
 	fmt.Println("  memql worker consent <op>  Manage the consent gate, one window per cluster")
 	fmt.Println("                                     (grant/revoke/status/watch; --cluster <id>).")
 	fmt.Println("")

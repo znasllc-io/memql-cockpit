@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/znasllc-io/memql-cockpit/internal/worker/appsession"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/backup"
@@ -18,10 +19,11 @@ import (
 // FleetOptions wires the shared machine-side singletons into one
 // supervisor that fans out a Runner per enabled home.
 type FleetOptions struct {
-	Logger     *slog.Logger
-	Workers    WorkersFile
-	Policy     *tools.Policy
-	PolicyPath string
+	Logger      *slog.Logger
+	Workers     WorkersFile
+	WorkersPath string
+	Policy      *tools.Policy
+	PolicyPath  string
 	// ToolsFor builds the dispatcher one home's stream serves tool calls
 	// through. PER HOME, because the consent gate inside it is per home
 	// (memql-cockpit#433): a window opened for one cluster must admit
@@ -45,19 +47,23 @@ type FleetOptions struct {
 // window -- so one home's disconnect must not StopAll another home's
 // in-flight work, and one cluster's consent admits nothing for another.
 type Fleet struct {
-	logger     *slog.Logger
-	workers    WorkersFile
-	policy     *tools.Policy
-	policyPath string
-	toolsFor   func(homeID string) ToolDispatcher
-	apps       AppInventory
-	modelsInv  ModelInventory
-	discoverer *models.Discoverer
-	metrics    *Metrics
-	limiter    *modelcall.Limiter
+	logger      *slog.Logger
+	workers     WorkersFile
+	workersPath string
+	machineID   string
+	policy      *tools.Policy
+	policyPath  string
+	toolsFor    func(homeID string) ToolDispatcher
+	apps        AppInventory
+	modelsInv   ModelInventory
+	discoverer  *models.Discoverer
+	metrics     *Metrics
+	limiter     *modelcall.Limiter
 
 	mu      sync.Mutex
 	runners []*Runner
+	managed map[string]*managedHome
+	runHome func(context.Context, *managedHome) error
 
 	// newRunner is NewRunner, and a seam: a test swaps in one that fails
 	// for one home, or one that hands the runner a scripted stream.
@@ -77,17 +83,19 @@ func NewFleet(opts FleetOptions) (*Fleet, error) {
 		limiter = modelcall.NewLimiter()
 	}
 	return &Fleet{
-		logger:     opts.Logger,
-		workers:    opts.Workers,
-		policy:     opts.Policy,
-		policyPath: opts.PolicyPath,
-		toolsFor:   opts.ToolsFor,
-		apps:       opts.Apps,
-		modelsInv:  opts.Models,
-		discoverer: opts.Discoverer,
-		metrics:    opts.Metrics,
-		limiter:    limiter,
-		newRunner:  NewRunner,
+		logger:      opts.Logger,
+		workers:     opts.Workers,
+		workersPath: opts.WorkersPath,
+		managed:     make(map[string]*managedHome),
+		policy:      opts.Policy,
+		policyPath:  opts.PolicyPath,
+		toolsFor:    opts.ToolsFor,
+		apps:        opts.Apps,
+		modelsInv:   opts.Models,
+		discoverer:  opts.Discoverer,
+		metrics:     opts.Metrics,
+		limiter:     limiter,
+		newRunner:   NewRunner,
 	}, nil
 }
 
@@ -130,79 +138,128 @@ type homeRun struct {
 // session's process -- is cancelled with them and ends on its own.
 func (f *Fleet) Run(ctx context.Context) error {
 	homes, duplicates := f.workers.runnableHomes()
-	if len(homes) == 0 {
-		return fmt.Errorf("fleet: no enabled homes")
-	}
-	for _, d := range duplicates {
-		f.logger.Warn(duplicateHomeSentence(d), "home", d.Home.ID)
-	}
-
-	// One machine id for every home, resolved before any of them
-	// connects: two homes minting at once would register this machine
-	// under two ids, which is the duplicate the id exists to prevent
-	// (memql-cockpit#430).
 	machineID, err := ResolveMachineID(f.workers.machineRoot())
 	if err != nil {
 		f.logger.Warn("machine id unavailable; registering without one", "error", err)
 	}
-
-	runs := make([]homeRun, 0, len(homes))
+	// Preserve upstream's all-or-nothing construction before any connection.
+	prepared := make(map[string]*homeRun)
 	for _, home := range homes {
 		run, err := f.buildHome(home, machineID)
 		if err != nil {
 			return fmt.Errorf("fleet: home %s: %w", home.ID, err)
 		}
-		runs = append(runs, run)
+		prepared[home.ID] = &run
 	}
-
+	suppressed := make(map[string]string)
+	for _, d := range duplicates {
+		f.logger.Warn(duplicateHomeSentence(d), "home", d.Home.ID)
+		suppressed[d.Home.ID] = d.Connects
+	}
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-
 	f.mu.Lock()
-	for _, run := range runs {
-		f.runners = append(f.runners, run.runner)
+	f.machineID = machineID
+	var wg sync.WaitGroup
+	for _, home := range f.workers.Homes {
+		h := &managedHome{home: home, enabled: home.IsEnabled(), wake: make(chan struct{}, 1), prepared: prepared[home.ID], duplicateOf: suppressed[home.ID]}
+		f.managed[home.ID] = h
+		if h.duplicateOf != "" {
+			continue
+		}
+		wg.Add(1)
+		go func() { defer wg.Done(); f.runManagedHome(runCtx, h) }()
 	}
 	f.mu.Unlock()
-
-	var wg sync.WaitGroup
-	for _, run := range runs {
-		run := run
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			run.backups.Run(runCtx, run.runner.RegistrationId)
-		}()
-		go func() {
-			defer wg.Done()
-			run.logger.Info("home stream starting",
-				"cluster_url", run.cfg.ClusterURL,
-				"name", run.cfg.Name,
-			)
-			err := run.runner.Run(runCtx)
-			run.sessions.StopAll("home stream ended")
-			if err != nil && runCtx.Err() == nil {
-				run.logger.Error("home stream exited", "error", err)
-			}
-		}()
-	}
-
-	// Every home's stream returning without a cancel is unusual (runners
-	// reconnect forever); the backup sweepers are then stopped with the
-	// rest, by the cancel on the way out.
-	streams := make(chan struct{})
-	go func() {
-		defer close(streams)
-		for _, run := range runs {
-			<-run.runner.closed
-		}
-	}()
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
 	select {
 	case <-ctx.Done():
-	case <-streams:
+	case <-done:
 	}
 	cancel()
-	wg.Wait()
+	<-done
 	return ctx.Err()
+}
+
+func (f *Fleet) runManagedHome(ctx context.Context, h *managedHome) {
+	for ctx.Err() == nil {
+		f.mu.Lock()
+		if !h.enabled {
+			f.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return
+			case <-h.wake:
+				continue
+			}
+		}
+		homeCtx, cancel := context.WithCancel(ctx)
+		h.cancel = cancel
+		h.retrying = false
+		f.mu.Unlock()
+		run := f.runHome
+		if run == nil {
+			run = f.runManagedHomeOnce
+		}
+		err := run(homeCtx, h)
+		wasCanceled := homeCtx.Err() != nil
+		cancel()
+		f.mu.Lock()
+		h.cancel = nil
+		h.runner = nil
+		h.retrying = !wasCanceled
+		f.mu.Unlock()
+		if !wasCanceled {
+			if err != nil {
+				f.logger.Error("home stream exited", "home", h.home.ID, "error", err)
+			}
+			// Keep this home's supervisor controllable when its runner ends.
+			// A bounded retry avoids stranding it while siblings keep running.
+			timer := time.NewTimer(time.Second)
+			select {
+			case <-ctx.Done():
+			case <-h.wake:
+			case <-timer.C:
+			}
+			timer.Stop()
+		}
+	}
+}
+
+func (f *Fleet) runManagedHomeOnce(ctx context.Context, h *managedHome) error {
+	run := h.prepared
+	h.prepared = nil
+	if run == nil {
+		built, err := f.buildHome(h.home, f.machineID)
+		if err != nil {
+			return err
+		}
+		run = &built
+	}
+	f.mu.Lock()
+	h.runner = run.runner
+	f.runners = append(f.runners, run.runner)
+	f.mu.Unlock()
+	defer func() {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		for i, r := range f.runners {
+			if r == run.runner {
+				f.runners = append(f.runners[:i], f.runners[i+1:]...)
+				break
+			}
+		}
+	}()
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { defer close(done); run.backups.Run(runCtx, run.runner.RegistrationId) }()
+	run.logger.Info("home stream starting", "cluster_url", run.cfg.ClusterURL, "name", run.cfg.Name)
+	err := run.runner.Run(runCtx)
+	cancel()
+	run.sessions.StopAll("home stream ended")
+	<-done
+	return err
 }
 
 // buildHome makes one home's runner and the per-home machinery around

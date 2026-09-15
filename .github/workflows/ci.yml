@@ -247,6 +247,12 @@ jobs:
       - name: go build (computeruse)
         working-directory: memql-cockpit
         run: CGO_ENABLED=1 go build -tags computeruse ./...
+      - name: Package and verify native menu companion
+        if: runner.os == 'macOS'
+        working-directory: memql-cockpit
+        run: |
+          ./scripts/macos/package-menubar.sh --arch="$(go env GOARCH)"
+          python3 scripts/macos/package_test.py --archive="dist/memql-menubar-darwin-$(go env GOARCH).tar.gz"
       - name: go vet (computeruse)
         working-directory: memql-cockpit
         run: CGO_ENABLED=1 go vet -tags computeruse ./...

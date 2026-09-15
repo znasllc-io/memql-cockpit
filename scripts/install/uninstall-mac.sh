@@ -121,7 +121,7 @@ function remove_launch_agent() {
         echo "INFO: launchctl not found; not unloading the LaunchAgent (the plist files are still removed)"
     fi
     local label plist
-    for label in "$SERVICE_LABEL_DARWIN" "$LEGACY_LABEL_DARWIN"; do
+    for label in "$SERVICE_LABEL_DARWIN" "$LEGACY_LABEL_DARWIN" "com.znasllc.memql-cockpit-menubar"; do
         plist="${plist_dir}/${label}.plist"
         if [[ ! -f "$plist" ]]; then
             # The legacy plist is absent on every machine installed
@@ -144,6 +144,26 @@ function remove_launch_agent() {
     done
 }
 
+# Only the standard companion bundle bearing our identifier is removed.
+# Custom destinations and rollback copies remain for the owner to inspect.
+function remove_menu_companion() {
+    local app="$HOME/Applications/MemQL Cockpit.app" identifier
+    [[ -e "$app" || -L "$app" ]] || return 0
+    if [[ -L "$app" || ! -d "$app" || ! -O "$app" ]]; then
+        echo "WARN: leaving unexpected menu app path $app"
+        record_kept "$app"
+        return 0
+    fi
+    identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null || true)"
+    if [[ "$identifier" != com.znasllc.memql-cockpit-menubar ]]; then
+        echo "WARN: leaving app with unexpected bundle identifier at $app"
+        record_kept "$app"
+        return 0
+    fi
+    rm -rf "$app"
+    record_removed "$app"
+}
+
 function main() {
     parse_args "$@"
     # Read BEFORE the token files go: --purge deletes the directory the
@@ -156,6 +176,7 @@ function main() {
     # agent still running would re-exec a binary that is about to go,
     # with a token that is about to go.
     remove_launch_agent
+    remove_menu_companion
     # A binary that needs sudo this run cannot get is reported and
     # left; the tokens still go, because they matter more, and the exit
     # code carries the leftover.

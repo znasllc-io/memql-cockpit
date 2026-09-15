@@ -1,73 +1,62 @@
 name: sbom
 
+# Generate inventory from the artifacts actually shipped. The former module
+# graph job tried to resolve unused engine modules at unpublished v0.0.0 refs
+# and failed on multiple releases. Reading binary build info avoids inventing
+# dependencies and distinguishes headless/computeruse and platform selections.
 on:
-  release:
-    types: [published]
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - 'go.mod'
-      - 'go.sum'
+    inputs:
+      tag:
+        description: Existing release with all eight worker binaries
+        required: true
+        type: string
 
 permissions:
   contents: read
 
-# Generates a CycloneDX SBOM for the cockpit Go module on every
-# release (and on go.mod / go.sum changes for main). The artifact
-# is uploaded to the release when triggered by a release event and
-# stashed as a workflow artifact otherwise. Mirrors the memql SBOM
-# workflow so the supply-chain story is uniform.
-#
-# memql-cockpit ships two binary variants from one module (headless
-# default + `computeruse` build tag). The SBOM produced here covers the
-# module-level dependency graph; per-binary SBOMs that reflect the
-# build-tagged subset are a separate exercise tracked in #65 (TBD).
-
 jobs:
   sbom:
-    name: cyclonedx-gomod
+    name: cyclonedx-binaries
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Checkout memql-cockpit
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          path: memql-cockpit
-      - name: Checkout memql (sibling for the ../memql replace directive, pinned)
-        # Pinned via .github/memql-pin -- see that file and go.mod. memql is
-        # mid module-split (memql#3228) and an unpinned main breaks cockpit the
-        # moment any nested go.mod lands.
-        uses: ./memql-cockpit/.github/actions/checkout-memql
-        with:
-          # Dependabot's restricted token can't read the sibling repo;
-          # MEMQL_SIBLING_TOKEN (Dependabot secret) covers that, with a
-          # fallback to the default token on normal runs.
-          token: ${{ secrets.MEMQL_SIBLING_TOKEN || github.token }}
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.26.6'
-          cache: true
-          cache-dependency-path: memql-cockpit/go.sum
-      - name: install cyclonedx-gomod
+          cache: false
+      - name: Install pinned inventory tool
         run: go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.10.0
-      - name: generate SBOM
-        working-directory: memql-cockpit
+      - name: Generate and attach per-binary SBOMs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
         run: |
-          mkdir -p sbom
-          cyclonedx-gomod mod -licenses -json -output sbom/memql-cockpit.cdx.json
-          cyclonedx-gomod mod -licenses -output sbom/memql-cockpit.cdx.xml
-      - name: upload SBOM as workflow artifact
+          set -euo pipefail
+          mkdir assets sbom
+          for flavour in memql memql-computeruse; do
+            for platform in darwin-arm64 darwin-amd64 linux-arm64 linux-amd64; do
+              asset="${flavour}-${platform}"
+              gh release download "$TAG" --dir assets --pattern "$asset"
+              chmod +x "assets/$asset"
+              # This reads build metadata and hashes, never executes a binary.
+              # Local replacements have no published license metadata to fetch;
+              # dependency relationships absent from build info remain unknown.
+              cyclonedx-gomod bin -version "$TAG" -json -output "sbom/${asset}.cdx.json" "assets/$asset"
+              cyclonedx-gomod bin -version "$TAG" -output "sbom/${asset}.cdx.xml" "assets/$asset"
+            done
+          done
+          gh release upload "$TAG" sbom/* --clobber
+      - name: Preserve generated SBOMs as workflow artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: sbom
-          path: memql-cockpit/sbom/
+          path: sbom/
           retention-days: 90
-      - name: attach SBOM to release
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
-        with:
-          files: |
-            memql-cockpit/sbom/memql-cockpit.cdx.json
-            memql-cockpit/sbom/memql-cockpit.cdx.xml

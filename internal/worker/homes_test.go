@@ -168,8 +168,8 @@ func TestRemoveHome(t *testing.T) {
 	if len(w.Homes) != 1 || w.Homes[0].IsEnabled() {
 		t.Fatalf("disableOnly left enabled: %+v", w.Homes[0])
 	}
-	if err := w.ValidateRun(); err == nil {
-		t.Fatal("ValidateRun should fail with no enabled homes")
+	if err := w.ValidateRun(); err != nil {
+		t.Fatal("all-paused supervisor must remain available for local resume", err)
 	}
 }
 
@@ -472,7 +472,7 @@ func TestDecideRunModeNeverResurrectsAnUnpairedCluster(t *testing.T) {
 	}{
 		{"an enabled home runs the fleet", false, true, withHomes(prod), legacy, runFleet, false},
 		{"unpaired: no homes left, mirror beside it", false, true, withHomes(), legacy, runNoHomes, false},
-		{"disabled: every home off, mirror beside it", false, true, withHomes(prodOff), legacy, runNoHomes, false},
+		{"disabled: every home off, mirror beside it", false, true, withHomes(prodOff), legacy, runFleet, false},
 		{"never had a workers.yaml: its worker.yaml runs", false, false, withHomes(), legacy, runSingleHome, false},
 		{"never had either file", false, false, withHomes(), Config{Name: "m", Capabilities: []string{"HEADLESS"}}, runNoHomes, false},
 		{"a malformed registry is an error, not a fallback", false, true, withHomes(bad), legacy, runFleet, true},

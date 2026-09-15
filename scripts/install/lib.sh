@@ -1240,3 +1240,38 @@ function print_uninstall_summary() {
     echo "(Fleet -> Machines), not from here."
     echo "================================================================"
 }
+
+# Fetch into a caller-owned staging directory. Verify the digest and closed
+# archive layout before extraction or execution; an archive cannot choose a
+# destination path, symlink, installer name, or extra executable.
+function fetch_macos_menu() {
+    local base="$1" arch="$2" stage="$3"
+    local asset expected actual entry
+    [[ "$arch" == arm64 || "$arch" == amd64 ]] || return 2
+    asset="memql-menubar-darwin-${arch}.tar.gz"
+    curl -fsSL --max-filesize 30000000 "${base}/${asset}" -o "$stage/$asset" || return 5
+    curl -fsSL --max-filesize 1024 "${base}/${asset}.sha256" -o "$stage/checksum" || return 5
+    expected="$(awk -v asset="$asset" 'NF == 2 && $2 == asset { print $1 }' "$stage/checksum")"
+    [[ "$expected" =~ ^[[:xdigit:]]{64}$ ]] || { echo "ERROR: invalid menu checksum manifest" >&2; return 3; }
+    actual="$(shasum -a 256 "$stage/$asset" | awk '{print $1}')"
+    [[ "$expected" == "$actual" ]] || { echo "ERROR: menu archive checksum mismatch" >&2; return 3; }
+    tar -tzf "$stage/$asset" > "$stage/entries" || return 3
+    tar -tvzf "$stage/$asset" > "$stage/types" || return 3
+    if grep -qvE '^[-d]' "$stage/types"; then
+        echo "ERROR: menu archive contains a link or special file" >&2
+        return 3
+    fi
+    while IFS= read -r entry; do
+        case "$entry" in
+            'MemQL Cockpit.app/'|'MemQL Cockpit.app/Contents/'|'MemQL Cockpit.app/Contents/MacOS/'|\
+            'MemQL Cockpit.app/Contents/Resources/'|'MemQL Cockpit.app/Contents/_CodeSignature/'|\
+            'MemQL Cockpit.app/Contents/Info.plist'|'MemQL Cockpit.app/Contents/MacOS/MemQLCockpit'|\
+            'MemQL Cockpit.app/Contents/Resources/mark.svg'|'MemQL Cockpit.app/Contents/_CodeSignature/CodeResources'|\
+            scripts/|scripts/lib/|scripts/macos/|scripts/lib/capability.sh|scripts/macos/install-menubar.sh) ;;
+            *) echo "ERROR: unexpected menu archive path: $entry" >&2; return 3 ;;
+        esac
+    done < "$stage/entries"
+    mkdir -p "$stage/unpacked"
+    tar -xzf "$stage/$asset" -C "$stage/unpacked" || return 5
+    [[ -x "$stage/unpacked/MemQL Cockpit.app/Contents/MacOS/MemQLCockpit" && -f "$stage/unpacked/scripts/macos/install-menubar.sh" && -f "$stage/unpacked/scripts/lib/capability.sh" ]] || return 3
+}

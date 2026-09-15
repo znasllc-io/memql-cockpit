@@ -61,3 +61,6 @@ jobs:
 
       - name: lib_test.sh (helper smoke tests)
         run: bash scripts/install/lib_test.sh
+
+      - name: Menu archive boundary tests
+        run: bash scripts/install/menubar_test.sh
