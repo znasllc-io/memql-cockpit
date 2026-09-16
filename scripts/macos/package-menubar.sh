@@ -23,7 +23,7 @@ function main() {
     [[ "$arch" != amd64 ]] || expected_arch=x86_64
     [[ "$(lipo -archs "$stage/MemQL Cockpit.app/Contents/MacOS/MemQLCockpit")" == "$expected_arch" ]] || cap_fail 3 "native binary architecture does not match requested asset"
     mkdir -p "$stage/scripts/macos" "$stage/scripts/lib" "$output"
-    cp "$REPO_ROOT/scripts/macos/install-menubar.sh" "$stage/scripts/macos/"
+    cp "$REPO_ROOT/scripts/macos/"{install-menubar,launchagent}.sh "$stage/scripts/macos/"
     cp "$REPO_ROOT/../memql/scripts/lib/capability.sh" "$stage/scripts/lib/"
     asset="memql-menubar-darwin-${arch}.tar.gz"
     COPYFILE_DISABLE=1 tar -czf "$output/$asset" -C "$stage" 'MemQL Cockpit.app' scripts

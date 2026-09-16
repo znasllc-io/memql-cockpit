@@ -171,7 +171,7 @@ function write_config() {
 function install_native_app() {
     NATIVE_APP=""; NATIVE_STAGE=""
     [[ "$FLAVOUR" == computeruse ]] || return 0
-    local version base source_app app_version old_requirement new_requirement transition
+    local version base source_app app_version old_requirement new_requirement transition alternate
     version="$(read_binary_version_exact "$INSTALLED_BINARY")"
     [[ -n "$version" && "$(compare_semver "$version" 0.15.0)" != -1 ]] || return 0
     base="$DOWNLOAD_BASE"
@@ -188,8 +188,13 @@ function install_native_app() {
         transition="$(macos_signing_transition "$old_requirement" "$new_requirement")"
         if [[ "$transition" != unchanged ]]; then
             echo "NOTICE: MemQL signing identity $transition; existing enabled privacy entries may not authorize this build."
-            echo "       If access stays denied, remove only MemQL from Accessibility and Screen Recording in Settings, add the current MemQL.app, and approve again."
-            echo "       No permission reset is performed during an update; readiness requires fresh worker evidence."
+            if [[ "$transition" == changed ]]; then
+                alternate="/Applications/MemQL.app"
+                [[ "$INSTALL_MODE" != system ]] || alternate="$HOME/Applications/MemQL.app"
+                repair_changed_macos_permissions "$NATIVE_APP" "$source_app" "$alternate" || return $?
+            else
+                echo "       Signing identity could not be measured; no permission reset performed."
+            fi
         else
             echo "INFO: MemQL signing requirement unchanged; preserving existing authorization decisions."
         fi

@@ -97,7 +97,11 @@ edits a privacy database directly. Sibling-home removal never resets permissions
 
 Updates compare the installed and incoming designated signing requirements.
 An unchanged requirement preserves existing authorization decisions. A changed
-requirement prints recovery instructions; no update silently resets grants.
+requirement clears only this user’s obsolete worker Accessibility and Screen
+Recording approvals before replacing the app. The installer announces the reset
+and asks for fresh approval. Another standard installation sharing the bundle
+identifier blocks this repair; unknown signing evidence never triggers a reset.
+A failed reset stops the update for retry; enrollments and other apps are retained.
 Explicit prerelease versions are compared exactly for download idempotence so a
 new local build is not mistaken for an already-installed build with the same
 numeric version. Only fresh worker OS preflight results can establish readiness.
@@ -215,7 +219,8 @@ Only one OS request may be pending at a time.
 Finder** reveals the installed executable with symlinks resolved. macOS can
 retain an entry for an older binary after an upgrade; inspect the file instead
 of trusting its display name. Recovery changes to existing grants remain
-explicit actions in System Settings; Cockpit does not reset TCC records.
+explicit actions in System Settings. During installation, a verified signing
+identity change resets only the obsolete worker approvals through tccutil.
 
 **Restart Worker…** asks for confirmation because it interrupts active work
 and every server connection. It checks the service's loaded PID and program,

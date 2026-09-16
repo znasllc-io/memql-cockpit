@@ -1312,7 +1312,7 @@ function fetch_macos_menu() {
             'MemQL Cockpit.app/Contents/Resources/'|'MemQL Cockpit.app/Contents/_CodeSignature/'|\
             'MemQL Cockpit.app/Contents/Info.plist'|'MemQL Cockpit.app/Contents/MacOS/MemQLCockpit'|\
             'MemQL Cockpit.app/Contents/Resources/mark.svg'|'MemQL Cockpit.app/Contents/Resources/MemQL.icns'|'MemQL Cockpit.app/Contents/_CodeSignature/CodeResources'|\
-            scripts/|scripts/lib/|scripts/macos/|scripts/lib/capability.sh|scripts/macos/install-menubar.sh) ;;
+            scripts/|scripts/lib/|scripts/macos/|scripts/lib/capability.sh|scripts/macos/install-menubar.sh|scripts/macos/launchagent.sh) ;;
             *) echo "ERROR: unexpected menu archive path: $entry" >&2; return 3 ;;
         esac
     done < "$stage/entries"
@@ -1347,7 +1347,7 @@ function fetch_macos_app() {
             app/Contents/Info.plist|app/Contents/MacOS/MemQL|app/Contents/Resources/MemQL.icns|app/Contents/_CodeSignature/|app/Contents/_CodeSignature/CodeResources|\
             menu/|menu/Contents/|menu/Contents/MacOS/|menu/Contents/Resources/|menu/Contents/Info.plist|menu/Contents/MacOS/MemQLCockpit|\
             menu/Contents/Resources/mark.svg|menu/Contents/Resources/MemQL.icns|menu/Contents/_CodeSignature/|menu/Contents/_CodeSignature/CodeResources|\
-            scripts/|scripts/lib/|scripts/macos/|scripts/lib/capability.sh|scripts/macos/install-app-files.sh|scripts/macos/activate-app.sh|scripts/macos/install-menubar.sh) ;;
+            scripts/|scripts/lib/|scripts/macos/|scripts/lib/capability.sh|scripts/macos/install-app-files.sh|scripts/macos/activate-app.sh|scripts/macos/install-menubar.sh|scripts/macos/launchagent.sh) ;;
             *) echo "ERROR: unexpected app archive path: $entry" >&2; return 3 ;;
         esac
     done < "$stage/entries"
@@ -1381,4 +1381,27 @@ function macos_privacy_scope_unique() {
             echo "ERROR: another MemQL installation at $alternate shares app permissions; no reset performed. App files retained for explicit cleanup." >&2
             return 3 ;;
     esac
+}
+
+# Obsolete ad-hoc approvals cannot authorize a replacement signature. Reset only
+# the current user's known worker bundle; never touch other apps or shared installs.
+function repair_changed_macos_permissions() {
+    local installed="$1" incoming="$2" alternate="$3" before after service
+    [[ -d "$installed" ]] || return 0
+    [[ ! -L "$installed" ]] || return 3
+    [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$installed/Contents/Info.plist")" == com.znasllc.memql-worker ]] || return 3
+    [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$incoming/Contents/Info.plist")" == com.znasllc.memql-worker ]] || return 3
+    codesign --verify --deep --strict "$incoming" >&2 || return 3
+    before="$(macos_bundle_requirement "$installed" || true)"
+    after="$(macos_bundle_requirement "$incoming" || true)"
+    [[ "$(macos_signing_transition "$before" "$after")" == changed ]] || return 0
+    [[ "$EUID" -ne 0 ]] || { echo "ERROR: run without sudo to keep permission repair scoped to your account" >&2; return 3; }
+    macos_privacy_scope_unique "$alternate" || return $?
+    for service in Accessibility ScreenCapture; do
+        tccutil reset "$service" com.znasllc.memql-worker >&2 || {
+            echo "ERROR: could not clear obsolete MemQL permissions; retry installation before approving the new app" >&2
+            return 5
+        }
+    done
+    echo "NOTICE: Obsolete MemQL approvals cleared for this account. Approve the new MemQL app when prompted."
 }

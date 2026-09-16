@@ -8,6 +8,7 @@ if [[ -f "$REPO_ROOT/scripts/lib/capability.sh" ]]; then
 else
     source "$REPO_ROOT/../memql/scripts/lib/capability.sh"
 fi
+source "$REPO_ROOT/scripts/macos/launchagent.sh"
 cap_init "cockpit.menubar.install" "Install and launch the current user's native menu companion."
 cap_spec_param "app" "Built app bundle (default: bin/MemQL Cockpit.app)"
 cap_spec_param "destination" "Installed app path (default: ~/Applications/MemQL Cockpit.app)"
@@ -27,7 +28,7 @@ function main() {
     codesign --verify --deep --strict "$app" >&2 || cap_fail 3 "app signature verification failed"
     mkdir -p "$(dirname "$destination")" "$HOME/Library/LaunchAgents"
     if [[ ! -d "$destination" ]] || ! diff -qr "$app" "$destination" >/dev/null; then
-        launchctl bootout "gui/$uid_value/$label" >/dev/null 2>&1 || true
+        stop_launchagent "gui/$uid_value/$label" || cap_fail 5 "could not stop previous service; retry after it exits"
         stage="$(mktemp -d "$(dirname "$destination")/.memql-menubar.XXXXXX")"
         ditto "$app" "$stage/MemQL Cockpit.app" >&2 || cap_fail 5 "could not stage menu bundle"
         if [[ -d "$destination" ]]; then
@@ -50,17 +51,16 @@ function main() {
     plutil -insert ProcessType -string Interactive "$plist_stage"
     chmod 600 "$plist_stage"
     if [[ ! -f "$plist" ]] || ! cmp -s "$plist_stage" "$plist"; then
-        launchctl bootout "gui/$uid_value/$label" >/dev/null 2>&1 || true
+        stop_launchagent "gui/$uid_value/$label" || cap_fail 5 "could not stop previous service; retry after it exits"
         mv "$plist_stage" "$plist"
         cap_changed
     else
         rm -f "$plist_stage"
     fi
     if ! launchctl print "gui/$uid_value/$label" >/dev/null 2>&1; then
-        launchctl bootstrap "gui/$uid_value" "$plist" >&2 || cap_fail 5 "could not load menu LaunchAgent"
         cap_changed
     fi
-    launchctl kickstart "gui/$uid_value/$label" >&2 || cap_fail 5 "could not start menu"
+    start_launchagent "gui/$uid_value" "$plist" "gui/$uid_value/$label" || cap_fail 5 "could not start menu"
     cap_result_set app "$destination"
     cap_result_set launch_agent "$label"
     cap_result_set worker "unchanged; the menu controls the existing worker"

@@ -68,9 +68,22 @@ function main() {
     printf '%s\\n' "$*" >> "$MEMQL_TEST_CALLS"
     local label
     case "$1" in
-        print) label="${2##*/}"; test -f "$MEMQL_TEST_STATE/$label" ;;
-        bootstrap) label="$(/usr/libexec/PlistBuddy -c 'Print :Label' "$3")"; touch "$MEMQL_TEST_STATE/$label" ;;
-        bootout) label="${2##*/}"; rm -f "$MEMQL_TEST_STATE/$label" ;;
+        print)
+            label="${2##*/}"
+            if [[ -f "$MEMQL_TEST_STATE/$label.stopping" && "${MEMQL_TEST_STUBBORN:-}" != 1 ]]; then
+                rm -f "$MEMQL_TEST_STATE/$label.stopping" "$MEMQL_TEST_STATE/$label"
+                return 0 # one last visible observation before removal
+            fi
+            test -f "$MEMQL_TEST_STATE/$label" ;;
+        bootstrap)
+            label="$(/usr/libexec/PlistBuddy -c 'Print :Label' "$3")"
+            [[ ! -f "$MEMQL_TEST_STATE/$label" ]] || return 5
+            [[ "${MEMQL_TEST_BOOTSTRAP_FAIL:-}" != 1 ]] || return 5
+            if [[ -f "$MEMQL_TEST_STATE/$label.retry" ]]; then
+                rm "$MEMQL_TEST_STATE/$label.retry"; return 5
+            fi
+            touch "$MEMQL_TEST_STATE/$label" ;;
+        bootout) label="${2##*/}"; touch "$MEMQL_TEST_STATE/$label.stopping" ;;
         unload) label="$(/usr/libexec/PlistBuddy -c 'Print :Label' "$2")"; rm -f "$MEMQL_TEST_STATE/$label" ;;
         kickstart) label="${@: -1}"; label="${label##*/}"; test -f "$MEMQL_TEST_STATE/$label" ;;
         *) return 98 ;;
@@ -79,6 +92,9 @@ function main() {
 main "$@"
 ''')
         launch.chmod(0o755)
+        sleep = shim / 'sleep'
+        sleep.write_text('#!/bin/bash\nexit 0\n')
+        sleep.chmod(0o755)
         tcc = shim / 'tccutil'
         tcc.write_text('#!/bin/bash\nfunction main() { test "$#" = 3; }\nmain "$@"\n')
         tcc.chmod(0o755)
@@ -141,6 +157,8 @@ main "$@"
         assert info['CFBundleIdentifier'] == 'com.znasllc.memql-worker'
         assert info['CFBundleExecutable'] == info['CFBundleDisplayName'] == info['CFBundleName'] == 'MemQL'
         assert (destination / 'Contents/Resources' / info['CFBundleIconFile']).stat().st_size > 1000
+        (state / 'com.znasllc.memql-worker').touch()
+        (state / 'com.znasllc.memql-worker.retry').touch()
         activate = ['bash', str(source / 'scripts/macos/activate-app.sh'), '--app=' + str(destination)]
         assert json.loads(run(activate, env).stdout)['changed'] is True
         after = plistlib.loads(worker_plist.read_bytes())
@@ -159,6 +177,21 @@ main "$@"
         assert json.loads(run(activate, env).stdout)['changed'] is False
         assert calls.read_text().count('bootout') == count, 'idempotent activation restarted a service'
         assert all(path.read_bytes() == data for path, data in protected.items())
+        # Matching files/marker must recover an unloaded service, not kickstart it.
+        (state / 'com.znasllc.memql-worker').unlink()
+        assert json.loads(run(activate, env).stdout)['changed'] is True
+        marker = private / 'state/app-activation.sha256'
+        original_plist = worker_plist.read_bytes()
+        marker.write_text('old build')
+        stubborn = dict(env, MEMQL_TEST_STUBBORN='1')
+        refused = run(activate, stubborn, ok=False)
+        assert refused.returncode == 5 and not json.loads(refused.stdout)['ok']
+        assert not marker.exists() and worker_plist.read_bytes() == original_plist
+        assert all(path.read_bytes() == data for path, data in protected.items())
+        failed = run(activate, dict(env, MEMQL_TEST_BOOTSTRAP_FAIL='1'), ok=False)
+        assert failed.returncode == 5 and not json.loads(failed.stdout)['ok']
+        assert not marker.exists()
+        assert json.loads(run(activate, env).stdout)['ok']
         # A valid source does not authorize replacing an unrelated app.
         bad = root / 'unrelated/MemQL.app'
         (bad / 'Contents').mkdir(parents=True)

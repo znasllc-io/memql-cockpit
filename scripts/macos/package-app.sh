@@ -22,7 +22,7 @@ function main() {
     [[ "$(lipo -archs "$stage/MemQL.app/Contents/MacOS/MemQL")" == "$expected" ]] || cap_fail 3 "worker architecture mismatch"
     [[ "$(lipo -archs "$stage/MemQL.app/Contents/Library/LoginItems/MemQL Menu.app/Contents/MacOS/MemQLCockpit")" == "$expected" ]] || cap_fail 3 "menu architecture mismatch"
     mkdir -p "$stage/scripts/macos" "$stage/scripts/lib" "$output"
-    cp "$REPO_ROOT/scripts/macos/"{install-app-files,activate-app,install-menubar}.sh "$stage/scripts/macos/"
+    cp "$REPO_ROOT/scripts/macos/"{install-app-files,activate-app,install-menubar,launchagent}.sh "$stage/scripts/macos/"
     cp "$REPO_ROOT/../memql/scripts/lib/capability.sh" "$stage/scripts/lib/"
     asset="memql-app-darwin-$arch.tar.gz"
     COPYFILE_DISABLE=1 tar -czf "$output/$asset" -C "$stage" MemQL.app scripts
