@@ -125,17 +125,28 @@ main "$@"
         assert repeated.returncode == 0, repeated.stdout.decode() + repeated.stderr.decode()
         assert (app / 'Contents/MacOS/MemQL').read_bytes() == before
         assert b'signing requirement unchanged' in repeated.stdout
-        assert not privacy_calls.exists(), 'install/update must not reset permissions'
+        assert not privacy_calls.exists(), 'unchanged update must preserve permissions'
         info_path = app / 'Contents/Info.plist'
         prior_info = plistlib.loads(info_path.read_bytes())
         prior_info['CFBundleVersion'] = 'prior-local-build'
         info_path.write_bytes(plistlib.dumps(prior_info))
         subprocess.run(['codesign', '--force', '--sign', '-', str(app)], check=True, capture_output=True)
+        # A partially failed reset must stop before replacing the installed app.
+        failed_upgrade = subprocess.run(command, input=script,
+            env=dict(env, MEMQL_TEST_TCC_FAIL='1'), cwd=root, capture_output=True)
+        assert failed_upgrade.returncode == 5, failed_upgrade.stdout + failed_upgrade.stderr
+        assert b'could not clear obsolete MemQL permissions' in failed_upgrade.stderr
+        assert plistlib.loads(info_path.read_bytes())['CFBundleVersion'] == 'prior-local-build'
+        assert token in (user / '.memql/workers.yaml').read_text()
+        privacy_calls.unlink()
         upgraded = subprocess.run(command, input=script, env=env, cwd=root, capture_output=True)
         assert upgraded.returncode == 0, upgraded.stdout.decode() + upgraded.stderr.decode()
         assert b'signing identity changed' in upgraded.stdout
-        assert b'No permission reset is performed during an update' in upgraded.stdout
-        assert not privacy_calls.exists()
+        assert b'Obsolete MemQL approvals cleared' in upgraded.stdout
+        assert privacy_calls.read_text().splitlines() == [
+            'reset Accessibility com.znasllc.memql-worker',
+            'reset ScreenCapture com.znasllc.memql-worker']
+        privacy_calls.unlink()
         alternate = root / 'other-install/MemQL.app'
         (alternate / 'Contents').mkdir(parents=True)
         (alternate / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier': 'com.znasllc.memql-worker'}))

@@ -7,6 +7,7 @@ if [[ -f "$REPO_ROOT/scripts/lib/capability.sh" ]]; then
 else
     source "$REPO_ROOT/../memql/scripts/lib/capability.sh"
 fi
+source "$REPO_ROOT/scripts/macos/launchagent.sh"
 cap_init "cockpit.app.activate" "Point the current user's existing worker and menu services at MemQL.app."
 cap_spec_param "app" "Absolute installed MemQL.app path"
 cap_spec_param "menu" "Start the embedded menu helper (true or false, default true)"
@@ -63,20 +64,22 @@ function main() {
         mkdir -p "$HOME/.memql/backups"
         backup="$(mktemp -d "$HOME/.memql/backups/app-activation.XXXXXX")"
         if [[ -f "$plist" ]]; then cp -p "$plist" "$backup/com.znasllc.memql-worker.plist"; fi
+        rm -f "$marker"
+        stop_launchagent "gui/$uid_value/com.znasllc.memql-cockpit-menubar" || cap_fail 5 "could not stop previous service; retry after it exits"
+        stop_launchagent "gui/$uid_value/com.znasllc.memql-worker" || cap_fail 5 "could not stop previous service; retry after it exits"
         mv "$stage" "$plist"
-        launchctl bootout "gui/$uid_value/com.znasllc.memql-cockpit-menubar" >/dev/null 2>&1 || true
-        launchctl bootout "gui/$uid_value/com.znasllc.memql-worker" >/dev/null 2>&1 || true
-        launchctl bootstrap "gui/$uid_value" "$plist" >&2 || cap_fail 5 "could not activate worker bundle; previous plist is in backups"
+        start_launchagent "gui/$uid_value" "$plist" "gui/$uid_value/com.znasllc.memql-worker" || cap_fail 5 "could not activate worker bundle; previous plist is in backups"
         cap_changed
     else
         rm -f "$stage"
-        launchctl kickstart "gui/$uid_value/com.znasllc.memql-worker" >&2 || cap_fail 5 "could not start worker service"
+        if ! launchctl print "gui/$uid_value/com.znasllc.memql-worker" >/dev/null 2>&1; then cap_changed; fi
+        start_launchagent "gui/$uid_value" "$plist" "gui/$uid_value/com.znasllc.memql-worker" || cap_fail 5 "could not start worker service"
     fi
     for identifier in com.znasllc.memql-cockpit-worker com.visionarys.memql-cockpit-worker; do
         legacy="$HOME/Library/LaunchAgents/$identifier.plist"
         if [[ -f "$legacy" && ! -L "$legacy" && -O "$legacy" ]]; then
             backup="$(mktemp -d "$HOME/.memql/backups/legacy-agent.XXXXXX")"
-            launchctl bootout "gui/$uid_value/$identifier" >/dev/null 2>&1 || true
+            stop_launchagent "gui/$uid_value/$identifier" || cap_fail 5 "could not stop previous service; retry after it exits"
             mv "$legacy" "$backup/$identifier.plist"
             cap_changed
         fi
@@ -84,7 +87,7 @@ function main() {
     if [[ "$menu" == true ]]; then
         "$REPO_ROOT/scripts/macos/install-menubar.sh" --app="$helper" --destination="$helper" >&2 || cap_fail 5 "could not activate embedded menu"
     else
-        launchctl bootout "gui/$uid_value/com.znasllc.memql-cockpit-menubar" >/dev/null 2>&1 || true
+        stop_launchagent "gui/$uid_value/com.znasllc.memql-cockpit-menubar" || cap_fail 5 "could not stop previous service; retry after it exits"
         rm -f "$HOME/Library/LaunchAgents/com.znasllc.memql-cockpit-menubar.plist"
     fi
     mkdir -p "$(dirname "$marker")"
