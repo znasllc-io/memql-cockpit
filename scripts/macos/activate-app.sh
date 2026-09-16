@@ -37,26 +37,26 @@ function main() {
         cp -p "$plist" "$stage"
         # plutil -replace inserts at an array index on current macOS. Remove
         # then insert so the old executable cannot become an extra CLI arg.
-        plutil -remove ProgramArguments.0 "$stage"
-        plutil -insert ProgramArguments.0 -string "$app/Contents/MacOS/MemQL" "$stage"
+        plutil -remove ProgramArguments.0 "$stage" >&2
+        plutil -insert ProgramArguments.0 -string "$app/Contents/MacOS/MemQL" "$stage" >&2
     else
-        plutil -create xml1 "$stage"
-        plutil -insert Label -string com.znasllc.memql-worker "$stage"
-        plutil -insert ProgramArguments -array "$stage"
-        plutil -insert ProgramArguments.0 -string "$app/Contents/MacOS/MemQL" "$stage"
-        plutil -insert ProgramArguments.1 -string worker "$stage"
-        plutil -insert ProgramArguments.2 -string run "$stage"
-        plutil -insert RunAtLoad -bool true "$stage"
-        plutil -insert KeepAlive -bool true "$stage"
-        plutil -insert StandardOutPath -string "$HOME/.memql/state/worker.log" "$stage"
-        plutil -insert StandardErrorPath -string "$HOME/.memql/state/worker.log" "$stage"
-        plutil -insert EnvironmentVariables -dictionary "$stage"
-        plutil -insert EnvironmentVariables.HOME -string "$HOME" "$stage"
+        plutil -create xml1 "$stage" >&2
+        plutil -insert Label -string com.znasllc.memql-worker "$stage" >&2
+        plutil -insert ProgramArguments -array "$stage" >&2
+        plutil -insert ProgramArguments.0 -string "$app/Contents/MacOS/MemQL" "$stage" >&2
+        plutil -insert ProgramArguments.1 -string worker "$stage" >&2
+        plutil -insert ProgramArguments.2 -string run "$stage" >&2
+        plutil -insert RunAtLoad -bool true "$stage" >&2
+        plutil -insert KeepAlive -bool true "$stage" >&2
+        plutil -insert StandardOutPath -string "$HOME/.memql/state/worker.log" "$stage" >&2
+        plutil -insert StandardErrorPath -string "$HOME/.memql/state/worker.log" "$stage" >&2
+        plutil -insert EnvironmentVariables -dictionary "$stage" >&2
+        plutil -insert EnvironmentVariables.HOME -string "$HOME" "$stage" >&2
         chmod 600 "$stage"
     fi
-    plutil -remove AssociatedBundleIdentifiers "$stage" 2>/dev/null || true
-    plutil -insert AssociatedBundleIdentifiers -array "$stage"
-    plutil -insert AssociatedBundleIdentifiers.0 -string com.znasllc.memql-worker "$stage"
+    plutil -remove AssociatedBundleIdentifiers "$stage" >/dev/null 2>&1 || true
+    plutil -insert AssociatedBundleIdentifiers -array "$stage" >&2
+    plutil -insert AssociatedBundleIdentifiers.0 -string com.znasllc.memql-worker "$stage" >&2
     marker="$HOME/.memql/state/app-activation.sha256"
     fingerprint="$(shasum -a 256 "$app/Contents/MacOS/MemQL" "$helper/Contents/MacOS/MemQLCockpit") menu=$menu"
     if [[ ! -f "$plist" ]] || ! cmp -s "$stage" "$plist" || [[ ! -f "$marker" || "$(cat "$marker")" != "$fingerprint" ]]; then

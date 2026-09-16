@@ -83,6 +83,21 @@ main "$@"
         tcc.write_text('#!/bin/bash\nfunction main() { test "$#" = 3; }\nmain "$@"\n')
         tcc.chmod(0o755)
 
+        # Some macOS versions print missing-key diagnostics to stdout. The
+        # activation capability must still emit exactly one JSON result.
+        plutil = shim / 'plutil'
+        plutil.write_text('''#!/bin/bash
+function main() {
+    if [[ "$1" == -remove && "$2" == AssociatedBundleIdentifiers ]] && ! /usr/libexec/PlistBuddy -c 'Print :AssociatedBundleIdentifiers' "$3" >/dev/null 2>&1; then
+        printf '%s\\n' 'No value to remove at key path AssociatedBundleIdentifiers'
+        return 1
+    fi
+    /usr/bin/plutil "$@"
+}
+main "$@"
+''')
+        plutil.chmod(0o755)
+
         env.update(HOME=str(user), PATH=str(shim) + ':' + env['PATH'],
                    MEMQL_TEST_STATE=str(state), MEMQL_TEST_CALLS=str(calls))
         private = user / '.memql'
