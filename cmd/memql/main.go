@@ -58,7 +58,7 @@ import (
 // buildVariant next door stays a `const` on purpose: it is chosen by a
 // build tag, not stamped, so there is nothing for -X to set.
 // TestVersionIsSettableByLdflags guards the difference.
-var version = "0.14.0"
+var version = "0.15.0"
 
 func main() {
 	// The worker registers this version with the cluster, and this
