@@ -115,6 +115,7 @@ function parse_args() {
             --inference)     INFERENCE="yes"; shift ;;
             --user-local)    INSTALL_MODE="user-local"; shift ;;
             --download-base) DOWNLOAD_BASE="$2"; shift 2 ;;
+            --download-base=*) DOWNLOAD_BASE="${1#*=}"; shift ;;
             --force)         FORCE="yes"; shift ;;
             --no-menu)       INSTALL_MENU="no"; shift ;;
             --no-service)    INSTALL_SERVICE="no"; shift ;;
@@ -150,7 +151,7 @@ function install_binary() {
     # ExecStart, and `memql --version`'s variant line all assume.
     local target_ver
     target_ver="$(resolve_target_version "$DOWNLOAD_BASE")"
-    install_binary_with_mode "$INSTALL_MODE" "$url" "$binary" "$INSTALLED_COMMAND" "$target_ver"
+    install_binary_with_mode "$INSTALL_MODE" "$url" "$binary" "$INSTALLED_COMMAND" "$target_ver" "${MEMQL_INSTALL_VERSION:-}"
     INSTALLED_BINARY="$INSTALL_BINARY_FRIENDLY"
 }
 
@@ -165,10 +166,63 @@ function write_config() {
     write_worker_yaml "$path" "$CLUSTER_URL" "$TOKEN" "$NAME" "$FORCE" "$capabilities"
 }
 
+# Computer-use releases from 0.15 carry the actual permission-bearing app.
+# Older releases retain their original raw-worker + standalone-menu layout.
+function install_native_app() {
+    NATIVE_APP=""; NATIVE_STAGE=""
+    [[ "$FLAVOUR" == computeruse ]] || return 0
+    local version base source_app app_version old_requirement new_requirement transition
+    version="$(read_binary_version_exact "$INSTALLED_BINARY")"
+    [[ -n "$version" && "$(compare_semver "$version" 0.15.0)" != -1 ]] || return 0
+    base="$DOWNLOAD_BASE"
+    [[ "$base" != "$DEFAULT_DOWNLOAD_BASE" ]] || base="https://github.com/znasllc-io/memql-cockpit/releases/download/v${version}"
+    NATIVE_STAGE="$(mktemp -d)"
+    fetch_macos_app "$base" "$(detect_arch)" "$NATIVE_STAGE" || return $?
+    source_app="$NATIVE_STAGE/unpacked/MemQL.app"
+    app_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$source_app/Contents/Info.plist")"
+    [[ "$app_version" == "$version" ]] || { echo "ERROR: app and worker versions differ" >&2; return 3; }
+    case "$INSTALL_MODE" in system) NATIVE_APP="/Applications/MemQL.app" ;; *) NATIVE_APP="$HOME/Applications/MemQL.app" ;; esac
+    if [[ -d "$NATIVE_APP" ]]; then
+        old_requirement="$(macos_bundle_requirement "$NATIVE_APP" || true)"
+        new_requirement="$(macos_bundle_requirement "$source_app" || true)"
+        transition="$(macos_signing_transition "$old_requirement" "$new_requirement")"
+        if [[ "$transition" != unchanged ]]; then
+            echo "NOTICE: MemQL signing identity $transition; existing enabled privacy entries may not authorize this build."
+            echo "       If access stays denied, remove only MemQL from Accessibility and Screen Recording in Settings, add the current MemQL.app, and approve again."
+            echo "       No permission reset is performed during an update; readiness requires fresh worker evidence."
+        else
+            echo "INFO: MemQL signing requirement unchanged; preserving existing authorization decisions."
+        fi
+    fi
+    case "$INSTALL_MODE" in
+        system)
+            NATIVE_APP="/Applications/MemQL.app"
+            sudo bash "$NATIVE_STAGE/unpacked/scripts/macos/install-app-files.sh" --app="$source_app" --destination="$NATIVE_APP" --cli-path="$INSTALLED_BINARY"
+            ;;
+        *)
+            NATIVE_APP="$HOME/Applications/MemQL.app"
+            bash "$NATIVE_STAGE/unpacked/scripts/macos/install-app-files.sh" --app="$source_app" --destination="$NATIVE_APP" --cli-path="$INSTALLED_BINARY"
+            ;;
+    esac
+    if [[ "$INSTALL_SERVICE" == yes ]]; then
+        "$NATIVE_APP/Contents/Library/LoginItems/MemQL Menu.app/Contents/MacOS/MemQLCockpit" --register-bundles
+    fi
+}
+
+function cleanup_native_stage() {
+    [[ -z "${NATIVE_STAGE:-}" ]] || rm -rf "$NATIVE_STAGE"
+}
+
 function install_launch_agent() {
     if [[ "$INSTALL_SERVICE" != "yes" ]]; then
         echo "INFO: --no-service set; skipping LaunchAgent installation"
         return 0
+    fi
+    if [[ -n "${NATIVE_APP:-}" ]]; then
+        local menu=true
+        [[ "$INSTALL_MENU" == yes ]] || menu=false
+        bash "$NATIVE_STAGE/unpacked/scripts/macos/activate-app.sh" --app="$NATIVE_APP" --menu="$menu"
+        return
     fi
     local plist_dir="${HOME}/Library/LaunchAgents"
     local plist="${plist_dir}/com.znasllc.memql-worker.plist"
@@ -218,6 +272,7 @@ PLIST
 }
 
 function install_menu_companion() {
+    [[ -z "${NATIVE_APP:-}" ]] || return 0
     if [[ "$INSTALL_SERVICE" != yes || "$INSTALL_MENU" != yes ]]; then
         echo "INFO: menu companion skipped (--no-service or --no-menu)"
         return 0
@@ -278,6 +333,10 @@ function main() {
 
     install_step 2 "Download or skip binary (version-aware)"
     install_binary
+
+    install_step app "Prepare native MemQL app identity"
+    trap cleanup_native_stage EXIT
+    install_native_app
 
     install_step 3 "Write workers.yaml (upsert home; siblings kept)"
     write_config

@@ -58,7 +58,7 @@ import (
 // buildVariant next door stays a `const` on purpose: it is chosen by a
 // build tag, not stamped, so there is nothing for -X to set.
 // TestVersionIsSettableByLdflags guards the difference.
-var version = "0.14.0"
+var version = "0.15.0"
 
 func main() {
 	// The worker registers this version with the cluster, and this
@@ -67,6 +67,9 @@ func main() {
 	// from rather than a second constant somebody has to remember to
 	// bump (memql-cockpit#346's registration row is read by /machines).
 	worker.SetVersion(version)
+	if openBundledApplication() {
+		return
+	}
 
 	if len(os.Args) < 2 {
 		printUsage()

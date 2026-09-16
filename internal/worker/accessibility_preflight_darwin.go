@@ -18,6 +18,15 @@ package worker
 static bool axProcessTrusted(void) {
     return (bool)AXIsProcessTrusted();
 }
+
+static void requestAccessibility(void) {
+    const void *key = kAXTrustedCheckOptionPrompt;
+    const void *value = kCFBooleanTrue;
+    CFDictionaryRef options = CFDictionaryCreate(NULL, &key, &value, 1,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    AXIsProcessTrustedWithOptions(options);
+    CFRelease(options);
+}
 */
 import "C"
 
@@ -30,3 +39,5 @@ import "C"
 func preflightAccessibilityAccess() bool {
 	return bool(C.axProcessTrusted())
 }
+
+func requestAccessibilityAccess() { C.requestAccessibility() }

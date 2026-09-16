@@ -90,7 +90,7 @@ func preflightComputerAction(action string) *memqlv1.Failure {
 		return failure("permission_denied", fmt.Sprintf(
 			"workerComputer.%s requires the Accessibility permission, which is not "+
 				"granted for this binary. Open System Settings -> Privacy & Security -> "+
-				"Accessibility, enable memql-cockpit-computeruse, then retry.", action))
+				"Accessibility, enable the installed MemQL worker, then retry.", action))
 	}
 
 	// macOS Screen Recording gate: same TCC pattern, screenshot only.
@@ -98,7 +98,7 @@ func preflightComputerAction(action string) *memqlv1.Failure {
 		return failure("permission_denied",
 			"Screen Recording permission is not granted for this binary. "+
 				"Open System Settings -> Privacy & Security -> Screen Recording, "+
-				"enable memql-cockpit-computeruse, then re-run.")
+				"enable the installed MemQL worker, then re-run.")
 	}
 
 	return nil

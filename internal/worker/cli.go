@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -731,10 +732,36 @@ func handleUnpair(args []string) {
 	workersPath := fs.String("workers", DefaultWorkersPath(), "path to workers.yaml")
 	configPath := fs.String("config", "", "path to the legacy worker.yaml mirror (default: the worker.yaml beside --workers)")
 	cluster := fs.String("cluster", "", "home id to remove (see `memql worker config`)")
+	clusterURL := fs.String("cluster-url", "", "remove all enrollments for this cluster URL")
+	dryRun := fs.Bool("dry-run", false, "preview URL-scoped removal without writing")
+	jsonOutput := fs.Bool("json", false, "print a token-free URL-scoped result")
 	disable := fs.Bool("disable", false, "disable the home instead of removing it")
 	fs.Parse(args)
 	if strings.TrimSpace(*configPath) == "" {
 		*configPath = mirrorPathFor(*workersPath)
+	}
+	if *clusterURL != "" {
+		if *cluster != "" || *disable || fs.NArg() != 0 {
+			fmt.Fprintln(os.Stderr, "ERROR: --cluster-url cannot be combined with a home id or --disable")
+			os.Exit(2)
+		}
+		res, err := RemoveHomesByURL(*workersPath, *configPath, *clusterURL, *dryRun)
+		if err != nil {
+			// Parser errors can contain configuration values. Keep credentials out
+			// of installer logs even when a hand-edited YAML file is malformed.
+			fmt.Fprintln(os.Stderr, "ERROR: scoped unpair could not safely read or update enrollment files; files may need repair")
+			os.Exit(5)
+		}
+		if *jsonOutput {
+			_ = json.NewEncoder(os.Stdout).Encode(res)
+		} else {
+			fmt.Printf("Matched %d enrollment(s); %d other enrollment(s) remain (preview: %t).\n", res.Removed, res.Remaining, res.DryRun)
+		}
+		return
+	}
+	if *dryRun || *jsonOutput {
+		fmt.Fprintln(os.Stderr, "ERROR: --dry-run and --json require --cluster-url")
+		os.Exit(2)
 	}
 	id := strings.TrimSpace(*cluster)
 	if id == "" && fs.NArg() > 0 {

@@ -178,6 +178,21 @@ jobs:
           TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: gh release upload "$TAG" dist/memql-menubar-*.tar.gz dist/memql-menubar-*.sha256 --clobber
 
+      - name: Package native permission-bearing MemQL app
+        if: runner.os == 'macOS'
+        working-directory: memql-cockpit
+        run: |
+          ./scripts/macos/package-app.sh --worker="$PWD/bin/memql-computeruse-darwin-${{ matrix.arch }}" --arch=${{ matrix.arch }}
+          python3 scripts/macos/app_package_test.py --archive=dist/memql-app-darwin-${{ matrix.arch }}.tar.gz
+
+      - name: Upload native MemQL app and checksum
+        if: runner.os == 'macOS'
+        working-directory: memql-cockpit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: gh release upload "$TAG" dist/memql-app-*.tar.gz dist/memql-app-*.sha256 --clobber
+
       - name: Upload computeruse binary to the release
         working-directory: memql-cockpit
         env:

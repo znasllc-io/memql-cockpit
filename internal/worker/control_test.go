@@ -193,7 +193,7 @@ func TestLocalControlRejectsInvalidRequests(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer l.Close()
-	for _, request := range []string{`{"action":"status","file":"/etc/passwd"}`, `{"action":"home","home":"a"}`, `{"action":"delete"}`} {
+	for _, request := range []string{`{"action":"status","file":"/etc/passwd"}`, `{"action":"home","home":"a"}`, `{"action":"delete"}`, `{"action":"request-permission","permission":"screen_recording"}`, `{"action":"request-permission","permission":"all","pid":1}`} {
 		conn, err := net.Dial("unix", path)
 		if err != nil {
 			t.Fatal(err)

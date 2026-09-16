@@ -138,6 +138,15 @@ function read_binary_version() {
     parse_memql_version_line "$out"
 }
 
+# Keep prerelease/build suffixes when matching a worker with its app archive.
+# Numeric normalization is only appropriate for upgrade ordering.
+function read_binary_version_exact() {
+    local bin="$1" exact
+    [[ -x "$bin" ]] || { echo ""; return 0; }
+    exact="$("$bin" --version 2>/dev/null | awk '$1 == "memql" {print $2; exit}')" || exact=""
+    if [[ "$exact" =~ ^[0-9]+(\.[0-9]+){1,3}([-+][[:alnum:].-]+)*$ ]]; then printf '%s\n' "$exact"; else echo ""; fi
+}
+
 # compare_semver prints -1 / 0 / 1 for a<b / a==b / a>b (numeric dotted).
 # Non-numeric segments compare as 0. Empty either side → treat as 0.0.0.
 function compare_semver() {
@@ -426,6 +435,11 @@ function download_binary() {
     echo "INFO: downloading $url"
     # Progress bar when stdout is a TTY; silent -sS for CI / pipes.
     local curl_flags=(-fL --proto '=https')
+    # Explicit local recovery testing only. Keep published/default downloads
+    # HTTPS-only, and refuse redirects from a loopback HTTP asset.
+    if [[ "${MEMQL_INSTALL_ALLOW_LOOPBACK_HTTP:-}" == 1 && "$url" =~ ^http://(127\.0\.0\.1|\[::1\])(:[0-9]+)?/ ]]; then
+        curl_flags=(-fL --proto '=http' --max-redirs 0)
+    fi
     if [[ -t 1 ]]; then
         curl_flags+=(--progress-bar)
     else
@@ -527,6 +541,8 @@ function install_binary_with_mode() {
     local friendly_name="$4"
     # Optional 5th arg: target version (empty → resolve / read after download).
     local target_ver="${5:-}"
+    local target_exact="${6:-}" installed_exact=""
+    target_exact="${target_exact#v}"
 
     local dest_dir
     dest_dir="$(install_mode_dir "$mode")"
@@ -542,6 +558,8 @@ function install_binary_with_mode() {
     elif [[ -x "$INSTALL_BINARY_DEST" ]]; then
         installed_ver="$(read_binary_version "$INSTALL_BINARY_DEST")"
     fi
+    installed_exact="$(read_binary_version_exact "$INSTALL_BINARY_FRIENDLY")"
+    [[ -n "$installed_exact" ]] || installed_exact="$(read_binary_version_exact "$INSTALL_BINARY_DEST")"
     INSTALL_BINARY_BEFORE="$installed_ver"
 
     if [[ -z "$target_ver" ]]; then
@@ -552,7 +570,7 @@ function install_binary_with_mode() {
     if [[ -n "$installed_ver" && -n "$target_ver" ]]; then
         local cmp
         cmp="$(compare_semver "$installed_ver" "$target_ver")"
-        if [[ "$cmp" == "0" ]]; then
+        if [[ "$cmp" == "0" && ( -z "$target_exact" || "$installed_exact" == "$target_exact" ) ]]; then
             echo "INFO: already at v${installed_ver}; skipping binary download"
             INSTALL_BINARY_ACTION="skip"
             INSTALL_BINARY_AFTER="$installed_ver"
@@ -592,6 +610,10 @@ function install_binary_with_mode() {
                 return 1
             fi
             local dl_ver
+            if [[ -n "$target_exact" && "$(read_binary_version_exact "$tmp")" != "$target_exact" ]]; then
+                echo "ERROR: downloaded binary does not match the explicitly selected build" >&2
+                rm -f "$tmp"; return 3
+            fi
             dl_ver="$(read_binary_version "$tmp")"
             if [[ -z "$target_ver" && -n "$dl_ver" ]]; then
                 target_ver="$dl_ver"
@@ -599,7 +621,7 @@ function install_binary_with_mode() {
             if [[ -n "$installed_ver" && -n "$dl_ver" ]]; then
                 local cmp2
                 cmp2="$(compare_semver "$installed_ver" "$dl_ver")"
-                if [[ "$cmp2" == "0" ]]; then
+                if [[ "$cmp2" == "0" && ( -z "$target_exact" || "$installed_exact" == "$(read_binary_version_exact "$tmp")" ) ]]; then
                     echo "INFO: already at v${installed_ver}; downloaded asset matches — leaving binary in place"
                     rm -f "$tmp"
                     INSTALL_BINARY_ACTION="skip"
@@ -633,6 +655,10 @@ function install_binary_with_mode() {
                 return 1
             fi
             local dl_ver
+            if [[ -n "$target_exact" && "$(read_binary_version_exact "$tmp")" != "$target_exact" ]]; then
+                echo "ERROR: downloaded binary does not match the explicitly selected build" >&2
+                rm -f "$tmp"; return 3
+            fi
             dl_ver="$(read_binary_version "$tmp")"
             if [[ -z "$target_ver" && -n "$dl_ver" ]]; then
                 target_ver="$dl_ver"
@@ -640,7 +666,7 @@ function install_binary_with_mode() {
             if [[ -n "$installed_ver" && -n "$dl_ver" ]]; then
                 local cmp2
                 cmp2="$(compare_semver "$installed_ver" "$dl_ver")"
-                if [[ "$cmp2" == "0" ]]; then
+                if [[ "$cmp2" == "0" && ( -z "$target_exact" || "$installed_exact" == "$(read_binary_version_exact "$tmp")" ) ]]; then
                     echo "INFO: already at v${installed_ver}; downloaded asset matches — leaving binary in place"
                     rm -f "$tmp"
                     INSTALL_BINARY_ACTION="skip"
@@ -1025,6 +1051,25 @@ function remove_tree_if_present() {
         record_kept "$dir (outside ${HOME}/.memql; not touched)"
         return 0
     fi
+    # Never allow a state_dir alias or ancestor to sweep credentials/backups.
+    local cursor="$dir" protected
+    while [[ "$cursor" != "$HOME/.memql" && "$cursor" != / ]]; do
+        if [[ -L "$cursor" && "$cursor" != "$dir" ]]; then
+            echo "WARN: kept $dir (symlinked ancestor)"
+            record_kept "$dir (symlinked ancestor)"
+            return 0
+        fi
+        cursor="$(dirname "$cursor")"
+    done
+    case "$dir" in
+        "$HOME/.memql"|*/./*|*/.) record_kept "$dir (unsafe purge target)"; return 0 ;;
+    esac
+    for protected in backups credentials certs certificates; do
+        case "$dir" in
+            "$HOME/.memql/$protected"|"$HOME/.memql/$protected/"*)
+                echo "WARN: kept $dir (protected data)"; record_kept "$dir (protected data)"; return 0 ;;
+        esac
+    done
     rm -rf "$dir"
     echo "INFO: removed $dir"
     record_removed "$dir"
@@ -1266,7 +1311,7 @@ function fetch_macos_menu() {
             'MemQL Cockpit.app/'|'MemQL Cockpit.app/Contents/'|'MemQL Cockpit.app/Contents/MacOS/'|\
             'MemQL Cockpit.app/Contents/Resources/'|'MemQL Cockpit.app/Contents/_CodeSignature/'|\
             'MemQL Cockpit.app/Contents/Info.plist'|'MemQL Cockpit.app/Contents/MacOS/MemQLCockpit'|\
-            'MemQL Cockpit.app/Contents/Resources/mark.svg'|'MemQL Cockpit.app/Contents/_CodeSignature/CodeResources'|\
+            'MemQL Cockpit.app/Contents/Resources/mark.svg'|'MemQL Cockpit.app/Contents/Resources/MemQL.icns'|'MemQL Cockpit.app/Contents/_CodeSignature/CodeResources'|\
             scripts/|scripts/lib/|scripts/macos/|scripts/lib/capability.sh|scripts/macos/install-menubar.sh) ;;
             *) echo "ERROR: unexpected menu archive path: $entry" >&2; return 3 ;;
         esac
@@ -1274,4 +1319,66 @@ function fetch_macos_menu() {
     mkdir -p "$stage/unpacked"
     tar -xzf "$stage/$asset" -C "$stage/unpacked" || return 5
     [[ -x "$stage/unpacked/MemQL Cockpit.app/Contents/MacOS/MemQLCockpit" && -f "$stage/unpacked/scripts/macos/install-menubar.sh" && -f "$stage/unpacked/scripts/lib/capability.sh" ]] || return 3
+}
+
+# The full app carries the permission-bearing worker plus an embedded menu.
+# Keep a closed file list; never extract links, extra tools, or traversal paths.
+function fetch_macos_app() {
+    local base="$1" arch="$2" stage="$3" asset expected actual entry normalized
+    [[ "$arch" == arm64 || "$arch" == amd64 ]] || return 2
+    asset="memql-app-darwin-${arch}.tar.gz"
+    curl -fsSL --max-filesize 120000000 "${base}/${asset}" -o "$stage/$asset" || return 5
+    curl -fsSL --max-filesize 1024 "${base}/${asset}.sha256" -o "$stage/checksum" || return 5
+    expected="$(awk -v asset="$asset" 'NF == 2 && $2 == asset { print $1 }' "$stage/checksum")"
+    [[ "$expected" =~ ^[[:xdigit:]]{64}$ ]] || return 3
+    actual="$(shasum -a 256 "$stage/$asset" | awk '{print $1}')"
+    [[ "$expected" == "$actual" ]] || { echo "ERROR: MemQL app checksum mismatch" >&2; return 3; }
+    tar -tzf "$stage/$asset" > "$stage/entries" || return 3
+    tar -tvzf "$stage/$asset" > "$stage/types" || return 3
+    if grep -qvE '^[-d]' "$stage/types"; then echo "ERROR: app archive contains a link or special file" >&2; return 3; fi
+    while IFS= read -r entry; do
+        normalized="$entry"
+        case "$entry" in
+            'MemQL.app/Contents/Library/LoginItems/MemQL Menu.app/'*) normalized="menu/${entry#MemQL.app/Contents/Library/LoginItems/MemQL Menu.app/}" ;;
+            'MemQL.app/'*) normalized="app/${entry#MemQL.app/}" ;;
+        esac
+        case "$normalized" in
+            app/|app/Contents/|app/Contents/MacOS/|app/Contents/Resources/|app/Contents/Library/|app/Contents/Library/LoginItems/|\
+            app/Contents/Info.plist|app/Contents/MacOS/MemQL|app/Contents/Resources/MemQL.icns|app/Contents/_CodeSignature/|app/Contents/_CodeSignature/CodeResources|\
+            menu/|menu/Contents/|menu/Contents/MacOS/|menu/Contents/Resources/|menu/Contents/Info.plist|menu/Contents/MacOS/MemQLCockpit|\
+            menu/Contents/Resources/mark.svg|menu/Contents/Resources/MemQL.icns|menu/Contents/_CodeSignature/|menu/Contents/_CodeSignature/CodeResources|\
+            scripts/|scripts/lib/|scripts/macos/|scripts/lib/capability.sh|scripts/macos/install-app-files.sh|scripts/macos/activate-app.sh|scripts/macos/install-menubar.sh) ;;
+            *) echo "ERROR: unexpected app archive path: $entry" >&2; return 3 ;;
+        esac
+    done < "$stage/entries"
+    mkdir -p "$stage/unpacked"
+    tar -xzf "$stage/$asset" -C "$stage/unpacked" || return 5
+    [[ -x "$stage/unpacked/MemQL.app/Contents/MacOS/MemQL" && -f "$stage/unpacked/scripts/macos/install-app-files.sh" && -f "$stage/unpacked/scripts/macos/activate-app.sh" && -f "$stage/unpacked/scripts/macos/install-menubar.sh" && -f "$stage/unpacked/scripts/lib/capability.sh" ]] || return 3
+}
+
+# Compare designated requirements, not paths, display names or version strings.
+# A stable signed update keeps the same requirement and needs no permission reset.
+function macos_signing_transition() {
+    local before="$1" after="$2"
+    if [[ -z "$before" || -z "$after" ]]; then echo unknown
+    elif [[ "$before" == "$after" ]]; then echo unchanged
+    else echo changed
+    fi
+}
+
+function macos_bundle_requirement() {
+    codesign -d -r- "$1" 2>&1 | sed -n -E 's/^#? ?(designated => .*)$/\1/p'
+}
+
+# Privacy decisions are bundle-wide within this user account. An alternate
+# standard installation sharing the identifier prevents scoped grant cleanup.
+function macos_privacy_scope_unique() {
+    local alternate="$1" identifier
+    [[ -d "$alternate" ]] || return 0
+    identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$alternate/Contents/Info.plist" 2>/dev/null || true)"
+    case "$identifier" in
+        com.znasllc.memql-worker|com.znasllc.memql-cockpit-menubar)
+            echo "ERROR: another MemQL installation at $alternate shares app permissions; no reset performed. App files retained for explicit cleanup." >&2
+            return 3 ;;
+    esac
 }
