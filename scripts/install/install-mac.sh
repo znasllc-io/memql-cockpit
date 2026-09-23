@@ -227,6 +227,12 @@ function install_launch_agent() {
         local menu=true
         [[ "$INSTALL_MENU" == yes ]] || menu=false
         bash "$NATIVE_STAGE/unpacked/scripts/macos/activate-app.sh" --app="$NATIVE_APP" --menu="$menu"
+        # Activation is idempotent when the app/plist are unchanged. Enrollment
+        # is not: worker run reads workers.yaml only at startup, so an existing
+        # process would keep the previous token (or never discover a new home).
+        # Match the raw-worker and Linux installers: reload saved enrollment
+        # by restarting only the worker, preserving the menu and all home data.
+        launchctl kickstart -k "gui/$(id -u)/com.znasllc.memql-worker"
         return
     fi
     local plist_dir="${HOME}/Library/LaunchAgents"
