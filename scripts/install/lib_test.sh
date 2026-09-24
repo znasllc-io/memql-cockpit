@@ -783,6 +783,62 @@ for _installer in install-mac.sh install-linux.sh; do
     fi
 done
 
+# Native activation may be an idempotent no-op for the same app. Enrollment
+# still changed: the already-running worker must consume the new workers.yaml.
+# Source the real installer without main, and fake only OS/archive boundaries.
+_native_fixture="${_tmp}/native-enrollment"
+mkdir -p "$_native_fixture/unpacked/scripts/macos"
+cat > "$_native_fixture/unpacked/scripts/macos/activate-app.sh" <<'SH'
+#!/usr/bin/env bash
+function main() {
+    printf '%s\n' activated >> "$MEMQL_TEST_ACTIVATION_LOG"
+    return "${MEMQL_TEST_ACTIVATION_EXIT:-0}"
+}
+main "$@"
+SH
+sed '/^main "\$@"$/d' "$_script_dir/install-mac.sh" > "$_native_fixture/installer-functions.sh"
+for _native_mode in restart no-service activation-failed restart-failed; do
+    _native_log="$_native_fixture/$_native_mode.log"
+    _out="$(MEMQL_TEST_ACTIVATION_LOG="$_native_log" bash -c '
+        source "$1/installer-functions.sh"
+        INSTALL_SERVICE=yes; INSTALL_MENU=yes
+        NATIVE_APP=/fixture/MemQL.app; NATIVE_STAGE="$1"
+        function launchctl() {
+            [[ "$*" == "kickstart -k gui/$(id -u)/com.znasllc.memql-worker" ]] || return 99
+            printf "%s\n" restarted >> "$MEMQL_TEST_ACTIVATION_LOG"
+            [[ "$MODE" != restart-failed ]]
+        }
+        MODE="$2"
+        case "$MODE" in
+            no-service) INSTALL_SERVICE=no ;;
+            activation-failed) export MEMQL_TEST_ACTIVATION_EXIT=5 ;;
+        esac
+        install_launch_agent
+    ' "$_script_dir/install-mac.sh" "$_native_fixture" "$_native_mode" 2>&1)"
+    _rc=$?
+    case "$_native_mode" in
+        restart)
+            expect_eq "native re-enrollment restarts unchanged worker" "$(cat "$_native_log")" $'activated\nrestarted'
+            expect_eq "native re-enrollment succeeds" "$_rc" 0 ;;
+        no-service)
+            expect_eq "native no-service succeeds" "$_rc" 0
+            if [[ ! -e "$_native_log" ]]; then
+                pass "native no-service does not activate or restart"
+            else
+                fail "native no-service touched services"
+            fi ;;
+        activation-failed)
+            expect_eq "native activation failure stops install" "$_rc" 5
+            expect_eq "native activation failure does not restart" "$(cat "$_native_log")" activated ;;
+        restart-failed)
+            if [[ "$_rc" != 0 ]]; then
+                pass "native restart failure fails install"
+            else
+                fail "native restart failure reported success"
+            fi ;;
+    esac
+done
+
 # ---------------------------------------------------------------
 # Uninstallers -- flags, the missing-tool path, and what is left on disk
 # ---------------------------------------------------------------
