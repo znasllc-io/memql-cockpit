@@ -1,6 +1,1 @@
-# Engine wire revision tested with this Cockpit branch.
-# ModelCall media, tool definitions/results, cancellation and permission fields
-# are consumed by internal/worker/modelcall and checked by wire_media_test.go.
-# Keep mappings and this pin together; workflows read this file through
-# .github/actions/checkout-memql. The Go require pseudo-versions are not pins.
-49e76795f4551b89346c1f99a48b84d3ade9cbac
+8cd9b2fd643fdf7e9a2575a1573b9b4fb283769f
