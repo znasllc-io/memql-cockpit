@@ -8,24 +8,10 @@ import (
 	"strings"
 )
 
-// The four modality calls (engine memql#5137, record D4).
-//
-// Vision and transcription go through the OpenAI-compatible surface
-// Ollama already exposes -- image parts on a chat message, `input_audio`
-// for audio -- speech through a Kokoro runtime, and image generation
-// through Ollama's own route. One transport, because the stream, the
-// credential and the ledger are already there; the alternative was a
-// second transport per modality.
-//
-// THE PAYLOADS HAVE NOWHERE TO TRAVEL YET, and that is the whole reason
-// this file is separate from the dispatch. At the pin ModelCallMessage
-// is {role, content} with no image parts, ModelCallDelta and
-// ModelCallEnd carry only strings, and embedding_input is []string --
-// so a vision call has nowhere to receive an image and speak and image
-// have nowhere to return one. Everything below is the RUNTIME half:
-// built, tested against a fake, and reached through payloadFor in
-// session.go, which is the single place the wire's fields will be read
-// when memql#5137 lands.
+// Modality calls use the worker's existing authenticated ModelCall stream.
+// Vision uses OpenAI chat image parts; ASR uses a declared OpenAI multipart,
+// whisper.cpp or chat-audio endpoint; speech uses an OpenAI-compatible runtime.
+// payload.go maps actual protobuf media fields before dispatch.
 
 // ImagePart is one image handed to a vision call.
 //
@@ -192,6 +178,11 @@ func (c *openAIClient) Vision(ctx context.Context, req VisionRequest, emit Emit)
 // dropped silently, and a vision call that quietly became a text call
 // answers confidently about nothing.
 func attachImages(in []Message, images []ImagePart) []Message {
+	for _, message := range in {
+		if len(message.Images) > 0 {
+			return in
+		}
+	}
 	out := append([]Message(nil), in...)
 	for i := len(out) - 1; i >= 0; i-- {
 		if out[i].Role == "user" {
@@ -237,6 +228,9 @@ func (c *ollamaClient) Vision(ctx context.Context, req VisionRequest, emit Emit)
 // own runtime is reached the same way, because that is the route this
 // cockpit's declared-runtime contract already promises.
 func (c *openAIClient) Transcribe(ctx context.Context, req TranscribeRequest) (TranscribeResult, error) {
+	if c.transcription == "openai" || c.transcription == "whisper-cpp" {
+		return c.transcribeFile(ctx, req)
+	}
 	if len(req.Audio) == 0 {
 		return TranscribeResult{}, fmt.Errorf("transcribe: no audio was supplied")
 	}
@@ -305,6 +299,9 @@ func (c *openAIClient) Speak(ctx context.Context, req SpeakRequest) (SpeakResult
 	}
 	body := map[string]any{"model": req.Model, "input": req.Text}
 	if v := strings.TrimSpace(req.Voice); v != "" {
+		if alias := c.voices[v]; alias != "" {
+			v = alias
+		}
 		body["voice"] = v
 	}
 	if f := strings.TrimSpace(req.Format); f != "" {
@@ -320,9 +317,12 @@ func (c *openAIClient) Speak(ctx context.Context, req SpeakRequest) (SpeakResult
 	}
 	defer resp.Body.Close()
 
-	audio, err := io.ReadAll(resp.Body)
+	audio, err := io.ReadAll(io.LimitReader(resp.Body, (16<<20)+1))
 	if err != nil {
 		return SpeakResult{}, err
+	}
+	if len(audio) > 16<<20 {
+		return SpeakResult{}, fmt.Errorf("speech response exceeds 16 MB")
 	}
 	if len(audio) == 0 {
 		// A 200 with an empty body is not success. The same trap

@@ -347,6 +347,8 @@ func RuntimeLabel(kind string) string { return RuntimeLabelPrefix + strings.Trim
 // the attributes on purpose: a blocked model is still reported, so the
 // portal can distinguish it from one that is not installed.
 type Info struct {
+	Transcription string
+	Voices        map[string]string
 	// ID is the runtime-facing model id -- the exact string the router
 	// will select on and send back in ModelCallStart.model, so it is
 	// never normalised or prettified here.

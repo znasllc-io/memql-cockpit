@@ -344,12 +344,8 @@ so a level carrying either character is dropped whole rather than escaped
 (`quantSafe`); without that, a runtime string could forge a second
 attribute the machine never claimed.
 
-**The engine parses none of the three at the current pin.** memql#5096
-has not merged, so this repository is DEFINING those keys and
-`TestWireContract` says so rather than pretending to transcribe. That is
-safe only in this direction, because the engine's parser skips a key it
-does not know -- which is also why a synonym invented on either side
-raises nothing anywhere and is simply a fleet that never ranks by size.
+The engine parses these model attributes. `TestWireContract` checks the
+shared names against the pinned engine; keep both sides synchronized.
 
 
 ## Setting a machine up to run models (epic memql-cockpit#387)
@@ -462,8 +458,7 @@ result) and takes no ModelCall slot (bandwidth, not the runner).
 ## The scanner, the probe, sharing, and the four modalities
 
 Epics memql-cockpit#393 (open-weight defaults) and #396 (the scanner and
-shared machines). Engine halves: memql#5137 and memql#5146, **neither
-merged**. Design records live in the ENGINE repo,
+shared machines). Engine halves: memql#5137 and memql#5146 are merged. Design records live in the ENGINE repo,
 `docs/superpowers/specs/2026-09-07-*-design.md`; this repository has no
 separate record for either. Operator doc: [docs/local-models.md](docs/local-models.md).
 
@@ -515,14 +510,17 @@ harder" -- it was guessing from a model id, and a "kokoro" in a name is
 not a runtime that answered. False is ABSENT on the label; there is no
 `vision=0`.
 
-**The four KINDS ship; the four PAYLOADS cannot.** `ModelCallStart.kind`
-is a plain string and labels are a `map<string,string>`, so both travel
-today. There is nowhere on the wire for an image in or audio bytes out
-until memql#5137 lands, so `modelcall/payload.go`'s `payloadFor` is the
-one place those fields will be read, and a modality call is refused with
-`payload_unavailable` rather than served as a text completion -- which
-would report success for a generation that never saw the image. The
-settled field names and numbers are written out in that file's comment.
+**Media and tool payloads travel on the worker stream.** `modelcall/payload.go`
+reads images, audio input, speech options and image parameters from the actual
+protobuf fields and writes binary outputs on `ModelCallEnd`. Tool definitions,
+assistant tool calls and tool-result IDs retain their wire identities. A missing
+required payload is refused as `payload_unavailable`.
+
+Declared ASR runtimes select `transcription: openai` (multipart
+`/audio/transcriptions`), `whisper-cpp` (`/inference` with a ready `/health`),
+or the default chat-audio protocol. Local speech can declare `voices.male` and
+`voices.female` aliases. `models.allow` is still required for either modality;
+declaring an endpoint does not authorize it. See [local-models.md](docs/local-models.md).
 
 **`--runtime` means two different things and the mix is REFUSED.**
 Alongside `--inference` it chooses how Ollama runs (docker | native); on

@@ -557,3 +557,33 @@ func TestResolvedOllamaBaseURL_IsTheSameAnswerTheProbeUses(t *testing.T) {
 		t.Errorf("override -> %q", got)
 	}
 }
+
+func TestDeclaredAudioRuntimeReadiness(t *testing.T) {
+	for _, tc := range []struct {
+		name, protocol, response string
+		want                     int
+	}{
+		{"empty OpenAI listing", "openai", `{"data":[]}`, 0},
+		{"loaded Whisper", "whisper-cpp", `{"status":"ok"}`, 1},
+		{"loading Whisper", "whisper-cpp", `{"status":"loading model"}`, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				path := "/models"
+				if tc.protocol == "whisper-cpp" {
+					path = "/health"
+				}
+				if r.URL.Path != path {
+					t.Errorf("probe path %s", r.URL.Path)
+				}
+				_, _ = w.Write([]byte(tc.response))
+			}))
+			defer server.Close()
+			d := discovererFor(server.URL, nil)
+			rows, _ := d.probeDeclared(context.Background(), DeclaredRuntime{Name: "asr", BaseURL: server.URL, Transcription: tc.protocol, Models: []DeclaredModel{{ID: "whisper-base.en", AudioIn: true}}})
+			if len(rows) != tc.want {
+				t.Fatalf("offered %d, expected %d", len(rows), tc.want)
+			}
+		})
+	}
+}

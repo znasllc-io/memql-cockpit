@@ -34,7 +34,21 @@ func (d *Discoverer) probeDeclared(ctx context.Context, rt DeclaredRuntime) ([]I
 	}
 
 	var listing openAIModelsResponse
-	err := d.getJSON(ctx, base+"/models", d.getenv(rt.APIKeyEnv), &listing)
+	var err error
+	switch rt.Transcription {
+	case "", "chat", "openai":
+		err = d.getJSON(ctx, base+"/models", d.getenv(rt.APIKeyEnv), &listing)
+	case "whisper-cpp":
+		var health struct {
+			Status string `json:"status"`
+		}
+		err = d.getJSON(ctx, base+"/health", d.getenv(rt.APIKeyEnv), &health)
+		if err == nil && health.Status != "ok" {
+			err = fmt.Errorf("transcription model is not ready")
+		}
+	default:
+		return nil, fmt.Sprintf("declared runtime %s has an unknown transcription protocol", name)
+	}
 	if err != nil {
 		return nil, fmt.Sprintf("declared runtime %s at %s did not answer (%v); its models are not offered", name, base, err)
 	}
@@ -56,7 +70,7 @@ func (d *Discoverer) probeDeclared(ctx context.Context, rt DeclaredRuntime) ([]I
 		if id == "" {
 			continue
 		}
-		if len(served) > 0 && !served[id] {
+		if rt.Transcription != "whisper-cpp" && !served[id] {
 			missing = append(missing, id)
 			continue
 		}
@@ -70,7 +84,8 @@ func (d *Discoverer) probeDeclared(ctx context.Context, rt DeclaredRuntime) ([]I
 			maxConcurrent = 1
 		}
 		out = append(out, Info{
-			ID:        id,
+			ID:            id,
+			Transcription: rt.Transcription, Voices: rt.Voices,
 			Kind:      KindOpenAICompatible,
 			Runtime:   name,
 			BaseURL:   base,
