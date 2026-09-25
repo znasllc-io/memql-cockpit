@@ -485,10 +485,7 @@ func TestModalityKindRefusedWhenNotAdvertised(t *testing.T) {
 	}
 }
 
-// A model that DID advertise the modality gets past that gate and hits
-// the payload seam, which is the honest answer at this engine version:
-// the field does not exist, so no image ever arrived, and answering
-// anyway would report success for a generation about nothing.
+// Advertising a modality does not permit an empty required input.
 func TestAdvertisedModalityRefusesOnTheAbsentPayload(t *testing.T) {
 	for _, tc := range []struct {
 		kind  string
@@ -496,8 +493,6 @@ func TestAdvertisedModalityRefusesOnTheAbsentPayload(t *testing.T) {
 	}{
 		{KindVision, models.Attributes{Vision: true}},
 		{KindTranscribe, models.Attributes{AudioIn: true}},
-		{KindSpeak, models.Attributes{AudioOut: true}},
-		{KindImage, models.Attributes{ImageGen: true}},
 	} {
 		t.Run(tc.kind, func(t *testing.T) {
 			inv := inventoryWith(ollamaModel("http://127.0.0.1:1", "m:9b", tc.attrs))
@@ -507,7 +502,7 @@ func TestAdvertisedModalityRefusesOnTheAbsentPayload(t *testing.T) {
 				t.Fatalf("error_code = %q, want %q -- got error %q",
 					end.GetErrorCode(), CodePayloadUnavailable, end.GetError())
 			}
-			if !strings.Contains(end.GetError(), "does not exist on ModelCallStart") {
+			if !strings.Contains(end.GetError(), "carried no ") {
 				t.Fatalf("the refusal must say WHY there is no payload: %q", end.GetError())
 			}
 		})
@@ -707,23 +702,11 @@ func TestTranscribeReportsNoSegmentsItDidNotReceive(t *testing.T) {
 	}
 }
 
-// The payload seam reports absent at this engine version, for every
-// kind. The test exists so that landing memql#5137 has an assertion
-// that changes -- rather than the seam quietly staying stubbed.
-func TestPayloadForIsAbsentAtThisEngineVersion(t *testing.T) {
-	for _, kind := range []string{KindVision, KindTranscribe, KindSpeak, KindImage} {
-		if _, ok := payloadFor(startModality("m", kind)); ok {
-			t.Fatalf("%s: payloadFor reported a payload; ModelCallStart has no modality fields yet", kind)
-		}
-	}
-}
-
 // -----------------------------------------------------------------------------
 // The serving path, end to end
 // -----------------------------------------------------------------------------
 
-// withPayload drives the proto seam so the serving path can be
-// exercised before the wire can reach it. See readPayload.
+// withPayload isolates modality-specific serving behavior; wire tests use real fields.
 func withPayload(t *testing.T, p Payload) {
 	t.Helper()
 	prev := readPayload

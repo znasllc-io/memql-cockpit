@@ -21,10 +21,15 @@ const probeTimeout = 5 * time.Second
 // policy.yaml declares (spec D1: LM Studio, vLLM, llamafile, and Ollama's
 // own /v1 surface all reach the cockpit this way).
 type DeclaredRuntime struct {
-	Name      string          `yaml:"name"`
-	BaseURL   string          `yaml:"base_url"`
-	APIKeyEnv string          `yaml:"api_key_env"`
-	Models    []DeclaredModel `yaml:"models"`
+	// Transcription chooses the actual local server protocol: chat (default),
+	// openai (/audio/transcriptions), or whisper-cpp (/inference).
+	Transcription string `yaml:"transcription"`
+	// Voices maps user-facing male/female preferences to this runtime's voice IDs.
+	Voices    map[string]string `yaml:"voices"`
+	Name      string            `yaml:"name"`
+	BaseURL   string            `yaml:"base_url"`
+	APIKeyEnv string            `yaml:"api_key_env"`
+	Models    []DeclaredModel   `yaml:"models"`
 }
 
 // DeclaredModel is one model on a declared runtime, with the attributes

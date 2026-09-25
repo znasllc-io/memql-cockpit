@@ -359,11 +359,6 @@ func TestAdmission_SchemaWithoutTheCapability(t *testing.T) {
 // catalogue it cannot honour does not refuse -- it answers in prose, and
 // the caller reads prose where it was waiting for a call. So the refusal
 // has to happen before the request is built.
-//
-// The gate is called DIRECTLY, and that is the point of it being a
-// function: the wire carries no tool catalogue yet (see toolsFromStart),
-// so a call routed through Start would arrive with no tools on it and
-// assert nothing at all.
 func TestAdmission_ToolsWithoutTheCapability(t *testing.T) {
 	tools := []Tool{{Name: "lookup", ParametersJSON: `{"type":"object"}`}}
 	plain := models.Info{ID: "plain", Kind: models.KindOllama, Allowed: true}

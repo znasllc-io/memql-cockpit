@@ -17,9 +17,11 @@ import (
 // whole.
 
 type openAIClient struct {
-	baseURL string
-	apiKey  string
-	http    *http.Client
+	transcription string
+	voices        map[string]string
+	baseURL       string
+	apiKey        string
+	http          *http.Client
 }
 
 type openAIChatChunk struct {

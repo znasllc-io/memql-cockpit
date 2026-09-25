@@ -41,13 +41,7 @@ const (
 	// CodePayloadUnavailable: the kind is served and the call carried
 	// no payload for it.
 	//
-	// THIS IS THE PROTO SEAM (memql#5137). At the pin there is nowhere
-	// on ModelCallStart to put an image or audio bytes, so a modality
-	// call that reached this worker would have arrived empty. It is
-	// REFUSED rather than served as a text call: a machine that
-	// answered a vision request with a completion that never saw the
-	// image would report success for a generation about nothing, and
-	// nothing downstream could detect it.
+	// Refuse missing media instead of silently turning a modality request into chat.
 	CodePayloadUnavailable = "payload_unavailable"
 	// CodeSchemaUnsupported: a response schema arrived for a model this
 	// machine never advertised structured output for.
@@ -414,7 +408,7 @@ func (m *Manager) resolve(ctx context.Context, start *memqlv1.ModelCallStart) (m
 			return models.Info{}, models.Inventory{}, refuse(CodeModalityUnsupported,
 				fmt.Sprintf("model %q does not advertise %s on this machine", info.ID, modality.Word))
 		}
-		// And the payload, which the wire cannot carry yet.
+		// Required media must actually be present in the envelope.
 		if _, ok := payloadFor(start); !ok {
 			return models.Info{}, models.Inventory{}, refuse(CodePayloadUnavailable, modalityUnavailableSentence(modality.Word))
 		}
@@ -516,11 +510,6 @@ func machineCap(inv models.Inventory) int {
 // answers in prose, and the caller then reads prose where it was waiting
 // for a call. That failure surfaces wherever the tool result was due and
 // names nothing on this machine.
-//
-// It is a function rather than three lines inside resolve so that it can
-// be exercised DIRECTLY. The wire cannot carry a tool catalogue yet (see
-// toolsFromStart), so a gate reachable only through resolve would be a
-// gate no test could put tools past.
 func toolsRefusal(info models.Info, tools []Tool) *memqlv1.ModelCallEnd {
 	if len(tools) == 0 || info.Tools {
 		return nil
@@ -575,10 +564,7 @@ func (m *Manager) run(ctx context.Context, sender Sender, c *call, info models.I
 		res, err = client.Embed(ctx, EmbedRequest{Model: info.ID, Input: start.GetEmbeddingInput()})
 
 	case isModalityKind(kind):
-		// resolve already refused a modality call whose payload the
-		// wire could not carry, so reaching here means payloadFor
-		// answered -- which today happens only under test, and after
-		// memql#5137 happens for real.
+		// Admission has validated the required media payload.
 		payload, _ := payloadFor(start)
 		res, modal, err = m.runModality(ctx, client, info, start, payload, stream.emit)
 
@@ -866,7 +852,7 @@ func NewClient(info models.Info, httpClient *http.Client, getenv func(string) st
 		if info.APIKeyEnv != "" && getenv != nil {
 			key = getenv(info.APIKeyEnv)
 		}
-		return &openAIClient{baseURL: info.BaseURL, apiKey: key, http: httpClient}
+		return &openAIClient{baseURL: info.BaseURL, apiKey: key, http: httpClient, transcription: info.Transcription, voices: info.Voices}
 	}
 	return &ollamaClient{baseURL: info.BaseURL, http: httpClient}
 }
@@ -951,30 +937,17 @@ func (s *deltaStream) send(content string, keepalive bool) error {
 // -----------------------------------------------------------------------------
 // Wire conversions
 //
-// THE TOOL SEAMS. Tool calling is live through the rest of this package
-// -- both clients send a catalogue and decode what comes back, and
-// toolsRefusal turns away a model that cannot do it -- but THE WIRE
-// CARRIES NONE OF IT. ModelCallStart has fields 1 to 11 and none is
-// `tools`; ModelCallMessage is `role` and `content`; ModelCallEnd has
-// fields 1 to 7 and none is a tool-call list; ModelCallDelta is
-// request_id / seq / content / keepalive. Engine epic memql#5096 adds all
-// four, and until this repository's pin crosses that merge there is
-// nothing to map.
-//
-// The mapping is confined to three functions on purpose -- toolsFromStart
-// and messageFrom on the way in, attachToolCalls on the way out -- so
-// that landing the proto is a change to those three and nothing else.
+// Wire mappings preserve the scoped catalogue, tool history and binary media.
 // -----------------------------------------------------------------------------
 
-// toolsFromStart is the ONE place a ModelCallStart's tool catalogue
-// becomes the runtime envelope's. It returns nil because ModelCallStart
-// has no `tools` field to read: no call reaching this worker can offer a
-// tool, which is also why toolsRefusal is unreachable through resolve
-// today and is tested directly.
+// toolsFromStart preserves the engine's scoped catalogue through the worker hop.
 func toolsFromStart(start *memqlv1.ModelCallStart) []Tool {
-	return nil
+	var out []Tool
+	for _, t := range start.GetTools() {
+		out = append(out, Tool{Name: t.GetName(), Description: t.GetDescription(), ParametersJSON: t.GetParametersJson()})
+	}
+	return out
 }
-
 func messagesFrom(in []*memqlv1.ModelCallMessage) []Message {
 	out := make([]Message, 0, len(in))
 	for _, m := range in {
@@ -982,32 +955,23 @@ func messagesFrom(in []*memqlv1.ModelCallMessage) []Message {
 	}
 	return out
 }
-
-// messageFrom is the ONE place a ModelCallMessage becomes an envelope
-// Message. Role and content are the WHOLE of that proto message;
-// memql#5096 adds `tool_call_id`, `name` and `tool_calls`, and Message
-// already carries all three for the clients that write them.
 func messageFrom(m *memqlv1.ModelCallMessage) Message {
-	return Message{Role: m.GetRole(), Content: m.GetContent()}
+	out := Message{Role: m.GetRole(), Content: m.GetContent(), ToolCallID: m.GetToolCallId(), Name: m.GetName()}
+	for _, call := range m.GetToolCalls() {
+		out.ToolCalls = append(out.ToolCalls, ToolCall{ID: call.GetId(), Name: call.GetName(), ArgumentsJSON: call.GetArgumentsJson()})
+	}
+	for _, image := range m.GetImages() {
+		out.Images = append(out.Images, ImagePart{Data: image.GetData(), MediaType: image.GetMediaType()})
+	}
+	return out
 }
 
-// attachToolCalls is the ONE place a finished call's tool calls would go
-// back on the wire, and it attaches nothing: ModelCallEnd has no
-// tool-call list.
-//
-// The DELTA side is the same gap and one step further away. ModelCallEnd
-// grows a field; ModelCallDelta's incremental arguments would also need
-// Sender to grow a parameter, and Sender is implemented by the worker's
-// Connection in another package. Nothing is lost by that wait: both
-// clients return their tool calls WHOLE on Result -- the
-// OpenAI-compatible one reassembles the fragments itself -- so there is
-// no partial call at this layer to stream even once the field exists.
-//
-// Read this as a wire gap rather than as dropped output: toolsFromStart
-// returns nil, so no runtime is ever offered a tool and none can answer
-// with one. Result.ToolCalls is reached from this package's tests and
-// from here.
-func attachToolCalls(end *memqlv1.ModelCallEnd, calls []ToolCall) {}
+// The authoritative complete list is returned on End, even for streaming runtimes.
+func attachToolCalls(end *memqlv1.ModelCallEnd, calls []ToolCall) {
+	for i, call := range calls {
+		end.ToolCalls = append(end.ToolCalls, &memqlv1.ModelCallToolCall{Id: call.ID, Name: call.Name, ArgumentsJson: call.ArgumentsJSON, Index: int32(i)})
+	}
+}
 
 func paramsFrom(p *memqlv1.ModelCallParams) Params {
 	if p == nil {

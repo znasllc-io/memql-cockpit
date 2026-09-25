@@ -279,9 +279,19 @@ them:
 
 ```yaml
 models:
+  allow: ["whisper-base.en", "kokoro-82m"]
   runtimes:
+    - name: local-transcription
+      base_url: http://127.0.0.1:8080
+      transcription: whisper-cpp
+      models:
+        - id: whisper-base.en
+          audio_in: true
     - name: local-speech
       base_url: http://127.0.0.1:8880/v1
+      voices:
+        male: am_michael
+        female: af_heart
       models:
         - id: kokoro-82m
           audio_out: true
@@ -295,17 +305,33 @@ page against this file reads one word in both places.
 
 The four kinds — `vision`, `transcribe`, `speak`, `image` — ride the same
 `ModelCall` envelope as chat, over the stream this worker already holds open.
-The machine's own runtimes serve them: vision and transcription through
-Ollama's OpenAI-compatible surface, speech through a Kokoro runtime, images
-through Ollama's own generate route.
+The machine's own runtimes serve them. Vision uses OpenAI chat image parts;
+transcription uses the declared protocol; speech uses an OpenAI-compatible
+`/audio/speech` endpoint; image generation uses the runtime's image route.
+Binary inputs, outputs and tool calls are carried on the authenticated worker
+stream. An incomplete payload is refused instead of being treated as chat.
 
-**At the current engine pin the payload has nowhere to travel.** The wire
-carries the *kind* and the *flags* today, and the fields for an image in or
-audio bytes out are the engine half of memql#5137, which has not merged. A
-modality call that arrives before then is refused with `payload_unavailable`
-and a sentence saying why — never served as a text completion, because a
-machine that answered a vision request with a generation that never saw the
-image would report success for a generation about nothing.
+`transcription: openai` selects multipart `/audio/transcriptions` with a WAV
+file. `transcription: whisper-cpp` selects `/inference` and requires `/health`
+to report `status: ok`; use the model actually loaded by whisper-server in the
+declaration. Omitting the option retains chat `input_audio` for runtimes that
+support it. OpenAI-compatible runtimes must list the declared model in `/models`.
+The `voices` map translates MemQL's male/female choices to runtime voice IDs.
+Neither transcription nor speech runs in Ollama merely because a model name
+resembles Whisper or Kokoro.
+
+For a local Ask voice route, run whisper.cpp with a loaded model, start Kokoro,
+and allow both models in policy. A 32 GB or 64 GB Apple Silicon machine can
+reserve most memory for its chat model while these smaller audio models run
+beside it; actual latency depends on the chat model and concurrent work. On a
+24 GB machine, start with a smaller chat model to avoid swapping. Check GPU
+VRAM independently of system RAM. NVIDIA Blackwell GPUs require a runtime
+image whose CUDA/PyTorch build supports that GPU; do not assume an older
+Kokoro GPU image supports an RTX 5090.
+
+The worker only routes to runtimes that answer its probes. Model files and
+runtime installation remain explicit operator actions; no credential or model
+is downloaded as a side effect of starting a conversation.
 
 ### `sharedInference` is not the cockpit's to send
 
