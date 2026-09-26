@@ -58,6 +58,26 @@ func serveRaw(t *testing.T, body string) (*httptest.Server, *[]byte) {
 
 func discardEmit(string) error { return nil }
 
+func TestOllamaStreamFailurePreservesTheRuntimeCause(t *testing.T) {
+	for _, tc := range []struct{ name, body, want string }{
+		{"runtime tool parser", `{"error":"tool call parsing failed: XML syntax error"}`, "tool call parsing failed: XML syntax error"},
+		{"context overflow", `{"error":"the input length exceeds the context length"}`, "input length exceeds the context length"},
+		{"malformed frame", "{broken}\n" + ollamaDoneFrame, "invalid stream frame"},
+		{"premature EOF", `{"message":{"content":"partial"}}`, "stream ended without a completion frame"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, _ := serveRaw(t, tc.body)
+			m := managerFor(inventoryWith(ollamaModel(srv.URL, "m", models.Attributes{MaxConcurrent: 1})))
+			rec := newRecorder()
+			m.Start(context.Background(), rec, start("r", "m", KindChat))
+			end := rec.wait(t)
+			if end.FinishReason != FinishError || !strings.Contains(end.Error, tc.want) {
+				t.Fatalf("runtime cause lost or failure reported success: %+v", end)
+			}
+		})
+	}
+}
+
 // The default 2048-token compute batch can evict a resident chat model even
 // with an 8K embedding context. Bound that allocation without shortening input.
 func TestOllamaEmbedBoundsComputeBatchWithoutShorteningInput(t *testing.T) {
