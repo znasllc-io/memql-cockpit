@@ -685,6 +685,18 @@ then died is a successful install and a runtime that is not there.
 
 ---
 
+## Progress during reasoning
+
+The runtime idle watchdog counts answer text, thinking tokens and tool-call
+fragments as progress. Ollama's `message.thinking` and compatible runtimes'
+`reasoning` / `reasoning_content` fields update liveness without entering the
+answer, logs or Fleet content deltas. A long reasoning phase can therefore
+finish without being mistaken for a stalled runtime.
+
+Worker keepalives and empty runtime frames do not reset that watchdog. The
+request's cancellation and whole-call limit still apply; work goals retain
+their separate durable recovery and budget controls.
+
 ## Related
 
 - Engine + protocol: [memql#4676](https://github.com/znasllc-io/memql/issues/4676),

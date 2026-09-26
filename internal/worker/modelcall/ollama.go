@@ -25,6 +25,7 @@ type ollamaChatChunk struct {
 	Model   string `json:"model"`
 	Message struct {
 		Content   string           `json:"content"`
+		Thinking  string           `json:"thinking"`
 		ToolCalls []ollamaToolCall `json:"tool_calls"`
 	} `json:"message"`
 	Done            bool   `json:"done"`
@@ -98,6 +99,9 @@ func (c *ollamaClient) Chat(ctx context.Context, req ChatRequest, emit emitFunc)
 			// the caller already has, and discarding it over one
 			// malformed frame would be a worse answer than a short one.
 			continue
+		}
+		if chunk.Message.Thinking != "" || len(chunk.Message.ToolCalls) > 0 {
+			reportRuntimeProgress(ctx)
 		}
 		if chunk.Message.Content != "" {
 			if err := emit(chunk.Message.Content); err != nil {
