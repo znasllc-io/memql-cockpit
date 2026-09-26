@@ -28,8 +28,10 @@ type openAIChatChunk struct {
 	Model   string `json:"model"`
 	Choices []struct {
 		Delta struct {
-			Content   string                `json:"content"`
-			ToolCalls []openAIToolCallDelta `json:"tool_calls"`
+			Content          string                `json:"content"`
+			Reasoning        string                `json:"reasoning"`
+			ReasoningContent string                `json:"reasoning_content"`
+			ToolCalls        []openAIToolCallDelta `json:"tool_calls"`
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
@@ -188,12 +190,18 @@ func (c *openAIClient) chatRaw(ctx context.Context, body map[string]any, emit em
 			out.Usage.Model = chunk.Model
 		}
 		for _, choice := range chunk.Choices {
+			if choice.Delta.Reasoning != "" || choice.Delta.ReasoningContent != "" {
+				reportRuntimeProgress(ctx)
+			}
 			if choice.Delta.Content != "" {
 				if err := emit(choice.Delta.Content); err != nil {
 					return out, err
 				}
 			}
 			for _, frag := range choice.Delta.ToolCalls {
+				if frag.ID != "" || frag.Function.Name != "" || frag.Function.Arguments != "" {
+					reportRuntimeProgress(ctx)
+				}
 				tools.add(frag)
 			}
 			if choice.FinishReason != "" {

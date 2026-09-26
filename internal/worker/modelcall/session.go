@@ -553,6 +553,7 @@ func (m *Manager) run(ctx context.Context, sender Sender, c *call, info models.I
 	defer stopWatchdog()
 	go m.watchdog(ctx, c, stream, limits, watchdogDone)
 
+	ctx = withRuntimeProgress(ctx, stream.runtimeProgress)
 	client := m.clientFor(info)
 	var (
 		res   Result
@@ -874,7 +875,8 @@ type deltaStream struct {
 	// lastSend is when this worker last put ANYTHING on the stream,
 	// content or keepalive. It drives the keepalive CADENCE.
 	lastSend time.Time
-	// lastContent is when the RUNTIME last produced output. It drives
+	// lastContent is when the RUNTIME last produced answer, reasoning or tool
+	// output. It drives
 	// the idle VERDICT, and the two are separate clocks for a reason
 	// that is easy to get wrong: a keepalive is this worker's own
 	// output and says nothing whatever about the runtime. A single
@@ -890,6 +892,14 @@ func (s *deltaStream) touch() {
 	s.mu.Lock()
 	now := time.Now()
 	s.lastSend, s.lastContent = now, now
+	s.mu.Unlock()
+}
+
+// Private reasoning and partial tool arguments move only the runtime clock.
+// Keepalive cadence stays independent, and none of that text leaves the adapter.
+func (s *deltaStream) runtimeProgress() {
+	s.mu.Lock()
+	s.lastContent = time.Now()
 	s.mu.Unlock()
 }
 
@@ -923,7 +933,8 @@ func (s *deltaStream) send(content string, keepalive bool) error {
 	s.seq++
 	now := time.Now()
 	s.lastSend = now
-	// ONLY CONTENT MOVES THE IDLE CLOCK. A keepalive proves this worker
+	// Only runtime output moves the idle clock (including private output via
+	// runtimeProgress). A keepalive proves this worker
 	// is alive to the engine; it proves nothing about the runtime, and
 	// letting it reset the idle verdict is what makes the ceiling
 	// unenforceable from this side.
