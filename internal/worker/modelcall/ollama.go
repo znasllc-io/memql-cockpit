@@ -22,6 +22,7 @@ type ollamaClient struct {
 // carries both the incremental content and, on the final line, the
 // outcome and the counts.
 type ollamaChatChunk struct {
+	Error   string `json:"error"`
 	Model   string `json:"model"`
 	Message struct {
 		Content   string           `json:"content"`
@@ -94,11 +95,13 @@ func (c *ollamaClient) Chat(ctx context.Context, req ChatRequest, emit emitFunc)
 		}
 		var chunk ollamaChatChunk
 		if err := json.Unmarshal(line, &chunk); err != nil {
-			// A line this side cannot read is skipped rather than
-			// failing the call: the generation so far is real output
-			// the caller already has, and discarding it over one
-			// malformed frame would be a worse answer than a short one.
-			continue
+			return out, fmt.Errorf("ollama: invalid stream frame: %w", err)
+		}
+		if chunk.Error != "" {
+			// Ollama can fail after HTTP 200, notably when its tool parser
+			// rejects model output or generation exhausts the context. Keep
+			// that cause so the engine can repair or compact appropriately.
+			return out, fmt.Errorf("ollama: %s", chunk.Error)
 		}
 		if chunk.Message.Thinking != "" || len(chunk.Message.ToolCalls) > 0 {
 			reportRuntimeProgress(ctx)
