@@ -873,21 +873,26 @@ function write_worker_yaml() {
         echo "$capabilities" | tr ',' '\n' | sed 's/^/  - /'
         echo "homes:"
         if [[ -e "$workers_path" ]]; then
-            # Emit sibling home blocks; skip the matched id (URL or id).
+            # Emit sibling home blocks at the same indentation as the new home.
+            # Go yaml.Marshal uses four spaces; shell installs use two. Keeping
+            # siblings verbatim makes the next additive install invalid YAML.
             awk -v keep_id="$match_id" '
                 BEGIN { in_homes=0; skip=0; buf="" }
                 /^homes:[[:space:]]*$/ { in_homes=1; next }
                 !in_homes { next }
                 /^[[:space:]]*-[[:space:]]*id:[[:space:]]*/ {
                     if (buf != "" && !skip) printf "%s", buf
-                    buf = $0 "\n"
+                    match($0, /[^[:space:]]/)
+                    indent = RSTART - 1
+                    buf = "  " substr($0, indent + 1) "\n"
                     id=$0; sub(/^[[:space:]]*-[[:space:]]*id:[[:space:]]*/, "", id)
                     skip = (id == keep_id) ? 1 : 0
                     next
                 }
                 in_homes {
                     if (buf == "") next
-                    buf = buf $0 "\n"
+                    # Preserve relative indentation inside each home.
+                    buf = buf "  " substr($0, indent + 1) "\n"
                 }
                 END { if (buf != "" && !skip) printf "%s", buf }
             ' "$workers_path"
