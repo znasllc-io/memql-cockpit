@@ -29,6 +29,18 @@
 # what --purge adds, the
 # nothing-installed run, ~/.memql kept for the CLI's clusters.yaml, and
 # the fence that keeps a state_dir outside ~/.memql from being deleted.
+# And the no-flag contract MemQL OS relies on (both platforms, a stub
+# memql standing in for the installed one): one enrollment is removed
+# as --cluster=<its url>, none proceeds as --all-homes, several refuse
+# with the command for each; --cluster=URL with no enrollment proceeds,
+# with no MATCHING enrollment refuses naming the enrolled ones, and
+# matches through trailing slashes and case; a binary too old for the
+# unpair contract (or none at all) falls back to full removal only when
+# the requested cluster is the only one; the install shape is detected
+# without --user-local; --dry-run prints the plan and leaves HOME
+# byte-identical; and the exact piped one-liner shapes all parse.
+# And the installers' --version pin: the composed download base, the
+# space and = spellings, --download-base winning, and the bad-value exit.
 #
 # Run: bash scripts/install/lib_test.sh
 # Wired into CI by .github/workflows/install-scripts-lint.yml.
@@ -854,7 +866,10 @@ done
 
 _nobin="${_tmp}/nobin"
 mkdir -p "$_nobin"
-for _tool in bash dirname basename uname rm rmdir sed head ls tr cat mktemp; do
+# awk reads the enrollment registry (list_enrolled_cluster_urls), id
+# names the launchd domain, sleep paces the stop loops -- all three are
+# on every macOS and Linux box the scripts run on.
+for _tool in bash dirname basename uname rm rmdir sed head ls tr cat mktemp awk id sleep; do
     if _real="$(command -v "$_tool")"; then
         ln -s "$_real" "${_nobin}/${_tool}"
     else
@@ -867,10 +882,84 @@ else
     pass "uninstall fixture: reduced PATH has no launchctl, systemctl or sudo"
 fi
 
+# write_memql_stub writes a test double for the installed memql at $1:
+# it answers --version with $2 (empty: says nothing, like a binary whose
+# version line cannot be read) and speaks the URL-scoped unpair contract
+# of internal/worker/unpair_url.go over $HOME/.memql -- the dry-run
+# counts, the real call rewrites workers.yaml (Go's `homes: []` when the
+# last home goes) and deletes the legacy mirror with the last enabled
+# home. Mode "old" ($3) exits 2 on `worker unpair --cluster-url`, as a
+# pre-0.15.0 flag parser does. Only tools on the reduced PATH are used.
+function write_memql_stub() {
+    local path="$1" version="$2" mode="${3:-current}"
+    {
+        echo '#!/usr/bin/env bash'
+        echo 'set -uo pipefail'
+        printf 'STUB_VERSION=%q\n' "$version"
+        printf 'STUB_MODE=%q\n' "$mode"
+        cat << 'STUB'
+if [[ "${1:-}" == --version ]]; then
+    [[ -z "$STUB_VERSION" ]] || echo "memql ${STUB_VERSION} (headless)"
+    exit 0
+fi
+[[ "${1:-}" == worker && "${2:-}" == unpair ]] || exit 0
+if [[ "$STUB_MODE" == old ]]; then
+    echo "flag provided but not defined: -cluster-url" >&2
+    exit 2
+fi
+shift 2
+url=""; dry=no
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --cluster-url) url="$2"; shift 2 ;;
+        --dry-run)     dry=yes; shift ;;
+        *)             shift ;;
+    esac
+done
+reg="$HOME/.memql/workers.yaml"; legacy="$HOME/.memql/worker.yaml"
+[[ -f "$reg" ]] || exit 5
+want="$(printf '%s' "$url" | tr '[:upper:]' '[:lower:]' | sed -E 's#/+$##; s#:443$##')"
+counts="$(awk -v want="$want" '
+    function norm(s) { s = tolower(s); sub(/\/+$/, "", s); sub(/:443$/, "", s); return s }
+    function flush() { if (url == "") return; if (norm(url) == want) removed++; else remaining++; url = "" }
+    /^homes:[[:space:]]*$/ { in_homes = 1; next }
+    !in_homes { next }
+    /^[[:space:]]*-[[:space:]]*id:/ { flush(); next }
+    /^[[:space:]]*cluster_url:/ { url = $0; sub(/^[[:space:]]*cluster_url:[[:space:]]*/, "", url) }
+    END { flush(); printf "%d %d\n", removed, remaining }
+' "$reg")"
+removed="${counts%% *}"; remaining="${counts##* }"
+if [[ "$dry" == yes ]]; then
+    printf '{"removed":%s,"remaining":%s,"changed":false,"dry_run":true}\n' "$removed" "$remaining"
+    exit 0
+fi
+changed=false
+if [[ "$removed" -gt 0 ]]; then
+    rewritten="$(awk -v want="$want" '
+        function norm(s) { s = tolower(s); sub(/\/+$/, "", s); sub(/:443$/, "", s); return s }
+        function flush() { if (buf == "") return; if (norm(url) != want) kept = kept buf; buf = ""; url = "" }
+        /^homes:[[:space:]]*$/ { in_homes = 1; next }
+        !in_homes { header = header $0 "\n"; next }
+        /^[[:space:]]*-[[:space:]]*id:/ { flush(); buf = $0 "\n"; next }
+        /^[[:space:]]*cluster_url:/ { url = $0; sub(/^[[:space:]]*cluster_url:[[:space:]]*/, "", url) }
+        { buf = buf $0 "\n" }
+        END { flush(); printf "%s", header; if (kept != "") printf "homes:\n%s", kept; else print "homes: []" }
+    ' "$reg")"
+    printf '%s\n' "$rewritten" > "$reg"
+    [[ "$remaining" -gt 0 ]] || rm -f "$legacy"
+    changed=true
+fi
+printf '{"removed":%s,"remaining":%s,"changed":%s,"dry_run":false}\n' "$removed" "$remaining" "$changed"
+STUB
+    } > "$path"
+    chmod +x "$path"
+}
+
 # uninstall_fixture lays down what an install leaves behind, for the
 # platform under test: workers.yaml + legacy worker.yaml with tokens,
-# policy.yaml, a state dir with a log, a --user-local binary with its
-# symlink, and the service file (plus worker.env on linux).
+# policy.yaml, a state dir with a log, a --user-local binary (the stub
+# above, so a no-flag run can unpair through it as on a real machine)
+# with its symlink, and the service file (plus worker.env on linux).
 function uninstall_fixture() {
     local home="$1"
     local platform="$2"
@@ -882,8 +971,7 @@ function uninstall_fixture() {
         "$home" > "${home}/.memql/workers.yaml"
     printf 'apps:\n  allow: []\n' > "${home}/.memql/policy.yaml"
     printf 'log line\n' > "${home}/.memql/state/worker.log"
-    printf '#!/bin/sh\nexit 0\n' > "${home}/.memql/bin/${_pf_headless}"
-    chmod +x "${home}/.memql/bin/${_pf_headless}"
+    write_memql_stub "${home}/.memql/bin/${_pf_headless}" 0.15.2
     ln -s "${home}/.memql/bin/${_pf_headless}" "${home}/.memql/bin/${INSTALLED_COMMAND}"
     case "$platform" in
         mac)
@@ -913,16 +1001,53 @@ chmod +x "${_uninstall_systemctl_dir}/systemctl"
 
 # run_uninstaller runs one uninstaller against a HOME with the reduced
 # PATH, from the script dir so the sibling lib.sh is what gets sourced.
-# Output (both streams) on stdout; the caller reads $? for the code.
+# Output (both streams) on stdout; the caller reads $? for the code. No
+# flag is added: a run with neither --cluster nor --all-homes is the
+# shape MemQL OS emitted, and the script decides from the fixture.
 function run_uninstaller() {
     local script="$1"
     local home="$2"
     shift 2
     local tool_path="$_nobin"
     if [[ "$script" == uninstall-linux.sh ]]; then tool_path="${_uninstall_systemctl_dir}:$_nobin"; fi
-    if [[ "$script" == uninstall-mac.sh ]]; then set -- --all-homes "$@"; fi
     (cd "$_script_dir" && HOME="$home" PATH="$tool_path" bash "./${script}" "$@" 2>&1)
 }
+
+# run_uninstaller_piped is the same run as the one-liner makes it: the
+# script on stdin, `bash -s -- <flags>`, from a cwd holding no lib.sh,
+# with RAW_BASE at the real lib.sh over file:// and curl on the PATH to
+# fetch it. What MemQL OS's line does, minus the network.
+function run_uninstaller_piped() {
+    local script="$1"
+    local home="$2"
+    shift 2
+    local tool_path="${_pipebin}:$_nobin"
+    if [[ "$script" == uninstall-linux.sh ]]; then tool_path="${_uninstall_systemctl_dir}:${tool_path}"; fi
+    (cd "$_piped_cwd" && HOME="$home" PATH="$tool_path" MEMQL_INSTALL_RAW_BASE="file://${_script_dir}" \
+        bash -s -- "$@" < "${_script_dir}/${script}" 2>&1)
+}
+
+# tree_fingerprint prints every path under $1 with its content hash or
+# link target, so "the dry run changed nothing" is a string comparison.
+function tree_fingerprint() {
+    (cd "$1" && find . -print | LC_ALL=C sort | while IFS= read -r entry; do
+        if [[ -L "$entry" ]]; then
+            printf '%s -> %s\n' "$entry" "$(readlink "$entry")"
+        elif [[ -f "$entry" ]]; then
+            printf '%s %s\n' "$entry" "$(shasum -a 256 < "$entry" | cut -d' ' -f1)"
+        else
+            printf '%s/\n' "$entry"
+        fi
+    done)
+}
+
+_pipebin="${_tmp}/pipebin"
+mkdir -p "$_pipebin"
+if _real="$(command -v curl)"; then
+    ln -s "$_real" "${_pipebin}/curl"
+else
+    fail "uninstall fixture: curl not on PATH"
+fi
 
 for _platform in mac linux; do
     _un="uninstall-${_platform}.sh"
@@ -1189,6 +1314,428 @@ if [[ "$_rc" -ne 0 && "$_out" == *PARTIAL* && -e "${_native_missing_home}/.memql
 else
     fail "missing systemctl must not purge a potentially running runtime: $_out"
 fi
+
+# ---------------------------------------------------------------
+# The no-flag contract -- what MemQL OS's one-liner relies on
+# ---------------------------------------------------------------
+#
+# Real runs against fixture HOMEs, both platforms, with the stub memql
+# standing in for the installed one. Every "nothing was changed" claim
+# is a fingerprint comparison of the whole HOME, not a reading of what
+# the script said. The auto-detect runs (no --user-local) are only
+# meaningful on a machine with no system install to detect -- one
+# would make the mac driver ask for sudo it cannot get -- so on such a
+# machine they run with --user-local and the detection line is skipped.
+
+_auto_ok="yes"
+if [[ "$_sys_present" == yes || -e /Applications/MemQL.app ]]; then
+    _auto_ok="no"
+    echo "INFO: a system install is present on this machine; auto-detect runs use --user-local"
+fi
+_auto_flag=""
+[[ "$_auto_ok" == yes ]] || _auto_flag="--user-local"
+
+function add_second_home() {
+    printf '  - id: d.example\n    cluster_url: https://d.example\n    token: mql_wkr_second\n    enabled: true\n' >> "$1/.memql/workers.yaml"
+}
+
+function fixture_home() {
+    local name="$1" platform="$2"
+    local home="${_tmp}/nf-${name}-${platform}"
+    mkdir -p "$home"
+    uninstall_fixture "$home" "$platform"
+    printf '%s' "$home"
+}
+
+for _platform in mac linux; do
+    _un="uninstall-${_platform}.sh"
+    case "$_platform" in
+        mac)   _svc="Library/LaunchAgents/${SERVICE_LABEL_DARWIN}.plist" ;;
+        linux) _svc=".config/systemd/user/${SERVICE_LABEL_LINUX}.service" ;;
+    esac
+
+    # (a) No flags, one enrollment: removed as --cluster=<its url>, through
+    # the binary, and the runtime goes with it (it was the last one).
+    _h="$(fixture_home one "$_platform")"
+    # shellcheck disable=SC2086  # _auto_flag is empty or one flag
+    _out="$(run_uninstaller "$_un" "$_h" $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un no flags + one enrollment exits 0" "$_rc" "0"
+    if [[ "$_out" == *"one worker enrollment on this machine, https://c.example"* ]]; then
+        pass "$_un no flags names the one enrollment it removes"
+    else
+        fail "$_un no flags should name the enrollment; got: $_out"
+    fi
+    if [[ ! -e "${_h}/.memql/workers.yaml" && ! -e "${_h}/.memql/worker.yaml" && ! -e "${_h}/${_svc}" \
+        && ! -e "${_h}/.memql/bin/${INSTALLED_COMMAND}" && ! -L "${_h}/.memql/bin/${INSTALLED_COMMAND}" ]]; then
+        pass "$_un no flags + one enrollment removes tokens, service file and binary"
+    else
+        fail "$_un no flags + one enrollment left something: $(ls -laR "${_h}" 2>&1)"
+    fi
+    # (d) ...and found the per-user install without being told the mode.
+    if [[ "$_auto_ok" == yes ]]; then
+        if [[ "$_out" == *"user-local install found"* && "$_out" == *"no system install"* ]]; then
+            pass "$_un detects the user-local install without --user-local"
+        else
+            fail "$_un should report the detected shapes; got: $_out"
+        fi
+    fi
+
+    # (b) No flags, zero enrollments: the runtime files go, exit 0.
+    _h="$(fixture_home zero "$_platform")"
+    rm -f "${_h}/.memql/workers.yaml" "${_h}/.memql/worker.yaml"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un no flags + zero enrollments exits 0" "$_rc" "0"
+    if [[ "$_out" == *"no worker enrollment on this machine"* && ! -e "${_h}/${_svc}" \
+        && ! -e "${_h}/.memql/bin/${INSTALLED_COMMAND}" && ! -L "${_h}/.memql/bin/${INSTALLED_COMMAND}" ]]; then
+        pass "$_un no flags + zero enrollments says so and removes the runtime"
+    else
+        fail "$_un no flags + zero enrollments; got: $_out"
+    fi
+
+    # (c) No flags, two enrollments: refused (2) with both URLs and the
+    # command for each, and nothing touched.
+    _h="$(fixture_home two "$_platform")"
+    add_second_home "$_h"
+    _before="$(tree_fingerprint "$_h")"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un no flags + two enrollments exits 2" "$_rc" "2"
+    if [[ "$_out" == *"--cluster=https://c.example"* && "$_out" == *"--cluster=https://d.example"* \
+        && "$_out" == *"--all-homes"* && "$_out" == *"2 clusters are enrolled"* ]]; then
+        pass "$_un two enrollments lists both URLs with the command for each"
+    else
+        fail "$_un two enrollments should list both commands; got: $_out"
+    fi
+    expect_eq "$_un two enrollments changes nothing" "$(tree_fingerprint "$_h")" "$_before"
+
+    # --cluster=URL with zero enrollments: nothing to unpair, proceed as
+    # --all-homes (a machine that never paired is still being uninstalled).
+    _h="$(fixture_home cluster-zero "$_platform")"
+    rm -f "${_h}/.memql/workers.yaml" "${_h}/.memql/worker.yaml"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" --cluster=https://c.example $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un --cluster with zero enrollments exits 0" "$_rc" "0"
+    if [[ "$_out" == *"nothing to unpair for https://c.example"* && ! -e "${_h}/${_svc}" ]]; then
+        pass "$_un --cluster with zero enrollments says so and removes the runtime"
+    else
+        fail "$_un --cluster with zero enrollments; got: $_out"
+    fi
+
+    # --cluster=URL that matches no enrollment: refused (3) naming the
+    # enrolled one and its command; nothing touched.
+    _h="$(fixture_home cluster-nomatch "$_platform")"
+    _before="$(tree_fingerprint "$_h")"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" --cluster=https://nomatch.example $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un --cluster with no matching enrollment exits 3" "$_rc" "3"
+    if [[ "$_out" == *"no enrollment on this machine matches --cluster=https://nomatch.example"* \
+        && "$_out" == *"--cluster=https://c.example"* && "$_out" == *"REFUSED"* ]]; then
+        pass "$_un --cluster no-match lists the enrolled cluster and its command"
+    else
+        fail "$_un --cluster no-match should list the enrolled command; got: $_out"
+    fi
+    expect_eq "$_un --cluster no-match changes nothing" "$(tree_fingerprint "$_h")" "$_before"
+
+    # --cluster=URL spelled another way (capitals, trailing slash) is the
+    # same enrollment -- matched the way the worker matches.
+    _h="$(fixture_home cluster-spelling "$_platform")"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" "--cluster=https://C.EXAMPLE/" $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un --cluster with another spelling of the URL exits 0" "$_rc" "0"
+    if [[ ! -e "${_h}/.memql/workers.yaml" && ! -e "${_h}/${_svc}" ]]; then
+        pass "$_un --cluster matches through case and a trailing slash"
+    else
+        fail "$_un --cluster spelling did not match; got: $_out"
+    fi
+
+    # --cluster URL (space form) is accepted too.
+    _h="$(fixture_home cluster-space "$_platform")"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" --cluster https://c.example $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un --cluster URL (space form) exits 0" "$_rc" "0"
+
+    # --cluster=URL with a sibling: that enrollment goes, the sibling and
+    # the whole runtime stay, exit 0.
+    _h="$(fixture_home cluster-sibling "$_platform")"
+    add_second_home "$_h"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" --cluster=https://c.example $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un --cluster with a sibling exits 0" "$_rc" "0"
+    if grep -q 'id: d.example' "${_h}/.memql/workers.yaml" && ! grep -q 'id: c.example' "${_h}/.memql/workers.yaml" \
+        && [[ -e "${_h}/${_svc}" && -x "${_h}/.memql/bin/${INSTALLED_COMMAND}" && "$_out" == *"1 other enrollment(s)"* ]]; then
+        pass "$_un --cluster with a sibling removes one home and keeps the runtime"
+    else
+        fail "$_un --cluster with a sibling; got: $_out $(cat "${_h}/.memql/workers.yaml" 2>&1)"
+    fi
+
+    # An installed memql too old for the unpair contract (0.15.0): the
+    # only enrollment goes with the runtime; with a sibling it refuses (4).
+    _h="$(fixture_home old-one "$_platform")"
+    write_memql_stub "${_h}/.memql/bin/${_pf_headless}" 0.14.0 old
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un old binary + one enrollment exits 0" "$_rc" "0"
+    if [[ "$_out" == *"predates URL-scoped unpair"* && "$_out" == *"only enrollment"* && ! -e "${_h}/.memql/workers.yaml" ]]; then
+        pass "$_un old binary + one enrollment falls back to full removal and says so"
+    else
+        fail "$_un old binary + one enrollment; got: $_out"
+    fi
+    _h="$(fixture_home old-two "$_platform")"
+    add_second_home "$_h"
+    write_memql_stub "${_h}/.memql/bin/${_pf_headless}" 0.14.0 old
+    _before="$(tree_fingerprint "$_h")"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" --cluster=https://c.example $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un old binary + sibling exits 4" "$_rc" "4"
+    if [[ "$_out" == *"0.15.0 or newer"* && "$_out" == *"--all-homes"* ]]; then
+        pass "$_un old binary + sibling names the upgrade and --all-homes"
+    else
+        fail "$_un old binary + sibling remedy; got: $_out"
+    fi
+    expect_eq "$_un old binary + sibling changes nothing" "$(tree_fingerprint "$_h")" "$_before"
+    # A binary whose version line says nothing but whose flag parser
+    # refuses --cluster-url (exit 2) is the same case, found at the call.
+    _h="$(fixture_home old-mute "$_platform")"
+    write_memql_stub "${_h}/.memql/bin/${_pf_headless}" "" old
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un mute old binary + one enrollment exits 0" "$_rc" "0"
+    if [[ "$_out" == *"does not support URL-scoped unpair"* && ! -e "${_h}/.memql/workers.yaml" ]]; then
+        pass "$_un mute old binary is detected at the call and falls back"
+    else
+        fail "$_un mute old binary; got: $_out"
+    fi
+
+    # No binary at all: the only enrollment goes with the runtime; with
+    # a sibling and an explicit --cluster it refuses (4).
+    _h="$(fixture_home nobin-one "$_platform")"
+    rm -f "${_h}/.memql/bin/${_pf_headless}" "${_h}/.memql/bin/${INSTALLED_COMMAND}"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un no binary + one enrollment exits 0" "$_rc" "0"
+    if [[ "$_out" == *"only enrollment"* && ! -e "${_h}/.memql/workers.yaml" && ! -e "${_h}/.memql/worker.yaml" ]]; then
+        pass "$_un no binary + one enrollment removes the worker files with the runtime"
+    else
+        fail "$_un no binary + one enrollment; got: $_out"
+    fi
+    _h="$(fixture_home nobin-two "$_platform")"
+    add_second_home "$_h"
+    rm -f "${_h}/.memql/bin/${_pf_headless}" "${_h}/.memql/bin/${INSTALLED_COMMAND}"
+    _before="$(tree_fingerprint "$_h")"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" --cluster=https://c.example $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un no binary + sibling + --cluster exits 4" "$_rc" "4"
+    expect_eq "$_un no binary + sibling changes nothing" "$(tree_fingerprint "$_h")" "$_before"
+
+    # A registry the reader cannot make sense of: refused (5) untouched;
+    # --all-homes is the way past it.
+    _h="$(fixture_home unreadable "$_platform")"
+    printf 'homes: [invalid yaml' > "${_h}/.memql/workers.yaml"
+    _before="$(tree_fingerprint "$_h")"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un unreadable registry + no flags exits 5" "$_rc" "5"
+    expect_eq "$_un unreadable registry changes nothing" "$(tree_fingerprint "$_h")" "$_before"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" --all-homes $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un unreadable registry + --all-homes exits 0" "$_rc" "0"
+    if [[ ! -e "${_h}/.memql/workers.yaml" ]]; then
+        pass "$_un --all-homes removes an unreadable registry"
+    else
+        fail "$_un --all-homes left the unreadable registry"
+    fi
+
+    # Bad parameters stay 2: an empty --cluster=, and both scope flags.
+    _h="$(fixture_home badparam "$_platform")"
+    _out="$(run_uninstaller "$_un" "$_h" --cluster=)"
+    expect_eq "$_un --cluster= (empty) exits 2" "$?" "2"
+    _out="$(run_uninstaller "$_un" "$_h" --cluster=https://c.example --all-homes)"
+    expect_eq "$_un --cluster + --all-homes exits 2" "$?" "2"
+
+    # --dry-run: the plan, and HOME byte-identical afterwards -- with no
+    # flags, with --purge, with --cluster piped exactly as the one-liner
+    # runs it, and the two-enrollment refusal with the same code.
+    _h="$(fixture_home dry "$_platform")"
+    _before="$(tree_fingerprint "$_h")"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" --dry-run $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un --dry-run exits 0" "$_rc" "0"
+    if [[ "$_out" == *"DRY RUN: nothing was changed."* && "$_out" == *"would unpair:  https://c.example"* \
+        && "$_out" == *"would remove:  ${_h}/.memql/workers.yaml"* && "$_out" == *"sudo:          not needed"* \
+        && "$_out" == *"would keep:    ${_h}/.memql/policy.yaml"* ]]; then
+        pass "$_un --dry-run prints the plan (unpair, paths, sudo, kept state)"
+    else
+        fail "$_un --dry-run plan is incomplete; got: $_out"
+    fi
+    expect_eq "$_un --dry-run leaves HOME byte-identical" "$(tree_fingerprint "$_h")" "$_before"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" --purge --dry-run $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un --purge --dry-run exits 0" "$_rc" "0"
+    if [[ "$_out" == *"would remove:  ${_h}/.memql/policy.yaml"* && "$_out" == *"would remove:  ${_h}/.memql/state (recursively)"* ]]; then
+        pass "$_un --purge --dry-run plans the purge targets"
+    else
+        fail "$_un --purge --dry-run plan; got: $_out"
+    fi
+    expect_eq "$_un --purge --dry-run leaves HOME byte-identical" "$(tree_fingerprint "$_h")" "$_before"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller_piped "$_un" "$_h" --cluster=https://c.example --dry-run $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un piped 'bash -s -- --cluster=URL --dry-run' exits 0" "$_rc" "0"
+    if [[ "$_out" == *"DRY RUN: nothing was changed."* && "$_out" == *"would unpair:  https://c.example"* ]]; then
+        pass "$_un piped --cluster --dry-run prints the plan"
+    else
+        fail "$_un piped --cluster --dry-run; got: $_out"
+    fi
+    expect_eq "$_un piped --cluster --dry-run leaves HOME byte-identical" "$(tree_fingerprint "$_h")" "$_before"
+    add_second_home "$_h"
+    _before="$(tree_fingerprint "$_h")"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" --dry-run $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un --dry-run with two enrollments refuses with 2" "$_rc" "2"
+    expect_eq "$_un --dry-run refusal leaves HOME byte-identical" "$(tree_fingerprint "$_h")" "$_before"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" --cluster=https://c.example --dry-run $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un --cluster --dry-run with a sibling exits 0" "$_rc" "0"
+    if [[ "$_out" == *"1 other enrollment(s) would remain"* && "$_out" == *"would stay for the remaining enrollment(s)"* ]]; then
+        pass "$_un --cluster --dry-run with a sibling says the runtime would stay"
+    else
+        fail "$_un --cluster --dry-run with a sibling; got: $_out"
+    fi
+    expect_eq "$_un --cluster --dry-run with a sibling leaves HOME byte-identical" "$(tree_fingerprint "$_h")" "$_before"
+
+    # (f) The exact shapes MemQL OS emits, piped, on an empty HOME: all
+    # parse, all exit 0, none creates ~/.memql.
+    for _shape in "" "--purge" "--user-local" "--cluster=https://api.example.test" "--cluster=https://api.example.test --dry-run" "--cluster=https://api.example.test --purge --user-local"; do
+        _h="${_tmp}/nf-shape-${_platform}-${_shape//[^a-z]/_}"
+        mkdir -p "$_h"
+        # shellcheck disable=SC2086  # the shape is a flag list on purpose
+        _out="$(run_uninstaller_piped "$_un" "$_h" $_shape)"
+        _rc=$?
+        if [[ "$_rc" == 0 && ! -e "${_h}/.memql" && "$_out" != *"choose --cluster"* \
+            && ( "$_out" == *"SUCCESS:"* || "$_out" == *"DRY RUN: nothing was changed."* ) ]]; then
+            pass "$_un piped 'bash -s -- ${_shape}' parses and runs clean on an empty HOME"
+        else
+            fail "$_un piped 'bash -s -- ${_shape}' rc=$_rc; got: $_out"
+        fi
+    done
+done
+
+# A symlinked enrollment file is not decided from (3), on either driver.
+_h="${_tmp}/nf-alias"
+mkdir -p "${_h}/.memql" "${_tmp}/nf-alias-target"
+printf 'version: 1\nhomes:\n  - id: c.example\n    cluster_url: https://c.example\n    token: mql_wkr_x\n' > "${_tmp}/nf-alias-target/workers.yaml"
+ln -s "${_tmp}/nf-alias-target/workers.yaml" "${_h}/.memql/workers.yaml"
+for _un in uninstall-mac.sh uninstall-linux.sh; do
+    _out="$(run_uninstaller "$_un" "$_h" --user-local)"
+    expect_eq "$_un symlinked workers.yaml + no flags exits 3" "$?" "3"
+    if [[ -f "${_tmp}/nf-alias-target/workers.yaml" && -L "${_h}/.memql/workers.yaml" ]]; then
+        pass "$_un symlinked workers.yaml is left alone"
+    else
+        fail "$_un touched the symlinked registry or its target"
+    fi
+done
+
+# ---------------------------------------------------------------
+# Installers -- the --version pin
+# ---------------------------------------------------------------
+#
+# MEMQL_INSTALL_RELEASE_BASE points the composition at a file:// tree
+# laid out like the releases page, so the pinned URL is asserted from
+# the preflight's own "checking release asset" line and the download
+# attempt that follows it -- offline, and exactly the URL a real run
+# would fetch. The run still fails later, by design (download_binary
+# refuses file://); what is under test is the URL.
+
+_rel="${_tmp}/releases"
+mkdir -p "${_rel}/download/v0.16.0" "${_rel}/latest/download"
+printf 'stub-binary' > "${_rel}/download/v0.16.0/${_pf_headless}"
+printf 'stub-binary' > "${_rel}/latest/download/${_pf_headless}"
+
+for _installer in install-mac.sh install-linux.sh; do
+    for _spelling in "--version=v0.16.0" "--version=0.16.0" "--version 0.16.0"; do
+        _vh="${_tmp}/ver-home-${_installer}-${_spelling//[^a-z0-9]/_}"
+        mkdir -p "$_vh"
+        # shellcheck disable=SC2086  # the spelling may be two words
+        _out="$(cd "$_script_dir" && HOME="$_vh" MEMQL_INSTALL_RELEASE_BASE="file://${_rel}" "./${_installer}" \
+            --token mql_wkr_test --cluster https://c.example --user-local --no-service $_spelling 2>&1)"
+        _rc=$?
+        if [[ "$_rc" != 4 && "$_out" == *"INFO: checking release asset file://${_rel}/download/v0.16.0/${_pf_headless}"* \
+            && "$_out" == *"INFO: downloading file://${_rel}/download/v0.16.0/${_pf_headless}"* ]]; then
+            pass "$_installer ${_spelling} composes the pinned download base"
+        else
+            fail "$_installer ${_spelling} should download from download/v0.16.0; rc=$_rc got: $_out"
+        fi
+        if [[ "$_out" == *"v0.16.0"* && "$_out" == *"fresh install"* ]]; then
+            pass "$_installer ${_spelling} names v0.16.0 as the target"
+        else
+            fail "$_installer ${_spelling} should name the pinned version; got: $_out"
+        fi
+    done
+
+    # Without a pin the base is the latest release, composed from the same root.
+    _vh="${_tmp}/ver-home-${_installer}-latest"
+    mkdir -p "$_vh"
+    _out="$(cd "$_script_dir" && HOME="$_vh" MEMQL_INSTALL_RELEASE_BASE="file://${_rel}" "./${_installer}" \
+        --token mql_wkr_test --cluster https://c.example --user-local --no-service 2>&1)"
+    if [[ "$_out" == *"INFO: checking release asset file://${_rel}/latest/download/${_pf_headless}"* ]]; then
+        pass "$_installer without --version downloads from latest/download"
+    else
+        fail "$_installer default base should be latest/download; got: $_out"
+    fi
+
+    # --download-base wins for the location when both are given.
+    _vh="${_tmp}/ver-home-${_installer}-both"
+    mkdir -p "$_vh"
+    _out="$(cd "$_script_dir" && HOME="$_vh" MEMQL_INSTALL_RELEASE_BASE="file://${_rel}" "./${_installer}" \
+        --token mql_wkr_test --cluster https://c.example --user-local --no-service \
+        --version=v0.16.0 --download-base "file://${_pf_assets}" 2>&1)"
+    if [[ "$_out" == *"INFO: checking release asset file://${_pf_assets}/${_pf_headless}"* ]]; then
+        pass "$_installer --download-base wins over --version for the location"
+    else
+        fail "$_installer --download-base should win; got: $_out"
+    fi
+
+    # A malformed pin is a bad parameter (2), before any preflight.
+    _vh="${_tmp}/ver-home-${_installer}-bad"
+    mkdir -p "$_vh"
+    _out="$(cd "$_script_dir" && HOME="$_vh" "./${_installer}" \
+        --token mql_wkr_test --cluster https://c.example --user-local --no-service --version=banana 2>&1)"
+    _rc=$?
+    expect_eq "$_installer --version=banana exits 2" "$_rc" "2"
+    if [[ "$_out" == *"ERROR: --version wants"* && "$_out" != *"checking release asset"* ]]; then
+        pass "$_installer --version=banana is refused before the preflight"
+    else
+        fail "$_installer --version=banana; got: $_out"
+    fi
+    _out="$(cd "$_script_dir" && HOME="$_vh" "./${_installer}" \
+        --token mql_wkr_test --cluster https://c.example --user-local --no-service --version 2>&1)"
+    expect_eq "$_installer --version without a value exits 2" "$?" "2"
+    if [[ "$_out" == *"--version"* ]]; then
+        pass "$_installer documents --version in its help"
+    else
+        fail "$_installer help should document --version"
+    fi
+done
 
 # ---------------------------------------------------------------
 # Summary

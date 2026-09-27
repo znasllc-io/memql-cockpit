@@ -57,18 +57,36 @@ macOS version is read from the actual worker Mach-O build metadata.
 
 ## Uninstall and local lifecycle testing
 
-Fleet must pass the selected cluster URL to the current macOS uninstaller:
+Fleet composes the macOS uninstaller with the selected cluster URL; every flag
+is optional, and a person copying the line need know nothing else:
 
 ```sh
-scripts/install/uninstall-mac.sh --cluster=https://api.example.com --user-local
+scripts/install/uninstall-mac.sh --cluster=https://api.example.com
 # Explicit whole-machine worker removal:
-scripts/install/uninstall-mac.sh --all-homes --user-local
+scripts/install/uninstall-mac.sh --all-homes
+# Only the per-user install (~/.memql/bin, ~/Applications/MemQL.app); never sudo:
+scripts/install/uninstall-mac.sh --cluster=https://api.example.com --user-local
+# The plan only, nothing changed:
+scripts/install/uninstall-mac.sh --cluster=https://api.example.com --dry-run
 ```
 
-A cluster removal uses the worker's YAML decoder and enrollment identity rules.
-It removes duplicate homes for that cluster and repairs the legacy token mirror.
-If another home remains (including a disabled home), the shared app, CLI, menu,
-policy and state stay. A running worker is stopped before the change and reloaded
+With neither `--cluster` nor `--all-homes` the script decides from the
+machine's enrollment files: one enrolled cluster is removed as if
+`--cluster=<its URL>` were given, none removes the runtime as `--all-homes`
+would, and several are refused (exit 2) with the exact command for each. A
+`--cluster` URL that matches no enrollment is refused (exit 3) with the
+enrolled ones listed; matching ignores whitespace and a trailing slash and
+compares the host case-insensitively, as the worker does. Without
+`--user-local` the install shape is detected: the per-user shape, the system
+shape (`/usr/local/bin`, `/Applications/MemQL.app`; sudo, asked for only when
+one is present and after the script has said so), or both.
+
+A cluster removal uses the worker's YAML decoder and enrollment identity rules
+(`memql worker unpair --cluster-url`, 0.15.0+; an older installed binary
+proceeds as `--all-homes` when the requested cluster is the only enrollment,
+and refuses with exit 4 when others exist). It removes duplicate homes for that
+cluster and repairs the legacy token mirror. If another home remains (including
+a disabled home), the shared app, CLI, menu, policy and state stay. A running worker is stopped before the change and reloaded
 for its remaining homes; a stopped worker is not started. The last enrollment
 removes the shared runtime, current and known legacy agents, and standard app.
 Uninstall waits up to ten seconds for launchd to remove each stopped service.
@@ -81,8 +99,10 @@ for only Accessibility and ScreenCapture and the known installed worker/menu
 bundle IDs. Failure retains the resolvable app and reports partial cleanup.
 Another standard MemQL installation sharing those IDs blocks the reset. Run the
 uninstaller as the current user, without sudo; privileged file deletion is separate.
-If tokens remain but the worker binary is missing or the YAML is invalid, scoped
-removal refuses safely; restore the files or explicitly choose full removal.
+If tokens remain but the worker binary is missing, a scoped removal of the only
+enrollment proceeds as full removal and says so; with other enrollments present
+it refuses (exit 4). An unreadable registry is refused (exit 5) before anything
+is touched: restore the file or explicitly choose `--all-homes`.
 
 Default removal keeps policy, state/logs, CLI credentials, cluster settings,
 certificates, models and rollback backups. `--purge` additionally removes worker

@@ -14,13 +14,25 @@
 # nothing here prompts except sudo.
 #
 # Usage:
-#   ./uninstall-mac.sh --cluster=URL|--all-homes [--purge] [--user-local]
+#   ./uninstall-mac.sh [--cluster=URL|--all-homes] [--purge] [--user-local] [--dry-run]
 #
-# Scope: ~/.memql, the managed LaunchAgents, binary paths under the chosen
-# prefix, and the standard MemQL app for that prefix. Rollback copies remain.
-# The machine's registration on the cluster is revoked from MemQL OS
-# (Fleet -> Machines), not from here -- by the time this script could
-# ask, the token that would have spoken for the machine is gone.
+# With neither --cluster nor --all-homes the script decides from the
+# machine: one enrollment is removed as if --cluster=<its url> were
+# given, none means the runtime files go (--all-homes), and several is
+# a refusal that prints the exact command for each. Which install shape
+# to remove is detected the same way: the per-user one (~/.memql/bin +
+# ~/Applications/MemQL.app), the system one (/usr/local/bin +
+# /Applications/MemQL.app, sudo), or both; --user-local narrows the run
+# to the per-user shape. Both decisions exist because MemQL OS composes
+# this as a one-liner and the person copying it should not have to know
+# either answer.
+#
+# Scope: ~/.memql, the managed LaunchAgents, binary paths under the
+# detected prefixes, and the standard MemQL app for each. Rollback
+# copies remain. The machine's registration on the cluster is revoked
+# from MemQL OS (Fleet -> Machines), not from here -- by the time this
+# script could ask, the token that would have spoken for the machine is
+# gone.
 
 set -euo pipefail
 
@@ -31,6 +43,10 @@ set -euo pipefail
 # script from -- and overridable so lib_test.sh can point the fetch
 # at a local file:// fixture and stay offline.
 readonly RAW_BASE="${MEMQL_INSTALL_RAW_BASE:-https://raw.githubusercontent.com/znasllc-io/memql-cockpit/main/scripts/install}"
+
+# This file's own name: the remedy printed for an ambiguous run has to
+# spell the command back, and under `bash -s --` $0 does not know it.
+readonly SCRIPT_NAME="uninstall-mac.sh"
 
 # Source the shared helper library. A sibling lib.sh (the cloned-repo
 # case) always wins, so a checkout never gains a network dependency.
@@ -69,21 +85,42 @@ and its symlink, and ~/.memql/workers.yaml plus the legacy
 worker.yaml (the tokens). Also removes the standard MemQL app and menu helper;
 custom app destinations and rollback copies are retained.
 
+With no options the script decides from the machine: one enrolled
+cluster is removed as if --cluster=<its URL> were given; no enrollment
+removes the worker runtime as --all-homes would; several enrollments
+are refused with the exact command to run for each. The install shape
+is detected too: the per-user install (\$HOME/.memql/bin,
+\$HOME/Applications/MemQL.app), the system install (/usr/local/bin,
+/Applications/MemQL.app, needs sudo), or both when both exist.
+
 Options:
     --cluster=URL             Remove this cluster enrollment. Keep the app and
                               services if any other enrollment remains.
     --all-homes               Remove every worker enrollment and shared runtime.
                               Last/full removal resets MemQL app approvals for
                               Accessibility and Screen Recording only.
-                              Required unless --cluster is supplied.
-    --user-local              Remove a --user-local install from
-                              \$HOME/.memql/bin instead of the default
-                              /usr/local/bin (which needs sudo).
+    --user-local              Remove only the per-user install under
+                              \$HOME/.memql/bin and \$HOME/Applications; never
+                              asks for sudo. Without it every shape found is
+                              removed, and sudo is asked for only when a
+                              system install is actually present.
     --purge                   Also remove ~/.memql/policy.yaml, the state
                               dir (logs, ledgers) and, once it is empty,
                               ~/.memql itself. Without it they are kept,
-                              and the script says so.
+                              and the script says so. Refused while another
+                              enrollment remains.
+    --dry-run                 Resolve everything -- the enrollment(s) that
+                              match, the install shape(s) found, every path
+                              and service that would go, whether sudo would
+                              be needed -- and print that plan without
+                              changing anything. Exit 0, or the refusal the
+                              real run would give before touching anything.
     --help                    Print this help
+
+Exit codes: 0 everything that existed was removed; 2 bad parameter (or
+several enrollments and none named); 3 refused; 4 a prerequisite is
+missing (sudo, the binary a scoped removal needs); 5 a step failed. A
+non-zero exit always names what remains and what to do about it.
 
 The machine's registration on the cluster is revoked from MemQL OS
 (Fleet -> Machines), not from here.
@@ -91,16 +128,21 @@ EOF
 }
 
 function parse_args() {
-    REMOVE_MODE="system"  # default: the sudo-gated /usr/local/bin, as the install's
+    REMOVE_SCOPE="auto"  # every install shape present; --user-local narrows to the per-user one
     PURGE="no"
     CLUSTER_URL=""
     ALL_HOMES="no"
+    DRY_RUN="no"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --user-local) REMOVE_MODE="user-local"; shift ;;
+            --user-local) REMOVE_SCOPE="user-local"; shift ;;
             --purge)      PURGE="yes"; shift ;;
-            --cluster=*)  CLUSTER_URL="${1#*=}"; shift ;;
+            --dry-run)    DRY_RUN="yes"; shift ;;
+            --cluster=*)
+                CLUSTER_URL="${1#*=}"
+                [[ -n "$CLUSTER_URL" ]] || { echo "ERROR: --cluster needs a URL" >&2; exit 2; }
+                shift ;;
             --cluster)    [[ $# -gt 1 ]] || { echo "ERROR: --cluster needs a URL" >&2; exit 2; }; CLUSTER_URL="$2"; shift 2 ;;
             --all-homes)  ALL_HOMES="yes"; shift ;;
             --help|-h)    show_help; exit 0 ;;
@@ -114,14 +156,81 @@ function parse_args() {
                 ;;
         esac
     done
-    if [[ -z "$CLUSTER_URL" && "$ALL_HOMES" != yes ]] || [[ -n "$CLUSTER_URL" && "$ALL_HOMES" == yes ]]; then
-        echo "ERROR: choose --cluster=URL or --all-homes" >&2
+    # Neither flag is fine -- resolve_uninstall_scope decides from the
+    # machine -- but both at once still contradict each other.
+    if [[ -n "$CLUSTER_URL" && "$ALL_HOMES" == yes ]]; then
+        echo "ERROR: --cluster=URL and --all-homes exclude each other; pass one" >&2
         exit 2
     fi
     if [[ -L "$HOME/.memql" ]]; then
         echo "ERROR: refusing an aliased ~/.memql directory" >&2
         exit 3
     fi
+}
+
+# worker_app_for_mode prints the standard MemQL app path for an
+# install shape; the app follows the CLI's prefix.
+function worker_app_for_mode() {
+    case "$1" in
+        system) echo "/Applications/MemQL.app" ;;
+        *)      echo "$HOME/Applications/MemQL.app" ;;
+    esac
+}
+
+# install_shape_present prints what is on disk for one shape -- the
+# bin directory when any of the install's names is in it, the app
+# when it is there -- one per line, or nothing.
+function install_shape_present() {
+    local mode="$1" app
+    if install_mode_has_files "$mode"; then
+        echo "$(install_mode_dir "$mode")/${INSTALLED_COMMAND} (and siblings)"
+    fi
+    app="$(worker_app_for_mode "$mode")"
+    if [[ -e "$app" || -L "$app" ]]; then
+        echo "$app"
+    fi
+}
+
+# detect_install_shapes decides WHICH shapes go from what is actually
+# installed, not from a flag the caller had to know: a machine may hold
+# the per-user shape, the system one, both after a mode switch, or
+# neither. --user-local narrows the run to the per-user shape and never
+# asks for sudo; otherwise every shape found is removed, and sudo is
+# named here, before it is asked for, only when something system-owned
+# is present. Sets REMOVE_MODES (space-separated; the two mode names
+# carry no spaces) and SYSTEM_SHAPE_PRESENT.
+function detect_install_shapes() {
+    local mode found
+    REMOVE_MODES="system user-local"
+    [[ "$REMOVE_SCOPE" != user-local ]] || REMOVE_MODES="user-local"
+    SYSTEM_SHAPE_PRESENT="no"
+    for mode in $REMOVE_MODES; do
+        found="$(install_shape_present "$mode")"
+        if [[ -n "$found" ]]; then
+            echo "INFO: ${mode} install found: $(printf '%s' "$found" | tr '\n' ' ')"
+            [[ "$mode" != system ]] || SYSTEM_SHAPE_PRESENT="yes"
+        else
+            echo "INFO: no ${mode} install under $(install_mode_dir "$mode") or at $(worker_app_for_mode "$mode")"
+        fi
+    done
+    if [[ "$SYSTEM_SHAPE_PRESENT" == yes ]]; then
+        echo "INFO: the system install is root-owned; removing it needs sudo, and you may be asked for your password."
+    fi
+}
+
+# ensure_system_sudo asks for sudo ONCE, right after the lines above
+# said why, and only when a system shape is actually present. A run
+# that cannot get it stops before touching anything: resetting the
+# app's privacy grants and deleting the per-user half around a system
+# app that then stays would leave a worse machine than the one found.
+function ensure_system_sudo() {
+    [[ "$SYSTEM_SHAPE_PRESENT" == yes ]] || return 0
+    if require_sudo uninstall; then
+        return 0
+    fi
+    echo "ERROR: this machine has a system install (listed above) and this session cannot use sudo; nothing was changed." >&2
+    echo "       Re-run from a terminal where sudo works, or pass --user-local to remove only the per-user install." >&2
+    return 4
 }
 
 # Stop by service label even when a partially removed install lost its plist.
@@ -147,6 +256,7 @@ function stop_agent() {
             sleep 0.25
         done
         echo "ERROR: could not stop $label (still loaded after 10s); runtime files retained" >&2
+        echo "       Stop it yourself, then re-run this uninstaller:  launchctl bootout $target" >&2
         return 5
     fi
 }
@@ -197,16 +307,20 @@ function stop_menu_bundle() {
         done
         if menu_process_matches "$pid" "$helper"; then
             echo "ERROR: menu PID $pid remains running after 10s; app retained" >&2
+            echo "       Quit MemQL from the menu bar (or kill $pid), then re-run this uninstaller." >&2
             return 5
         fi
         echo "INFO: stopped menu process $pid at $helper"
     done <<< "$processes"
 }
 
+# The embedded menu of every shape being removed, then the standalone
+# pre-0.15 menu companion, which only ever had the per-user location.
 function stop_remaining_menus() {
-    local app="$HOME/Applications/MemQL.app"
-    [[ "$REMOVE_MODE" != system ]] || app="/Applications/MemQL.app"
-    stop_menu_bundle "$app" com.znasllc.memql-worker 'Contents/Library/LoginItems/MemQL Menu.app/Contents/MacOS/MemQLCockpit' || return $?
+    local mode
+    for mode in $REMOVE_MODES; do
+        stop_menu_bundle "$(worker_app_for_mode "$mode")" com.znasllc.memql-worker 'Contents/Library/LoginItems/MemQL Menu.app/Contents/MacOS/MemQLCockpit' || return $?
+    done
     stop_menu_bundle "$HOME/Applications/MemQL Cockpit.app" com.znasllc.memql-cockpit-menubar 'Contents/MacOS/MemQLCockpit'
 }
 
@@ -230,51 +344,146 @@ function remove_menu_companion() {
     record_removed "$app"
 }
 
+# One shape's app. Only a bundle carrying OUR identifier is removed;
+# anything else at the standard path is named and left, with a
+# non-zero return so the summary is PARTIAL rather than SUCCESS over
+# something the person should look at.
 function remove_worker_app() {
-    local app identifier
-    case "$REMOVE_MODE" in system) app="/Applications/MemQL.app" ;; *) app="$HOME/Applications/MemQL.app" ;; esac
+    local mode="$1" app identifier
+    app="$(worker_app_for_mode "$mode")"
     [[ -e "$app" || -L "$app" ]] || return 0
-    if [[ -L "$app" || ! -d "$app" ]]; then record_kept "$app"; return 1; fi
+    if [[ -L "$app" || ! -d "$app" ]]; then record_kept "$app (not a regular app bundle; inspect and delete by hand)"; return 1; fi
     identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null || true)"
     if [[ "$identifier" != com.znasllc.memql-worker ]]; then
-        echo "WARN: leaving unrelated app at $app"; record_kept "$app"; return 1
+        echo "WARN: leaving unrelated app at $app"; record_kept "$app (bundle identifier is not ours; inspect and delete by hand)"; return 1
     fi
-    case "$REMOVE_MODE" in
+    case "$mode" in
         system)
-            if ! require_sudo uninstall || ! sudo rm -rf "$app"; then record_kept "$app"; return 1; fi
+            if ! require_sudo uninstall || ! sudo rm -rf "$app"; then record_kept "$app (needs sudo; delete it by hand)"; return 1; fi
             ;;
         *)
-            if [[ ! -O "$app" ]]; then record_kept "$app"; return 1; fi
+            if [[ ! -O "$app" ]]; then record_kept "$app (not owned by you; delete it by hand)"; return 1; fi
             rm -rf "$app"
             ;;
     esac
     record_removed "$app"
 }
 
-# Use the worker's YAML decoder and identity rules, never a text approximation
-# of workers.yaml. A partially missing CLI may still have the real app worker.
+function remove_worker_apps() {
+    local mode rc=0
+    for mode in $REMOVE_MODES; do
+        remove_worker_app "$mode" || rc=$?
+    done
+    return "$rc"
+}
+
+function remove_binaries_for_modes() {
+    local mode rc=0 step_rc
+    for mode in $REMOVE_MODES; do
+        step_rc=0
+        remove_binaries_with_mode "$mode" || step_rc=$?
+        [[ "$rc" -ne 0 ]] || rc="$step_rc"
+    done
+    return "$rc"
+}
+
+# retain_runtime is what happens to the app and the CLI when a step
+# between stopping the worker and deleting the bundle failed -- a menu
+# that would not stop, a permission reset that did not go through. The
+# retry needs a bundle Launch Services can still resolve, and a `memql`
+# pointing into a deleted app helps nobody, so both stay and the
+# summary says so; the error above names the remedy.
+function retain_runtime() {
+    local why="$1" mode app dest_dir name names
+    names="$(mode_binary_names)"
+    for mode in $REMOVE_MODES; do
+        app="$(worker_app_for_mode "$mode")"
+        [[ ! -d "$app" ]] || record_kept "$app (${why})"
+        dest_dir="$(install_mode_dir "$mode")"
+        for name in $names; do
+            if [[ -e "$dest_dir/$name" || -L "$dest_dir/$name" ]]; then
+                record_kept "$dest_dir/$name (${why})"
+            fi
+        done
+    done
+    app="$HOME/Applications/MemQL Cockpit.app"
+    [[ ! -d "$app" ]] || record_kept "$app (${why})"
+}
+
+# installed_memql_binary prints a memql that can parse the enrollment
+# files: the app's worker for each shape being removed, else the CLI in
+# that shape's bin directory. Any of them will do -- they are the same
+# build -- and a dangling symlink is skipped.
+function installed_memql_binary() {
+    local mode candidates=""
+    for mode in $REMOVE_MODES; do
+        candidates="$candidates
+$(worker_app_for_mode "$mode")/Contents/MacOS/MemQL
+$(install_mode_dir "$mode")/${INSTALLED_COMMAND}"
+    done
+    local IFS=$'\n'
+    # shellcheck disable=SC2086  # split on newlines on purpose; paths may hold spaces
+    first_executable $candidates
+}
+
+# Use the worker's YAML decoder and identity rules, never a text
+# approximation of workers.yaml: the shell's view of the registry
+# (scoped_precheck) only counts and names clusters -- which homes belong
+# to one is the binary's call. A partially missing CLI may still have
+# the real app worker. The cases where no binary can be asked (none
+# installed, or one older than the 0.15.0 unpair contract) are settled
+# by scoped_without_binary: full removal when this is the only
+# enrollment, a refusal when others would be swept with it.
 function scoped_unpair() {
-    local binary="$HOME/Applications/MemQL.app/Contents/MacOS/MemQL"
-    [[ "$REMOVE_MODE" != system ]] || binary="/Applications/MemQL.app/Contents/MacOS/MemQL"
-    [[ -x "$binary" ]] || binary="$(install_mode_dir "$REMOVE_MODE")/memql"
-    if [[ ! -f "$HOME/.memql/workers.yaml" && ! -f "$HOME/.memql/worker.yaml" && ! -L "$HOME/.memql/workers.yaml" && ! -L "$HOME/.memql/worker.yaml" ]]; then
+    scoped_precheck "$SCRIPT_NAME" "$CARRIED_FLAGS" || return $?
+    if [[ "$SCOPED_DECISION" == full ]]; then
         OTHER_HOMES=0
         return 0
     fi
-    if [[ ! -x "$binary" ]]; then
-        echo "ERROR: cluster-scoped removal needs the installed MemQL binary to parse enrollment safely. Restore its files, or explicitly use --all-homes for complete removal." >&2
-        return 4
+    local binary="" ver=""
+    binary="$(installed_memql_binary)" || binary=""
+    [[ -z "$binary" ]] || ver="$(read_binary_version "$binary")"
+    binary_speaks_scoped_unpair "$binary" "$ver" || binary=""
+    if [[ -z "$binary" ]]; then
+        scoped_without_binary
+        return $?
     fi
-    local result remaining plist target was_loaded=no
+    local result remaining plist target was_loaded=no rc=0
     result="$(mktemp)"
-    if ! "$binary" worker unpair --cluster-url "$CLUSTER_URL" --dry-run --json > "$result"; then
-        rm -f "$result"; return 5
-    fi
-    remaining="$(/usr/bin/plutil -extract remaining raw -o - "$result")" || { rm -f "$result"; return 5; }
+    "$binary" worker unpair --cluster-url "$CLUSTER_URL" --dry-run --json > "$result" 2> "$result.err" || rc=$?
+    case "$rc" in
+        0) ;;
+        1|2)
+            # flag.ExitOnError's "flag provided but not defined" (2) or an
+            # unknown `worker` verb (1): a build that does not speak the
+            # contract, whatever its version line said. Not a fault of
+            # this machine's files, so the no-binary rule applies.
+            rm -f "$result" "$result.err"
+            echo "INFO: the installed memql${ver:+ v$ver} does not support URL-scoped unpair"
+            scoped_without_binary
+            return $?
+            ;;
+        *)
+            cat "$result.err" >&2
+            rm -f "$result" "$result.err"
+            return 5
+            ;;
+    esac
+    rm -f "$result.err"
+    remaining="$(unpair_json_remaining "$result")" || { rm -f "$result"; return 5; }
+    PREVIEW_REMOVED="$(unpair_json_removed "$result")"
     if [[ "$PURGE" == yes && "$remaining" -gt 0 ]]; then
         rm -f "$result"
         echo "ERROR: --purge would erase state shared with other enrollments; no enrollment was removed. Omit --purge or explicitly use --all-homes." >&2
         return 3
+    fi
+    if [[ "$DRY_RUN" == yes ]]; then
+        # The preview IS the dry run of this step: the binary matched the
+        # enrollment(s) without writing anything.
+        rm -f "$result"
+        echo "  would unpair:  ${CLUSTER_URL} via ${binary} (${PREVIEW_REMOVED} home(s) match; ${remaining} other enrollment(s) would remain)"
+        OTHER_HOMES="$remaining"
+        return 0
     fi
     plist="$HOME/Library/LaunchAgents/$SERVICE_LABEL_DARWIN.plist"
     target="gui/$(id -u)/$SERVICE_LABEL_DARWIN"
@@ -291,7 +500,7 @@ function scoped_unpair() {
         echo "ERROR: removal did not complete; worker remains stopped so a removed token cannot reconnect. Repair enrollment before restarting." >&2
         return 5
     fi
-    OTHER_HOMES="$(/usr/bin/plutil -extract remaining raw -o - "$result")" || { rm -f "$result"; return 5; }
+    OTHER_HOMES="$(unpair_json_remaining "$result")" || { rm -f "$result"; return 5; }
     rm -f "$result"
     if [[ "$OTHER_HOMES" -gt 0 ]]; then
         local legacy
@@ -310,19 +519,21 @@ function scoped_unpair() {
 # bundle so Launch Services can still resolve its identifier. Its success means
 # decisions were reset, not that every cached Settings row has disappeared.
 function reset_installed_memql_permissions() {
-    local worker_app="$HOME/Applications/MemQL.app" app identifier targets="" service failed=no
-    [[ "$REMOVE_MODE" != system ]] || worker_app="/Applications/MemQL.app"
-    if [[ -L "$worker_app" ]]; then
-        echo "ERROR: refusing permission cleanup through an aliased MemQL app path" >&2
-        return 3
-    fi
-    for app in "$worker_app" "$worker_app/Contents/Library/LoginItems/MemQL Menu.app" "$HOME/Applications/MemQL Cockpit.app"; do
-        [[ -d "$app" && ! -L "$app" ]] || continue
-        identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null || true)"
-        case "$identifier" in
-            com.znasllc.memql-worker|com.znasllc.memql-cockpit-menubar)
-                case " $targets " in *" $identifier "*) ;; *) targets="$targets $identifier" ;; esac ;;
-        esac
+    local mode worker_app app identifier targets="" service failed=no
+    for mode in $REMOVE_MODES; do
+        worker_app="$(worker_app_for_mode "$mode")"
+        if [[ -L "$worker_app" ]]; then
+            echo "ERROR: refusing permission cleanup through an aliased MemQL app path" >&2
+            return 3
+        fi
+        for app in "$worker_app" "$worker_app/Contents/Library/LoginItems/MemQL Menu.app" "$HOME/Applications/MemQL Cockpit.app"; do
+            [[ -d "$app" && ! -L "$app" ]] || continue
+            identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null || true)"
+            case "$identifier" in
+                com.znasllc.memql-worker|com.znasllc.memql-cockpit-menubar)
+                    case " $targets " in *" $identifier "*) ;; *) targets="$targets $identifier" ;; esac ;;
+            esac
+        done
     done
     if [[ -z "$targets" ]]; then
         echo "INFO: no installed matching MemQL bundle found; no permission reset attempted. If a MemQL row remains in Settings, remove that row manually."
@@ -332,9 +543,12 @@ function reset_installed_memql_permissions() {
         echo "ERROR: run this uninstaller without sudo so permission resets stay scoped to your user account; privileged file removal is handled separately" >&2
         return 3
     fi
-    local alternate="/Applications/MemQL.app"
-    [[ "$REMOVE_MODE" != system ]] || alternate="$HOME/Applications/MemQL.app"
-    macos_privacy_scope_unique "$alternate" || return $?
+    # Privacy decisions are per bundle identifier, so a standard install
+    # that STAYS must keep its grants. Only a --user-local run leaves one
+    # (the system app); a run removing every shape has no alternate.
+    if [[ "$REMOVE_SCOPE" == user-local ]]; then
+        macos_privacy_scope_unique "$(worker_app_for_mode system)" || return $?
+    fi
     if ! command -v tccutil >/dev/null 2>&1; then
         echo "ERROR: tccutil is unavailable; app retained so its scoped permission cleanup can be retried" >&2
         return 4
@@ -356,30 +570,130 @@ function reset_installed_memql_permissions() {
     echo "INFO: MemQL authorization decisions reset. If Settings still displays a MemQL row, refresh Settings and remove that row manually; row disappearance is not guaranteed by tccutil."
 }
 
+# print_dry_run_plan is main()'s full-removal half as read-only probes,
+# in main()'s order, so what it prints is what the real run would do.
+# launchctl print and PlistBuddy read; nothing here writes or prompts.
+function print_dry_run_plan() {
+    local state_dir="$1" label plist target mode app identifier
+    echo ""
+    echo "DRY RUN: the plan for this machine. Nothing below has been done."
+    if [[ "$SYSTEM_SHAPE_PRESENT" == yes ]]; then
+        echo "  sudo:          needed (a system install is present); the real run asks once, before removing anything"
+    else
+        echo "  sudo:          not needed"
+    fi
+    for label in "$SERVICE_LABEL_DARWIN" "$LEGACY_LABEL_DARWIN" "com.visionarys.memql-cockpit-worker" "com.znasllc.memql-cockpit-menubar"; do
+        plist="${HOME}/Library/LaunchAgents/${label}.plist"
+        target="gui/$(id -u)/${label}"
+        if command -v launchctl >/dev/null 2>&1 && launchctl print "$target" >/dev/null 2>&1; then
+            echo "  would stop:    ${label} (loaded)"
+        fi
+        plan_path "$plist"
+    done
+    for mode in $REMOVE_MODES; do
+        app="$(worker_app_for_mode "$mode")"
+        if [[ -d "$app" && ! -L "$app" ]]; then
+            identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null || true)"
+            if [[ "$identifier" == com.znasllc.memql-worker ]]; then
+                echo "  would reset:   Accessibility + ScreenCapture decisions for ${identifier} (and its embedded menu)"
+                echo "  would remove:  $app"
+            else
+                echo "  would keep:    $app (bundle identifier is not ours)"
+            fi
+        elif [[ -e "$app" || -L "$app" ]]; then
+            echo "  would keep:    $app (not a regular app bundle)"
+        fi
+        plan_binaries_with_mode "$mode"
+    done
+    if [[ "$REMOVE_SCOPE" == user-local && -d "$(worker_app_for_mode system)" ]]; then
+        echo "  note:          $(worker_app_for_mode system) stays (--user-local); if it is a MemQL install the real run refuses the permission reset"
+    fi
+    app="$HOME/Applications/MemQL Cockpit.app"
+    if [[ -d "$app" && ! -L "$app" ]]; then
+        echo "  would remove:  $app (standalone menu companion)"
+    fi
+    plan_worker_config
+    if [[ "$PURGE" == yes ]]; then
+        plan_purge_state "$state_dir"
+    else
+        plan_kept_state "$state_dir"
+    fi
+    echo "  kept always:   CLI credentials, cluster settings, certificates, rollback backups"
+    echo ""
+    echo "DRY RUN: nothing was changed."
+}
+
+# finish is the ONE way out once anything may have changed: every path
+# prints the summary -- what went, what stayed and why -- and exits
+# with the code it was handed, so a refusal halfway through never
+# leaves the person reading a stack of INFO lines with no verdict.
+function finish() {
+    local rc="$1"
+    print_uninstall_summary "$rc"
+    exit "$rc"
+}
+
 function main() {
     parse_args "$@"
-    local state_dir binary_rc=0
+    # The flags a printed remedy must carry so it is the same run plus
+    # the missing piece: only --user-local, which stays valid whatever
+    # scope is chosen (--purge is added only where it is allowed).
+    CARRIED_FLAGS=""
+    [[ "$REMOVE_SCOPE" != user-local ]] || CARRIED_FLAGS=" --user-local"
+    resolve_uninstall_scope "$SCRIPT_NAME" "$CARRIED_FLAGS" || exit $?
+    detect_install_shapes
+    # Read BEFORE the token files go: --purge deletes the directory the
+    # worker actually used, and the default is only where that usually is.
+    local state_dir rc=0
     state_dir="$(worker_state_dir_from_yaml "${HOME}/.memql/worker.yaml")"
     if [[ -n "$CLUSTER_URL" ]]; then
-        scoped_unpair || exit $?
-        [[ "$OTHER_HOMES" -eq 0 ]] || exit 0
+        # Refusals here (a worker that will not stop, a --purge with
+        # siblings, a missing binary the person relied on) leave every
+        # file as it was; the summary says REFUSED.
+        scoped_unpair || finish $?
+        # Siblings remain: the worker is still installed for them, so
+        # the SUCCESS line scoped_unpair printed is the whole verdict.
+        if [[ "$OTHER_HOMES" -gt 0 ]]; then
+            [[ "$DRY_RUN" != yes ]] || echo "DRY RUN: the shared app, CLI, menu, policy and state would stay for the remaining enrollment(s). Nothing was changed."
+            exit 0
+        fi
     fi
-    remove_launch_agent || exit $?
-    stop_remaining_menus || exit $?
-    reset_installed_memql_permissions || exit $?
-    remove_menu_companion
-    remove_binaries_with_mode "$REMOVE_MODE" || binary_rc=$?
-    remove_worker_app || binary_rc=1
+    if [[ "$DRY_RUN" == yes ]]; then
+        print_dry_run_plan "$state_dir"
+        exit 0
+    fi
+    # From here on the last enrollment is gone or never existed, and the
+    # runtime goes: services first, then the app's permission grants,
+    # then the app and the CLI, then the token files, then (--purge) the
+    # state. The order leaves the least behind if a step is interrupted.
+    ensure_system_sudo || finish $?
+    remove_launch_agent || finish $?
+    local runtime_rc=0
+    stop_remaining_menus || runtime_rc=$?
+    if [[ "$runtime_rc" -eq 0 ]]; then
+        reset_installed_memql_permissions || runtime_rc=$?
+    fi
+    if [[ "$runtime_rc" -eq 0 ]]; then
+        remove_menu_companion
+        remove_binaries_for_modes || rc=$?
+        remove_worker_apps || rc=$?
+    else
+        # The app stays resolvable for the retry; the tokens still go,
+        # because a stopped worker's dead token is the one thing this
+        # script must never leave behind.
+        retain_runtime "retained after the error above; re-run this uninstaller once it is fixed"
+        rc="$runtime_rc"
+    fi
     remove_worker_config
-    if [[ "$PURGE" == "yes" ]]; then
+    if [[ "$PURGE" == "yes" && "$runtime_rc" -eq 0 ]]; then
         purge_worker_state "$state_dir"
     else
+        [[ "$PURGE" != yes ]] || echo "INFO: --purge skipped while runtime files are retained; re-run with --purge once they are gone"
         report_kept_state "$state_dir"
     fi
     echo "INFO: CLI credentials, cluster settings, certificates and rollback backups are retained."
     echo "INFO: shared credentials/backups were not purged, and no service-wide permission reset or direct privacy database edit was performed."
-    print_uninstall_summary "$binary_rc"
-    exit "$binary_rc"
+    finish "$rc"
 }
 
 main "$@"

@@ -177,7 +177,11 @@ main "$@"
         saved_registry = (private / 'workers.yaml').read_bytes()
         uninstall('--cluster=https://fixture.invalid', '--purge', expected=3)
         assert (private / 'workers.yaml').read_bytes() == saved_registry
-        uninstall(expected=2)  # No implicit full-machine deletion.
+        # Two enrollments and no --cluster/--all-homes: the run must say which
+        # one, so it refuses (2) naming both and the command for each.
+        ambiguous = uninstall(expected=2)
+        assert b'--cluster=https://fixture.invalid' in ambiguous.stderr and b'--cluster=https://other.invalid' in ambiguous.stderr
+        assert (private / 'workers.yaml').read_bytes() == saved_registry
         (private / 'workers.yaml').write_text('homes: [invalid yaml')
         uninstall('--cluster=https://fixture.invalid', expected=5)
         assert (private / 'workers.yaml').read_text() == 'homes: [invalid yaml'
@@ -259,7 +263,11 @@ main "$@"
         assert token not in registry and token not in mirror
         assert 'mql_wkr_other_fixture' in registry and 'mql_wkr_other_fixture' in mirror
         assert all(path.read_bytes() == value for path, value in protected.items())
-        uninstall('--cluster=https://fixture.invalid')  # Missing target keeps other home.
+        # A URL no enrollment matches is refused (3) naming the enrolled one;
+        # a wrong URL never removes someone else's enrollment.
+        mismatch = uninstall('--cluster=https://fixture.invalid', expected=3)
+        assert b'--cluster=https://other.invalid' in mismatch.stderr
+        assert 'mql_wkr_other_fixture' in (private / 'workers.yaml').read_text()
         env['MEMQL_TEST_FAIL_STOP'] = '1'
         uninstall('--cluster=https://other.invalid', expected=5)
         assert cli.exists() and app.exists() and 'mql_wkr_other_fixture' in (private / 'workers.yaml').read_text()
@@ -288,7 +296,9 @@ main "$@"
         assert set(privacy_calls.read_text().splitlines()) == expected_resets
         assert len(privacy_calls.read_text().splitlines()) == 8
         assert all(path.read_bytes() == value for path, value in protected.items())
-        uninstall('--cluster=https://other.invalid')  # Idempotent after complete runtime removal.
+        # No enrollment at all: --cluster=URL has nothing to unpair and
+        # proceeds as --all-homes, so a repeated run is idempotent.
+        uninstall('--cluster=https://other.invalid')
         # Missing runtime cannot safely parse remaining homes: preserve and refuse.
         (private / 'workers.yaml').write_bytes(saved_registry)
         uninstall('--cluster=https://fixture.invalid', expected=4)
