@@ -46,14 +46,16 @@ import (
 // bytes are actually sent -- a touched file whose contents did not change
 // costs one read and no upload.
 type Stamp struct {
-	Size    int64  `json:"size"`
-	ModUnix int64  `json:"modUnix"`
-	SHA256  string `json:"sha256,omitempty"`
+	Identity string `json:"identity,omitempty"`
+	Size     int64  `json:"size"`
+	ModUnix  int64  `json:"modUnix"`
+	ModNano  int64  `json:"modNano,omitempty"`
+	SHA256   string `json:"sha256,omitempty"`
 }
 
 // Unchanged reports whether the cheap half matches, so no digest is needed.
 func (s Stamp) Unchanged(other Stamp) bool {
-	return s.Size == other.Size && s.ModUnix == other.ModUnix
+	return s.Size == other.Size && s.ModUnix == other.ModUnix && s.ModNano == other.ModNano && s.Identity == other.Identity
 }
 
 // Entry is one file the sweep found.
@@ -186,8 +188,8 @@ func Scan(root string, excludes []string, includeHidden bool, deny func(string) 
 			Path: path,
 			Rel:  rel,
 			Stamp: Stamp{
-				Size:    fi.Size(),
-				ModUnix: fi.ModTime().UTC().Unix(),
+				Identity: fileIdentity(fi), Size: fi.Size(),
+				ModUnix: fi.ModTime().UTC().Unix(), ModNano: fi.ModTime().UnixNano(),
 			},
 		})
 		out.Bytes += fi.Size()
@@ -283,5 +285,5 @@ func statOf(path string) (Stamp, error) {
 	if err != nil {
 		return Stamp{}, err
 	}
-	return Stamp{Size: fi.Size(), ModUnix: fi.ModTime().UTC().Unix()}, nil
+	return Stamp{Identity: fileIdentity(fi), Size: fi.Size(), ModUnix: fi.ModTime().UTC().Unix(), ModNano: fi.ModTime().UnixNano()}, nil
 }

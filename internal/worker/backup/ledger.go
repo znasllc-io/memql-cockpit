@@ -21,11 +21,9 @@ import (
 // stamp locally is what turns every sweep after the first into a few thousand
 // stat calls instead of a few thousand uploads.
 //
-// IT IS A CACHE, NOT A SOURCE OF TRUTH. Losing it costs one expensive sweep
-// and nothing else: every re-push is keyed on (machine, path), so a file the
-// ledger forgot is re-sent and lands as a new VERSION of the same row rather
-// than as a duplicate. That property is what lets this be a plain JSON file
-// with no migration story.
+// IT IS A CACHE, NOT A SOURCE OF TRUTH. Losing it requires comparison with the
+// remote digest before a version baseline can be adopted. A mismatch is a
+// conflict rather than permission to overwrite an unknown remote revision.
 //
 // ONE FILE PER WATCH, named by the watch id, so a watch somebody stopped can
 // be forgotten by deleting one file, and two watches sweeping concurrently
@@ -42,7 +40,8 @@ type Record struct {
 	// FileID is the v1:library:file the last push produced. Kept so the
 	// verify lane can report a state without asking the engine which row a
 	// path belongs to on every sweep; an empty value simply means "ask".
-	FileID string `json:"fileId,omitempty"`
+	FileID        string `json:"fileId,omitempty"`
+	VersionNumber int    `json:"versionNumber,omitempty"`
 	// PushedAtUnix is when those bytes were accepted.
 	PushedAtUnix int64 `json:"pushedAtUnix,omitempty"`
 	// VerifiedAtUnix is when this file's link state was last REPORTED to the
@@ -63,8 +62,9 @@ type Record struct {
 	//
 	// Cleared on success. A stale pair costs one extra request and falls
 	// through to a fresh session, so it can never stop a backup.
-	UploadID   string `json:"uploadId,omitempty"`
-	UploadSize int64  `json:"uploadSize,omitempty"`
+	UploadID     string `json:"uploadId,omitempty"`
+	UploadSize   int64  `json:"uploadSize,omitempty"`
+	UploadSHA256 string `json:"uploadSHA256,omitempty"`
 }
 
 // Ledger is one watch's record set, held in memory and persisted whole.
@@ -87,9 +87,8 @@ type ledgerDoc struct {
 // LoadLedger reads the ledger for one watch, or returns an empty one.
 //
 // EVERY FAILURE IS AN EMPTY LEDGER, not an error. A corrupt or unreadable
-// cache must not stop a backup: the cost of ignoring it is one expensive
-// sweep, and the cost of refusing to run is that somebody's files stop being
-// copied because a JSON file got truncated.
+// cache must not prevent verification. The manager compares the remote
+// digest before adopting the current version, and refuses unknown conflicts.
 func LoadLedger(stateDir, watchID string) *Ledger {
 	l := &Ledger{path: ledgerPath(stateDir, watchID), files: map[string]Record{}}
 	data, err := os.ReadFile(l.path)
@@ -187,6 +186,10 @@ func writeFileAtomic(path string, body []byte, mode os.FileMode) error {
 		_ = tmp.Close()
 		return fmt.Errorf("backup: write %s: %w", tmpName, err)
 	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("backup: close %s: %w", tmpName, err)
 	}
@@ -196,7 +199,14 @@ func writeFileAtomic(path string, body []byte, mode os.FileMode) error {
 	if err := os.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("backup: rename into %s: %w", path, err)
 	}
-	return nil
+	// Persist the directory entry too: syncing only the file can still lose
+	// the rename after a power failure.
+	directory, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
 }
 
 // ErrNoLedgerDir is returned when a caller asks for ledgers with no state

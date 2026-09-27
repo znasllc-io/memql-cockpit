@@ -142,3 +142,38 @@ up, last checked three weeks ago" is a different claim from "backed up".
   Files app like any other.
 - **Following symlinks out of a watched folder.** A link would let anything on
   the machine be pulled in, which is the policy veto defeated from the inside.
+
+## Source changes and interrupted transfers
+
+The watched folder is a collection of individually linked originals. It is
+separate from uploading a directory in Files, which creates one ZIP. Browser
+uploads cannot discover an absolute host path; tracking requires an explicitly
+configured watch and this machine's allowed backup roots.
+
+Each changed file is first copied to a private disk spool. The source must
+remain stable while that snapshot is prepared. Upload chunks read the snapshot,
+so editing the original during an upload cannot mix two versions. Large files
+therefore need temporary local disk space in addition to cluster storage.
+
+Before the first chunk is sent, Cockpit durably records the session and the
+snapshot's SHA-256. After restart it rebuilds the snapshot and resumes only if
+the bytes match, not merely because the filename and size match. A lost commit
+response is recovered from the completed session instead of creating another
+version. An inventory outage keeps the existing session for the next sweep.
+Orphaned local spools older than seven days are removed during preparation.
+
+Renames and moves within one authorized watched folder preserve the stored
+file and history when both filesystem identity (device/inode) and content
+match. Copies, ambiguous hard links, cross-volume moves and moves outside the
+watch are not guessed. The previous stored copy always remains available.
+
+An unavailable watched root may be an unplugged drive. Its files are marked
+**Unavailable**, not deleted. Individual originals are marked missing only
+when an authorized lookup confirms they no longer exist. Excluded or unreadable
+entries are unavailable. Host deletion never removes the stored copy.
+
+Uploads carry the last known stored version. If another editor has changed the
+stored file, Cockpit reports a conflict and preserves it. It does not write back
+to the host or silently choose a winner. If the local ledger was lost, a matching
+stored digest restores the baseline; unmatched content requires explicit review.
+Trashed origins are refused by the cluster rather than recreated by the watcher.
