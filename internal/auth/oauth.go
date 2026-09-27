@@ -1,43 +1,12 @@
-// Package auth handles authentication for memQL Cockpit against
-// memQL's in-house identity service. The flow is modelled after RFC
-// 6749 Authorization Code grant, but identity replaces the standard
-// /authorize page with an email-driven /login + magic-link
-// completion. There is no /.well-known/openid-configuration --
-// identity is not an OIDC provider, just a code-flow OAuth issuer.
-//
-// Sequence:
-//
-//  1. Cockpit opens a loopback HTTP listener on a random port.
-//
-//  2. Cockpit opens the user's browser at
-//
-//     <issuer>/login?return_to=http://127.0.0.1:<port>/cockpit/callback
-//
-//     Identity matches return_to against its registered clients (the
-//     "cockpit" client has loopback-any-port redirects per RFC 8252)
-//     and renders the email-entry form.
-//
-//  3. User enters their email, identity issues a magic link.
-//
-//  4. User clicks the magic link, identity's /auth/complete consumes
-//     the token and 302s the browser to
-//
-//     http://127.0.0.1:<port>/cockpit/callback?code=<auth_code>&state=<...>
-//
-//  5. Cockpit's callback handler captures the code and POSTs to
-//     <issuer>/oauth/token to swap it for an access + refresh token
-//     pair.
-//
-// State is supplied by identity (not by the cockpit) and is not
-// validated client-side. The CSRF surface is bounded by the
-// short-lived loopback listener (only listens for ~5min, only on
-// 127.0.0.1) plus identity's own consumed-once auth-code rule.
+// Package auth implements native OAuth authorization with PKCE and a loopback callback.
 package auth
 
 import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -47,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -64,6 +34,10 @@ type LoginResult struct {
 // a LoginResult on success. Times out after 5 minutes if the user
 // doesn't complete the magic-link round trip.
 func Login(ctx context.Context, issuer, clientId string) (*LoginResult, error) {
+	return loginWithBrowser(ctx, issuer, clientId, openBrowser)
+}
+
+func loginWithBrowser(ctx context.Context, issuer, clientId string, open func(string) error) (*LoginResult, error) {
 	issuer = strings.TrimRight(strings.TrimSpace(issuer), "/")
 	if issuer == "" {
 		return nil, errors.New("auth: issuer is required")
@@ -75,41 +49,61 @@ func Login(ctx context.Context, issuer, clientId string) (*LoginResult, error) {
 
 	// 127.0.0.1 (not "localhost") so the redirect URL the browser
 	// follows is unambiguous regardless of the user's /etc/hosts +
-	// IPv6 resolution. Identity's registered URIs include both
-	// host forms; either matches the loopback rule.
+	// IPv6 resolution. Identity registers this exact loopback host and path.
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, fmt.Errorf("listen for callback: %w", err)
 	}
+	defer listener.Close()
 	port := listener.Addr().(*net.TCPAddr).Port
 	redirectURL := fmt.Sprintf("http://127.0.0.1:%d/cockpit/callback", port)
 
-	authURL := buildLoginURL(issuer, redirectURL)
+	state, err := randomString(32)
+	if err != nil {
+		return nil, err
+	}
+	verifier, err := randomString(32)
+	if err != nil {
+		return nil, err
+	}
+	digest := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(digest[:])
+	authURL := buildLoginURL(issuer, clientId, redirectURL, state, challenge)
 
 	codeCh := make(chan callbackResult, 1)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/cockpit/callback", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || subtle.ConstantTimeCompare([]byte(r.URL.Query().Get("state")), []byte(state)) != 1 {
+			http.Error(w, "Invalid sign-in response", http.StatusBadRequest)
+			return
+		}
+		deliver := func(result callbackResult) {
+			select {
+			case codeCh <- result:
+			default:
+			}
+		}
 		if errParam := r.URL.Query().Get("error"); errParam != "" {
 			desc := r.URL.Query().Get("error_description")
 			msg := errParam
 			if desc != "" {
 				msg = errParam + ": " + desc
 			}
-			codeCh <- callbackResult{err: errors.New(msg)}
+			deliver(callbackResult{err: errors.New(msg)})
 			writeCallbackPage(w, false, "Sign-in failed", msg)
 			return
 		}
 		code := r.URL.Query().Get("code")
 		if code == "" {
-			codeCh <- callbackResult{err: errors.New("no code in callback")}
+			deliver(callbackResult{err: errors.New("no code in callback")})
 			writeCallbackPage(w, false, "Sign-in failed", "The identity service didn't return an authorization code.")
 			return
 		}
-		codeCh <- callbackResult{code: code}
+		deliver(callbackResult{code: code})
 		writeCallbackPage(w, true, "You're signed in", "memQL Cockpit has been authorized to connect on your behalf.")
 	})
 
-	server := &http.Server{Handler: mux}
+	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	serveErrCh := make(chan error, 1)
 	go func() { serveErrCh <- server.Serve(listener) }()
 	defer func() {
@@ -118,7 +112,8 @@ func Login(ctx context.Context, issuer, clientId string) (*LoginResult, error) {
 		_ = server.Shutdown(shutdownCtx)
 	}()
 
-	if err := openBrowser(authURL); err != nil {
+	fmt.Fprintln(os.Stderr, "Complete sign-in in your browser:", authURL)
+	if err := open(authURL); err != nil {
 		return nil, fmt.Errorf("%w: %v (URL: %s)", ErrNoBrowser, err, authURL)
 	}
 
@@ -127,7 +122,7 @@ func Login(ctx context.Context, issuer, clientId string) (*LoginResult, error) {
 		if result.err != nil {
 			return nil, fmt.Errorf("auth callback: %w", result.err)
 		}
-		return exchangeCodeForToken(ctx, issuer, clientId, redirectURL, result.code)
+		return exchangeCodeForToken(ctx, issuer, clientId, redirectURL, result.code, verifier)
 	case err := <-serveErrCh:
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil, errors.New("callback server closed before receiving the auth code")
@@ -142,10 +137,16 @@ func Login(ctx context.Context, issuer, clientId string) (*LoginResult, error) {
 
 // buildLoginURL composes the URL the browser should hit to start the
 // login flow.
-func buildLoginURL(issuer, redirectURL string) string {
+func buildLoginURL(issuer, clientId, redirectURL, state, challenge string) string {
 	params := url.Values{}
-	params.Set("return_to", redirectURL)
-	return issuer + "/login?" + params.Encode()
+	params.Set("client_id", clientId)
+	params.Set("redirect_uri", redirectURL)
+	params.Set("response_type", "code")
+	params.Set("scope", "openid profile email offline_access")
+	params.Set("state", state)
+	params.Set("code_challenge", challenge)
+	params.Set("code_challenge_method", "S256")
+	return issuer + "/authorize?" + params.Encode()
 }
 
 // tokenResponse mirrors identity's /oauth/token success body
@@ -165,12 +166,13 @@ type errorResponse struct {
 }
 
 // exchangeCodeForToken POSTs the auth code to /oauth/token.
-func exchangeCodeForToken(ctx context.Context, issuer, clientId, redirectURL, code string) (*LoginResult, error) {
+func exchangeCodeForToken(ctx context.Context, issuer, clientId, redirectURL, code, verifier string) (*LoginResult, error) {
 	payload, err := json.Marshal(map[string]string{
-		"grant_type":   "authorization_code",
-		"code":         code,
-		"client_id":    clientId,
-		"redirect_uri": redirectURL,
+		"grant_type":    "authorization_code",
+		"code":          code,
+		"code_verifier": verifier,
+		"client_id":     clientId,
+		"redirect_uri":  redirectURL,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal token request: %w", err)

@@ -27,14 +27,6 @@ func TestRandomString(t *testing.T) {
 	}
 }
 
-func TestBuildLoginURL(t *testing.T) {
-	got := buildLoginURL("http://localhost:8081", "http://127.0.0.1:54321/cockpit/callback")
-	const want = "http://localhost:8081/login?return_to=http%3A%2F%2F127.0.0.1%3A54321%2Fcockpit%2Fcallback"
-	if got != want {
-		t.Errorf("buildLoginURL = %q, want %q", got, want)
-	}
-}
-
 func TestExchangeCodeForToken_Success(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/oauth/token" {
@@ -54,7 +46,7 @@ func TestExchangeCodeForToken_Success(t *testing.T) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if body["grant_type"] != "authorization_code" || body["code"] != "ABC" || body["client_id"] != "cockpit" {
+		if body["grant_type"] != "authorization_code" || body["code"] != "ABC" || body["client_id"] != "cockpit" || body["code_verifier"] != "test-verifier" {
 			http.Error(w, "missing field", http.StatusBadRequest)
 			return
 		}
@@ -68,7 +60,7 @@ func TestExchangeCodeForToken_Success(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	res, err := exchangeCodeForToken(context.Background(), ts.URL, "cockpit", "http://127.0.0.1:54321/cockpit/callback", "ABC")
+	res, err := exchangeCodeForToken(context.Background(), ts.URL, "cockpit", "http://127.0.0.1:54321/cockpit/callback", "ABC", "test-verifier")
 	if err != nil {
 		t.Fatalf("exchangeCodeForToken: %v", err)
 	}
@@ -94,7 +86,7 @@ func TestExchangeCodeForToken_OAuthError(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	_, err := exchangeCodeForToken(context.Background(), ts.URL, "cockpit", "http://127.0.0.1:54321/cockpit/callback", "ABC")
+	_, err := exchangeCodeForToken(context.Background(), ts.URL, "cockpit", "http://127.0.0.1:54321/cockpit/callback", "ABC", "test-verifier")
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}
@@ -113,7 +105,7 @@ func TestExchangeCodeForToken_MissingAccessToken(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	_, err := exchangeCodeForToken(context.Background(), ts.URL, "cockpit", "http://127.0.0.1:54321/cockpit/callback", "ABC")
+	_, err := exchangeCodeForToken(context.Background(), ts.URL, "cockpit", "http://127.0.0.1:54321/cockpit/callback", "ABC", "test-verifier")
 	if err == nil || !strings.Contains(err.Error(), "missing access_token") {
 		t.Errorf("expected missing access_token error, got %v", err)
 	}
