@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // The bytes half: pushing a file into the Library.
@@ -67,7 +69,14 @@ type Library struct {
 
 func NewLibrary(baseURL string, client *http.Client, bearer func(context.Context) (string, error)) *Library {
 	if client == nil {
-		client = http.DefaultClient
+		// Bound each request, not the whole multi-gigabyte transfer. A dead
+		// connection must return to the durable sweep retry rather than hang forever.
+		client = &http.Client{Timeout: 15 * time.Minute}
+	}
+	if client.Timeout <= 0 {
+		bounded := *client
+		bounded.Timeout = 15 * time.Minute
+		client = &bounded
 	}
 	return &Library{
 		baseURL:      strings.TrimRight(baseURL, "/"),
@@ -98,7 +107,7 @@ func (l *Library) Push(ctx context.Context, workerID, path, folderID string, siz
 		out, err := l.pushOneShot(ctx, workerID, path, folderID)
 		return out, err
 	}
-	return l.pushSession(ctx, workerID, path, folderID, size, resumeID)
+	return l.pushSession(ctx, workerID, path, path, folderID, size, resumeID, 0, nil)
 }
 
 func (l *Library) authorized(ctx context.Context, req *http.Request) error {
@@ -137,7 +146,11 @@ func readCapped(r io.Reader) []byte {
 // ---------------------------------------------------------------------------
 
 func (l *Library) pushOneShot(ctx context.Context, workerID, path, folderID string) (PushResult, error) {
-	f, err := os.Open(path)
+	return l.pushSnapshotOneShot(ctx, workerID, path, path, folderID, 0)
+}
+
+func (l *Library) pushSnapshotOneShot(ctx context.Context, workerID, path, sourcePath, folderID string, expectedVersion int) (PushResult, error) {
+	f, err := os.Open(sourcePath)
 	if err != nil {
 		return PushResult{}, err
 	}
@@ -160,6 +173,9 @@ func (l *Library) pushOneShot(ctx context.Context, workerID, path, folderID stri
 	}
 	if folderID != "" {
 		fields["folderId"] = folderID
+	}
+	if expectedVersion > 0 {
+		fields["expectedVersion"] = strconv.Itoa(expectedVersion)
 	}
 	for key, value := range fields {
 		// The machine NAME is deliberately not claimed. The engine resolves
@@ -193,7 +209,7 @@ func (l *Library) pushOneShot(ctx context.Context, workerID, path, folderID stri
 	defer func() { _ = resp.Body.Close() }()
 	body := readCapped(resp.Body)
 	if resp.StatusCode/100 != 2 {
-		return PushResult{}, statusError("upload "+filepath.Base(path), resp, body)
+		return PushResult{}, &httpFailure{status: resp.StatusCode, err: statusError("upload "+filepath.Base(path), resp, body)}
 	}
 	var out PushResult
 	if err := json.Unmarshal(body, &out); err != nil {
@@ -232,7 +248,7 @@ type inventoryResponse struct {
 // On a folder of video over a domestic uplink that is the difference between
 // a backup that finishes and one that starts again every time the laptop
 // sleeps.
-func (l *Library) pushSession(ctx context.Context, workerID, path, folderID string, size int64, resumeID string) (PushResult, error) {
+func (l *Library) pushSession(ctx context.Context, workerID, path, sourcePath, folderID string, size int64, resumeID string, expectedVersion int, remember func(string) error) (PushResult, error) {
 	name := filepath.Base(path)
 
 	// RESUME FIRST, and this is the half the first draft was missing. It
@@ -248,8 +264,23 @@ func (l *Library) pushSession(ctx context.Context, workerID, path, folderID stri
 	// through to a fresh session rather than failing, because a stale hint
 	// must never be able to stop a backup.
 	if strings.TrimSpace(resumeID) != "" {
-		if session, have, ok := l.resumable(ctx, resumeID, size); ok {
-			return l.streamChunks(ctx, path, name, session, have, size)
+		inv, err := l.inventory(ctx, resumeID)
+		if err != nil {
+			var failure *httpFailure
+			if !errors.As(err, &failure) || (failure.status != 404 && failure.status != 410) {
+				return PushResult{UploadID: resumeID}, err
+			}
+		} else if inv.Size == size && inv.Status == "completed" {
+			// The last completion response may have been lost after commit.
+			out, err := l.complete(ctx, resumeID, name)
+			out.UploadID = resumeID
+			return out, err
+		} else if inv.Status == "open" && inv.Size == size && inv.ChunkSize > 0 {
+			have := make(map[int]int64, len(inv.Staged))
+			for _, chunk := range inv.Staged {
+				have[chunk.N] = chunk.Size
+			}
+			return l.streamChunks(ctx, sourcePath, name, sessionRef{ID: resumeID, ChunkSize: inv.ChunkSize}, have, size)
 		}
 	}
 
@@ -261,6 +292,9 @@ func (l *Library) pushSession(ctx context.Context, workerID, path, folderID stri
 	}
 	if folderID != "" {
 		body["folderId"] = folderID
+	}
+	if expectedVersion > 0 {
+		body["expectedVersion"] = expectedVersion
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -281,7 +315,7 @@ func (l *Library) pushSession(ctx context.Context, workerID, path, folderID stri
 	initBody := readCapped(resp.Body)
 	_ = resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		return PushResult{}, statusError("open session for "+name, resp, initBody)
+		return PushResult{}, &httpFailure{status: resp.StatusCode, err: statusError("open session for "+name, resp, initBody)}
 	}
 	var session initResponse
 	if err := json.Unmarshal(initBody, &session); err != nil {
@@ -296,7 +330,12 @@ func (l *Library) pushSession(ctx context.Context, workerID, path, folderID stri
 		return PushResult{}, fmt.Errorf("backup: open session for %s: the cluster named no chunk size", name)
 	}
 
-	return l.streamChunks(ctx, path, name, sessionRef{ID: session.UploadID, ChunkSize: chunkSize}, nil, size)
+	if remember != nil {
+		if err := remember(session.UploadID); err != nil {
+			return PushResult{UploadID: session.UploadID}, err
+		}
+	}
+	return l.streamChunks(ctx, sourcePath, name, sessionRef{ID: session.UploadID, ChunkSize: chunkSize}, nil, size)
 }
 
 // sessionRef is the part of a session the chunk loop needs, whether it was
@@ -304,25 +343,6 @@ func (l *Library) pushSession(ctx context.Context, workerID, path, folderID stri
 type sessionRef struct {
 	ID        string
 	ChunkSize int64
-}
-
-// resumable reports whether a previously-opened session can still take the
-// rest of this file, and what it already holds.
-//
-// Refuses on ANY doubt -- not open, a different declared size, an unreadable
-// inventory -- because the cost of a wrong yes is a committed file assembled
-// from two different versions of the bytes, and the cost of a wrong no is one
-// wasted upload.
-func (l *Library) resumable(ctx context.Context, uploadID string, size int64) (sessionRef, map[int]int64, bool) {
-	inv, err := l.inventory(ctx, uploadID)
-	if err != nil || inv.Status != "open" || inv.Size != size || inv.ChunkSize <= 0 {
-		return sessionRef{}, nil, false
-	}
-	have := make(map[int]int64, len(inv.Staged))
-	for _, chunk := range inv.Staged {
-		have[chunk.N] = chunk.Size
-	}
-	return sessionRef{ID: uploadID, ChunkSize: inv.ChunkSize}, have, true
 }
 
 // streamChunks sends everything the server does not already hold, then
@@ -341,13 +361,13 @@ func (l *Library) streamChunks(ctx context.Context, path, name string, session s
 			// and pick this session back up next sweep.
 			return PushResult{UploadID: session.ID}, err
 		}
-		if _, ok := have[n]; ok {
-			continue
-		}
 		offset := int64(n-1) * session.ChunkSize
 		length := session.ChunkSize
 		if remaining := size - offset; remaining < length {
 			length = remaining
+		}
+		if stagedSize, ok := have[n]; ok && stagedSize == length {
+			continue
 		}
 		if err := l.putChunk(ctx, session.ID, n, io.NewSectionReader(f, offset, length), length, name); err != nil {
 			return PushResult{UploadID: session.ID}, err
@@ -373,7 +393,7 @@ func (l *Library) inventory(ctx context.Context, uploadID string) (inventoryResp
 	defer func() { _ = resp.Body.Close() }()
 	body := readCapped(resp.Body)
 	if resp.StatusCode/100 != 2 {
-		return inventoryResponse{}, statusError("read staged chunks", resp, body)
+		return inventoryResponse{}, &httpFailure{status: resp.StatusCode, err: statusError("read staged chunks", resp, body)}
 	}
 	var inv inventoryResponse
 	if err := json.Unmarshal(body, &inv); err != nil {
@@ -427,7 +447,7 @@ func (l *Library) complete(ctx context.Context, uploadID, name string) (PushResu
 		// declared, and the SESSION STAYS OPEN -- so the next sweep re-reads
 		// the inventory and sends what is missing rather than starting over.
 		// The server's sentence carries the numbers.
-		return PushResult{}, statusError("complete "+name, resp, body)
+		return PushResult{}, &httpFailure{status: resp.StatusCode, err: statusError("complete "+name, resp, body)}
 	}
 	var out PushResult
 	if err := json.Unmarshal(body, &out); err != nil {
@@ -435,3 +455,12 @@ func (l *Library) complete(ctx context.Context, uploadID, name string) (PushResu
 	}
 	return out, nil
 }
+
+// httpFailure preserves status for deciding whether a saved session is gone.
+type httpFailure struct {
+	status int
+	err    error
+}
+
+func (e *httpFailure) Error() string { return e.err.Error() }
+func (e *httpFailure) Unwrap() error { return e.err }
