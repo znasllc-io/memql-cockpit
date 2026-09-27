@@ -597,11 +597,14 @@ and then never repaired, because the digest already matches.
 
 The ledger under `<state_dir>/backup/<watchId>.json` is a CACHE -- losing it
 costs one expensive sweep, because every re-push is keyed on `(machine, path)`
-and lands as a new VERSION rather than a duplicate. It is saved on the way OUT
-of a sweep, deferred, so an interrupted one keeps what it already sent; and it
-carries the open session id, which is what makes the resume real (a fresh
-session's inventory is empty by construction, so asking one what it holds
-resumes nothing).
+and lands as a new VERSION rather than a duplicate. It is saved BEFORE sending a chunked session's first bytes and after each
+completed file, as well as on sweep exit. The saved session is bound to a
+SHA-256, never size alone. Uploads read a private disk snapshot, not a live host
+file. A lost completion response is recovered idempotently. Root unavailability
+is not evidence that every file was deleted. Device/inode PLUS digest allows a
+rename within an authorized watch to retain its file identity; a same-name or
+same-content guess never does. Optimistic version preconditions preserve edits
+made in Files. See docs/watched-folders.md for recovery and local spool costs.
 
 **`memql worker backup --once` needs a recorded registration id.** The id
 arrives on a RegisterAck inside a connection only the running worker holds, so

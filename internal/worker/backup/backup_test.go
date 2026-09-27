@@ -419,7 +419,7 @@ func TestAFileDeletedAtTheOriginIsFlaggedAndNothingIsDeleted(t *testing.T) {
 	// anywhere in this package, and this is the assertion that says so.
 	for _, call := range f.calls {
 		for _, forbidden := range []string{"archive", "delete", "Delete", "Archive"} {
-			if strings.Contains(call, forbidden) {
+			if strings.Contains(constructOf(call), forbidden) {
 				t.Errorf("the sweeper sent a destructive call, which the one-way invariant forbids: %s", call)
 			}
 		}

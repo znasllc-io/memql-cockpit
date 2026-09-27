@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	langparser "github.com/znasllc-io/memql/component/language/parser"
 )
@@ -55,7 +56,12 @@ type Graph struct {
 // anything.
 func NewGraph(baseURL string, client *http.Client, bearer func(context.Context) (string, error)) *Graph {
 	if client == nil {
-		client = http.DefaultClient
+		client = &http.Client{Timeout: time.Minute}
+	}
+	if client.Timeout <= 0 {
+		bounded := *client
+		bounded.Timeout = time.Minute
+		client = &bounded
 	}
 	return &Graph{baseURL: strings.TrimRight(baseURL, "/"), client: client, bearer: bearer}
 }
@@ -298,4 +304,19 @@ func rowStrings(row map[string]any, key string) []string {
 		}
 	}
 	return out
+}
+
+// FileAt reads the remote baseline when a local ledger has been lost or predates
+// version preconditions. It never assumes an existing remote edit is disposable.
+func (g *Graph) FileAt(ctx context.Context, workerID, path string) (map[string]any, error) {
+	rows, err := g.call(ctx, "query libraryFileByUploadedFrom(workerId: "+langparser.QuoteString(workerID)+", path: "+langparser.QuoteString(path)+")")
+	if err != nil || len(rows) == 0 {
+		return nil, err
+	}
+	return rows[0], nil
+}
+
+func (g *Graph) Relink(ctx context.Context, fileID, workerID, previousPath, path string) error {
+	_, err := g.call(ctx, "builtin relinkLibraryFileOrigin(fileId: "+langparser.QuoteString(fileID)+", workerId: "+langparser.QuoteString(workerID)+", previousPath: "+langparser.QuoteString(previousPath)+", path: "+langparser.QuoteString(path)+")")
+	return err
 }

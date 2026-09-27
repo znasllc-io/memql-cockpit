@@ -3,11 +3,13 @@ package backup
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"math/rand"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -241,10 +243,9 @@ func (m *Manager) sweepWatch(ctx context.Context, watch Watch) {
 			state = "missing"
 		}
 		m.report(ctx, watch.ID, state, 0, 0, err.Error())
-		// A folder that is gone takes its files with it, and every one of them
-		// is now origin_gone. Reported from the ledger, because the walk found
-		// nothing to report from.
-		m.flagAllGone(ctx, watch)
+		// A missing root may be an unplugged drive. Keep its durable copies
+		// and report unavailable rather than claiming each original was deleted.
+		m.flagAllUnavailable(ctx, watch)
 		return
 	}
 
@@ -260,6 +261,7 @@ func (m *Manager) sweepWatch(ctx context.Context, watch Watch) {
 			log.Warn("backup: could not save this machine's record of what it sent", "error", err)
 		}
 	}()
+	m.followMoves(ctx, ledger, scan)
 	var pushErr string
 	pushed := 0
 	for _, entry := range scan.Entries {
@@ -322,39 +324,76 @@ func (m *Manager) pushIfChanged(ctx context.Context, watch Watch, ledger *Ledger
 	// One observation, used for the size, the digest and the record. A file
 	// that changes DURING the push still converges: the recorded stamp will
 	// not match the next sweep's stat, so it is pushed again.
-	fresh, err := statOf(entry.Path)
+	if m.opts.CheckPath == nil {
+		return false, fmt.Errorf("backup: no local path policy")
+	}
+	if err := m.opts.CheckPath(entry.Path); err != nil {
+		return false, err
+	}
+	sourcePath, fresh, err := snapshot(ctx, m.opts.StateDir, entry.Path)
 	if err != nil {
 		return false, err
 	}
-	digest, err := Digest(entry.Path)
-	if err != nil {
-		return false, err
+	defer os.Remove(sourcePath)
+	digest := fresh.SHA256
+	if prior.VersionNumber == 0 {
+		remote, readErr := m.graph.FileAt(ctx, m.workerID, entry.Path)
+		if readErr != nil {
+			return false, readErr
+		}
+		if remote != nil {
+			remoteDigest := rowString(remote, "sha256")
+			if remoteDigest == "" || (remoteDigest != digest && remoteDigest != prior.Stamp.SHA256) {
+				fileID := rowString(remote, "id")
+				if fileID != "" {
+					_ = m.graph.SetLinkState(ctx, fileID, "conflict")
+				}
+				return false, fmt.Errorf("backup: the stored copy has no matching local baseline; keep both copies and relink explicitly")
+			}
+			version, parseErr := strconv.Atoi(fmt.Sprint(rowField(remote, "versionNumber")))
+			if parseErr != nil || version < 1 {
+				version = 1
+			}
+			prior.FileID = rowString(remote, "id")
+			prior.VersionNumber = version
+			if remoteDigest == digest {
+				prior.Stamp = fresh
+				prior.LinkState = "synced"
+				ledger.Put(entry.Path, prior)
+				return false, ledger.Save()
+			}
+		}
 	}
 	if known && prior.Stamp.SHA256 == digest && prior.FileID != "" {
-		// Same bytes, new timestamp. Record the new stamp so the next sweep
-		// takes the cheap path again, and send nothing.
 		prior.Stamp = fresh
-		prior.Stamp.SHA256 = digest
 		ledger.Put(entry.Path, prior)
 		return false, nil
 	}
-
-	// Hand back a session this path left open at this exact size, so a push
-	// interrupted partway resumes instead of starting again. A mismatch is
-	// ignored by the resume check itself.
 	resumeID := ""
-	if known && prior.UploadSize == fresh.Size {
+	if known && prior.UploadSize == fresh.Size && prior.UploadSHA256 == digest {
 		resumeID = prior.UploadID
 	}
-	result, err := m.library.Push(ctx, m.workerID, entry.Path, watch.FolderID, fresh.Size, resumeID)
+	remember := func(id string) error {
+		prior.UploadID = id
+		prior.UploadSize = fresh.Size
+		prior.UploadSHA256 = digest
+		ledger.Put(entry.Path, prior)
+		// Persist BEFORE the first chunk: SIGKILL or power loss must not
+		// forget a partially completed multi-gigabyte upload.
+		return ledger.Save()
+	}
+	var result PushResult
+	if fresh.Size <= m.library.oneShotLimit {
+		result, err = m.library.pushSnapshotOneShot(ctx, m.workerID, entry.Path, sourcePath, watch.FolderID, prior.VersionNumber)
+	} else {
+		result, err = m.library.pushSession(ctx, m.workerID, entry.Path, sourcePath, watch.FolderID, fresh.Size, resumeID, prior.VersionNumber, remember)
+	}
 	if err != nil {
-		// Remember the session the failed push was using, and the size it was
-		// opened for, so the next sweep can pick it up. Nothing else about the
-		// record changes: the file is still not backed up.
-		if result.UploadID != "" {
-			prior.UploadID = result.UploadID
-			prior.UploadSize = fresh.Size
+		var failure *httpFailure
+		if errors.As(err, &failure) && failure.status == 409 && !strings.Contains(err.Error(), "origin_trashed") && prior.FileID != "" {
+			prior.LinkState = "conflict"
 			ledger.Put(entry.Path, prior)
+			_ = m.graph.SetLinkState(ctx, prior.FileID, "conflict")
 		}
 		return false, err
 	}
@@ -366,6 +405,7 @@ func (m *Manager) pushIfChanged(ctx context.Context, watch Watch, ledger *Ledger
 	ledger.Put(entry.Path, Record{
 		Stamp:          stamp,
 		FileID:         result.FileID,
+		VersionNumber:  result.VersionNumber,
 		PushedAtUnix:   now,
 		VerifiedAtUnix: now,
 		// The ENGINE stamps `synced` on any push naming a (machine, path), so
@@ -374,6 +414,9 @@ func (m *Manager) pushIfChanged(ctx context.Context, watch Watch, ledger *Ledger
 		// second write saying the same thing.
 		LinkState: "synced",
 	})
+	if err := ledger.Save(); err != nil {
+		return true, err
+	}
 	return true, nil
 }
 
@@ -412,13 +455,24 @@ func (m *Manager) verify(ctx context.Context, ledger *Ledger, scan ScanResult) {
 			// It was pushed from this folder and is not there any more. THE
 			// COPY IS NOT TOUCHED -- this is a label, and the row stays in the
 			// ledger so a later sweep can tell "gone" from "never seen".
-			want = "origin_gone"
+			want = "unavailable"
+			// Excluded, inaccessible and unmounted paths are not proof of
+			// deletion. Only an authorized lookup that confirms ENOENT is.
+			if m.opts.CheckPath != nil && m.opts.CheckPath(path) == nil {
+				_, statErr := os.Lstat(path)
+				if errors.Is(statErr, fs.ErrNotExist) {
+					want = "origin_gone"
+				}
+			}
 		} else if !origin.Unchanged(rec.Stamp) {
 			// The origin has moved on from what was last successfully pushed.
 			// Reported rather than assumed transient: a push that keeps
 			// failing would otherwise leave the copy described as current
 			// indefinitely, and the person would have no way to see it.
 			want = "stale"
+			if rec.LinkState == "conflict" {
+				want = "conflict"
+			}
 		}
 		changed := rec.LinkState != want
 		stale := now-rec.VerifiedAtUnix >= int64(verifyRefreshInterval/time.Second)
@@ -444,10 +498,20 @@ func (m *Manager) verify(ctx context.Context, ledger *Ledger, scan ScanResult) {
 	}
 }
 
-// flagAllGone reports every file of a watch whose folder itself has vanished.
-func (m *Manager) flagAllGone(ctx context.Context, watch Watch) {
+// flagAllUnavailable preserves uncertainty when the root is gone or unreadable.
+func (m *Manager) flagAllUnavailable(ctx context.Context, watch Watch) {
 	ledger := m.ledgerFor(watch.ID)
-	m.verify(ctx, ledger, ScanResult{})
+	for _, path := range ledger.Paths() {
+		rec, _ := ledger.Get(path)
+		if rec.FileID == "" || rec.LinkState == "unavailable" {
+			continue
+		}
+		if m.graph.SetLinkState(ctx, rec.FileID, "unavailable") == nil {
+			rec.LinkState = "unavailable"
+			rec.VerifiedAtUnix = time.Now().Unix()
+			ledger.Put(path, rec)
+		}
+	}
 	if err := ledger.Save(); err != nil {
 		m.logger.Warn("backup: could not save this machine's record", "watch", watch.ID, "error", err)
 	}
