@@ -115,3 +115,48 @@ func TestAppsAllow_ReloadPicksUpANewApp(t *testing.T) {
 		t.Errorf("after reload apps.allow = %v, want two entries", got)
 	}
 }
+
+// TestDenyPaths_ExpandsTheDenyList: an app session is handed fs.deny as paths
+// its app may neither read nor write, and a sandbox cannot resolve "~". So
+// the list comes back expanded -- the defaults and the owner's own entries,
+// merged as CheckPath sees them -- and as a copy a SIGHUP cannot rewrite
+// under a session that is reading it.
+func TestDenyPaths_ExpandsTheDenyList(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	path := filepath.Join(t.TempDir(), "policy.yaml")
+	if err := os.WriteFile(path, []byte("fs:\n  deny:\n    - ~/secrets\n    - /srv/private\n"), 0o600); err != nil {
+		t.Fatalf("write policy: %v", err)
+	}
+	p, err := LoadPolicy(path)
+	if err != nil {
+		t.Fatalf("LoadPolicy: %v", err)
+	}
+
+	got := p.DenyPaths()
+	has := map[string]bool{}
+	for _, d := range got {
+		has[d] = true
+		if d == "~" || len(d) > 1 && d[:2] == "~/" {
+			t.Errorf("DenyPaths() kept %q unexpanded", d)
+		}
+	}
+	for _, want := range []string{
+		filepath.Join(home, ".ssh"), // a default
+		filepath.Join(home, "secrets"),
+		"/srv/private",
+	} {
+		if !has[want] {
+			t.Errorf("DenyPaths() = %v, want %s in it", got, want)
+		}
+	}
+
+	got[0] = "/mutated"
+	if p.DenyPaths()[0] == "/mutated" {
+		t.Error("DenyPaths() handed out the policy's own slice")
+	}
+	var nilPolicy *Policy
+	if nilPolicy.DenyPaths() != nil {
+		t.Error("a nil policy denied something")
+	}
+}

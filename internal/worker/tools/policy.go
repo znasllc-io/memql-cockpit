@@ -982,6 +982,22 @@ func (p *Policy) WorkspaceRoot() string {
 	return expandHome(p.fs.WorkspaceRoot)
 }
 
+// DenyPaths returns fs.deny with every "~" expanded: the paths CheckPath
+// refuses a tool, which an app session's app may neither read nor write
+// either (appsession/protected.go). A copy, for AppsAllow's reason.
+func (p *Policy) DenyPaths() []string {
+	if p == nil {
+		return nil
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make([]string, 0, len(p.fs.Deny))
+	for _, deny := range p.fs.Deny {
+		out = append(out, expandHome(deny))
+	}
+	return out
+}
+
 // -----------------------------------------------------------------------------
 // helpers
 // -----------------------------------------------------------------------------

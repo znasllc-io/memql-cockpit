@@ -252,7 +252,7 @@ func (s *session) reportedUsage() *memqlv1.AppSessionUsage {
 // returns the artifact ids.
 func (s *session) pushOutputs(ctx context.Context) ([]string, error) {
 	s.mu.Lock()
-	library, transcript, before := s.library, s.transcript, s.before
+	library, transcript, before, workspace := s.library, s.transcript, s.before, s.workspace
 	s.transcript = nil
 	s.mu.Unlock()
 
@@ -275,7 +275,9 @@ func (s *session) pushOutputs(ctx context.Context) ([]string, error) {
 	var ids []string
 	var failures []string
 
-	workspace := strings.TrimSpace(s.start.GetWorkspace())
+	// The RESOLVED workspace, not the start's: a start that named none ran
+	// in a directory this machine chose, and what the app made there is
+	// output all the same.
 	if workspace != "" && before != nil {
 		produced, skipped := collectProduced(workspace, before)
 		for _, note := range skipped {
@@ -373,15 +375,24 @@ func (s *session) sendEnd(code int, message string, artifacts []string) {
 		Effort:              effort,
 	}
 	if err := s.sender.SendAppSessionEnd(end); err != nil {
-		s.logger.Warn("app session end could not be sent", "error", err)
+		s.logger.Warn("app session end could not be sent", "error", err, "session_error", end.GetError())
 		return
 	}
-	s.logger.Info("app session ended",
+	attrs := []any{
 		"exit_code", code,
 		"served_model", model,
 		"served_effort", effort,
 		"artifacts", len(artifacts),
 		"usage_known", end.GetUsage().GetKnown(),
-		"error", message != "",
-	)
+	}
+	if end.GetError() == "" {
+		s.logger.Info("app session ended", attrs...)
+		return
+	}
+	// THE REASON, not the fact of one. The End carries it to the engine,
+	// but whoever is debugging THIS machine reads its log, and a line
+	// saying only that there was an error sends them to a cluster they may
+	// not be able to query. Redacted exactly as the End is -- it is the
+	// End's own text.
+	s.logger.Warn("app session ended with an error", append(attrs, "error", end.GetError())...)
 }

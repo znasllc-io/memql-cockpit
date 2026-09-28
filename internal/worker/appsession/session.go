@@ -187,8 +187,37 @@ type Options struct {
 	// CheckWorkspace vetoes a workspace path. The delegation policy
 	// picks the workspace root, but the cockpit still gets to refuse a
 	// path outside its own -- the engine is naming a directory on
-	// somebody else's machine.
+	// somebody else's machine. A directory this machine chose itself
+	// (workspace.go) passes through it too.
 	CheckWorkspace func(path string) error
+	// Home is the cluster home this manager serves (the fleet's home id).
+	// A workspace this machine chooses is filed under it, so two clusters
+	// enrolled on one machine never share a directory. Empty files it
+	// under "default", the id a home with no cluster URL gets.
+	Home string
+	// WorkspaceRoot is policy.yaml's fs.workspace_root, already expanded,
+	// or "" when it names none (tools.Policy.WorkspaceRoot). A function so
+	// a SIGHUP reaches the next session. When it names a root, a workspace
+	// this machine chooses goes under it.
+	WorkspaceRoot func() string
+	// ScratchRoot is where a workspace this machine chooses goes when
+	// fs.workspace_root names none. Empty is the platform's data directory
+	// (scratchRootFor); tests set it.
+	ScratchRoot string
+	// WorkerPaths are this worker's own files and directories: its
+	// configuration (the worker tokens), policy.yaml (apps.allow, the app
+	// consent gate), its state. DenyPaths is policy.yaml's fs.deny, already
+	// expanded (tools.Policy.DenyPaths); a function so a SIGHUP reaches the
+	// next session.
+	//
+	// A session may not run in, above or below any of them, and the app is
+	// told to neither read nor write one (protected.go).
+	WorkerPaths []string
+	DenyPaths   func() []string
+	// OpenCommand is how the open kind puts a terminal in front of a
+	// person. Nil is the platform's (platformOpenCommand); tests set it, so
+	// a test does not open a window on the machine running it.
+	OpenCommand func(script string) (argv []string, note string, err error)
 	// Detector resolves WHICH HARNESS drives an app on this machine.
 	//
 	// It is a field rather than a package call because the answer is a
@@ -261,6 +290,10 @@ func (m *Manager) Start(ctx context.Context, sender Sender, start *memqlv1.AppSe
 		manager: m,
 		logger:  m.logger.With("session_id", id, "app", start.GetApp(), "kind", start.GetKind()),
 		cancel:  cancel,
+		// From the first moment, so a session refused before it reaches
+		// the app still redacts the End it sends and the log line that
+		// says why.
+		redact: newRedactor(start.GetCredential()),
 		// Closed until a turn loop opens it. A session that is not
 		// driving turns -- the open kind, or one that failed before it
 		// started -- must REFUSE a follow-up rather than swallow it into
@@ -382,6 +415,15 @@ type session struct {
 	library       *Library
 	child         *child
 	cancelReason_ string
+	// workspace is the directory the session runs in, once resolved --
+	// the start's, or one this machine chose (workspace.go).
+	// ownsWorkspace is true only for a directory made for this session
+	// alone, which is removed when it ends.
+	workspace     string
+	ownsWorkspace bool
+	// deny is what the app may neither read nor write (protected.go),
+	// read once with the workspace check so the two agree.
+	deny []string
 	// policy decides which files the recording reads back (record.go);
 	// pulled are the Library inputs as they landed, for the fingerprint.
 	policy *contentPolicy
@@ -426,6 +468,7 @@ func (s *session) run(ctx context.Context) {
 			// that is already gone.
 			s.logger.Error("app session panicked", "panic", rec)
 			s.teardown()
+			s.keepWorkspace("the session panicked before its outputs were pushed")
 			s.sendEnd(-1, fmt.Sprintf("cockpit panic during session: %v", rec), nil)
 		}
 	}()
@@ -438,6 +481,15 @@ func (s *session) run(ctx context.Context) {
 		err = pushErr
 	} else if pushErr != nil {
 		err = fmt.Errorf("%w; additionally: %v", err, pushErr)
+	}
+	// After the push, which reads the directory, and before the End, so
+	// nobody told the session is over can find it still on disk -- unless
+	// the push failed, when the directory holds the only copy of what the
+	// app made.
+	if pushErr != nil {
+		s.keepWorkspace("its outputs could not all be pushed to the Library")
+	} else {
+		s.releaseWorkspace()
 	}
 
 	message := ""
@@ -469,8 +521,6 @@ func (s *session) execute(ctx context.Context) (int, error) {
 	if err != nil {
 		return -1, err
 	}
-
-	s.redact = newRedactor(s.start.GetCredential())
 
 	// The MCP configuration first: an app that starts without it reaches
 	// nothing over MCP and reports that as "MemQL's tools are broken".
@@ -677,11 +727,18 @@ func levelNote(spec apps.Spec, p levelPlan) string {
 		p.level, spec.ID, harness.DescribeKnobs(spec.Harness, p.knobs), source)
 }
 
-// resolveWorkspace validates the directory the engine named.
+// resolveWorkspace settles the directory the session runs in: the one the
+// engine named, or -- when it named none -- one this machine chooses
+// (workspace.go). Either way it passes this machine's own check before
+// anything is written into it.
 func (s *session) resolveWorkspace() (string, error) {
 	workspace := strings.TrimSpace(s.start.GetWorkspace())
-	if workspace == "" {
-		return "", errors.New("app session: no workspace in AppSessionStart")
+	chosen, bySession := workspace == "", false
+	if chosen {
+		var err error
+		if workspace, bySession, err = s.chooseWorkspace(); err != nil {
+			return "", err
+		}
 	}
 	if !filepath.IsAbs(workspace) {
 		return "", fmt.Errorf("app session: workspace %q is not absolute", workspace)
@@ -691,8 +748,32 @@ func (s *session) resolveWorkspace() (string, error) {
 			return "", fmt.Errorf("app session: workspace refused by this machine's policy: %w", err)
 		}
 	}
+	// The workspace is the app's write grant, so it may not reach what the
+	// session must never touch (protected.go) -- a check CheckWorkspace does
+	// not make, for the engine's path or this machine's own choice.
+	protected := s.protectedPaths()
+	if err := checkWorkspaceOverlap(workspace, protected); err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(workspace, configDirMode); err != nil {
 		return "", fmt.Errorf("app session: workspace: %w", err)
+	}
+	// An open session's directory is never this machine's to remove: the
+	// person it was handed to can still be working in it after the session
+	// ends (a cancel stops the launcher, not their terminal).
+	owns := chosen && bySession && s.start.GetKind() != KindOpen
+	s.mu.Lock()
+	s.workspace = workspace
+	s.ownsWorkspace = owns
+	s.deny = appDenyPaths(protected)
+	s.mu.Unlock()
+	if chosen {
+		keyedBy := "run"
+		if bySession {
+			keyedBy = "session"
+		}
+		s.logger.Info("app session named no workspace; running in one this machine chose",
+			"workspace", workspace, "keyed_by", keyedBy, "removed_at_end", owns)
 	}
 	return workspace, nil
 }
@@ -767,6 +848,7 @@ func (s *session) runTurns(ctx context.Context, spec apps.Spec, workspace, resum
 		ResumeRef:      resumeRef,
 		Level:          plan.level,
 		Levels:         plan.table,
+		DenyPaths:      s.denyPaths(),
 		Launch:         s.launcher(),
 	}
 	if err := h.Start(ctx, hspec); err != nil {
@@ -903,6 +985,14 @@ func (s *session) nextFollowUp() (string, bool) {
 	return next, true
 }
 
+// denyPaths is what the app may neither read nor write, as resolveWorkspace
+// settled it.
+func (s *session) denyPaths() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.deny...)
+}
+
 // mcpEnv is the environment the app must run with -- CODEX_HOME for
 // Codex, nothing for Claude Code.
 func (s *session) mcpEnv() []string {
@@ -952,7 +1042,11 @@ func (s *session) pump(c *child, onStdout, onStderr func(string, []byte) error) 
 
 // runOpen hands the app to the human -- the open kind.
 func (s *session) runOpen(ctx context.Context, spec apps.Spec, workspace string) (int, error) {
-	c, note, err := launchOpen(ctx, spec, workspace, s.start.GetPrompt(), s.mcpEnv())
+	openCommand := s.manager.opts.OpenCommand
+	if openCommand == nil {
+		openCommand = platformOpenCommand
+	}
+	c, note, err := launchOpen(ctx, spec, workspace, s.start.GetPrompt(), s.mcpEnv(), openCommand)
 	if err != nil {
 		// Immediately, with a reason, and with no fallback to headless:
 		// the user asked to drive it themselves.
