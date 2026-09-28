@@ -9,15 +9,16 @@ import (
 )
 
 // levels_test.go pins what a LEVEL on a model call does on this machine
-// (memql#5393, memql-cockpit#438): nothing to the call, and nothing
-// invented on the way back.
+// (memql#5393, memql-cockpit#438): it never changes the model, and nothing
+// is invented on the way back.
 //
 // The router has already chosen `model` from this machine's advertisement,
-// so the level is a ledger and log fact here -- a level steers an app, which
-// has knobs, while a runtime has only the model it was asked for. And the
-// End's usage carries the model the runtime REPORTED and no effort, because
-// neither Ollama nor an OpenAI-compatible response states one.
-func TestModelCall_TheLevelSteersNothingAndNoEffortIsGuessed(t *testing.T) {
+// so the level does not displace it -- a level steers an app, which has
+// knobs, while a runtime has only the model it was asked for. The one runtime
+// knob it reaches is Ollama's thinking on a fast call (ollama_think_test.go).
+// And the End's usage carries the model the runtime REPORTED and no effort,
+// because neither Ollama nor an OpenAI-compatible response states one.
+func TestModelCall_TheLevelNeverDisplacesTheModelAndNoEffortIsGuessed(t *testing.T) {
 	srv, seen := ollamaChatStub(t, []string{"ok"}, true)
 	m := managerFor(inventoryWith(ollamaModel(srv.URL, "llama3.1:8b",
 		models.Attributes{ContextWindow: 8192, MaxConcurrent: 1})))
