@@ -29,6 +29,15 @@ readonly INSTALL_PREFIX_USER="${HOME}/.memql/bin"
 
 readonly STATE_DIR_DEFAULT="${HOME}/.memql/state"
 
+# Where releases live. Both download bases the installers compose hang
+# off this one root: `latest/download` when no version is named, and
+# `download/vX.Y.Z` for a --version pin (and for the app / menu
+# archives, which must match the worker that was just installed).
+# Overridable ONLY so lib_test.sh can point the composition at a
+# file:// fixture and prove the pinned URL offline; the published
+# default is GitHub, and download_binary still enforces https on it.
+readonly RELEASE_BASE="${MEMQL_INSTALL_RELEASE_BASE:-https://github.com/znasllc-io/memql-cockpit/releases}"
+
 # The installed command. ONE name for both build variants (design D4,
 # znasllc-io/memql-cockpit#352): the download artifact carries the variant,
 # the installed file never does. `memql --version` is what answers "which
@@ -212,6 +221,32 @@ function resolve_target_version() {
     echo ""
 }
 
+# release_download_base prints the download base for ONE release tag,
+# from a version with or without its leading v. This is the URL a
+# --version pin downloads from, and the one the app / menu archives
+# are fetched from once the worker's version is known.
+function release_download_base() {
+    local ver="$1"
+    printf '%s/download/v%s\n' "$RELEASE_BASE" "${ver#v}"
+}
+
+# parse_version_flag validates a --version value and prints it
+# normalised (leading v dropped, prerelease / build suffix kept, so an
+# explicit 0.16.0-rc1 is downloaded and checked as exactly that). "v"
+# is accepted because that is how the tag is spelled on the releases
+# page and how people copy it. Anything else is a bad parameter (2):
+# a typo here must fail before a download, not surface as a 404 whose
+# URL the person then has to read backwards.
+function parse_version_flag() {
+    local raw="$1" ver
+    ver="${raw#v}"
+    if [[ ! "$ver" =~ ^[0-9]+(\.[0-9]+){1,3}([-+][[:alnum:].-]+)*$ ]]; then
+        echo "ERROR: --version wants a release version such as 0.16.0 or v0.16.0 (got '${raw}')" >&2
+        return 2
+    fi
+    printf '%s\n' "$ver"
+}
+
 # home_id_from_cluster_url mirrors Go HomeIDFromURL: host only, lowercased.
 function home_id_from_cluster_url() {
     local cluster_url="$1"
@@ -238,6 +273,24 @@ function same_cluster_url() {
     ha="$(home_id_from_cluster_url "$a")"
     hb="$(home_id_from_cluster_url "$b")"
     [[ "$ha" != "default" && "$ha" == "$hb" ]]
+}
+
+# require_cluster_url_flag refuses (2) a --cluster value the binary's
+# `worker unpair --cluster-url` is certain to reject
+# (internal/worker/unpair_url.go): an http(s) URL with a host and no
+# userinfo, query or fragment. same_cluster_url matches a bare host the
+# way Go's sameClusterURL does, which is right for the registry and
+# wrong as an admission test for the flag: without this a bare
+# `api.example.com` matched the enrollment in the shell and then reached
+# the binary, which answered 5 blaming the enrollment files.
+function require_cluster_url_flag() {
+    local url re
+    url="$(printf '%s' "$1" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    re='^[Hh][Tt][Tt][Pp][Ss]?://[^/?#@[:space:]]+(/[^?#[:space:]]*)?$'
+    if [[ ! "$url" =~ $re ]]; then
+        echo "ERROR: --cluster wants the cluster's URL, such as https://api.example.com (got '${1}'); nothing was changed" >&2
+        return 2
+    fi
 }
 
 # find_home_id_by_cluster_url prints the id of a home whose cluster_url
@@ -416,8 +469,9 @@ function preflight_asset() {
     echo "       (flavour: ${flavour}, platform: ${os}/${arch})" >&2
     echo "       The default download base is the LATEST release" >&2
     echo "       (releases/latest/download), which may not publish an asset for" >&2
-    echo "       this flavour. Check the release's published assets, or pass" >&2
-    echo "       --download-base to point at a release that ships it." >&2
+    echo "       this flavour. Check the release's published assets, pass" >&2
+    echo "       --version=X.Y.Z to pin a release that ships it, or pass" >&2
+    echo "       --download-base to point at any other location." >&2
     echo "       Nothing was installed or modified." >&2
     return 4
 }
@@ -765,6 +819,7 @@ function linux_worker_capabilities() {
 #
 # The concurrency block (HEADLESS: 8, COMPUTERUSE: 1) is fixed and
 # platform-agnostic; os/arch labels come from detect_os/detect_arch.
+# shellcheck disable=SC2034  # WORKER_YAML_ACTION / _HOME_ID are read by the installers' closing block
 function write_worker_yaml() {
     local path="$1"
     local cluster_url="$2"
@@ -780,6 +835,11 @@ function write_worker_yaml() {
     # different id (e.g. pair --home-id local vs install host id).
     home_id="$(home_id_from_cluster_url "$cluster_url")"
     match_id="$home_id"
+    # What this write did to the enrollment, for the installer's closing
+    # block: "created" a home, "refreshed" the one already holding this
+    # cluster (the same token and cluster re-run is a refresh that
+    # changes nothing), or "remapped" one under --force.
+    WORKER_YAML_ACTION="created"
 
     mkdir -p "$dir"
 
@@ -796,12 +856,14 @@ function write_worker_yaml() {
         by_url="$(printf '%s' "$by_url" | tr -d '\r' | head -1)"
         if [[ -n "$by_url" ]]; then
             match_id="$by_url"
+            WORKER_YAML_ACTION="refreshed"
             echo "INFO: refreshing existing home ${match_id} for ${cluster_url} (token upsert; --force not required)"
         else
             existing_url="$(find_home_cluster_url_by_id "$workers_path" "$home_id")"
             if [[ -n "$existing_url" ]]; then
                 if same_cluster_url "$existing_url" "$cluster_url"; then
                     match_id="$home_id"
+                    WORKER_YAML_ACTION="refreshed"
                 elif [[ "$force" != "yes" ]]; then
                     echo "ERROR: $workers_path already has home id '${home_id}' for ${existing_url}." >&2
                     echo "       Pass --force to remap that home to ${cluster_url} (siblings are preserved)." >&2
@@ -809,6 +871,7 @@ function write_worker_yaml() {
                     return 1
                 else
                     match_id="$home_id"
+                    WORKER_YAML_ACTION="remapped"
                     echo "INFO: --force remapping home ${match_id}: ${existing_url} → ${cluster_url}"
                 fi
             fi
@@ -824,7 +887,9 @@ function write_worker_yaml() {
             echo "ERROR: $path already exists for ${legacy_url}; pass --force to replace that home (siblings are preserved in workers.yaml)" >&2
             return 1
         fi
+        [[ -z "$legacy_url" ]] || WORKER_YAML_ACTION="refreshed"
     fi
+    WORKER_YAML_HOME_ID="$match_id"
 
     # Rebuild workers.yaml: keep sibling homes, upsert this one.
     # Preserve existing registry HEADER fields (worker_name, labels,
@@ -997,6 +1062,20 @@ function record_kept() {
     UNINSTALL_KEPT="${UNINSTALL_KEPT}  $1"$'\n'
 }
 
+# record_scoped_unpair_failure is for the one failure that happens AFTER
+# a write: the real `worker unpair` ran and failed, or answered
+# something unreadable, once the worker had been stopped. That run is
+# not "nothing was changed" -- the service is down until the person
+# looks, and Go writes workers.yaml before the worker.yaml mirror, so
+# the files may be half-applied. $1 is the command that starts the
+# worker again, empty when this run did not stop it. With something
+# kept and nothing removed the summary reads FAILED, not REFUSED.
+function record_scoped_unpair_failure() {
+    local restart="${1:-}"
+    record_kept "${HOME}/.memql/workers.yaml and worker.yaml (removal of ${CLUSTER_URL} did not complete and may be half-applied; repair them before restarting the worker)"
+    [[ -z "$restart" ]] || record_kept "the worker service (stopped by this run and NOT restarted; once repaired, start it with:  ${restart})"
+}
+
 # under_memql_home answers whether $1 lies inside ${HOME}/.memql, the
 # ONLY tree the uninstallers delete recursively. It is strict about
 # shape on purpose -- absolute, no `..` segment -- because a state_dir
@@ -1041,59 +1120,122 @@ function remove_worker_config() {
     remove_path_if_present "${HOME}/.memql/worker.yaml"
 }
 
-# remove_tree_if_present deletes a directory recursively, inside the
-# ~/.memql fence and nowhere else. Outside it the directory is KEPT
-# and reported with its path, so the person can decide. That is not
-# an error: the uninstall still did everything it was allowed to.
-function remove_tree_if_present() {
-    local dir="$1"
+# normalize_tree_path prints $1 with every `//` collapsed and every
+# trailing slash dropped ("/" stays "/"). The fence below compares
+# STRINGS, and a state_dir is operator-authored text: `~/.memql/` IS
+# ~/.memql and must hit the same guard (a review found it did not, and
+# --purge then rm -rf'd the whole tree, credentials and backups
+# included). The trailing slash matters for rm as well: `rm -rf link/`
+# FOLLOWS the link (POSIX trailing-slash resolution; BSD rm removes the
+# target directory, GNU rm empties it, both exit 0), so nothing here may
+# hand rm a path ending in `/`. Spelled with prefix/suffix expansions on
+# purpose: bash 3.2 renders `${p//\/\//\/}` with a literal backslash.
+function normalize_tree_path() {
+    local p="$1"
+    while [[ "$p" == *//* ]]; do p="${p%%//*}/${p#*//}"; done
+    while [[ "$p" == */ && "$p" != / ]]; do p="${p%/}"; done
+    printf '%s\n' "$p"
+}
+
+# tree_removal_verdict is the ONE statement of what a recursive delete
+# under --purge may touch. It prints "absent", "remove", or "keep:<why>"
+# for a directory and changes nothing, so the remover and the --dry-run
+# plan cannot disagree about the fence: inside ~/.memql only; never
+# through a symlinked ancestor (an alias that would sweep something
+# else); never ~/.memql itself or a `.` spelling of it; never the
+# credential / certificate / backup trees, whatever a state_dir says.
+# Every guard judges ONE normalized spelling (normalize_tree_path).
+function tree_removal_verdict() {
+    local dir
+    dir="$(normalize_tree_path "$1")"
     if [[ ! -e "$dir" && ! -L "$dir" ]]; then
-        echo "INFO: $dir not present; nothing to remove"
+        echo "absent"
         return 0
     fi
     if ! under_memql_home "$dir"; then
-        echo "WARN: $dir is outside ${HOME}/.memql; not touched. Delete it by hand if you want it gone."
-        record_kept "$dir (outside ${HOME}/.memql; not touched)"
+        echo "keep:outside ${HOME}/.memql; not touched"
         return 0
     fi
-    # Never allow a state_dir alias or ancestor to sweep credentials/backups.
     local cursor="$dir" protected
     while [[ "$cursor" != "$HOME/.memql" && "$cursor" != / ]]; do
         if [[ -L "$cursor" && "$cursor" != "$dir" ]]; then
-            echo "WARN: kept $dir (symlinked ancestor)"
-            record_kept "$dir (symlinked ancestor)"
+            echo "keep:symlinked ancestor"
             return 0
         fi
         cursor="$(dirname "$cursor")"
     done
     case "$dir" in
-        "$HOME/.memql"|*/./*|*/.) record_kept "$dir (unsafe purge target)"; return 0 ;;
+        "$HOME/.memql"|*/./*|*/.) echo "keep:unsafe purge target"; return 0 ;;
     esac
+    # Case-folded: macOS's default APFS is case-insensitive, so
+    # ~/.memql/Credentials IS ~/.memql/credentials there. On a
+    # case-sensitive filesystem this over-keeps a genuinely distinct
+    # directory of that name, which is the safe direction and is said
+    # in the summary. bash 3.2 has no ${var,,}; tr does the folding.
+    local dir_folded fence_folded
+    dir_folded="$(printf '%s' "$dir" | tr '[:upper:]' '[:lower:]')"
+    fence_folded="$(printf '%s' "${HOME}/.memql" | tr '[:upper:]' '[:lower:]')"
     for protected in backups credentials certs certificates; do
-        case "$dir" in
-            "$HOME/.memql/$protected"|"$HOME/.memql/$protected/"*)
-                echo "WARN: kept $dir (protected data)"; record_kept "$dir (protected data)"; return 0 ;;
+        case "$dir_folded" in
+            "$fence_folded/$protected"|"$fence_folded/$protected/"*) echo "keep:protected data"; return 0 ;;
         esac
     done
-    rm -rf "$dir"
-    echo "INFO: removed $dir"
-    record_removed "$dir"
+    echo "remove"
 }
 
-# worker_state_dir_from_yaml prints the state_dir worker config names,
-# or the default when the file or the key is absent. Prefers the path
-# handed in (usually legacy worker.yaml), then the multi-home registry
-# workers.yaml beside it -- install always mirrors both, but a machine
-# that only has the registry still has a purge target. The drivers call
-# it BEFORE the token files are removed: --purge has to delete the
-# directory the worker actually used, and write_worker_yaml's default
-# is only where that usually is. A leading `~/` is expanded the way
-# the shell would have; anything else reaches the fence as written.
+# remove_tree_if_present deletes a directory recursively, inside the
+# ~/.memql fence and nowhere else. Outside it the directory is KEPT
+# and reported with its path, so the person can decide. That is not
+# an error: the uninstall still did everything it was allowed to. A
+# symlink AT the path is removed as a link and nothing else: what it
+# points at (a state dir someone moved to another disk) is theirs.
+function remove_tree_if_present() {
+    local dir verdict
+    dir="$(normalize_tree_path "$1")"
+    verdict="$(tree_removal_verdict "$dir")"
+    case "$verdict" in
+        absent)
+            echo "INFO: $dir not present; nothing to remove"
+            ;;
+        remove)
+            if [[ -L "$dir" ]]; then
+                rm -f "$dir"
+                echo "INFO: removed the symlink $dir (what it pointed at was not touched)"
+                record_removed "$dir (the symlink only)"
+            else
+                rm -rf "$dir"
+                echo "INFO: removed $dir"
+                record_removed "$dir"
+            fi
+            ;;
+        keep:outside*)
+            echo "WARN: $dir is outside ${HOME}/.memql; not touched. Delete it by hand if you want it gone."
+            record_kept "$dir (${verdict#keep:})"
+            ;;
+        keep:*)
+            echo "WARN: kept $dir (${verdict#keep:})"
+            record_kept "$dir (${verdict#keep:})"
+            ;;
+    esac
+}
+
+# worker_state_dir_from_yaml prints the machine's state ROOT, the
+# directory --purge removes, or the default when no file names one.
+# It reads the multi-home registry (workers.yaml beside the path handed
+# in) FIRST -- its state_dir is the machine root -- and the legacy
+# mirror second: the installer writes the mirror's state_dir PER HOME
+# (<root>/homes/<id>, mirroring ConfigForHome), and a purge that read
+# the mirror first removed one home's subdirectory, left worker.log and
+# the root behind, and said SUCCESS (a review finding). A per-home
+# directory answers its root exactly as Go's machineStateRoot does
+# (internal/worker/machineid.go). The drivers call it BEFORE the token
+# files are removed. A leading `~/` is expanded the way the shell would
+# have; the spelling is normalized (normalize_tree_path); anything else
+# reaches the fence as written.
 function worker_state_dir_from_yaml() {
     local path="$1"
-    local dir=""
-    local try
-    for try in "$path" "$(dirname "$path")/workers.yaml"; do
+    local dir="" try parent
+    for try in "$(dirname "$path")/workers.yaml" "$path"; do
         if [[ -f "$try" ]]; then
             dir="$(sed -n -E 's/^state_dir:[[:space:]]*"?([^"#]*[^"#[:space:]])"?[[:space:]]*(#.*)?$/\1/p' "$try" | head -1)"
             [[ -n "$dir" ]] && break
@@ -1101,9 +1243,60 @@ function worker_state_dir_from_yaml() {
     done
     case "$dir" in
         "")   dir="$STATE_DIR_DEFAULT" ;;
+        \~)   dir="$HOME" ;;
         \~/*) dir="${HOME}/${dir#\~/}" ;;
     esac
+    dir="$(normalize_tree_path "$dir")"
+    parent="${dir%/*}"
+    if [[ "$dir" == */* && "$parent" == */* && "${parent##*/}" == homes && -n "${parent%/*}" ]]; then
+        dir="${parent%/*}"
+    fi
     echo "$dir"
+}
+
+# mode_binary_names prints every file name an install can leave in a
+# mode's bin directory: the installed command (first, so it goes first
+# on the way out), the two download-named binaries for this platform
+# (headless and computer-use) and the pre-rename names. One list, read
+# by the remover, the presence probe and the retained-runtime ledger,
+# so a rename cannot leave one of them looking for the old name.
+function mode_binary_names() {
+    local headless computeruse
+    headless="$(binary_name_for headless)" || return 1
+    computeruse="$(binary_name_for computeruse)" || return 1
+    printf '%s\n' "${INSTALLED_COMMAND} ${headless} ${computeruse} ${LEGACY_BINARIES}"
+}
+
+# install_mode_has_files answers whether ANYTHING an install leaves in
+# a mode's bin directory is there -- a dangling `memql` symlink counts,
+# because it is ours to remove. It is how the uninstallers detect the
+# shapes on a machine instead of asking the caller which one was used.
+function install_mode_has_files() {
+    local mode="$1" dest_dir names name path
+    dest_dir="$(install_mode_dir "$mode")" || return 1
+    names="$(mode_binary_names)" || return 1
+    for name in $names; do
+        path="${dest_dir}/${name}"
+        if [[ -e "$path" || -L "$path" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# first_executable prints the first argument that is an executable
+# regular file (through a symlink), or returns 1 when none is. The
+# uninstallers use it to find A memql that can parse the enrollment
+# files -- any installed shape will do, and a dangling symlink will not.
+function first_executable() {
+    local candidate
+    for candidate in "$@"; do
+        if [[ -n "$candidate" && -f "$candidate" && -x "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
 }
 
 # remove_binaries_with_mode is install_binary_with_mode's inverse: from
@@ -1124,21 +1317,12 @@ function worker_state_dir_from_yaml() {
 # and exit with that code at the end.
 function remove_binaries_with_mode() {
     local mode="$1"
-    local dest_dir
+    local dest_dir names
     dest_dir="$(install_mode_dir "$mode")" || return 1
-    local headless computeruse
-    headless="$(binary_name_for headless)" || return 1
-    computeruse="$(binary_name_for computeruse)" || return 1
-    local names="${INSTALLED_COMMAND} ${headless} ${computeruse} ${LEGACY_BINARIES}"
+    names="$(mode_binary_names)" || return 1
 
-    local name path present="no"
-    for name in $names; do
-        path="${dest_dir}/${name}"
-        if [[ -e "$path" || -L "$path" ]]; then
-            present="yes"
-        fi
-    done
-    if [[ "$present" == "no" ]]; then
+    local name path
+    if ! install_mode_has_files "$mode"; then
         echo "INFO: no ${INSTALLED_COMMAND} binary at ${dest_dir}; nothing to remove"
         return 0
     fi
@@ -1243,19 +1427,418 @@ function remove_memql_home_if_empty() {
     record_kept "$dir (still holds: ${left})"
 }
 
+# ---------------------------------------------------------------
+# Enrollment discovery + the no-flag decision -- shared by both uninstallers
+# ---------------------------------------------------------------
+#
+# MemQL OS composes the uninstall one-liner without --cluster=URL or
+# --all-homes, and the first thing a person copying it saw was
+# "ERROR: choose --cluster=URL or --all-homes". The person has no
+# better information than the enrollment files already hold, so the
+# script reads them and decides; the flags remain for saying it
+# explicitly. The reading here is a TEXT view of workers.yaml (one URL
+# per cluster identity, matched the way Go's sameClusterURL matches),
+# used only to count and to name clusters -- the removal itself still
+# goes through the installed binary's `worker unpair --cluster-url`,
+# whose YAML decoder is the one that decides what a home is.
+
+# enrollment_files_regular refuses (3) to decide anything from an
+# enrollment file that is a symlink: the binary refuses to unpair
+# through one ("enrollment files must be regular files"), and a text
+# reader that followed the link would count tokens that live somewhere
+# this uninstall has no business touching.
+function enrollment_files_regular() {
+    local path
+    for path in "${HOME}/.memql/workers.yaml" "${HOME}/.memql/worker.yaml"; do
+        if [[ -L "$path" ]]; then
+            echo "ERROR: $path is a symlink; not deciding from it. Restore the file, or pass --all-homes to remove everything." >&2
+            return 3
+        fi
+    done
+}
+
+# count_lines prints how many non-empty lines $1 holds. Pure bash: the
+# uninstallers run this under a PATH that may hold no wc or grep.
+function count_lines() {
+    local text="$1" n=0 line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ -n "$line" ]]; then
+            n=$((n + 1))
+        fi
+    done <<< "$text"
+    echo "$n"
+}
+
+# list_enrolled_cluster_urls prints one cluster URL per enrolled
+# cluster: from the `homes:` list of workers.yaml when it is present
+# (the registry is the whole truth once it exists -- see
+# decideRunMode), else from the top-level cluster_url of the legacy
+# worker.yaml. Two homes for the same cluster identity -- the same
+# host, however the URL is spelled -- print once, because unpairing by
+# URL removes them together and they are one enrollment to the person.
+# Disabled homes count: they are enrollments a scoped removal keeps.
+# Neither file, or `homes: []`, prints nothing. The reader accepts
+# every block-list spelling yaml.v3 does (a review found three it
+# missed, each read as ZERO enrollments): items indented under the key
+# or at column 0 (a mapping-rooted document has no other column-0
+# dash, so one cannot start a new top-level key), a comment on the
+# `homes:` line, and an item whose first key is cluster_url rather
+# than id -- any `- ` starts an item, whatever key follows it.
+function list_enrolled_cluster_urls() {
+    local workers_path="$1" legacy_path="$2"
+    if [[ -f "$workers_path" && ! -L "$workers_path" ]]; then
+        # The registry's `homes:` key comes in two shapes this reader
+        # understands: a block list, or Go's `homes: []` for a machine
+        # that unpaired its last cluster. Anything else (a flow-style or
+        # half-edited list) is a file the shell must not decide from --
+        # "no enrollment" over an unreadable registry would delete a
+        # token file nobody could read. 5, the binary's own code for it.
+        if ! awk 'BEGIN { ok = 1 }
+                  /^homes:/ { ok = ($0 ~ /^homes:[[:space:]]*(\[[[:space:]]*\])?[[:space:]]*(#.*)?$/) }
+                  END { exit ok ? 0 : 1 }' "$workers_path"; then
+            echo "ERROR: $workers_path is not an enrollment registry this script can read; nothing was changed." >&2
+            echo "       Restore it, or pass --all-homes to remove everything on this machine." >&2
+            return 5
+        fi
+        awk '
+            function norm(s) {
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
+                gsub(/^["'"'"']|["'"'"']$/, "", s)
+                sub(/\/+$/, "", s)
+                return tolower(s)
+            }
+            function host(s) {
+                s = norm(s)
+                sub(/^[a-z][a-z0-9+.-]*:\/\//, "", s)
+                sub(/\/.*$/, "", s)
+                sub(/:[0-9]+$/, "", s)
+                return s
+            }
+            function flush(    key) {
+                if (cur == "") return
+                key = host(cur)
+                if (key == "") key = norm(cur)
+                if (!(key in seen)) { seen[key] = 1; print cur }
+                cur = ""
+            }
+            BEGIN { in_homes = 0; cur = "" }
+            /^homes:[[:space:]]*(#.*)?$/ { in_homes = 1; next }
+            !in_homes { next }
+            /^[^[:space:]#-]/ { flush(); in_homes = 0; next }
+            /^[[:space:]]*-[[:space:]]*/ { flush(); sub(/^[[:space:]]*-[[:space:]]*/, "") }
+            /^[[:space:]]*cluster_url:[[:space:]]*/ {
+                cur = $0
+                sub(/^[[:space:]]*cluster_url:[[:space:]]*/, "", cur)
+                sub(/[[:space:]]+(#.*)?$/, "", cur)
+                gsub(/^["'"'"']|["'"'"']$/, "", cur)
+                next
+            }
+            END { flush() }
+        ' "$workers_path"
+    elif [[ -f "$legacy_path" && ! -L "$legacy_path" ]]; then
+        awk '
+            /^cluster_url:[[:space:]]*/ {
+                sub(/^cluster_url:[[:space:]]*/, "")
+                sub(/[[:space:]]+(#.*)?$/, "")
+                gsub(/^["'"'"']|["'"'"']$/, "")
+                if ($0 != "") print
+                exit
+            }
+        ' "$legacy_path"
+    fi
+}
+
+# unpair_json_remaining prints the `remaining` count out of the JSON
+# `worker unpair --cluster-url ... --json` writes -- Go's
+# UnpairURLResult, one object of ints and bools on one line (see
+# internal/worker/unpair_url.go). Anything that is not that shape is a
+# failure (5), never a guess: this number decides whether the shared
+# runtime stays. sed rather than a platform JSON tool so the Linux
+# driver and the ubuntu test lane read it the same way macOS does.
+function unpair_json_remaining() {
+    unpair_json_int "$1" remaining
+}
+
+# unpair_json_removed prints the `removed` count out of the same
+# result: how many homes matched the URL. The --dry-run plan says it;
+# the decision to keep the runtime is `remaining`'s alone.
+function unpair_json_removed() {
+    unpair_json_int "$1" removed
+}
+
+function unpair_json_int() {
+    local file="$1" field="$2" n
+    n="$(sed -n -E 's/^\{.*"'"$field"'":[[:space:]]*([0-9]+)[,}].*$/\1/p' "$file")"
+    if [[ ! "$n" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: unexpected unpair result; enrollment files left as they were" >&2
+        return 5
+    fi
+    printf '%s\n' "$n"
+}
+
+# uninstall_invocation prints how THIS run was started, so a printed
+# remedy is the same command with the missing flag added: the script
+# by path when it was run from a clone, or the `curl ... | bash -s --`
+# one-liner from RAW_BASE (what MemQL OS shows) when it was piped, in
+# which case $0 is `bash` and says nothing about where it came from.
+# $1 is the driver's file name.
+function uninstall_invocation() {
+    local script_name="$1"
+    if [[ "$(basename "$0")" == "$script_name" && -f "$0" ]]; then
+        printf '%s' "$0"
+    else
+        printf 'curl -fsSL %s/%s | bash -s --' \
+            "${RAW_BASE:-https://raw.githubusercontent.com/znasllc-io/memql-cockpit/main/scripts/install}" "$script_name"
+    fi
+}
+
+# print_enrollment_commands prints, for every enrolled cluster, the
+# exact command that removes just it, then the one that removes them
+# all -- so the person copies rather than guesses. $2 carries the flags
+# that stay valid for a one-cluster removal (--user-local); --purge is
+# only offered on the --all-homes line, because a scoped removal
+# refuses it while another enrollment remains.
+function print_enrollment_commands() {
+    local script_name="$1" carried="$2" urls="$3"
+    local prefix url all_flags="$carried"
+    prefix="$(uninstall_invocation "$script_name")"
+    [[ "${PURGE:-no}" != yes ]] || all_flags="${all_flags} --purge"
+    while IFS= read -r url; do
+        [[ -n "$url" ]] || continue
+        echo "         ${prefix}${carried} --cluster=${url}"
+    done <<< "$urls"
+    echo "       Or remove every enrollment and the shared worker runtime at once:"
+    echo "         ${prefix}${all_flags} --all-homes"
+}
+
+# resolve_uninstall_scope turns a run with neither --cluster=URL nor
+# --all-homes into one of them, from the machine:
+#
+#   one enrollment  -> that cluster, as if --cluster=<its url> were given
+#   none            -> --all-homes: nothing to unpair, only runtime files
+#   several         -> refuse (2) with one exact command per cluster
+#
+# Explicit flags are left exactly as given. Reads and sets the drivers'
+# CLUSTER_URL / ALL_HOMES globals. An enrollment file that is a symlink
+# is not decided from (3), and a registry the reader cannot make sense
+# of is not either (5) -- --all-homes is the way past both. $1 is the
+# driver's file name and $2 the flags to carry into printed commands.
+# shellcheck disable=SC2034  # CLUSTER_URL / ALL_HOMES are the drivers' globals
+function resolve_uninstall_scope() {
+    local script_name="$1" carried="${2:-}"
+    if [[ -n "$CLUSTER_URL" || "$ALL_HOMES" == yes ]]; then
+        return 0
+    fi
+    enrollment_files_regular || return $?
+    local urls n
+    urls="$(list_enrolled_cluster_urls "${HOME}/.memql/workers.yaml" "${HOME}/.memql/worker.yaml")" || return $?
+    n="$(count_lines "$urls")"
+    case "$n" in
+        0)
+            ALL_HOMES="yes"
+            echo "INFO: no worker enrollment on this machine; removing the worker runtime (as --all-homes)"
+            ;;
+        1)
+            CLUSTER_URL="$urls"
+            echo "INFO: one worker enrollment on this machine, ${CLUSTER_URL}; removing it (as --cluster=${CLUSTER_URL})"
+            ;;
+        *)
+            {
+                echo "ERROR: ${n} clusters are enrolled on this machine and this run did not say which one to remove."
+                echo "       Nothing was changed. Re-run naming the cluster to remove:"
+                print_enrollment_commands "$script_name" "$carried" "$urls"
+            } >&2
+            return 2
+            ;;
+    esac
+}
+
+# scoped_precheck runs before the binary is asked to unpair CLUSTER_URL
+# and settles the cases where the binary is the wrong tool:
+#
+#   no enrollment at all   -> SCOPED_DECISION=full: nothing to unpair; the
+#                             runtime goes as --all-homes would (a machine
+#                             that never paired, or already unpaired, is
+#                             still being uninstalled)
+#   none matches the URL   -> refuse (3) with every enrolled cluster and
+#                             the command for each: a wrong URL must never
+#                             remove someone else's enrollment
+#   one matches            -> SCOPED_DECISION=unpair, and ENROLLED_OTHER
+#                             says whether any OTHER cluster is enrolled,
+#                             which is what the no-binary path needs
+#
+# Matching is Go's sameClusterURL, via same_cluster_url: whitespace and
+# a trailing slash trimmed, case-insensitive, and the same host counts,
+# so https://api.memql.localhost/ and https://api.memql.localhost are
+# one enrollment. $1 is the driver's file name, $2 the carried flags.
+# shellcheck disable=SC2034  # SCOPED_DECISION / ENROLLED_OTHER are read by the drivers' scoped_unpair
+function scoped_precheck() {
+    local script_name="$1" carried="${2:-}" urls n url matched=no
+    enrollment_files_regular || return $?
+    urls="$(list_enrolled_cluster_urls "${HOME}/.memql/workers.yaml" "${HOME}/.memql/worker.yaml")" || return $?
+    n="$(count_lines "$urls")"
+    SCOPED_DECISION="unpair"
+    ENROLLED_OTHER="no"
+    if [[ "$n" -eq 0 ]]; then
+        echo "INFO: no worker enrollment on this machine, so there is nothing to unpair for ${CLUSTER_URL}; removing the worker runtime (as --all-homes)"
+        SCOPED_DECISION="full"
+        return 0
+    fi
+    while IFS= read -r url; do
+        [[ -n "$url" ]] || continue
+        if same_cluster_url "$url" "$CLUSTER_URL"; then
+            matched="yes"
+        else
+            ENROLLED_OTHER="yes"
+        fi
+    done <<< "$urls"
+    if [[ "$matched" != yes ]]; then
+        {
+            echo "ERROR: no enrollment on this machine matches --cluster=${CLUSTER_URL}; nothing was changed."
+            echo "       Enrolled clusters, each with the command that removes just it:"
+            print_enrollment_commands "$script_name" "$carried" "$urls"
+        } >&2
+        return 3
+    fi
+}
+
+# binary_speaks_scoped_unpair answers whether an installed memql can
+# be asked `worker unpair --cluster-url ... --dry-run --json` at all:
+# that contract shipped in 0.15.0, and an older build's flag parser
+# exits 2 on the unknown flag (or 1 on an unknown verb) after printing
+# its usage. $2 is the version read from it, possibly empty -- an
+# unreadable version is not held against the binary; the call itself
+# then decides (see the drivers' handling of exit 1 / 2).
+function binary_speaks_scoped_unpair() {
+    local binary="$1" ver="$2"
+    [[ -n "$binary" ]] || return 1
+    if [[ -n "$ver" && "$(compare_semver "$ver" 0.15.0)" == -1 ]]; then
+        echo "INFO: the installed memql v${ver} predates URL-scoped unpair (0.15.0)"
+        return 1
+    fi
+}
+
+# scoped_without_binary is the scoped path when no installed memql can
+# split the enrollment -- none is there, or the one there is too old.
+# Fine when the requested cluster is the only one: the whole machine
+# IS that enrollment, and the worker files go with the runtime exactly
+# as --all-homes would. A refusal (4, prerequisite missing) when others
+# exist: the shell's text view of the registry counts and names
+# clusters, it never decides which of several homes to delete.
+# shellcheck disable=SC2034  # OTHER_HOMES is the drivers' global
+function scoped_without_binary() {
+    if [[ "$ENROLLED_OTHER" == no ]]; then
+        echo "INFO: ${CLUSTER_URL} is the only enrollment on this machine; removing it with the worker files (as --all-homes)"
+        OTHER_HOMES=0
+        return 0
+    fi
+    echo "ERROR: removing ${CLUSTER_URL} while keeping the other enrollment(s) needs an installed memql 0.15.0 or newer; nothing was changed." >&2
+    echo "       Re-run the installer to upgrade it (enrollments are kept), or pass --all-homes to remove every enrollment." >&2
+    return 4
+}
+
+# ---------------------------------------------------------------
+# --dry-run: the plan, printed from read-only probes
+# ---------------------------------------------------------------
+#
+# A dry run resolves everything the real run would -- the scope, the
+# shapes, which files and services exist -- and prints what would go,
+# what would stay and why, changing nothing. The refusals a real run
+# makes BEFORE touching anything (several enrollments and none named,
+# a URL nothing matches, an unreadable registry) come out identical,
+# with the same exit code; otherwise the plan ends in exit 0. These
+# helpers print the per-path lines; the drivers order them the way
+# their main() runs.
+
+# plan_path prints one "would remove" line for a present file or
+# symlink, and nothing for an absent one.
+function plan_path() {
+    local path="$1"
+    if [[ -e "$path" || -L "$path" ]]; then
+        echo "  would remove:  $path"
+    fi
+}
+
+# plan_binaries_with_mode is remove_binaries_with_mode's read-only twin.
+function plan_binaries_with_mode() {
+    local mode="$1" dest_dir names name
+    dest_dir="$(install_mode_dir "$mode")" || return 1
+    names="$(mode_binary_names)" || return 1
+    if ! install_mode_has_files "$mode"; then
+        echo "  nothing at:    ${dest_dir} (no ${INSTALLED_COMMAND} binary)"
+        return 0
+    fi
+    for name in $names; do
+        plan_path "${dest_dir}/${name}"
+    done
+}
+
+# plan_worker_config is remove_worker_config's read-only twin.
+function plan_worker_config() {
+    plan_path "${HOME}/.memql/workers.yaml"
+    plan_path "${HOME}/.memql/worker.yaml"
+}
+
+# plan_tree prints the fence's verdict for one directory, over the same
+# normalized spelling the remover uses.
+function plan_tree() {
+    local dir verdict
+    dir="$(normalize_tree_path "$1")"
+    verdict="$(tree_removal_verdict "$dir")"
+    case "$verdict" in
+        absent) ;;
+        remove)
+            if [[ -L "$dir" ]]; then
+                echo "  would remove:  $dir (the symlink only; what it points at is not touched)"
+            else
+                echo "  would remove:  $dir (recursively)"
+            fi ;;
+        keep:*) echo "  would keep:    $dir (${verdict#keep:})" ;;
+    esac
+}
+
+# plan_purge_state is purge_worker_state's read-only twin;
+# plan_kept_state is report_kept_state's.
+function plan_purge_state() {
+    local state_dir="$1"
+    plan_path "${HOME}/.memql/policy.yaml"
+    plan_tree "$state_dir"
+    plan_path "${HOME}/.memql/worker.sock"
+    plan_tree "${HOME}/.memql/ollama"
+    echo "  would remove:  ${HOME}/.memql (only once nothing else is left in it)"
+}
+
+function plan_kept_state() {
+    local state_dir="$1" path
+    for path in "${HOME}/.memql/policy.yaml" "$state_dir" "${HOME}/.memql/ollama"; do
+        if [[ -e "$path" ]]; then
+            echo "  would keep:    $path (--purge removes it)"
+        fi
+    done
+}
+
 # print_uninstall_summary is the closing block, the uninstall's
 # counterpart to the installers' SUCCESS block: what went, what stayed
 # and why, and the one thing this script cannot do. The registration
 # row lives on the cluster, and the token that could have spoken for
 # this machine has just been deleted -- Fleet -> Machines in MemQL OS
 # is where a machine is revoked, and a worker retrying with a dead
-# token is the reason to revoke there first. $1 is the binary step's
-# return code: non-zero means something is still on disk, and the
-# heading says so rather than claiming success over a leftover.
+# token is the reason to revoke there first. $1 is the run's exit
+# code: non-zero with something removed means something else is still
+# on disk (PARTIAL); non-zero with nothing removed but something kept
+# means a step ran and failed, and Kept says what it left (FAILED);
+# non-zero with nothing recorded at all means the run refused before it
+# touched anything (REFUSED, and the error above says why). No heading
+# claims success over a leftover, and none claims "nothing was changed"
+# over a stopped worker.
 function print_uninstall_summary() {
     local rc="${1:-0}"
     local heading="SUCCESS: memql-worker uninstalled."
-    if [[ "$rc" -ne 0 ]]; then
+    if [[ "$rc" -ne 0 && -z "$UNINSTALL_REMOVED" && -z "$UNINSTALL_KEPT" ]]; then
+        heading="REFUSED: memql-worker was not uninstalled; nothing was changed (see the error above)."
+    elif [[ "$rc" -ne 0 && -z "$UNINSTALL_REMOVED" ]]; then
+        heading="FAILED: memql-worker uninstall did not complete; nothing was removed, and Kept names what needs you (see the error above)."
+    elif [[ "$rc" -ne 0 ]]; then
         heading="PARTIAL: memql-worker uninstalled, with leftovers (see Kept)."
     fi
     echo ""

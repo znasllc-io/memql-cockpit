@@ -17,7 +17,8 @@
 #   --name <name>       Worker name (default: hostname).
 #   --computeruse               Install the computer-use variant (memql-computeruse).
 #   --inference         Also set this machine up to serve local models.
-#   --download-base <u> Base URL for binary downloads.
+#   --version <X.Y.Z>   Pin the release to install (0.16.0 or v0.16.0); default: latest.
+#   --download-base <u> Base URL for binary downloads (wins over --version).
 #   --force             Remap a home id onto a different cluster_url (not binary overwrite).
 #   --no-service        Skip LaunchAgent installation.
 
@@ -59,7 +60,8 @@ function source_lib() {
 }
 source_lib
 
-readonly DEFAULT_DOWNLOAD_BASE="https://github.com/znasllc-io/memql-cockpit/releases/latest/download"
+# The latest release, unless --version pins one (see parse_args).
+readonly DEFAULT_DOWNLOAD_BASE="${RELEASE_BASE}/latest/download"
 
 function show_help() {
     cat << EOF
@@ -83,7 +85,13 @@ Options:
                               Provides weaker isolation -- a compromised
                               user account can swap the binary without
                               privilege escalation.
-    --download-base <url>     Override binary download base URL
+    --version <X.Y.Z>         Install this release instead of the latest:
+                              downloads from releases/download/vX.Y.Z and
+                              checks the binary answers to it. "0.16.0" and
+                              "v0.16.0" both work. An older release than the
+                              installed one is refused (no downgrade).
+    --download-base <url>     Override binary download base URL (wins over
+                              --version for where to download from)
     --force                   Remap a home id onto a different cluster_url
                               (siblings kept). Not required to refresh the
                               same cluster_url or re-run install; never
@@ -105,6 +113,8 @@ function parse_args() {
     INSTALL_MENU="yes"
     INSTALL_MODE="system"  # default: sudo-gated /usr/local/bin (#66)
     INFERENCE="no"
+    PIN_VERSION=""
+    DOWNLOAD_BASE_SET="no"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -114,8 +124,18 @@ function parse_args() {
             --computeruse)           FLAVOUR="computeruse"; shift ;;
             --inference)     INFERENCE="yes"; shift ;;
             --user-local)    INSTALL_MODE="user-local"; shift ;;
-            --download-base) DOWNLOAD_BASE="$2"; shift 2 ;;
-            --download-base=*) DOWNLOAD_BASE="${1#*=}"; shift ;;
+            --download-base) DOWNLOAD_BASE="$2"; DOWNLOAD_BASE_SET="yes"; shift 2 ;;
+            --download-base=*) DOWNLOAD_BASE="${1#*=}"; DOWNLOAD_BASE_SET="yes"; shift ;;
+            # Both spellings, because the portal composes one and people
+            # type the other. A malformed value is a bad parameter (2)
+            # here, not a 404 later.
+            --version=*)
+                PIN_VERSION="$(parse_version_flag "${1#*=}")" || exit 2
+                shift ;;
+            --version)
+                [[ $# -gt 1 ]] || { echo "ERROR: --version needs a value, e.g. --version 0.16.0" >&2; exit 2; }
+                PIN_VERSION="$(parse_version_flag "$2")" || exit 2
+                shift 2 ;;
             --force)         FORCE="yes"; shift ;;
             --no-menu)       INSTALL_MENU="no"; shift ;;
             --no-service)    INSTALL_SERVICE="no"; shift ;;
@@ -136,6 +156,18 @@ function parse_args() {
     if [[ ! "$TOKEN" =~ ^mql_wkr_ ]]; then
         echo "ERROR: token must start with mql_wkr_" >&2
         exit 1
+    fi
+    # A pin names the release to download from -- unless --download-base
+    # said where, which wins for the location. Either way the pin is the
+    # version the downloaded binary must answer to: MEMQL_INSTALL_VERSION
+    # is what resolve_target_version and install_binary_with_mode's
+    # exact-build check already read, so the flag feeds that one path
+    # rather than a second one.
+    if [[ -n "$PIN_VERSION" ]]; then
+        MEMQL_INSTALL_VERSION="$PIN_VERSION"
+        if [[ "$DOWNLOAD_BASE_SET" != yes ]]; then
+            DOWNLOAD_BASE="$(release_download_base "$PIN_VERSION")"
+        fi
     fi
 }
 
@@ -175,7 +207,7 @@ function install_native_app() {
     version="$(read_binary_version_exact "$INSTALLED_BINARY")"
     [[ -n "$version" && "$(compare_semver "$version" 0.15.0)" != -1 ]] || return 0
     base="$DOWNLOAD_BASE"
-    [[ "$base" != "$DEFAULT_DOWNLOAD_BASE" ]] || base="https://github.com/znasllc-io/memql-cockpit/releases/download/v${version}"
+    [[ "$base" != "$DEFAULT_DOWNLOAD_BASE" ]] || base="$(release_download_base "$version")"
     NATIVE_STAGE="$(mktemp -d)"
     fetch_macos_app "$base" "$(detect_arch)" "$NATIVE_STAGE" || return $?
     source_app="$NATIVE_STAGE/unpacked/MemQL.app"
@@ -301,7 +333,7 @@ function install_menu_companion() {
     base="$DOWNLOAD_BASE"
     # Match the actual installed worker, even if latest moves during install.
     if [[ "$base" == "$DEFAULT_DOWNLOAD_BASE" ]]; then
-        base="https://github.com/znasllc-io/memql-cockpit/releases/download/v${version}"
+        base="$(release_download_base "$version")"
     fi
     stage="$(mktemp -d)"
     if fetch_macos_menu "$base" "$(detect_arch)" "$stage"; then
@@ -373,7 +405,10 @@ function main() {
 ================================================================
 SUCCESS: memql-worker installed.
 
+Version:   $(read_binary_version "$INSTALLED_BINARY") (${FLAVOUR})
 Binary:    ${INSTALLED_BINARY}
+Cluster:   ${CLUSTER_URL}
+Home:      ${WORKER_YAML_HOME_ID} (${WORKER_YAML_ACTION})
 Config:    ${HOME}/.memql/workers.yaml (legacy mirror: worker.yaml)
 Logs:      ${HOME}/.memql/state/worker.log
 
@@ -388,9 +423,11 @@ To stop it:
 
 To uninstall this worker (keeps clusters.yaml / credentials):
 
-  curl -fsSL https://raw.githubusercontent.com/znasllc-io/memql-cockpit/main/scripts/install/uninstall-mac.sh | bash
+  curl -fsSL ${RAW_BASE}/uninstall-mac.sh | bash -s --
   # or, from a clone:  ./scripts/install/uninstall-mac.sh
-  # add --purge to also remove state + policy.yaml
+  # with one enrollment on this machine that is the one removed;
+  # add --cluster=${CLUSTER_URL} to name it, --purge to also remove
+  # state + policy.yaml
 ================================================================
 EOF
 }
