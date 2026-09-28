@@ -137,7 +137,7 @@ logs every heartbeat.
 
 ### 3. `models.allow` in `~/.memql/policy.yaml`
 
-**Default-deny**, the same posture `apps.allow` has and for the same reason:
+**Default-deny**, the same posture app consent (`apps.homes`) has and for the same reason:
 serving a call spends this machine's own GPU on somebody else's prompt.
 An empty allow list is the state of every machine upgrading into this feature,
 and it does not mean "all".

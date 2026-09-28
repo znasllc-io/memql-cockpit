@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/url"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -67,21 +68,32 @@ type FSPolicy struct {
 	Deny          []string `yaml:"deny"`
 }
 
-// AppsPolicy controls which local apps this machine will let the engine
-// drive (memql-cockpit#346).
+// AppsPolicy controls which local apps this machine will let each cluster
+// drive (memql-cockpit#346), PER CLUSTER:
 //
 //	apps:
-//	  allow:
-//	    - claude-code
-//	    - codex
+//	  homes:
+//	    api.memql.localhost:     # a home id from workers.yaml
+//	      allow:
+//	        - claude-code
+//	        - codex
 //
 // DEFAULT-DENY, and deliberately so. An app session does exactly what
 // workerHost.exec does -- edits files and runs commands on somebody's own
 // computer -- so it gets the same posture the rest of this file has:
-// nothing runs until the machine's owner says which app may. An empty
-// allow list is the state of every machine that has not been configured,
-// including every machine upgrading into this feature, and it must not
-// mean "all".
+// nothing runs until the machine's owner says which app may. A cluster the
+// block does not name is allowed NOTHING, which is the state of every
+// machine that has not been configured and of every cluster paired after
+// the owner wrote this block.
+//
+// PER CLUSTER, because consent here is the owner's word about one cluster.
+// A single machine-wide list meant that allowing Claude Code to test it
+// against a local cluster offered it to production too -- the crossing the
+// per-home tool consent windows already rule out (consent/homes.go,
+// memql-cockpit#433). The machine-wide `apps.allow` this replaced is not
+// read at all; a file that still has it is TOLD so (AppConsentProblems),
+// with the command that writes the per-cluster entry, rather than being
+// either honoured or silently ignored.
 //
 // An app that is present but not listed is still REPORTED, with
 // allowed=false. That is what makes the portal able to say
@@ -113,7 +125,17 @@ type FSPolicy struct {
 // would misread REFUSES its level rather than falling back -- see
 // AppLevels.
 type AppsPolicy struct {
-	Allow []string `yaml:"allow"`
+	// Homes is apps.homes, kept as the YAML node it was written as and read
+	// by readAppsHomes, for the reason Levels below is: a typed decode
+	// fails the WHOLE file on a shorthand (`api.memql.localhost:
+	// [claude-code]`), and a worker that cannot parse policy.yaml runs on
+	// defaults that lose every other line the owner wrote. Walking the node
+	// makes that one entry's problem, and allows nothing for it.
+	Homes yaml.Node `yaml:"homes"`
+	// RetiredAllow is the machine-wide `apps.allow` this file no longer
+	// honours. It is decoded only so a file that still carries it can be
+	// told so; nothing reads it as consent.
+	RetiredAllow yaml.Node `yaml:"allow"`
 	// Levels is kept as the YAML node it was written as, and read by
 	// readAppLevels, rather than decoded into Go types here. A typed decode
 	// has two failure modes and both are wrong for this block. A key it
@@ -147,7 +169,7 @@ type AppsPolicy struct {
 //	        - id: kokoro-82m
 //	          audio_out: true
 //
-// DEFAULT-DENY, for the reason apps.allow is. Serving a model call spends
+// DEFAULT-DENY, for the reason app consent is. Serving a model call spends
 // this machine's own GPU on somebody else's prompt, so nothing is offered
 // until the machine's owner says which model may be. An empty allow list
 // is the state of every machine upgrading into this feature, and it must
@@ -197,7 +219,7 @@ type ModelsPolicy struct {
 //	    - ~/Clients
 //	    - /Volumes/Work
 //
-// DEFAULT-DENY, the same posture as apps.allow and for a stronger reason.
+// DEFAULT-DENY, the same posture as app consent and for a stronger reason.
 // A watched folder is arranged in the GRAPH -- somebody sets it up in a
 // browser, on a different machine -- so the path in it is one the CLUSTER is
 // naming on somebody else's computer. That is exactly the situation
@@ -398,17 +420,20 @@ func (p *Policy) reload() error {
 	if raw.HTTP.BlockPrivateNet {
 		p.http.BlockPrivateNet = true
 	}
-	// Apps merge the same way shell/fs allow lists do, so SIGHUP adds an
-	// app without a worker restart. There is no baseline to merge onto:
-	// DefaultPolicy leaves this empty, which is the default-deny above.
-	p.apps.Allow = mergeUnique(p.apps.Allow, raw.Apps.Allow)
+	// apps.homes REPLACES, for inference.serve's reason below: it is a
+	// consent, and merging it would make withdrawing one -- `memql worker
+	// apps --deny`, or deleting the line -- take a restart. There is no
+	// baseline either way: DefaultPolicy names no cluster, which is the
+	// default-deny above.
+	p.apps.Homes = raw.Apps.Homes
+	p.apps.RetiredAllow = raw.Apps.RetiredAllow
 	// apps.levels REPLACES, for the reason models.runtimes does below: an
 	// entry is a record, and merging two generations of one would run a
 	// model from one file at an effort from another. A SIGHUP that removed
 	// the block returns this machine to the built-in table.
 	p.apps.Levels = raw.Apps.Levels
-	// models.allow merges the way apps.allow does, so SIGHUP makes a
-	// newly pulled model offerable without a worker restart.
+	// models.allow merges the way the shell and fs lists do, so SIGHUP
+	// makes a newly pulled model offerable without a worker restart.
 	p.models.Allow = mergeUnique(p.models.Allow, raw.Models.Allow)
 	// models.pull REPLACES rather than merges, for the reason the
 	// runtimes below do and one of its own: the field is tri-state, so
@@ -548,7 +573,7 @@ func (p *Policy) CheckBackupPath(path string) error {
 }
 
 // BackupRoots returns a copy of the folders this machine will back up.
-// The copy matters for AppsAllow's reason: a SIGHUP can reload underneath a
+// The copy matters for AppsAllowFor's reason: a SIGHUP can reload underneath a
 // sweep that is already walking.
 func (p *Policy) BackupRoots() []string {
 	if p == nil {
@@ -631,23 +656,46 @@ func (p *Policy) MaxRedirects() int {
 	return p.http.MaxRedirects
 }
 
-// AppsAllow returns a copy of the allowed app ids.
+// AppsAllowFor returns the app ids policy.yaml allows for ONE cluster:
+// apps.homes.<home>.allow, with <home> the id workers.yaml gives it. A
+// cluster the block does not name gets nil -- default-deny per cluster,
+// never an inheritance from a machine-wide list or from another cluster.
 //
-// The copy matters: the worker calls this on every heartbeat and hands
-// the result to the detector, and a shared slice would race a SIGHUP
-// reload mid-beat.
-func (p *Policy) AppsAllow() []string {
+// The home and the ids are read without regard to case or surrounding
+// space: home ids are hostnames and registry names, and app ids are read
+// the way apps.levels reads them, so the keys an owner writes side by side
+// agree about what they name.
+//
+// The slice is the caller's own, built fresh from the block on every call:
+// the worker asks on every heartbeat and at every session start, and a
+// shared slice would race a SIGHUP reload. There is no second, cached copy
+// of the answer for a reload to leave stale.
+func (p *Policy) AppsAllowFor(home string) []string {
 	if p == nil {
 		return nil
 	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	if len(p.apps.Allow) == 0 {
+	return readAppsHomes(p.apps.Homes).allow[normalHomeID(home)]
+}
+
+// AppConsentProblems is every problem with this machine's app consent, as
+// sentences an owner can act on: an entry in apps.homes this cockpit
+// cannot read (it allows nothing), and the retired machine-wide apps.allow
+// (which allows nothing anywhere). The worker logs them when the file is
+// read and `memql worker apps` prints them, because a consent that
+// silently did nothing is indistinguishable from a machine that is broken.
+func (p *Policy) AppConsentProblems() []string {
+	if p == nil {
 		return nil
 	}
-	out := make([]string, len(p.apps.Allow))
-	copy(out, p.apps.Allow)
-	return out
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	problems := readAppsHomes(p.apps.Homes).problems
+	if retired := retiredAllowProblem(p.apps.RetiredAllow); retired != "" {
+		problems = append([]string{retired}, problems...)
+	}
+	return problems
 }
 
 // AppLevels returns the owner's apps.levels entries for one app that
@@ -664,7 +712,7 @@ func (p *Policy) AppsAllow() []string {
 // indistinguishable from the owner's entry working.
 //
 // The maps are the caller's own, built fresh on every call, for
-// AppsAllow's reason: a SIGHUP can reload underneath a session that is
+// AppsAllowFor's reason: a SIGHUP can reload underneath a session that is
 // still deciding.
 func (p *Policy) AppLevels(appID string) (harness.Table, map[string]string) {
 	if p == nil {
@@ -690,6 +738,119 @@ func (p *Policy) AppLevelProblems() []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return readAppLevels(p.apps.Levels).problems
+}
+
+// appsHomesRead is apps.homes read against what this cockpit can drive.
+type appsHomesRead struct {
+	// allow holds the app ids each cluster is allowed, by normalHomeID.
+	allow map[string][]string
+	// problems is every sentence, in a stable order.
+	problems []string
+}
+
+// readAppsHomes validates apps.homes. Like readAppLevels it is a pure
+// function of the block as written, run on every read, and it never fails:
+// a shape it cannot read becomes a sentence about that entry, and that
+// entry allows NOTHING -- the default-deny direction, never a guess at
+// what the owner meant. Keys are walked in sorted order so the problem
+// list does not shuffle between two reads of one file.
+func readAppsHomes(block yaml.Node) appsHomesRead {
+	read := appsHomesRead{allow: map[string][]string{}}
+	root := resolveYAML(&block)
+	if yamlAbsent(root) {
+		return read
+	}
+	if root.Kind != yaml.MappingNode {
+		read.problems = append(read.problems,
+			"apps.homes: a mapping of clusters belongs here (api.memql.example.com:), not "+describeYAML(root)+
+				", so no app is allowed for any cluster")
+		return read
+	}
+	byHome := yamlMapping(root)
+	for _, key := range sortedKeys(byHome) {
+		where := "apps.homes." + key
+		entry := resolveYAML(byHome[key])
+		if yamlAbsent(entry) {
+			// `local:` with nothing under it allows nothing, which is what
+			// it reads as; not a problem.
+			continue
+		}
+		if entry.Kind != yaml.MappingNode {
+			read.problems = append(read.problems, fmt.Sprintf(
+				"%s: a mapping with allow: belongs here (for example {allow: [claude-code]}), not %s, so no app is allowed for it",
+				where, describeYAML(entry)))
+			continue
+		}
+		fields := yamlMapping(entry)
+		for _, field := range sortedKeys(fields) {
+			if field != "allow" {
+				read.problems = append(read.problems, fmt.Sprintf(
+					"%s: takes allow, and %q is not it, so that key is ignored", where, field))
+			}
+		}
+		list := resolveYAML(fields["allow"])
+		if yamlAbsent(list) {
+			continue
+		}
+		if list.Kind != yaml.SequenceNode {
+			read.problems = append(read.problems, fmt.Sprintf(
+				"%s.allow: a list of apps belongs here (allow: [claude-code]), not %s, so no app is allowed for it",
+				where, describeYAML(list)))
+			continue
+		}
+		home := normalHomeID(key)
+		for _, item := range list.Content {
+			item = resolveYAML(item)
+			if item == nil || item.Kind != yaml.ScalarNode || yamlAbsent(item) {
+				read.problems = append(read.problems, fmt.Sprintf(
+					"%s.allow: each entry is one app id, and one is not, so that entry allows nothing", where))
+				continue
+			}
+			id := normalAppID(item.Value)
+			if _, ok := apps.SpecFor(id); !ok {
+				read.problems = append(read.problems, fmt.Sprintf(
+					"%s.allow: this cockpit drives no app called %q (it drives %s), so that entry allows nothing",
+					where, item.Value, knownAppIDs()))
+				continue
+			}
+			if !slices.Contains(read.allow[home], id) {
+				read.allow[home] = append(read.allow[home], id)
+			}
+		}
+	}
+	return read
+}
+
+// retiredAllowProblem is the sentence for a file that still carries the
+// machine-wide apps.allow, or "" when it does not. It names the command
+// that writes the per-cluster entry -- and removes this list in the same
+// edit -- with the ids the list held, so the owner decides which cluster
+// they meant rather than having every cluster decided for them.
+func retiredAllowProblem(n yaml.Node) string {
+	root := resolveYAML(&n)
+	if yamlAbsent(root) {
+		return ""
+	}
+	var flags []string
+	if root.Kind == yaml.SequenceNode {
+		for _, item := range root.Content {
+			if item = resolveYAML(item); item != nil && item.Kind == yaml.ScalarNode && !yamlAbsent(item) {
+				flags = append(flags, "--allow "+strings.TrimSpace(item.Value))
+			}
+		}
+	}
+	if len(flags) == 0 {
+		flags = []string{"--allow <app>"}
+	}
+	return "apps.allow is no longer read: app consent is per cluster now, so this machine-wide list allows nothing anywhere. " +
+		"Allow an app for the cluster you mean with `memql worker apps " + strings.Join(flags, " ") + " --home <cluster>` " +
+		"(`memql worker apps` lists the clusters), which writes apps.homes.<cluster>.allow and removes apps.allow"
+}
+
+// normalHomeID reads a home id the way apps.homes keys are matched: without
+// regard to case or surrounding space.
+func normalHomeID(id string) string {
+	return strings.ToLower(strings.TrimSpace(id))
 }
 
 // appLevelsRead is apps.levels read against what this cockpit can drive.
@@ -858,7 +1019,7 @@ func describeYAML(n *yaml.Node) string {
 	return "something else"
 }
 
-// normalAppID reads an app id the way the detector reads apps.allow:
+// normalAppID reads an app id the way the detector reads app consent:
 // without regard to case or surrounding space, so the two keys an owner
 // writes side by side agree about what they name.
 func normalAppID(id string) string {

@@ -16,19 +16,40 @@ where, and what to check when it does not work.
 
 Nothing is on by default. Two switches, and both must be thrown:
 
-**1. `apps.allow` in `~/.memql/policy.yaml`** — the machine owner's word.
+**1. Allow the app for a cluster** — the machine owner's word, given to ONE
+cluster at a time:
+
+```sh
+memql worker apps --allow claude-code --home api.memql.localhost
+```
+
+That writes `apps.homes.<cluster>.allow` in `~/.memql/policy.yaml` — a textual
+edit that leaves the rest of the file, comments included, exactly as it was —
+and signals the running worker. The cluster sees the change on the worker's
+next heartbeat. `--deny` withdraws it the same way; `--home` takes the home id
+from `workers.yaml` or the cluster's URL, and may be left out when the machine
+is enrolled with only one cluster. By hand, the block is:
 
 ```yaml
 apps:
-  allow:
-    - claude-code
-    - codex
+  homes:
+    api.memql.localhost:    # a home id from ~/.memql/workers.yaml
+      allow:
+        - claude-code
+        - codex
 ```
 
-`SIGHUP` the worker (or restart it) and the change takes effect on the next
-heartbeat. An empty or absent list means **nothing is allowed** — an app
-session does exactly what `workerHost.exec` does, so it gets the same
-default-deny posture as the rest of `policy.yaml`.
+**Default-deny, per cluster.** A cluster the block does not name is allowed
+nothing — including a cluster paired after you wrote it. An app session does
+exactly what `workerHost.exec` does, so it gets the same default-deny posture
+as the rest of `policy.yaml`, and consent given for a local test cluster is
+never consent for production. `SIGHUP` (or restart) after a hand edit; the
+block is replaced on reload, so a withdrawal takes effect without a restart.
+
+**Upgrading from the machine-wide `apps.allow`.** That list is no longer read,
+and it allows nothing anywhere: the worker logs a warning naming the command,
+and `memql worker apps` shows it. Run `memql worker apps --allow <app> --home
+<cluster>` for each cluster you meant; the same edit removes the old list.
 
 **2. Sign in to the app itself.** The engine routes to a machine only when the
 app is both **allowed** and **signed in**, so a machine with the binary but no
@@ -54,7 +75,7 @@ On `Register` and on **every** heartbeat:
 | `version` | the CLI's own `--version` output, verbatim |
 | `signed_in` | the app's own state files (see below) |
 | `subscription` | what the app REPORTS; `unknown` when it said nothing |
-| `allowed` | `policy.yaml apps.allow` |
+| `allowed` | `policy.yaml apps.homes.<this cluster>.allow` — each cluster is told its own |
 
 `Register` also carries one **app descriptor** per app — the harness this
 machine drives it through and whether that harness can return a structured
@@ -343,13 +364,13 @@ Claude Code never states one). Upgrade, or override the row — for example
 
 ### Choosing your own
 
-Override any row in `~/.memql/policy.yaml`, beside `apps.allow`:
+Override any row in `~/.memql/policy.yaml`, beside `apps.homes`:
 
 ```yaml
 apps:
-  allow:
-    - claude-code
-    - codex
+  homes:
+    api.memql.localhost:
+      allow: [claude-code, codex]
   levels:
     claude-code:
       reasoning:
@@ -363,8 +384,8 @@ apps:
 ```
 
 - **An absent block is the built-in table**, not "nothing" — unlike
-  `apps.allow`, which is default-deny, because this decides *how* an allowed
-  app runs, not *whether* it may.
+  `apps.homes`, which is default-deny, because this decides *how* an allowed
+  app runs, not *whether* it may. Levels are the machine's, not a cluster's.
 - **An entry replaces its row whole.** `strong: {model: opus}` runs Opus at
   Claude Code's default effort, not at the built-in `high` — what you write is
   exactly what the app is given.
@@ -686,9 +707,11 @@ applied silently:
 | What you see | What it means |
 |---|---|
 | `/machines` shows the app but not selectable | one of `allowed` / `signed in` is false; the badge says which |
-| The machine never appears at all | `claude` / `codex` is not on the worker's `PATH`. A LaunchAgent's `PATH` is not your shell's |
-| `is not in this machine's policy.yaml apps.allow` | the engine routed here anyway; add it to `apps.allow` or ask why the label was derived |
-| `is allowed here but is not on this worker's PATH` | the binary moved, or the worker's `PATH` is not your shell's. A LaunchAgent inherits neither your shell profile nor a version manager's shims |
+| The machine never appears at all | `claude` / `codex` is in none of the directories the worker searches. A service does not get your shell's `PATH`: the worker searches its own, with `~/.local/bin`, `~/.claude/local`, `/opt/homebrew/bin` and `/usr/local/bin` appended at start, and logs the result once (`worker PATH extended`). An app installed anywhere else needs that directory in the service's own `PATH` |
+| `is not allowed for this cluster by this machine's policy.yaml (apps.homes)` | the engine routed here anyway. `memql worker apps --allow <app> --home <this cluster>`, or ask why the label was derived |
+| `apps.allow is no longer read` (worker log, `memql worker apps`) | a `policy.yaml` from before consent was per cluster. Allow the app for the cluster you meant with `--home`; that removes the old list |
+| `apps.homes.<cluster>…` (worker log, `memql worker apps`) | an entry the worker cannot read allows nothing. The sentence names the line; `{allow: [claude-code]}` is the shape |
+| `is allowed here but is not on this worker's PATH` | the binary moved, or it lives outside the directories above. A service inherits neither your shell profile nor a version manager's shims |
 | `workspace refused by this machine's policy` naming a directory under `workspaces/<home>/` | the engine named no workspace and the one this machine chose is outside `fs.workspace_root` or under `fs.deny`. Set `fs.workspace_root` (the choice then goes under it) or fix the deny entry |
 | `no workspace in AppSessionStart, and this machine has no home directory` | there is nowhere to choose one. Set `fs.workspace_root` in `policy.yaml` |
 | `reported MemQL's MCP server "memql" as failed` | Claude Code could not connect to the session's MCP endpoint: unreachable, or a certificate it does not trust. The mkcert CA must be in the system keychain |

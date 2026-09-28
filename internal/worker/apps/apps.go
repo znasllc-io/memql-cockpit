@@ -140,7 +140,8 @@ type Info struct {
 type Spec struct {
 	// ID is the engine's app id.
 	ID string
-	// Binary is what the app calls itself on PATH.
+	// Binary is what the app calls itself on PATH -- and, on a spec
+	// Detector.ResolveSpec returned, the path that lookup resolved it to.
 	Binary string
 	// VersionArgs asks the app for its own version. Whatever it prints
 	// is reported verbatim -- the engine reduces it to major.minor for
