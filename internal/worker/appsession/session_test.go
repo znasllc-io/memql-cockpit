@@ -766,8 +766,8 @@ func TestSession_RefusesAnAppNotInPolicy(t *testing.T) {
 		s.SessionId = "sess-denied"
 		s.App = apps.IDCodex
 	})
-	if !strings.Contains(end.GetError(), "apps.allow") {
-		t.Errorf("error = %q, want it to name policy.yaml apps.allow", end.GetError())
+	if !strings.Contains(end.GetError(), "apps.homes") {
+		t.Errorf("error = %q, want it to name policy.yaml apps.homes", end.GetError())
 	}
 }
 

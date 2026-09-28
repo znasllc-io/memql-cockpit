@@ -161,7 +161,8 @@ func (d *Detector) runProbe(ctx context.Context, bin string, args []string) erro
 
 // Detect returns the inventory to report, sorted by id.
 //
-// allow is policy.yaml's apps.allow. An app that is present but not
+// allow is what policy.yaml allows for the ONE cluster this inventory is
+// reported to (apps.homes.<home>.allow). An app that is present but not
 // allowed is reported with allowed=false rather than omitted: the portal
 // then shows it as present-and-blocked, which is the state an operator
 // can act on. Omitting it would render identically to "not installed",

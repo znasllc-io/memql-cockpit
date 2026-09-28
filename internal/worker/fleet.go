@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -28,8 +27,11 @@ type FleetOptions struct {
 	// through. PER HOME, because the consent gate inside it is per home
 	// (memql-cockpit#433): a window opened for one cluster must admit
 	// nothing another cluster dispatches.
-	ToolsFor   func(homeID string) ToolDispatcher
-	Apps       AppInventory
+	ToolsFor func(homeID string) ToolDispatcher
+	// AppsFor builds the app inventory one home reports. PER HOME, because
+	// app consent is per cluster (policy.yaml apps.homes): the same app is
+	// allowed for one cluster and blocked for another. Nil reports no apps.
+	AppsFor    func(homeID string) AppInventory
 	Models     ModelInventory
 	Discoverer *models.Discoverer
 	Metrics    *Metrics
@@ -54,7 +56,7 @@ type Fleet struct {
 	policy      *tools.Policy
 	policyPath  string
 	toolsFor    func(homeID string) ToolDispatcher
-	apps        AppInventory
+	appsFor     func(homeID string) AppInventory
 	modelsInv   ModelInventory
 	discoverer  *models.Discoverer
 	metrics     *Metrics
@@ -90,7 +92,7 @@ func NewFleet(opts FleetOptions) (*Fleet, error) {
 		policy:      opts.Policy,
 		policyPath:  opts.PolicyPath,
 		toolsFor:    opts.ToolsFor,
-		apps:        opts.Apps,
+		appsFor:     opts.AppsFor,
 		modelsInv:   opts.Models,
 		discoverer:  opts.Discoverer,
 		metrics:     opts.Metrics,
@@ -273,17 +275,8 @@ func (f *Fleet) buildHome(home Home, machineID string) (homeRun, error) {
 		Logger:     homeLogger,
 		StateDir:   cfg.StateDir,
 		ClusterURL: cfg.ClusterURL,
-		Allowed: func(appID string) bool {
-			if f.policy == nil {
-				return false
-			}
-			for _, allowed := range f.policy.AppsAllow() {
-				if strings.EqualFold(strings.TrimSpace(allowed), appID) {
-					return true
-				}
-			}
-			return false
-		},
+		// This cluster's own consent, never another's (apps.homes).
+		Allowed: appsAllowedFor(f.policy, home.ID),
 		// The owner's apps.levels (memql-cockpit#438). The method value is
 		// safe on a nil policy: AppLevels answers "no entries", which is
 		// the built-in table.
@@ -315,6 +308,10 @@ func (f *Fleet) buildHome(home Home, machineID string) (homeRun, error) {
 	if f.toolsFor != nil {
 		dispatcher = f.toolsFor(home.ID)
 	}
+	var appInventory AppInventory
+	if f.appsFor != nil {
+		appInventory = f.appsFor(home.ID)
+	}
 	newRunner := f.newRunner
 	if newRunner == nil {
 		newRunner = NewRunner
@@ -323,7 +320,7 @@ func (f *Fleet) buildHome(home Home, machineID string) (homeRun, error) {
 		Logger:         homeLogger,
 		Config:         cfg,
 		Tools:          dispatcher,
-		Apps:           f.apps,
+		Apps:           appInventory,
 		Models:         f.modelsInv,
 		Calls:          calls,
 		Sessions:       sessions,

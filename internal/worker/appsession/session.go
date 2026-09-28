@@ -170,9 +170,11 @@ type Options struct {
 	LibraryBase string
 	// HTTPClient is the client the Library calls use.
 	HTTPClient *http.Client
-	// Allowed reports whether policy.yaml apps.allow lists an app.
-	// Nil means nothing is allowed, which is the default-deny posture
-	// the rest of the worker has.
+	// Allowed reports whether policy.yaml allows an app for THIS
+	// manager's cluster (apps.homes.<home>.allow) -- consent is per
+	// cluster, and each home runs its own Manager. Nil means nothing is
+	// allowed, which is the default-deny posture the rest of the worker
+	// has.
 	Allowed func(appID string) bool
 	// Levels returns the machine owner's policy.yaml apps.levels entries
 	// for one app, and the levels those entries refuse, each with the
@@ -582,7 +584,7 @@ func (s *session) resolveApp(ctx context.Context) (apps.Spec, error) {
 		// it again is the point: policy.yaml is the machine owner's
 		// word, and it is checked where it is enforced rather than
 		// trusted from a round trip.
-		return apps.Spec{}, fmt.Errorf("app session: %q is not in this machine's policy.yaml apps.allow", id)
+		return apps.Spec{}, fmt.Errorf("app session: %q is not allowed for this cluster by this machine's policy.yaml (apps.homes)", id)
 	}
 	spec, ok := s.manager.opts.Detector.ResolveSpec(ctx, id)
 	if !ok {
