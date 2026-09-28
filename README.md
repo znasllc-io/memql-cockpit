@@ -116,7 +116,9 @@ and the person copying it need know nothing else.
   enrollment. URLs match the way the worker matches them: whitespace and a
   trailing slash ignored, case-insensitive host, so
   `https://api.memql.localhost/` and `https://api.memql.localhost` are one
-  enrollment. `--all-homes` removes every enrollment and the runtime. An
+  enrollment. The value must be the cluster's http(s) URL (no userinfo,
+  query or fragment); anything else is a bad parameter (exit 2) before
+  anything runs. `--all-homes` removes every enrollment and the runtime. An
   installed `memql` older than 0.15.0 cannot split enrollments: when the
   requested cluster is the only one the run proceeds as `--all-homes` and
   says so; when others exist it refuses (exit 4) and names the upgrade.
@@ -134,7 +136,19 @@ and the person copying it need know nothing else.
   missing binary, a legacy service label, an enrollment file from the
   older single-home layout (`worker.yaml`) — each step reports "removed"
   or "nothing to do", none aborts the rest, and the closing summary says
-  what was removed, what was kept and why.
+  what was removed, what was kept and why. Its heading is SUCCESS,
+  PARTIAL (something removed, something left), FAILED (a step ran and
+  failed; Kept names what it left, such as a worker this run stopped) or
+  REFUSED (nothing was changed).
+- **`--purge` and the state directory.** The purge target is the machine's
+  state root as the enrollment files name it (the registry first, the
+  legacy mirror's per-home `<root>/homes/<id>` collapsed to `<root>`),
+  judged by one fence whatever the spelling: never `~/.memql` itself
+  (`~/.memql/` and `~/.memql//` included), never the `credentials`,
+  `backups`, `certs` or `certificates` trees in any letter case, never
+  outside `~/.memql`, never through a symlinked ancestor. A state
+  directory that is itself a symlink is removed as a link; what it points
+  at is not touched.
 
 On macOS, last-home or full removal resets only the installed MemQL apps’
 Accessibility and Screen Recording decisions; shared sibling enrollments keep

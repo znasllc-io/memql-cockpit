@@ -889,7 +889,9 @@ fi
 # counts, the real call rewrites workers.yaml (Go's `homes: []` when the
 # last home goes) and deletes the legacy mirror with the last enabled
 # home. Mode "old" ($3) exits 2 on `worker unpair --cluster-url`, as a
-# pre-0.15.0 flag parser does. Only tools on the reduced PATH are used.
+# pre-0.15.0 flag parser does; "real-fail" and "real-garbage" pass the
+# preview and then fail the real call (exit 5, or an unreadable answer).
+# Only tools on the reduced PATH are used.
 function write_memql_stub() {
     local path="$1" version="$2" mode="${3:-current}"
     {
@@ -909,6 +911,14 @@ if [[ "$STUB_MODE" == old ]]; then
 fi
 shift 2
 url=""; dry=no
+# real-fail: the preview succeeds and the real call exits 5 having
+# written nothing (Go's code for a read/write error of either file);
+# real-garbage: the real call answers something the reader cannot parse.
+case "$STUB_MODE:$*" in
+    real-fail:*--dry-run*|real-garbage:*--dry-run*) ;;
+    real-fail:*)    echo "ERROR: scoped unpair could not safely read or update enrollment files; files may need repair" >&2; exit 5 ;;
+    real-garbage:*) echo "oops"; exit 0 ;;
+esac
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --cluster-url) url="$2"; shift 2 ;;
@@ -964,7 +974,10 @@ function uninstall_fixture() {
     local home="$1"
     local platform="$2"
     mkdir -p "${home}/.memql/state" "${home}/.memql/bin"
-    printf 'cluster_url: https://c.example\ntoken: mql_wkr_fixture\nstate_dir: %s/.memql/state\n' \
+    # The legacy mirror the way write_worker_yaml writes it: state_dir PER
+    # HOME (<root>/homes/<id>). A purge that read this first removed one
+    # home's subdirectory and left the root and worker.log behind.
+    printf 'cluster_url: https://c.example\ntoken: mql_wkr_fixture\nstate_dir: %s/.memql/state/homes/c.example\n' \
         "$home" > "${home}/.memql/worker.yaml"
     # Multi-home registry (install writes this first; legacy is the mirror).
     printf 'version: 1\nworker_name: fixture\nstate_dir: %s/.memql/state\nhomes:\n  - id: c.example\n    cluster_url: https://c.example\n    token: mql_wkr_fixture\n    enabled: true\n' \
@@ -1224,8 +1237,11 @@ for _platform in mac linux; do
     mkdir -p "$_fh" "$_outside"
     uninstall_fixture "$_fh" "$_platform"
     printf 'keep me\n' > "${_outside}/precious"
+    # In BOTH files: the registry's state_dir is read first, the mirror's second.
     printf 'cluster_url: https://c.example\ntoken: mql_wkr_fixture\nstate_dir: %s\n' \
         "$_outside" > "${_fh}/.memql/worker.yaml"
+    printf 'version: 1\nworker_name: fixture\nstate_dir: %s\nhomes:\n  - id: c.example\n    cluster_url: https://c.example\n    token: mql_wkr_fixture\n    enabled: true\n' \
+        "$_outside" > "${_fh}/.memql/workers.yaml"
     _out="$(run_uninstaller "$_un" "$_fh" --user-local --purge)"
     _rc=$?
     expect_eq "$_un --purge with an outside state_dir exits 0" "$_rc" "0"
@@ -1296,7 +1312,7 @@ for _stop_failure in no yes; do
             fail "native uninstall did not stop and purge the runtime"
         fi
     else
-        if [[ "$_rc" -ne 0 && "$_out" == *PARTIAL* && -e "${_native_home}/.memql/ollama/runtime/bin/ollama" && -e "${_native_home}/.config/systemd/user/memql-ollama.service" && ! -e "${_native_home}/.memql/worker.yaml" ]]; then
+        if [[ "$_rc" -eq 5 && "$_out" == *PARTIAL* && -e "${_native_home}/.memql/ollama/runtime/bin/ollama" && -e "${_native_home}/.config/systemd/user/memql-ollama.service" && ! -e "${_native_home}/.memql/worker.yaml" ]]; then
             pass "failed runtime stop preserves runtime and reports partial uninstall while removing token"
         else
             fail "failed runtime stop must not purge or claim success: $_out"
@@ -1309,7 +1325,7 @@ _native_missing_home="${_tmp}/native-stop-missing"
 uninstall_fixture "$_native_missing_home" linux
 _out="$(cd "$_script_dir" && HOME="$_native_missing_home" PATH="$_nobin" bash ./uninstall-linux.sh --user-local --purge 2>&1)"
 _rc=$?
-if [[ "$_rc" -ne 0 && "$_out" == *PARTIAL* && -e "${_native_missing_home}/.memql/ollama/runtime/bin/ollama" && -e "${_native_missing_home}/.config/systemd/user/memql-ollama.service" && ! -e "${_native_missing_home}/.memql/worker.yaml" ]]; then
+if [[ "$_rc" -eq 5 && "$_out" == *PARTIAL* && -e "${_native_missing_home}/.memql/ollama/runtime/bin/ollama" && -e "${_native_missing_home}/.config/systemd/user/memql-ollama.service" && ! -e "${_native_missing_home}/.memql/worker.yaml" ]]; then
     pass "missing systemctl preserves runtime for safe retry and removes token"
 else
     fail "missing systemctl must not purge a potentially running runtime: $_out"
@@ -1519,27 +1535,34 @@ for _platform in mac linux; do
     fi
 
     # No binary at all: the only enrollment goes with the runtime; with
-    # a sibling and an explicit --cluster it refuses (4).
+    # a sibling and an explicit --cluster it refuses (4). Skipped on a
+    # machine with a real system memql: the binary is looked for in both
+    # shapes now, and that one would be found and asked.
+    if [[ "$_sys_present" == yes ]]; then
+        echo "INFO: /usr/local/bin holds a memql install; skipping the no-binary checks"
+    fi
     _h="$(fixture_home nobin-one "$_platform")"
     rm -f "${_h}/.memql/bin/${_pf_headless}" "${_h}/.memql/bin/${INSTALLED_COMMAND}"
-    # shellcheck disable=SC2086
-    _out="$(run_uninstaller "$_un" "$_h" $_auto_flag)"
-    _rc=$?
-    expect_eq "$_un no binary + one enrollment exits 0" "$_rc" "0"
-    if [[ "$_out" == *"only enrollment"* && ! -e "${_h}/.memql/workers.yaml" && ! -e "${_h}/.memql/worker.yaml" ]]; then
-        pass "$_un no binary + one enrollment removes the worker files with the runtime"
-    else
-        fail "$_un no binary + one enrollment; got: $_out"
+    if [[ "$_sys_present" != yes ]]; then
+        # shellcheck disable=SC2086
+        _out="$(run_uninstaller "$_un" "$_h" $_auto_flag)"
+        _rc=$?
+        expect_eq "$_un no binary + one enrollment exits 0" "$_rc" "0"
+        if [[ "$_out" == *"only enrollment"* && ! -e "${_h}/.memql/workers.yaml" && ! -e "${_h}/.memql/worker.yaml" ]]; then
+            pass "$_un no binary + one enrollment removes the worker files with the runtime"
+        else
+            fail "$_un no binary + one enrollment; got: $_out"
+        fi
+        _h="$(fixture_home nobin-two "$_platform")"
+        add_second_home "$_h"
+        rm -f "${_h}/.memql/bin/${_pf_headless}" "${_h}/.memql/bin/${INSTALLED_COMMAND}"
+        _before="$(tree_fingerprint "$_h")"
+        # shellcheck disable=SC2086
+        _out="$(run_uninstaller "$_un" "$_h" --cluster=https://c.example $_auto_flag)"
+        _rc=$?
+        expect_eq "$_un no binary + sibling + --cluster exits 4" "$_rc" "4"
+        expect_eq "$_un no binary + sibling changes nothing" "$(tree_fingerprint "$_h")" "$_before"
     fi
-    _h="$(fixture_home nobin-two "$_platform")"
-    add_second_home "$_h"
-    rm -f "${_h}/.memql/bin/${_pf_headless}" "${_h}/.memql/bin/${INSTALLED_COMMAND}"
-    _before="$(tree_fingerprint "$_h")"
-    # shellcheck disable=SC2086
-    _out="$(run_uninstaller "$_un" "$_h" --cluster=https://c.example $_auto_flag)"
-    _rc=$?
-    expect_eq "$_un no binary + sibling + --cluster exits 4" "$_rc" "4"
-    expect_eq "$_un no binary + sibling changes nothing" "$(tree_fingerprint "$_h")" "$_before"
 
     # A registry the reader cannot make sense of: refused (5) untouched;
     # --all-homes is the way past it.
@@ -1653,6 +1676,444 @@ for _un in uninstall-mac.sh uninstall-linux.sh; do
     else
         fail "$_un touched the symlinked registry or its target"
     fi
+done
+
+# ---------------------------------------------------------------
+# Review findings -- one regression per confirmed defect
+# ---------------------------------------------------------------
+#
+# An adversarial review of the no-flag contract confirmed thirteen
+# defects (two of them one defect seen through two lenses); each has a
+# test here that failed before its fix. The destructive ones plant
+# credentials, backups, certificates and clusters.yaml that must survive
+# a --purge, and every destructive case has a --dry-run twin asserted on
+# a byte-identical HOME. The system-shape cases run the REAL driver
+# (main included) with its two path-answering functions redefined, so a
+# fixture directory stands in for /usr/local/bin and /Applications and
+# nothing on this machine is looked at.
+
+# plant_protected writes what a --purge must never take; protected_intact
+# answers whether every one of them still reads as written.
+function plant_protected() {
+    local home="$1"
+    mkdir -p "${home}/.memql/credentials" "${home}/.memql/backups" "${home}/.memql/certs"
+    printf 'secret\n' > "${home}/.memql/credentials/token"
+    printf 'previous worker\n' > "${home}/.memql/backups/previous-worker"
+    printf 'cert\n' > "${home}/.memql/certs/client.pem"
+    printf 'clusters: []\n' > "${home}/.memql/clusters.yaml"
+}
+
+function protected_intact() {
+    local home="$1"
+    [[ "$(cat "${home}/.memql/credentials/token" 2>/dev/null)" == secret \
+        && "$(cat "${home}/.memql/backups/previous-worker" 2>/dev/null)" == "previous worker" \
+        && "$(cat "${home}/.memql/certs/client.pem" 2>/dev/null)" == cert \
+        && "$(cat "${home}/.memql/clusters.yaml" 2>/dev/null)" == "clusters: []" ]]
+}
+
+# set_state_dir rewrites BOTH enrollment files of a fixture HOME with one
+# state_dir spelling: the registry is read first, the mirror second.
+function set_state_dir() {
+    local home="$1" spelling="$2"
+    printf 'cluster_url: https://c.example\ntoken: mql_wkr_fixture\nstate_dir: %s\n' "$spelling" > "${home}/.memql/worker.yaml"
+    printf 'version: 1\nworker_name: fixture\nstate_dir: %s\nhomes:\n  - id: c.example\n    cluster_url: https://c.example\n    token: mql_wkr_fixture\n    enabled: true\n' \
+        "$spelling" > "${home}/.memql/workers.yaml"
+}
+
+# A launchctl that answers from a state directory, as the macOS end-to-end
+# test's does: print -> loaded iff the label's file exists, bootout removes
+# it, bootstrap recreates it. Lets the mac driver take its "the worker was
+# running" branches under the reduced PATH.
+_review_launchctl_dir="${_tmp}/review-launchctl"
+mkdir -p "$_review_launchctl_dir"
+cat > "${_review_launchctl_dir}/launchctl" <<'STUB'
+#!/usr/bin/env bash
+case "$1" in
+    print)     test -f "$MEMQL_TEST_AGENT_STATE/${2##*/}" ;;
+    bootout)   rm -f "$MEMQL_TEST_AGENT_STATE/${2##*/}" ;;
+    bootstrap) : > "$MEMQL_TEST_AGENT_STATE/$(basename "$3" .plist)" ;;
+    *)         exit 98 ;;
+esac
+STUB
+chmod +x "${_review_launchctl_dir}/launchctl"
+
+# run_uninstaller_agent is run_uninstaller with the service stub for the
+# platform on the PATH: launchctl above for mac (state in $1), the
+# always-succeeding systemctl for linux.
+function run_uninstaller_agent() {
+    local state="$1" script="$2" home="$3"
+    shift 3
+    local tool_path="${_review_launchctl_dir}:$_nobin"
+    if [[ "$script" == uninstall-linux.sh ]]; then tool_path="${_uninstall_systemctl_dir}:$_nobin"; fi
+    (cd "$_script_dir" && HOME="$home" PATH="$tool_path" MEMQL_TEST_AGENT_STATE="$state" bash "./${script}" "$@" 2>&1)
+}
+
+# run_with_system_shape runs the REAL driver with install_mode_dir and
+# worker_app_for_mode redefined, so $3 stands in for /usr/local/bin (and
+# $3/MemQL.app for /Applications/MemQL.app), under the reduced PATH plus
+# the platform's service stub -- and so with NO sudo. The driver is
+# sourced with its `main "$@"` line removed and main called after the
+# overrides; $0 is the script's real path, so its sibling lib.sh
+# sourcing works as it does from a clone.
+_review_scratch="${_tmp}/review-scratch"
+mkdir -p "$_review_scratch"
+function run_with_system_shape() {
+    local state="$1" script="$2" home="$3" sysbin="$4"
+    shift 4
+    local tool_path="${_review_launchctl_dir}:$_nobin"
+    if [[ "$script" == uninstall-linux.sh ]]; then tool_path="${_uninstall_systemctl_dir}:$_nobin"; fi
+    (cd "$_script_dir" && HOME="$home" PATH="$tool_path" MEMQL_TEST_AGENT_STATE="$state" \
+        MEMQL_TEST_SYSBIN="$sysbin" MEMQL_TEST_SCRATCH="$_review_scratch" bash -c '
+        sed "/^main \"\$@\"\$/d" "$0" > "$MEMQL_TEST_SCRATCH/$(basename "$0")"
+        source "$MEMQL_TEST_SCRATCH/$(basename "$0")"
+        function install_mode_dir() {
+            case "$1" in
+                system)     echo "$MEMQL_TEST_SYSBIN" ;;
+                user-local) echo "$INSTALL_PREFIX_USER" ;;
+                *)          echo "ERROR: unknown install mode $1" >&2; return 1 ;;
+            esac
+        }
+        function worker_app_for_mode() {
+            case "$1" in system) echo "$MEMQL_TEST_SYSBIN/MemQL.app" ;; *) echo "$HOME/Applications/MemQL.app" ;; esac
+        }
+        main "$@"
+    ' "$_script_dir/$script" "$@" 2>&1)
+}
+
+# [X3] worker_state_dir_from_yaml answers the machine's state ROOT.
+_sd="${_tmp}/review-state-dir"
+mkdir -p "$_sd/installer" "$_sd/legacy" "$_sd/slash" "$_sd/homes-name" "$_sd/root-homes"
+printf 'state_dir: %s/.memql/state/homes/c.example\n' "$_sd" > "$_sd/installer/worker.yaml"
+printf 'state_dir: %s/.memql/state\nhomes: []\n' "$_sd" > "$_sd/installer/workers.yaml"
+expect_eq "state root: registry first, per-home mirror second" \
+    "$(worker_state_dir_from_yaml "$_sd/installer/worker.yaml")" "$_sd/.memql/state"
+printf 'state_dir: %s/.memql/state/homes/c.example\n' "$_sd" > "$_sd/legacy/worker.yaml"
+expect_eq "state root: a legacy-only per-home dir answers its root" \
+    "$(worker_state_dir_from_yaml "$_sd/legacy/worker.yaml")" "$_sd/.memql/state"
+printf 'state_dir: ~/.memql/state/homes/x/\n' > "$_sd/slash/worker.yaml"
+expect_eq "state root: ~/ and a trailing slash are expanded and dropped" \
+    "$(worker_state_dir_from_yaml "$_sd/slash/worker.yaml")" "${HOME}/.memql/state"
+printf 'state_dir: ~/.memql/homes\n' > "$_sd/homes-name/worker.yaml"
+expect_eq "state root: a directory merely named homes is left alone" \
+    "$(worker_state_dir_from_yaml "$_sd/homes-name/worker.yaml")" "${HOME}/.memql/homes"
+printf 'state_dir: /homes/x\n' > "$_sd/root-homes/worker.yaml"
+expect_eq "state root: /homes/x has no root above it" \
+    "$(worker_state_dir_from_yaml "$_sd/root-homes/worker.yaml")" "/homes/x"
+
+# [9] Every block-list spelling yaml.v3 accepts reads as the same enrollments.
+_rs="${_tmp}/review-registry-shapes"
+mkdir -p "$_rs"
+printf 'version: 1\nhomes:\n- id: c.example\n  cluster_url: https://c.example\n  token: t\n- id: d.example\n  cluster_url: https://d.example\n  token: t\n' > "$_rs/column0.yaml"
+printf 'version: 1\nhomes: # enrolled clusters\n  - id: c.example\n    cluster_url: https://c.example\n  - id: d.example\n    cluster_url: https://d.example\n' > "$_rs/comment.yaml"
+printf 'version: 1\nhomes:\n  - cluster_url: https://c.example\n    id: c.example\n  - cluster_url: https://d.example\n    id: d.example\nother:\n  cluster_url: https://not-a-home.example\n' > "$_rs/urlfirst.yaml"
+printf 'version: 1\nhomes: [] # none\n' > "$_rs/empty.yaml"
+for _shape in column0 comment urlfirst; do
+    expect_eq "registry shape ${_shape} lists both clusters" \
+        "$(list_enrolled_cluster_urls "$_rs/${_shape}.yaml" /nonexistent | tr '\n' ' ')" "https://c.example https://d.example "
+done
+expect_eq "registry shape empty lists nothing" "$(list_enrolled_cluster_urls "$_rs/empty.yaml" /nonexistent)" ""
+
+# [8] The flag's shape is judged in the shell, once.
+for _good in https://api.example.com HTTPS://api.example.com/ "https://api.example.com/path" " https://c.example "; do
+    if require_cluster_url_flag "$_good" 2>/dev/null; then pass "require_cluster_url_flag accepts '${_good}'"; else fail "require_cluster_url_flag should accept '${_good}'"; fi
+done
+for _bad in api.memql.localhost "https://c.example?x=1" "https://u@c.example" "https://c.example#f" "ftp://c.example" ""; do
+    require_cluster_url_flag "$_bad" >/dev/null 2>&1
+    expect_eq "require_cluster_url_flag refuses '${_bad}' with 2" "$?" "2"
+done
+
+for _platform in mac linux; do
+    _un="uninstall-${_platform}.sh"
+    case "$_platform" in
+        mac)   _svc="Library/LaunchAgents/${SERVICE_LABEL_DARWIN}.plist" ;;
+        linux) _svc=".config/systemd/user/${SERVICE_LABEL_LINUX}.service" ;;
+    esac
+    _state="${_tmp}/review-agent-state-${_platform}"
+    mkdir -p "$_state"
+
+    # [1] state_dir spelled as ~/.memql with a trailing slash (or a double
+    # one, or the absolute form): --purge must judge it as ~/.memql and
+    # keep it, credentials and backups included. Dry run first.
+    # shellcheck disable=SC2088  # the literal ~ IS the spelling under test; the script expands it
+    for _spelling in '~/.memql/' '~/.memql//' 'ABS/.memql/'; do
+        _h="$(fixture_home "purge-root-${_spelling//[^a-z]/_}" "$_platform")"
+        plant_protected "$_h"
+        set_state_dir "$_h" "${_spelling/ABS/$_h}"
+        _before="$(tree_fingerprint "$_h")"
+        # shellcheck disable=SC2086
+        _out="$(run_uninstaller "$_un" "$_h" --purge --dry-run $_auto_flag)"
+        _rc=$?
+        expect_eq "$_un --purge --dry-run with state_dir ${_spelling} exits 0" "$_rc" "0"
+        if [[ "$_out" == *"would keep:    ${_h}/.memql (unsafe purge target)"* ]]; then
+            pass "$_un --purge --dry-run with state_dir ${_spelling} plans to keep ~/.memql"
+        else
+            fail "$_un --purge --dry-run with state_dir ${_spelling}; got: $_out"
+        fi
+        expect_eq "$_un --purge --dry-run with state_dir ${_spelling} leaves HOME byte-identical" "$(tree_fingerprint "$_h")" "$_before"
+        # shellcheck disable=SC2086
+        _out="$(run_uninstaller "$_un" "$_h" --purge $_auto_flag)"
+        _rc=$?
+        expect_eq "$_un --purge with state_dir ${_spelling} exits 0" "$_rc" "0"
+        if protected_intact "$_h" && [[ -d "${_h}/.memql" && "$_out" == *"unsafe purge target"* ]]; then
+            pass "$_un --purge with state_dir ${_spelling} keeps ~/.memql, credentials, backups, certs and clusters.yaml"
+        else
+            fail "$_un --purge with state_dir ${_spelling} took protected data; got: $_out $(ls -laR "${_h}/.memql" 2>&1)"
+        fi
+    done
+
+    # [2] A symlinked state_dir written with a trailing slash: the link
+    # goes, what it points at is not touched. Dry run first.
+    _h="$(fixture_home purge-link "$_platform")"
+    plant_protected "$_h"
+    _outside_state="${_tmp}/review-outside-state-${_platform}"
+    mkdir -p "$_outside_state"
+    printf 'keep me\n' > "${_outside_state}/keepme"
+    rm -rf "${_h}/.memql/state"
+    ln -s "$_outside_state" "${_h}/.memql/state"
+    # shellcheck disable=SC2088  # the literal ~ IS the spelling under test
+    set_state_dir "$_h" '~/.memql/state/'
+    _before="$(tree_fingerprint "$_h")"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" --purge --dry-run $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un --purge --dry-run with a symlinked state_dir/ exits 0" "$_rc" "0"
+    if [[ "$_out" == *"would remove:  ${_h}/.memql/state (the symlink only"* ]]; then
+        pass "$_un --purge --dry-run with a symlinked state_dir/ plans the link only"
+    else
+        fail "$_un --purge --dry-run with a symlinked state_dir/; got: $_out"
+    fi
+    expect_eq "$_un --purge --dry-run with a symlinked state_dir/ leaves HOME byte-identical" "$(tree_fingerprint "$_h")" "$_before"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" --purge $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un --purge with a symlinked state_dir/ exits 0" "$_rc" "0"
+    if [[ -f "${_outside_state}/keepme" && ! -L "${_h}/.memql/state" && ! -e "${_h}/.memql/state" ]] && protected_intact "$_h"; then
+        pass "$_un --purge with a symlinked state_dir/ removes the link and leaves its target alone"
+    else
+        fail "$_un --purge with a symlinked state_dir/ followed the link or kept it; got: $_out $(ls -la "$_outside_state" 2>&1)"
+    fi
+
+    # [3] A case variant of a protected directory is protected (APFS is
+    # case-insensitive by default; elsewhere this over-keeps, safely).
+    _h="$(fixture_home purge-case "$_platform")"
+    plant_protected "$_h"
+    mkdir -p "${_h}/.memql/Credentials"
+    printf 'marker\n' > "${_h}/.memql/Credentials/marker"
+    # shellcheck disable=SC2088  # the literal ~ IS the spelling under test
+    set_state_dir "$_h" '~/.memql/Credentials'
+    _before="$(tree_fingerprint "$_h")"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" --purge --dry-run $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un --purge --dry-run with state_dir ~/.memql/Credentials exits 0" "$_rc" "0"
+    if [[ "$_out" == *"would keep:    ${_h}/.memql/Credentials (protected data)"* ]]; then
+        pass "$_un --purge --dry-run judges ~/.memql/Credentials as protected"
+    else
+        fail "$_un --purge --dry-run with ~/.memql/Credentials; got: $_out"
+    fi
+    expect_eq "$_un --purge --dry-run with ~/.memql/Credentials leaves HOME byte-identical" "$(tree_fingerprint "$_h")" "$_before"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" --purge $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un --purge with state_dir ~/.memql/Credentials exits 0" "$_rc" "0"
+    if protected_intact "$_h" && [[ "$_out" == *"protected data"* ]]; then
+        pass "$_un --purge with state_dir ~/.memql/Credentials keeps the credentials"
+    else
+        fail "$_un --purge with state_dir ~/.memql/Credentials took the credentials; got: $_out"
+    fi
+
+    # [X3] An installer-written machine: --purge removes the whole state
+    # root (worker.log included) and an emptied ~/.memql, and the plan
+    # names the root rather than one home's subdirectory.
+    _h="$(fixture_home purge-root-of-home "$_platform")"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" --purge --dry-run $_auto_flag)"
+    if [[ "$_out" == *"would remove:  ${_h}/.memql/state (recursively)"* && "$_out" != *"homes/c.example"* ]]; then
+        pass "$_un --purge --dry-run plans the state root, not the per-home dir"
+    else
+        fail "$_un --purge --dry-run should plan the state root; got: $_out"
+    fi
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" --purge $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un --purge on an installer-written machine exits 0" "$_rc" "0"
+    if [[ ! -e "${_h}/.memql/state" && ! -e "${_h}/.memql" ]]; then
+        pass "$_un --purge on an installer-written machine removes the state root and ~/.memql"
+    else
+        fail "$_un --purge left the state root or ~/.memql: $(ls -laR "${_h}/.memql" 2>&1)"
+    fi
+
+    # [4] The real unpair fails (or answers garbage) after a good preview:
+    # the summary reads FAILED, names the enrollment files and the
+    # stopped worker with its restart command, and never says nothing
+    # was changed.
+    for _mode in real-fail real-garbage; do
+        _h="$(fixture_home "unpair-${_mode}" "$_platform")"
+        write_memql_stub "${_h}/.memql/bin/${_pf_headless}" 0.15.2 "$_mode"
+        : > "${_state}/${SERVICE_LABEL_DARWIN}"
+        # shellcheck disable=SC2086
+        _out="$(run_uninstaller_agent "$_state" "$_un" "$_h" --cluster=https://c.example $_auto_flag)"
+        _rc=$?
+        expect_eq "$_un ${_mode} after a good preview exits 5" "$_rc" "5"
+        case "$_platform" in
+            mac)   _restart="launchctl bootstrap gui/$(id -u) ${_h}/${_svc}" ;;
+            linux) _restart="systemctl --user start ${SERVICE_LABEL_LINUX}.service" ;;
+        esac
+        if [[ "$_out" == *"FAILED:"* && "$_out" == *"did not complete"* && "$_out" == *"$_restart"* \
+            && "$_out" != *"nothing was changed"* ]]; then
+            pass "$_un ${_mode} reports FAILED with the files and the restart command"
+        else
+            fail "$_un ${_mode} summary; got: $_out"
+        fi
+        if [[ "$_platform" == mac && ! -e "${_state}/${SERVICE_LABEL_DARWIN}" ]]; then
+            pass "$_un ${_mode}: the worker really was stopped, as the summary says"
+        fi
+    done
+
+    # [5] / [X] A system shape, no sudo, one enrollment: refused BEFORE the
+    # enrollment is unpaired and the agent booted out (mac); on linux the
+    # unpair proceeds and the system binary is named as kept (PARTIAL).
+    _sysbin="${_tmp}/review-sysbin-${_platform}"
+    mkdir -p "$_sysbin"
+    write_memql_stub "${_sysbin}/${_pf_headless}" 0.15.2
+    ln -sf "${_sysbin}/${_pf_headless}" "${_sysbin}/${INSTALLED_COMMAND}"
+    _h="$(fixture_home sys-nosudo "$_platform")"
+    rm -f "${_h}/.memql/bin/${_pf_headless}" "${_h}/.memql/bin/${INSTALLED_COMMAND}"
+    : > "${_state}/${SERVICE_LABEL_DARWIN}"
+    _before="$(tree_fingerprint "$_h")"
+    _out="$(run_with_system_shape "$_state" "$_un" "$_h" "$_sysbin")"
+    _rc=$?
+    expect_eq "$_un system shape + no sudo + one enrollment exits 4" "$_rc" "4"
+    if [[ "$_out" == *"needs sudo"* ]]; then
+        pass "$_un system shape says sudo is needed before asking"
+    else
+        fail "$_un system shape should announce sudo; got: $_out"
+    fi
+    case "$_platform" in
+        mac)
+            expect_eq "$_un system shape + no sudo leaves HOME byte-identical" "$(tree_fingerprint "$_h")" "$_before"
+            if [[ "$_out" == *"REFUSED:"* && -e "${_state}/${SERVICE_LABEL_DARWIN}" ]]; then
+                pass "$_un system shape + no sudo refuses with the agent still loaded"
+            else
+                fail "$_un system shape + no sudo unpaired or stopped before refusing; got: $_out"
+            fi
+            ;;
+        linux)
+            if [[ "$_out" == *"PARTIAL:"* && -x "${_sysbin}/${INSTALLED_COMMAND}" && "$_out" == *"Delete these by hand"* && ! -e "${_h}/.memql/workers.yaml" ]]; then
+                pass "$_un system shape + no sudo keeps the system binary, names it, and still removes the tokens"
+            else
+                fail "$_un system shape + no sudo; got: $_out"
+            fi
+            ;;
+    esac
+
+    # [7] --user-local with a sibling and only a system memql: the binary
+    # is found wherever it is; the user-local scope narrows what is
+    # removed, not what may be asked.
+    _h="$(fixture_home sys-userlocal "$_platform")"
+    add_second_home "$_h"
+    rm -f "${_h}/.memql/bin/${_pf_headless}" "${_h}/.memql/bin/${INSTALLED_COMMAND}"
+    : > "${_state}/${SERVICE_LABEL_DARWIN}"
+    _before="$(tree_fingerprint "$_h")"
+    _out="$(run_with_system_shape "$_state" "$_un" "$_h" "$_sysbin" --user-local --cluster=https://c.example --dry-run)"
+    _rc=$?
+    expect_eq "$_un --user-local --cluster --dry-run with only a system memql exits 0" "$_rc" "0"
+    if [[ "$_out" == *"would unpair:  https://c.example via ${_sysbin}/${INSTALLED_COMMAND}"* ]]; then
+        pass "$_un --user-local finds the system memql for the unpair"
+    else
+        fail "$_un --user-local should use the system memql; got: $_out"
+    fi
+    expect_eq "$_un --user-local --cluster --dry-run leaves HOME byte-identical" "$(tree_fingerprint "$_h")" "$_before"
+    _out="$(run_with_system_shape "$_state" "$_un" "$_h" "$_sysbin" --user-local --cluster=https://c.example)"
+    _rc=$?
+    expect_eq "$_un --user-local --cluster with only a system memql exits 0" "$_rc" "0"
+    if grep -q 'id: d.example' "${_h}/.memql/workers.yaml" && ! grep -q 'id: c.example' "${_h}/.memql/workers.yaml" \
+        && [[ -x "${_sysbin}/${INSTALLED_COMMAND}" && -e "${_h}/${_svc}" ]]; then
+        pass "$_un --user-local --cluster removes the home through the system memql and touches nothing system-owned"
+    else
+        fail "$_un --user-local --cluster with only a system memql; got: $_out $(cat "${_h}/.memql/workers.yaml" 2>&1)"
+    fi
+
+    # [6] A step that fails exits 5: an app at the standard path that is
+    # not ours, or not a bundle at all (mac; the linux cases are the
+    # tightened unit assertions above).
+    if [[ "$_platform" == mac ]]; then
+        _h="$(fixture_home foreign-app mac)"
+        mkdir -p "${_h}/Applications/MemQL.app/Contents"
+        printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.example.other</string></dict></plist>\n' \
+            > "${_h}/Applications/MemQL.app/Contents/Info.plist"
+        # shellcheck disable=SC2086
+        _out="$(run_uninstaller "$_un" "$_h" $_auto_flag)"
+        _rc=$?
+        expect_eq "$_un an app that is not ours at the standard path exits 5" "$_rc" "5"
+        if [[ "$_out" == *"PARTIAL:"* && "$_out" == *"leaving unrelated app"* && -d "${_h}/Applications/MemQL.app" ]]; then
+            pass "$_un leaves the foreign app, names it, and says PARTIAL"
+        else
+            fail "$_un foreign app; got: $_out"
+        fi
+        _h="$(fixture_home file-app mac)"
+        mkdir -p "${_h}/Applications"
+        printf 'not a bundle\n' > "${_h}/Applications/MemQL.app"
+        # shellcheck disable=SC2086
+        _out="$(run_uninstaller "$_un" "$_h" $_auto_flag)"
+        _rc=$?
+        expect_eq "$_un a plain file at the app path exits 5" "$_rc" "5"
+    fi
+
+    # [8] A --cluster value the binary would reject is a bad parameter here.
+    _h="$(fixture_home bad-url "$_platform")"
+    _before="$(tree_fingerprint "$_h")"
+    for _bad in "--cluster=api.memql.localhost" "--cluster=https://c.example?x=1" "--cluster=https://u@c.example"; do
+        # shellcheck disable=SC2086
+        _out="$(run_uninstaller "$_un" "$_h" "$_bad" $_auto_flag)"
+        _rc=$?
+        expect_eq "$_un ${_bad} exits 2" "$_rc" "2"
+        if [[ "$_out" == *"--cluster wants the cluster's URL"* ]]; then
+            pass "$_un ${_bad} names the shape it wants"
+        else
+            fail "$_un ${_bad}; got: $_out"
+        fi
+    done
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" --cluster api.memql.localhost $_auto_flag)"
+    expect_eq "$_un --cluster api.memql.localhost (space form) exits 2" "$?" "2"
+    expect_eq "$_un bad --cluster values change nothing" "$(tree_fingerprint "$_h")" "$_before"
+
+    # [9] Two enrollments in each registry spelling: refused, nothing touched.
+    for _shape in column0 comment urlfirst; do
+        _h="$(fixture_home "shape-${_shape}" "$_platform")"
+        cp "$_rs/${_shape}.yaml" "${_h}/.memql/workers.yaml"
+        _before="$(tree_fingerprint "$_h")"
+        # shellcheck disable=SC2086
+        _out="$(run_uninstaller "$_un" "$_h" $_auto_flag)"
+        _rc=$?
+        expect_eq "$_un no flags + two enrollments (${_shape} spelling) exits 2" "$_rc" "2"
+        if [[ "$_out" == *"--cluster=https://c.example"* && "$_out" == *"--cluster=https://d.example"* ]]; then
+            pass "$_un ${_shape} spelling lists both clusters"
+        else
+            fail "$_un ${_shape} spelling; got: $_out"
+        fi
+        expect_eq "$_un ${_shape} spelling changes nothing" "$(tree_fingerprint "$_h")" "$_before"
+    done
+
+    # [10] The space form never swallows the next flag or an empty word.
+    _h="$(fixture_home cluster-swallow "$_platform")"
+    rm -f "${_h}/.memql/workers.yaml" "${_h}/.memql/worker.yaml"
+    _before="$(tree_fingerprint "$_h")"
+    for _shape in "--cluster --dry-run" "--cluster --purge"; do
+        # shellcheck disable=SC2086  # the shape is a flag list on purpose
+        _out="$(run_uninstaller "$_un" "$_h" $_shape)"
+        _rc=$?
+        expect_eq "$_un '${_shape}' exits 2" "$_rc" "2"
+        if [[ "$_out" == *"--cluster needs a URL"* ]]; then
+            pass "$_un '${_shape}' says what --cluster needs"
+        else
+            fail "$_un '${_shape}'; got: $_out"
+        fi
+    done
+    _out="$(run_uninstaller "$_un" "$_h" --cluster "")"
+    expect_eq "$_un --cluster '' exits 2" "$?" "2"
+    expect_eq "$_un a swallowed --cluster changes nothing" "$(tree_fingerprint "$_h")" "$_before"
 done
 
 # ---------------------------------------------------------------

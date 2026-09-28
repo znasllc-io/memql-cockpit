@@ -126,6 +126,17 @@ main "$@"
         assert (app / 'Contents/MacOS/MemQL').read_bytes() == before
         assert b'signing requirement unchanged' in repeated.stdout
         assert not privacy_calls.exists(), 'unchanged update must preserve permissions'
+        # The installer writes the legacy mirror's state_dir per home
+        # (<root>/homes/<id>); a --purge plan must name the root, never
+        # the per-home directory, and change nothing. --no-service left
+        # no state directory behind, so give the plan one to judge.
+        (user / '.memql/state').mkdir(exist_ok=True)
+        (user / '.memql/state/worker.log').write_text('log line')
+        plan = subprocess.run(['bash', '-s', '--', '--user-local', '--purge', '--dry-run'], input=uninstaller, env=env, cwd=root, capture_output=True)
+        assert plan.returncode == 0, plan.stdout.decode() + plan.stderr.decode()
+        assert ('would remove:  ' + str(user / '.memql/state') + ' (recursively)').encode() in plan.stdout
+        assert b'homes/fixture.invalid' not in plan.stdout
+        assert token in (user / '.memql/workers.yaml').read_text() and (user / '.memql/worker.yaml').exists()
         info_path = app / 'Contents/Info.plist'
         prior_info = plistlib.loads(info_path.read_bytes())
         prior_info['CFBundleVersion'] = 'prior-local-build'
@@ -181,6 +192,13 @@ main "$@"
         # one, so it refuses (2) naming both and the command for each.
         ambiguous = uninstall(expected=2)
         assert b'--cluster=https://fixture.invalid' in ambiguous.stderr and b'--cluster=https://other.invalid' in ambiguous.stderr
+        assert (private / 'workers.yaml').read_bytes() == saved_registry
+        # A --cluster value the binary would reject is refused as a bad
+        # parameter (2) before anything runs; so is a space form whose URL
+        # was omitted, which must not swallow the flag after it.
+        for bad in (['--cluster=fixture.invalid'], ['--cluster=https://fixture.invalid?x=1'], ['--cluster', '--dry-run'], ['--cluster', '']):
+            refused = uninstall(*bad, expected=2)
+            assert b'--cluster' in refused.stderr
         assert (private / 'workers.yaml').read_bytes() == saved_registry
         (private / 'workers.yaml').write_text('homes: [invalid yaml')
         uninstall('--cluster=https://fixture.invalid', expected=5)

@@ -275,6 +275,24 @@ function same_cluster_url() {
     [[ "$ha" != "default" && "$ha" == "$hb" ]]
 }
 
+# require_cluster_url_flag refuses (2) a --cluster value the binary's
+# `worker unpair --cluster-url` is certain to reject
+# (internal/worker/unpair_url.go): an http(s) URL with a host and no
+# userinfo, query or fragment. same_cluster_url matches a bare host the
+# way Go's sameClusterURL does, which is right for the registry and
+# wrong as an admission test for the flag: without this a bare
+# `api.example.com` matched the enrollment in the shell and then reached
+# the binary, which answered 5 blaming the enrollment files.
+function require_cluster_url_flag() {
+    local url re
+    url="$(printf '%s' "$1" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+    re='^[Hh][Tt][Tt][Pp][Ss]?://[^/?#@[:space:]]+(/[^?#[:space:]]*)?$'
+    if [[ ! "$url" =~ $re ]]; then
+        echo "ERROR: --cluster wants the cluster's URL, such as https://api.example.com (got '${1}'); nothing was changed" >&2
+        return 2
+    fi
+}
+
 # find_home_id_by_cluster_url prints the id of a home whose cluster_url
 # matches, or empty. Used so install (URL-host id) and pair (--home-id
 # local) refresh the same enrollment without --force.
@@ -1044,6 +1062,20 @@ function record_kept() {
     UNINSTALL_KEPT="${UNINSTALL_KEPT}  $1"$'\n'
 }
 
+# record_scoped_unpair_failure is for the one failure that happens AFTER
+# a write: the real `worker unpair` ran and failed, or answered
+# something unreadable, once the worker had been stopped. That run is
+# not "nothing was changed" -- the service is down until the person
+# looks, and Go writes workers.yaml before the worker.yaml mirror, so
+# the files may be half-applied. $1 is the command that starts the
+# worker again, empty when this run did not stop it. With something
+# kept and nothing removed the summary reads FAILED, not REFUSED.
+function record_scoped_unpair_failure() {
+    local restart="${1:-}"
+    record_kept "${HOME}/.memql/workers.yaml and worker.yaml (removal of ${CLUSTER_URL} did not complete and may be half-applied; repair them before restarting the worker)"
+    [[ -z "$restart" ]] || record_kept "the worker service (stopped by this run and NOT restarted; once repaired, start it with:  ${restart})"
+}
+
 # under_memql_home answers whether $1 lies inside ${HOME}/.memql, the
 # ONLY tree the uninstallers delete recursively. It is strict about
 # shape on purpose -- absolute, no `..` segment -- because a state_dir
@@ -1088,6 +1120,23 @@ function remove_worker_config() {
     remove_path_if_present "${HOME}/.memql/worker.yaml"
 }
 
+# normalize_tree_path prints $1 with every `//` collapsed and every
+# trailing slash dropped ("/" stays "/"). The fence below compares
+# STRINGS, and a state_dir is operator-authored text: `~/.memql/` IS
+# ~/.memql and must hit the same guard (a review found it did not, and
+# --purge then rm -rf'd the whole tree, credentials and backups
+# included). The trailing slash matters for rm as well: `rm -rf link/`
+# FOLLOWS the link (POSIX trailing-slash resolution; BSD rm removes the
+# target directory, GNU rm empties it, both exit 0), so nothing here may
+# hand rm a path ending in `/`. Spelled with prefix/suffix expansions on
+# purpose: bash 3.2 renders `${p//\/\//\/}` with a literal backslash.
+function normalize_tree_path() {
+    local p="$1"
+    while [[ "$p" == *//* ]]; do p="${p%%//*}/${p#*//}"; done
+    while [[ "$p" == */ && "$p" != / ]]; do p="${p%/}"; done
+    printf '%s\n' "$p"
+}
+
 # tree_removal_verdict is the ONE statement of what a recursive delete
 # under --purge may touch. It prints "absent", "remove", or "keep:<why>"
 # for a directory and changes nothing, so the remover and the --dry-run
@@ -1095,8 +1144,10 @@ function remove_worker_config() {
 # through a symlinked ancestor (an alias that would sweep something
 # else); never ~/.memql itself or a `.` spelling of it; never the
 # credential / certificate / backup trees, whatever a state_dir says.
+# Every guard judges ONE normalized spelling (normalize_tree_path).
 function tree_removal_verdict() {
-    local dir="$1"
+    local dir
+    dir="$(normalize_tree_path "$1")"
     if [[ ! -e "$dir" && ! -L "$dir" ]]; then
         echo "absent"
         return 0
@@ -1116,9 +1167,17 @@ function tree_removal_verdict() {
     case "$dir" in
         "$HOME/.memql"|*/./*|*/.) echo "keep:unsafe purge target"; return 0 ;;
     esac
+    # Case-folded: macOS's default APFS is case-insensitive, so
+    # ~/.memql/Credentials IS ~/.memql/credentials there. On a
+    # case-sensitive filesystem this over-keeps a genuinely distinct
+    # directory of that name, which is the safe direction and is said
+    # in the summary. bash 3.2 has no ${var,,}; tr does the folding.
+    local dir_folded fence_folded
+    dir_folded="$(printf '%s' "$dir" | tr '[:upper:]' '[:lower:]')"
+    fence_folded="$(printf '%s' "${HOME}/.memql" | tr '[:upper:]' '[:lower:]')"
     for protected in backups credentials certs certificates; do
-        case "$dir" in
-            "$HOME/.memql/$protected"|"$HOME/.memql/$protected/"*) echo "keep:protected data"; return 0 ;;
+        case "$dir_folded" in
+            "$fence_folded/$protected"|"$fence_folded/$protected/"*) echo "keep:protected data"; return 0 ;;
         esac
     done
     echo "remove"
@@ -1127,18 +1186,27 @@ function tree_removal_verdict() {
 # remove_tree_if_present deletes a directory recursively, inside the
 # ~/.memql fence and nowhere else. Outside it the directory is KEPT
 # and reported with its path, so the person can decide. That is not
-# an error: the uninstall still did everything it was allowed to.
+# an error: the uninstall still did everything it was allowed to. A
+# symlink AT the path is removed as a link and nothing else: what it
+# points at (a state dir someone moved to another disk) is theirs.
 function remove_tree_if_present() {
-    local dir="$1" verdict
+    local dir verdict
+    dir="$(normalize_tree_path "$1")"
     verdict="$(tree_removal_verdict "$dir")"
     case "$verdict" in
         absent)
             echo "INFO: $dir not present; nothing to remove"
             ;;
         remove)
-            rm -rf "$dir"
-            echo "INFO: removed $dir"
-            record_removed "$dir"
+            if [[ -L "$dir" ]]; then
+                rm -f "$dir"
+                echo "INFO: removed the symlink $dir (what it pointed at was not touched)"
+                record_removed "$dir (the symlink only)"
+            else
+                rm -rf "$dir"
+                echo "INFO: removed $dir"
+                record_removed "$dir"
+            fi
             ;;
         keep:outside*)
             echo "WARN: $dir is outside ${HOME}/.memql; not touched. Delete it by hand if you want it gone."
@@ -1151,20 +1219,23 @@ function remove_tree_if_present() {
     esac
 }
 
-# worker_state_dir_from_yaml prints the state_dir worker config names,
-# or the default when the file or the key is absent. Prefers the path
-# handed in (usually legacy worker.yaml), then the multi-home registry
-# workers.yaml beside it -- install always mirrors both, but a machine
-# that only has the registry still has a purge target. The drivers call
-# it BEFORE the token files are removed: --purge has to delete the
-# directory the worker actually used, and write_worker_yaml's default
-# is only where that usually is. A leading `~/` is expanded the way
-# the shell would have; anything else reaches the fence as written.
+# worker_state_dir_from_yaml prints the machine's state ROOT, the
+# directory --purge removes, or the default when no file names one.
+# It reads the multi-home registry (workers.yaml beside the path handed
+# in) FIRST -- its state_dir is the machine root -- and the legacy
+# mirror second: the installer writes the mirror's state_dir PER HOME
+# (<root>/homes/<id>, mirroring ConfigForHome), and a purge that read
+# the mirror first removed one home's subdirectory, left worker.log and
+# the root behind, and said SUCCESS (a review finding). A per-home
+# directory answers its root exactly as Go's machineStateRoot does
+# (internal/worker/machineid.go). The drivers call it BEFORE the token
+# files are removed. A leading `~/` is expanded the way the shell would
+# have; the spelling is normalized (normalize_tree_path); anything else
+# reaches the fence as written.
 function worker_state_dir_from_yaml() {
     local path="$1"
-    local dir=""
-    local try
-    for try in "$path" "$(dirname "$path")/workers.yaml"; do
+    local dir="" try parent
+    for try in "$(dirname "$path")/workers.yaml" "$path"; do
         if [[ -f "$try" ]]; then
             dir="$(sed -n -E 's/^state_dir:[[:space:]]*"?([^"#]*[^"#[:space:]])"?[[:space:]]*(#.*)?$/\1/p' "$try" | head -1)"
             [[ -n "$dir" ]] && break
@@ -1172,8 +1243,14 @@ function worker_state_dir_from_yaml() {
     done
     case "$dir" in
         "")   dir="$STATE_DIR_DEFAULT" ;;
+        \~)   dir="$HOME" ;;
         \~/*) dir="${HOME}/${dir#\~/}" ;;
     esac
+    dir="$(normalize_tree_path "$dir")"
+    parent="${dir%/*}"
+    if [[ "$dir" == */* && "$parent" == */* && "${parent##*/}" == homes && -n "${parent%/*}" ]]; then
+        dir="${parent%/*}"
+    fi
     echo "$dir"
 }
 
@@ -1400,7 +1477,13 @@ function count_lines() {
 # host, however the URL is spelled -- print once, because unpairing by
 # URL removes them together and they are one enrollment to the person.
 # Disabled homes count: they are enrollments a scoped removal keeps.
-# Neither file, or `homes: []`, prints nothing.
+# Neither file, or `homes: []`, prints nothing. The reader accepts
+# every block-list spelling yaml.v3 does (a review found three it
+# missed, each read as ZERO enrollments): items indented under the key
+# or at column 0 (a mapping-rooted document has no other column-0
+# dash, so one cannot start a new top-level key), a comment on the
+# `homes:` line, and an item whose first key is cluster_url rather
+# than id -- any `- ` starts an item, whatever key follows it.
 function list_enrolled_cluster_urls() {
     local workers_path="$1" legacy_path="$2"
     if [[ -f "$workers_path" && ! -L "$workers_path" ]]; then
@@ -1439,10 +1522,10 @@ function list_enrolled_cluster_urls() {
                 cur = ""
             }
             BEGIN { in_homes = 0; cur = "" }
-            /^homes:[[:space:]]*$/ { in_homes = 1; next }
+            /^homes:[[:space:]]*(#.*)?$/ { in_homes = 1; next }
             !in_homes { next }
-            /^[^[:space:]#]/ { flush(); in_homes = 0; next }
-            /^[[:space:]]*-[[:space:]]*id:[[:space:]]*/ { flush(); next }
+            /^[^[:space:]#-]/ { flush(); in_homes = 0; next }
+            /^[[:space:]]*-[[:space:]]*/ { flush(); sub(/^[[:space:]]*-[[:space:]]*/, "") }
             /^[[:space:]]*cluster_url:[[:space:]]*/ {
                 cur = $0
                 sub(/^[[:space:]]*cluster_url:[[:space:]]*/, "", cur)
@@ -1696,13 +1779,20 @@ function plan_worker_config() {
     plan_path "${HOME}/.memql/worker.yaml"
 }
 
-# plan_tree prints the fence's verdict for one directory.
+# plan_tree prints the fence's verdict for one directory, over the same
+# normalized spelling the remover uses.
 function plan_tree() {
-    local dir="$1" verdict
+    local dir verdict
+    dir="$(normalize_tree_path "$1")"
     verdict="$(tree_removal_verdict "$dir")"
     case "$verdict" in
         absent) ;;
-        remove) echo "  would remove:  $dir (recursively)" ;;
+        remove)
+            if [[ -L "$dir" ]]; then
+                echo "  would remove:  $dir (the symlink only; what it points at is not touched)"
+            else
+                echo "  would remove:  $dir (recursively)"
+            fi ;;
         keep:*) echo "  would keep:    $dir (${verdict#keep:})" ;;
     esac
 }
@@ -1735,14 +1825,19 @@ function plan_kept_state() {
 # is where a machine is revoked, and a worker retrying with a dead
 # token is the reason to revoke there first. $1 is the run's exit
 # code: non-zero with something removed means something else is still
-# on disk (PARTIAL); non-zero with nothing removed and nothing kept
-# means the run refused before it touched anything (REFUSED, and the
-# error above says why). Neither heading claims success over a leftover.
+# on disk (PARTIAL); non-zero with nothing removed but something kept
+# means a step ran and failed, and Kept says what it left (FAILED);
+# non-zero with nothing recorded at all means the run refused before it
+# touched anything (REFUSED, and the error above says why). No heading
+# claims success over a leftover, and none claims "nothing was changed"
+# over a stopped worker.
 function print_uninstall_summary() {
     local rc="${1:-0}"
     local heading="SUCCESS: memql-worker uninstalled."
     if [[ "$rc" -ne 0 && -z "$UNINSTALL_REMOVED" && -z "$UNINSTALL_KEPT" ]]; then
         heading="REFUSED: memql-worker was not uninstalled; nothing was changed (see the error above)."
+    elif [[ "$rc" -ne 0 && -z "$UNINSTALL_REMOVED" ]]; then
+        heading="FAILED: memql-worker uninstall did not complete; nothing was removed, and Kept names what needs you (see the error above)."
     elif [[ "$rc" -ne 0 ]]; then
         heading="PARTIAL: memql-worker uninstalled, with leftovers (see Kept)."
     fi

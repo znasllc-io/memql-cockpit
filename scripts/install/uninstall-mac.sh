@@ -143,7 +143,10 @@ function parse_args() {
                 CLUSTER_URL="${1#*=}"
                 [[ -n "$CLUSTER_URL" ]] || { echo "ERROR: --cluster needs a URL" >&2; exit 2; }
                 shift ;;
-            --cluster)    [[ $# -gt 1 ]] || { echo "ERROR: --cluster needs a URL" >&2; exit 2; }; CLUSTER_URL="$2"; shift 2 ;;
+            # The space form takes the NEXT WORD, so an omitted URL must
+            # not swallow the flag after it: `--cluster --dry-run` once
+            # read `--dry-run` as the cluster and ran for real.
+            --cluster)    [[ $# -gt 1 && -n "$2" && "$2" != -* ]] || { echo "ERROR: --cluster needs a URL" >&2; exit 2; }; CLUSTER_URL="$2"; shift 2 ;;
             --all-homes)  ALL_HOMES="yes"; shift ;;
             --help|-h)    show_help; exit 0 ;;
             *)
@@ -162,6 +165,9 @@ function parse_args() {
         echo "ERROR: --cluster=URL and --all-homes exclude each other; pass one" >&2
         exit 2
     fi
+    # The shape the binary will accept, refused here as a bad parameter
+    # rather than later as its "files may need repair" 5.
+    [[ -z "$CLUSTER_URL" ]] || require_cluster_url_flag "$CLUSTER_URL" || exit 2
     if [[ -L "$HOME/.memql" ]]; then
         echo "ERROR: refusing an aliased ~/.memql directory" >&2
         exit 3
@@ -345,24 +351,26 @@ function remove_menu_companion() {
 }
 
 # One shape's app. Only a bundle carrying OUR identifier is removed;
-# anything else at the standard path is named and left, with a
-# non-zero return so the summary is PARTIAL rather than SUCCESS over
-# something the person should look at.
+# anything else at the standard path is named and left, with the
+# documented codes (4 when sudo could not be had, 5 for a step that
+# failed) so the summary is PARTIAL rather than SUCCESS over something
+# the person should look at.
 function remove_worker_app() {
     local mode="$1" app identifier
     app="$(worker_app_for_mode "$mode")"
     [[ -e "$app" || -L "$app" ]] || return 0
-    if [[ -L "$app" || ! -d "$app" ]]; then record_kept "$app (not a regular app bundle; inspect and delete by hand)"; return 1; fi
+    if [[ -L "$app" || ! -d "$app" ]]; then record_kept "$app (not a regular app bundle; inspect and delete by hand)"; return 5; fi
     identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null || true)"
     if [[ "$identifier" != com.znasllc.memql-worker ]]; then
-        echo "WARN: leaving unrelated app at $app"; record_kept "$app (bundle identifier is not ours; inspect and delete by hand)"; return 1
+        echo "WARN: leaving unrelated app at $app"; record_kept "$app (bundle identifier is not ours; inspect and delete by hand)"; return 5
     fi
     case "$mode" in
         system)
-            if ! require_sudo uninstall || ! sudo rm -rf "$app"; then record_kept "$app (needs sudo; delete it by hand)"; return 1; fi
+            require_sudo uninstall || { record_kept "$app (needs sudo; delete it by hand)"; return 4; }
+            sudo rm -rf "$app" || { record_kept "$app (could not be removed; delete it by hand)"; return 5; }
             ;;
         *)
-            if [[ ! -O "$app" ]]; then record_kept "$app (not owned by you; delete it by hand)"; return 1; fi
+            if [[ ! -O "$app" ]]; then record_kept "$app (not owned by you; delete it by hand)"; return 5; fi
             rm -rf "$app"
             ;;
     esac
@@ -411,12 +419,16 @@ function retain_runtime() {
 }
 
 # installed_memql_binary prints a memql that can parse the enrollment
-# files: the app's worker for each shape being removed, else the CLI in
-# that shape's bin directory. Any of them will do -- they are the same
-# build -- and a dangling symlink is skipped.
+# files: the app's worker, else the CLI in the bin directory, of
+# WHICHEVER shape holds one -- which shape is being removed does not
+# narrow it, because the binary only reads the enrollment files in
+# $HOME and needs no sudo (a --user-local scoped run on a machine with
+# only a system install once refused for want of a binary it had). The
+# per-user shape is probed first. Any of them will do -- they are the
+# same build -- and a dangling symlink is skipped.
 function installed_memql_binary() {
     local mode candidates=""
-    for mode in $REMOVE_MODES; do
+    for mode in user-local system; do
         candidates="$candidates
 $(worker_app_for_mode "$mode")/Contents/MacOS/MemQL
 $(install_mode_dir "$mode")/${INSTALLED_COMMAND}"
@@ -485,6 +497,15 @@ function scoped_unpair() {
         OTHER_HOMES="$remaining"
         return 0
     fi
+    # The last enrollment takes the runtime with it, and the runtime may
+    # be the system shape: settle sudo BEFORE the worker is stopped and
+    # the registry rewritten, or a refused sudo would leave the enrollment
+    # gone and the agent booted out under a summary saying nothing was
+    # changed (a review finding). A sibling-remaining removal touches
+    # nothing system-owned and must keep working without sudo.
+    if [[ "$remaining" -eq 0 ]]; then
+        ensure_system_sudo || { rc=$?; rm -f "$result"; return "$rc"; }
+    fi
     plist="$HOME/Library/LaunchAgents/$SERVICE_LABEL_DARWIN.plist"
     target="gui/$(id -u)/$SERVICE_LABEL_DARWIN"
     if command -v launchctl >/dev/null 2>&1 && launchctl print "$target" >/dev/null 2>&1; then
@@ -495,12 +516,18 @@ function scoped_unpair() {
         was_loaded=yes
     fi
     stop_agent "$SERVICE_LABEL_DARWIN" || { rm -f "$result"; return 5; }
+    # From here a failure is not "nothing was changed": the worker is
+    # down, and the files may be half-applied. The summary must say so,
+    # with the command that starts the worker again once they are fixed.
+    local restart=""
+    [[ "$was_loaded" != yes ]] || restart="launchctl bootstrap gui/$(id -u) $plist"
     if ! "$binary" worker unpair --cluster-url "$CLUSTER_URL" --json > "$result"; then
         rm -f "$result"
         echo "ERROR: removal did not complete; worker remains stopped so a removed token cannot reconnect. Repair enrollment before restarting." >&2
+        record_scoped_unpair_failure "$restart"
         return 5
     fi
-    OTHER_HOMES="$(unpair_json_remaining "$result")" || { rm -f "$result"; return 5; }
+    OTHER_HOMES="$(unpair_json_remaining "$result")" || { rm -f "$result"; record_scoped_unpair_failure "$restart"; return 5; }
     rm -f "$result"
     if [[ "$OTHER_HOMES" -gt 0 ]]; then
         local legacy
@@ -666,6 +693,8 @@ function main() {
     # runtime goes: services first, then the app's permission grants,
     # then the app and the CLI, then the token files, then (--purge) the
     # state. The order leaves the least behind if a step is interrupted.
+    # A no-op on the scoped path, which settled sudo before its first
+    # write; this is the gate for the no-enrollment and no-binary paths.
     ensure_system_sudo || finish $?
     remove_launch_agent || finish $?
     local runtime_rc=0

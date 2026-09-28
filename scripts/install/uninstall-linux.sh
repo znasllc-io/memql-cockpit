@@ -145,7 +145,10 @@ function parse_args() {
                 CLUSTER_URL="${1#*=}"
                 [[ -n "$CLUSTER_URL" ]] || { echo "ERROR: --cluster needs a URL" >&2; exit 2; }
                 shift ;;
-            --cluster)    [[ $# -gt 1 ]] || { echo "ERROR: --cluster needs a URL" >&2; exit 2; }; CLUSTER_URL="$2"; shift 2 ;;
+            # The space form takes the NEXT WORD, so an omitted URL must
+            # not swallow the flag after it: `--cluster --dry-run` once
+            # read `--dry-run` as the cluster and ran for real.
+            --cluster)    [[ $# -gt 1 && -n "$2" && "$2" != -* ]] || { echo "ERROR: --cluster needs a URL" >&2; exit 2; }; CLUSTER_URL="$2"; shift 2 ;;
             --all-homes)  ALL_HOMES="yes"; shift ;;
             --help|-h)    show_help; exit 0 ;;
             *)
@@ -164,6 +167,9 @@ function parse_args() {
         echo "ERROR: --cluster=URL and --all-homes exclude each other; pass one" >&2
         exit 2
     fi
+    # The shape the binary will accept, refused here as a bad parameter
+    # rather than later as its "files may need repair" 5.
+    [[ -z "$CLUSTER_URL" ]] || require_cluster_url_flag "$CLUSTER_URL" || exit 2
     if [[ -L "$HOME/.memql" ]]; then
         echo "ERROR: refusing an aliased ~/.memql directory" >&2
         exit 3
@@ -197,11 +203,16 @@ function detect_install_shapes() {
 }
 
 # installed_memql_binary prints a memql that can parse the enrollment
-# files: the CLI in each shape's bin directory, whichever is there. Any
-# will do -- they are the same build -- and a dangling symlink is skipped.
+# files: the CLI in the bin directory of WHICHEVER shape holds one --
+# which shape is being removed does not narrow it, because the binary
+# only reads the enrollment files in $HOME and needs no sudo (a
+# --user-local scoped run on a machine with only a system install once
+# refused for want of a binary it had). The per-user shape is probed
+# first. Any will do -- they are the same build -- and a dangling
+# symlink is skipped.
 function installed_memql_binary() {
     local mode candidates=""
-    for mode in $REMOVE_MODES; do
+    for mode in user-local system; do
         candidates="$candidates
 $(install_mode_dir "$mode")/${INSTALLED_COMMAND}"
     done
@@ -286,12 +297,18 @@ function scoped_unpair() {
     else
         echo "INFO: systemctl not found; a running worker keeps its current stream until it is restarted"
     fi
+    # From here a failure is not "nothing was changed": the worker is
+    # down, and the files may be half-applied. The summary must say so,
+    # with the command that starts the worker again once they are fixed.
+    local restart=""
+    [[ "$was_active" != yes ]] || restart="systemctl --user start ${unit}"
     if ! "$binary" worker unpair --cluster-url "$CLUSTER_URL" --json > "$result"; then
         rm -f "$result"
         echo "ERROR: removal did not complete; worker remains stopped so a removed token cannot reconnect. Repair enrollment before restarting." >&2
+        record_scoped_unpair_failure "$restart"
         return 5
     fi
-    OTHER_HOMES="$(unpair_json_remaining "$result")" || { rm -f "$result"; return 5; }
+    OTHER_HOMES="$(unpair_json_remaining "$result")" || { rm -f "$result"; record_scoped_unpair_failure "$restart"; return 5; }
     rm -f "$result"
     if [[ "$OTHER_HOMES" -gt 0 ]]; then
         # The pre-rename unit is retired even when the worker stays: two
@@ -319,10 +336,11 @@ function scoped_unpair() {
 # runtime out from under a unit still trying to restart it). The
 # runtime's unit goes BEFORE the runtime directory does, for that
 # reason. A failed disable (for example an unavailable user manager)
-# reports a partial uninstall and keeps the unit and runtime state
-# for a safe retry while the worker token is still removed. A machine
-# with no systemctl on PATH gets the same preservation: an absent
-# command cannot establish that the service stopped.
+# reports a partial uninstall (5, a failed step) and keeps the unit
+# and runtime state for a safe retry while the worker token is still
+# removed. A machine with no systemctl on PATH gets the same
+# preservation: an absent command cannot establish that the service
+# stopped.
 function remove_systemd_unit() {
     local unit_dir="${HOME}/.config/systemd/user"
     local have_systemctl="yes"
@@ -345,7 +363,7 @@ function remove_systemd_unit() {
         fi
         if [[ "$have_systemctl" == "no" ]]; then
             record_kept "$path (systemctl missing; retry uninstall with the user manager available)"
-            unit_rc=1
+            unit_rc=5
             continue
         fi
         if [[ "$have_systemctl" == "yes" ]]; then
@@ -354,7 +372,7 @@ function remove_systemd_unit() {
             else
                 echo "WARN: systemctl --user disable --now ${unit} failed; keeping the unit and runtime state so a running service is not purged"
                 record_kept "$path (stop failed; retry uninstall when the user manager is available)"
-                unit_rc=1
+                unit_rc=5
                 continue
             fi
         fi
