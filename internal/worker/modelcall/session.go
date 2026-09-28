@@ -531,10 +531,11 @@ func refuse(code, message string) *memqlv1.ModelCallEnd {
 // -----------------------------------------------------------------------------
 
 func (m *Manager) run(ctx context.Context, sender Sender, c *call, info models.Info, limits callLimits, start *memqlv1.ModelCallStart, stream *deltaStream) {
-	// The level rides along for the owner's own logs (memql#5393). It
-	// steers NOTHING here: the router chose this model from this machine's
-	// advertisement, and a level is translated into knobs only for an app,
-	// which has them. A runtime has the model it was asked for.
+	// The level rides along for the owner's own logs (memql#5393). It never
+	// changes the model: the router chose this one from this machine's
+	// advertisement, and a runtime has the model it was asked for. The one
+	// knob it reaches is thinking -- a fast call on Ollama runs with it off
+	// (ollamaThink).
 	m.logger.Debug("model call running",
 		"request_id", c.requestID, "model", info.ID, "kind", start.GetKind(),
 		"level", start.GetLevel(), "purpose", start.GetPurpose())
@@ -576,6 +577,7 @@ func (m *Manager) run(ctx context.Context, sender Sender, c *call, info models.I
 			Params:   paramsFrom(start.GetParams()),
 			Schema:   start.GetResponseFormatSchema(),
 			Tools:    toolsFromStart(start),
+			Level:    start.GetLevel(),
 		}, stream.emit)
 	}
 
