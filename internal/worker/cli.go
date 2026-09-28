@@ -389,6 +389,11 @@ func handleRun(args []string) {
 			// reaches the next one (memql-cockpit#438).
 			Levels:         policy.AppLevels,
 			CheckWorkspace: policy.CheckPath,
+			// Where a session goes when the engine names no workspace:
+			// under fs.workspace_root when the owner set one, filed by
+			// this home either way (appsession/workspace.go).
+			Home:          legacyCfg.Home,
+			WorkspaceRoot: policy.WorkspaceRoot,
 		})
 		stopSessions = sessions.StopAll
 		calls := modelcall.NewManager(modelcall.Options{

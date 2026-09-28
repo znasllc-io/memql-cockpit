@@ -1576,3 +1576,330 @@ func TestLauncher_IsTheSupervisorWithStdinAsADecision(t *testing.T) {
 		}
 	})
 }
+
+// --- the workspace a session runs in ---------------------------------------
+
+// rigHome is the cluster home the workspace tests' manager serves.
+const rigHome = "cluster.example"
+
+// scratchApp is a fake claude that records the directory it ran in --
+// OUTSIDE that directory, so the record outlives a workspace the session
+// removes -- leaves a file behind, and answers.
+func scratchApp(t *testing.T) (cwdFile string) {
+	t.Helper()
+	cwdFile = filepath.Join(t.TempDir(), "cwd")
+	fakeApp(t, "claude", "pwd -P > '"+cwdFile+"'\necho 'made here' > notes.md\n"+quietClaude)
+	return cwdFile
+}
+
+// ranIn is the directory the fake app recorded, or "" when it never ran.
+func ranIn(t *testing.T, cwdFile string) string {
+	t.Helper()
+	data, err := os.ReadFile(cwdFile)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// realPath resolves a path the way `pwd -P` reports it (a macOS temp dir is
+// behind /var -> /private/var).
+func realPath(t *testing.T, path string) string {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatalf("resolve %s: %v", path, err)
+	}
+	return resolved
+}
+
+// isEmptyDir reports whether nothing was made under dir.
+func isEmptyDir(t *testing.T, dir string) bool {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read %s: %v", dir, err)
+	}
+	return len(entries) == 0
+}
+
+// TestRunWithoutWorkspaceUsesScratchDir: an AppSessionStart that names no
+// workspace is the engine saying "the machine chooses" -- it cannot know a
+// path on somebody else's computer. The session runs in a directory of its
+// own under this home, keyed by the session when no run owns it, pushes what
+// it made, and takes the directory away with it.
+func TestRunWithoutWorkspaceUsesScratchDir(t *testing.T) {
+	cwdFile := scratchApp(t)
+	h := newRig(t)
+	scratch := t.TempDir()
+	h.manager.opts.Home = rigHome
+	h.manager.opts.ScratchRoot = scratch
+
+	end := h.start(t, func(s *memqlv1.AppSessionStart) { s.Workspace = "" })
+
+	if end.GetError() != "" || end.GetExitCode() != 0 {
+		t.Fatalf("end = %d %q, want a session that ran", end.GetExitCode(), end.GetError())
+	}
+	want := filepath.Join(realPath(t, scratch), rigHome, "sess-test")
+	if got := ranIn(t, cwdFile); got != want {
+		t.Errorf("the app ran in %q, want the machine's own directory %q", got, want)
+	}
+	pushed := false
+	for name, body := range h.library.uploaded() {
+		pushed = pushed || (strings.HasSuffix(name, "notes.md") && string(body) == "made here\n")
+	}
+	if !pushed {
+		t.Errorf("what the app made in the scratch directory was not pushed: %v", h.library.uploaded())
+	}
+	if _, err := os.Stat(want); !os.IsNotExist(err) {
+		t.Errorf("the session's own directory outlived it (stat: %v); nothing else will ever clean it", err)
+	}
+}
+
+// TestScratchWorkspaceUnderPolicyRoot: a machine whose policy.yaml names
+// fs.workspace_root keeps its sessions under it -- per home, then per run --
+// and the path still goes through this machine's workspace check, as a path
+// the engine named would.
+func TestScratchWorkspaceUnderPolicyRoot(t *testing.T) {
+	cwdFile := scratchApp(t)
+	h := newRig(t)
+	root := t.TempDir()
+	unused := t.TempDir()
+	var checked []string
+	h.manager.opts.Home = rigHome
+	h.manager.opts.ScratchRoot = unused
+	h.manager.opts.WorkspaceRoot = func() string { return root }
+	h.manager.opts.CheckWorkspace = func(path string) error {
+		checked = append(checked, path)
+		return nil
+	}
+
+	end := h.start(t, func(s *memqlv1.AppSessionStart) {
+		s.Workspace = ""
+		s.RunId = "run-7"
+	})
+
+	if end.GetError() != "" {
+		t.Fatalf("end error = %q", end.GetError())
+	}
+	want := filepath.Join(root, rigHome, "run-7")
+	if got := ranIn(t, cwdFile); got != realPath(t, want) {
+		t.Errorf("the app ran in %q, want %q under fs.workspace_root", got, want)
+	}
+	if len(checked) != 1 || checked[0] != want {
+		t.Errorf("CheckWorkspace saw %v, want exactly the chosen %q", checked, want)
+	}
+	if !isEmptyDir(t, unused) {
+		t.Error("the default scratch directory was used although policy.yaml names a workspace root")
+	}
+}
+
+// TestScratchWorkspaceRefusedByPolicyNeverRuns: the machine's own choice is
+// not exempt from its own policy. A refused path ends the session naming it,
+// before anything runs.
+func TestScratchWorkspaceRefusedByPolicyNeverRuns(t *testing.T) {
+	cwdFile := scratchApp(t)
+	h := newRig(t)
+	h.manager.opts.Home = rigHome
+	h.manager.opts.ScratchRoot = t.TempDir()
+	h.manager.opts.CheckWorkspace = func(path string) error {
+		return fmt.Errorf("fs deny list: %q", path)
+	}
+
+	end := h.start(t, func(s *memqlv1.AppSessionStart) { s.Workspace = "" })
+
+	if !strings.Contains(end.GetError(), "workspace refused by this machine's policy") ||
+		!strings.Contains(end.GetError(), filepath.Join(rigHome, "sess-test")) {
+		t.Errorf("error = %q, want the refusal naming the directory this machine chose", end.GetError())
+	}
+	if got := ranIn(t, cwdFile); got != "" {
+		t.Errorf("the app ran in %q in a workspace this machine refused", got)
+	}
+}
+
+// TestRunKeyedScratchSurvivesSessionEnd: a directory keyed by a RUN belongs
+// to the run -- a later session of the same run finds what an earlier one
+// left there -- so the session's end removes only its own scaffolding, and
+// the bearer with it.
+func TestRunKeyedScratchSurvivesSessionEnd(t *testing.T) {
+	cwdFile := scratchApp(t)
+	h := newRig(t)
+	scratch := t.TempDir()
+	h.manager.opts.Home = rigHome
+	h.manager.opts.ScratchRoot = scratch
+
+	end := h.start(t, func(s *memqlv1.AppSessionStart) {
+		s.Workspace = ""
+		s.RunId = "run-42"
+	})
+
+	if end.GetError() != "" {
+		t.Fatalf("end error = %q", end.GetError())
+	}
+	dir := filepath.Join(scratch, rigHome, "run-42")
+	if got := ranIn(t, cwdFile); got != realPath(t, dir) {
+		t.Errorf("the app ran in %q, want the run's directory %q", got, dir)
+	}
+	if body, err := os.ReadFile(filepath.Join(dir, "notes.md")); err != nil || string(body) != "made here\n" {
+		t.Errorf("the run's file did not survive the session's end: %q, %v", body, err)
+	}
+	for _, gone := range []string{".mcp.json", sessionScaffoldDir} {
+		if _, err := os.Stat(filepath.Join(dir, gone)); !os.IsNotExist(err) {
+			t.Errorf("%s outlived the session in the run's directory (stat: %v)", gone, err)
+		}
+	}
+}
+
+// TestExplicitWorkspaceUnchanged: a workspace the engine named is used as
+// named, and never removed -- it can be a real project somebody works in.
+func TestExplicitWorkspaceUnchanged(t *testing.T) {
+	cwdFile := scratchApp(t)
+	h := newRig(t)
+	scratch := t.TempDir()
+	h.manager.opts.Home = rigHome
+	h.manager.opts.ScratchRoot = scratch
+
+	end := h.start(t, func(s *memqlv1.AppSessionStart) { s.RunId = "run-9" })
+
+	if end.GetError() != "" {
+		t.Fatalf("end error = %q", end.GetError())
+	}
+	if got := ranIn(t, cwdFile); got != realPath(t, h.workspace) {
+		t.Errorf("the app ran in %q, want the named workspace %q", got, h.workspace)
+	}
+	if _, err := os.Stat(filepath.Join(h.workspace, "notes.md")); err != nil {
+		t.Errorf("the named workspace lost what the app made in it: %v", err)
+	}
+	if !isEmptyDir(t, scratch) {
+		t.Error("a scratch directory was made although the engine named a workspace")
+	}
+}
+
+// TestScratchRootIsOutsideTheWorkerDir: with no fs.workspace_root the
+// sessions go in the platform's data directory, NEVER under ~/.memql -- that
+// holds the worker's tokens and the consent file, and a session runs shell
+// commands where it works.
+func TestScratchRootIsOutsideTheWorkerDir(t *testing.T) {
+	const home = "/home/ada"
+	cases := []struct {
+		name, goos, xdg, want string
+	}{
+		{"macOS", "darwin", "", "/home/ada/Library/Application Support/MemQL/workspaces"},
+		{"macOS ignores XDG", "darwin", "/x/data", "/home/ada/Library/Application Support/MemQL/workspaces"},
+		{"linux default", "linux", "", "/home/ada/.local/share/memql/workspaces"},
+		{"linux XDG_DATA_HOME", "linux", "/x/data", "/x/data/memql/workspaces"},
+		// The XDG spec says a relative value is to be ignored.
+		{"linux relative XDG", "linux", "data", "/home/ada/.local/share/memql/workspaces"},
+		{"no home", "linux", "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := home
+			if c.name == "no home" {
+				h = ""
+			}
+			got := scratchRootFor(c.goos, h, c.xdg)
+			if got != c.want {
+				t.Errorf("scratchRootFor(%q, %q, %q) = %q, want %q", c.goos, h, c.xdg, got, c.want)
+			}
+			if got != "" && strings.HasPrefix(got+"/", filepath.Join(home, ".memql")+"/") {
+				t.Errorf("%q is under ~/.memql", got)
+			}
+		})
+	}
+}
+
+// TestScratchKeyIsOnePathSegment: the keys are server-minted ids, and a
+// directory name is built from them, so nothing in one may climb out of the
+// home's directory or hide in it.
+func TestScratchKeyIsOnePathSegment(t *testing.T) {
+	for in, want := range map[string]string{
+		"v1:work:run:6de15921": "v1_work_run_6de15921",
+		"../../etc":            "_._.._etc",
+		"..":                   "unnamed",
+		"":                     "unnamed",
+		"api.memql.localhost":  "api.memql.localhost",
+		".hidden":              "_hidden",
+	} {
+		if got := scratchSegment(in); got != want {
+			t.Errorf("scratchSegment(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// logBuffer is a log sink a session goroutine can write while a test reads.
+type logBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *logBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *logBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// settled waits until the manager has let go of every session. The End is
+// logged AFTER it is sent, so the sender seeing it is not yet the log having
+// it; the session is forgotten only once its goroutine has returned.
+func (h *rig) settled(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for h.manager.Live() > 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the session never let go after its End")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestSessionEndLogsWhyItFailed: a refused or failed session says WHY in the
+// machine's own log, not just that it did. The End carries the reason to the
+// engine, but the person debugging a machine reads its log -- and "error=true"
+// sends them to a cluster they may not be able to query. The reason is
+// redacted exactly as the End's is.
+func TestSessionEndLogsWhyItFailed(t *testing.T) {
+	t.Run("a refusal", func(t *testing.T) {
+		h := newRig(t)
+		logs := &logBuffer{}
+		h.manager.logger = slog.New(slog.NewTextHandler(logs, nil))
+
+		end := h.start(t, func(s *memqlv1.AppSessionStart) { s.Workspace = "not/absolute" })
+
+		if !strings.Contains(end.GetError(), "is not absolute") {
+			t.Fatalf("end error = %q, want the workspace refusal", end.GetError())
+		}
+		h.settled(t)
+		out := logs.String()
+		if !strings.Contains(out, "level=WARN") || !strings.Contains(out, "is not absolute") {
+			t.Errorf("the machine's log does not say why the session was refused:\n%s", out)
+		}
+	})
+
+	t.Run("a failure quoting the bearer", func(t *testing.T) {
+		fakeApp(t, "claude", "echo 'auth broke: "+testBearer+"' >&2\nexit 1\n")
+		h := newRig(t)
+		logs := &logBuffer{}
+		h.manager.logger = slog.New(slog.NewTextHandler(logs, nil))
+
+		end := h.start(t, nil)
+
+		if end.GetError() == "" {
+			t.Fatal("a session whose app exited 1 ended without an error")
+		}
+		h.settled(t)
+		out := logs.String()
+		if !strings.Contains(out, "auth broke") {
+			t.Errorf("the machine's log does not carry the app's reason:\n%s", out)
+		}
+		if strings.Contains(out, testBearer) {
+			t.Errorf("the session bearer reached the machine's log:\n%s", out)
+		}
+	})
+}

@@ -223,6 +223,26 @@ Four rules here are load-bearing, and each is the kind that fails silently:
    enough: every write is recorded in a ledger under the state dir, and
    `appsession.Sweep` clears what a SIGKILL left behind at the next start.
 
+**AN EMPTY `AppSessionStart.workspace` IS THE MACHINE'S CHOICE**, never a
+refusal: the engine cannot know a path here. `appsession/workspace.go` makes
+`<fs.workspace_root or the platform data dir>/<home>/<run_id or session_id>`,
+passes it through `CheckWorkspace` like an engine-named path, and removes it
+at End only when it was keyed by the session. Never under `~/.memql` (tokens,
+consent). Read the RESOLVED workspace (`session.workspace`), not the start's
+field: the start's is empty for a chosen directory, and the output push reading
+it pushes nothing the app made.
+
+**CLAUDE CODE'S PERMISSIONS ARE IN THE ARGV, NOT IN ~/.claude**
+(`claudeGrantArgs`): `--setting-sources=` (no settings file),
+`--strict-mcp-config`, `--permission-mode dontAsk`, `--allowedTools
+"Edit(/**) Read(/**) mcp__memql"`, and the sandbox inline via `--settings`.
+Bash has no rule -- the sandbox's auto-allow is its only approval, so a
+command the sandbox did not take has none. `--tools` is NOT passed: it would
+drop ToolSearch, which loads deferred MCP tools. Every flag before `--`.
+`CLAUDE_CODE_CERT_STORE=bundled,system` is pinned per turn (mkcert CA), and an
+init event reporting MemQL's server `failed`/`needs-auth` stops the turn;
+`pending` does not.
+
 **The app-server's frames carry no `"jsonrpc"` header** -- its README
 says so, and none of a real 0.153.4 turn's lines has one -- so
 `jsonrpcConn.route` recognises a frame by its shape (`rpcMessage.isFrame`:

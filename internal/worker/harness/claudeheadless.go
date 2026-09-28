@@ -209,13 +209,19 @@ func (h *claudeHeadless) Turn(ctx context.Context, prompt string, sink Sink) (Tu
 	rec.startTurn()
 
 	argv := claudeArgv(spec, knobs, prompt, ref)
-	proc, err := spec.Launch(ctx, spec.Workspace, argv, spec.Env, false)
+	proc, err := spec.Launch(ctx, spec.Workspace, argv, claudeEnv(spec.Env), false)
 	if err != nil {
 		return TurnResult{ExitCode: -1, AppSessionRef: ref},
 			fmt.Errorf("harness: could not start %s: %w", spec.Binary, err)
 	}
 
 	turn := &claudeTurn{sink: sink, rec: rec, cwd: spec.Workspace}
+	if strings.TrimSpace(spec.MCPConfigPath) != "" {
+		// Only a session that configured MemQL's server can be let down
+		// by it; the stop is the process group, as a cancel's is.
+		turn.mcpServer = MCPServerName
+		turn.stop = proc.Terminate
+	}
 
 	// The context is watched here as well as by the launcher because
 	// Process.Terminate is the seam that stops the whole process GROUP.
@@ -268,6 +274,14 @@ func (h *claudeHeadless) Turn(ctx context.Context, prompt string, sink Sink) (Tu
 	// its stream (2.1.270), so the only value that could go here is the
 	// --effort this client passed, and a request is not a report.
 	res.Model = turn.servedModel()
+
+	// A turn stopped because MemQL's server could not serve it failed for
+	// THAT reason, whatever status the stopped process exited with: the
+	// signal is this client's doing, and naming it would send an operator
+	// looking for a crash.
+	if turn.mcpFailure != "" {
+		return res, errors.New(turn.mcpFailure)
+	}
 
 	// The exit status is the first question -- but a failed turn can still
 	// carry the structured answer the schema asked for, and it goes back
@@ -338,6 +352,9 @@ func (h *claudeHeadless) rememberRef(ref string) {
 // 2.1.270), so neither can swallow a following argument the way the
 // variadic can. CheckKnobs has already refused a value that begins with
 // a dash, which is the one value that would read as a flag of its own.
+//
+// Then the session's GRANT (claudeGrantArgs), which is the machine
+// owner's decision and not the user's settings file.
 func claudeArgv(spec Spec, knobs Knobs, prompt, ref string) []string {
 	argv := []string{spec.Binary, "-p", "--output-format", "stream-json", "--verbose"}
 	if knobs.Model != "" {
@@ -346,6 +363,7 @@ func claudeArgv(spec Spec, knobs Knobs, prompt, ref string) []string {
 	if knobs.Effort != "" {
 		argv = append(argv, "--effort", knobs.Effort)
 	}
+	argv = append(argv, claudeGrantArgs()...)
 	if path := strings.TrimSpace(spec.MCPConfigPath); path != "" {
 		argv = append(argv, "--mcp-config", path)
 	}
@@ -358,6 +376,98 @@ func claudeArgv(spec Spec, knobs Knobs, prompt, ref string) []string {
 		argv = append(argv, "--json-schema", schema)
 	}
 	return append(argv, "--", prompt)
+}
+
+// claudeGrantArgs is what a session's Claude Code may do, as flags.
+//
+// THE GRANT IS THE MACHINE OWNER'S DECISION, not the user's settings file:
+// inside a session Claude Code may edit files and run shell commands INSIDE
+// THE SESSION WORKSPACE, and call MemQL's tools over MCP -- nothing else,
+// and nothing a personal ~/.claude/settings.json can widen or narrow.
+// Before this, `claude -p` ran with no permission flags at all, so what a
+// session could do was whatever that file happened to say on this machine.
+//
+// Each flag below was checked against `claude --help` and the binary of
+// 2.1.275 and 2.1.283; none of it has been run against a real prompt here.
+//
+//   - `--setting-sources=` loads NO settings file: not the user's, not the
+//     workspace's .claude/settings.json, not settings.local.json (the app's
+//     own parser returns an empty list for ""). What still loads is the
+//     settings passed on this command line -- the grant -- and the machine's
+//     MANAGED settings, which are its administrator's to impose. The `=`
+//     form is the one Claude Code respawns itself with, and it keeps the
+//     empty value one token rather than an argument that could go missing.
+//   - `--strict-mcp-config` loads no MCP server but the ones --mcp-config
+//     names, which is the session's own. Without it the user's global
+//     servers ride along on a session somebody else started.
+//   - `--permission-mode dontAsk` REFUSES whatever is not granted below
+//     rather than asking. Nobody is at a `claude -p` to answer, and `-p`
+//     already refused (the recorded 2.1.270 refusals in
+//     claudeactions_test.go); the mode says so instead of relying on it.
+//   - `--allowedTools` grants `Edit(/**)` and `Read(/**)` -- a command-line
+//     rule's leading "/" is the working directory, which is the workspace,
+//     so both stop at its edge. Edit rules govern every file-writing tool
+//     (Edit, Write) and Read rules the reading ones (Read, Glob, Grep). And
+//     `mcp__memql`, every tool of MemQL's server. It is variadic like
+//     --mcp-config, which is fine only because every flag precedes `--`.
+//   - Bash has NO rule of its own. The sandbox approves it
+//     (claudeSandboxSettings), and approves a command BECAUSE it runs
+//     sandboxed -- so a command the sandbox did not take has no approval
+//     in this grant, and dontAsk refuses it.
+//
+// `--tools` is deliberately NOT passed. It would narrow the built-in set to
+// the grant's tools, but it would take ToolSearch with it -- the tool Claude
+// Code loads a deferred MCP tool with before it can call one (the recorded
+// turn in claudeactions_test.go) -- and whether it spares the synthetic
+// StructuredOutput tool a --json-schema answer rides could not be verified
+// without a real run. The permission mode is what refuses everything else.
+func claudeGrantArgs() []string {
+	return []string{
+		"--setting-sources=",
+		"--strict-mcp-config",
+		"--permission-mode", "dontAsk",
+		"--allowedTools", "Edit(/**) Read(/**) mcp__" + MCPServerName,
+		"--settings", claudeSandboxSettings,
+	}
+}
+
+// claudeSandboxSettings turns on Claude Code's own sandbox for every shell
+// command a session runs (Seatbelt on macOS, bubblewrap on Linux), passed
+// inline as `--settings` -- the one settings source the grant keeps.
+//
+// The sandbox confines WRITES to the working directory (plus the temporary
+// directory it always allows), keeps the app's mandatory write protections
+// (.mcp.json -- this session's bearer --, .git/hooks, .git/config, shell rc
+// files), and sends a command's network through its own proxy, which
+// approves domains one at a time; this grant approves none. It does NOT
+// confine reads: a sandboxed command can read outside the workspace, and
+// this machine's fs.deny list is not handed to it.
+//
+//   - failIfUnavailable: a machine that cannot sandbox fails the turn at
+//     start in the app's own words (a Linux box without bubblewrap, say),
+//     rather than warning and running every command unsandboxed.
+//   - autoAllowBashIfSandboxed: the approval Bash gets instead of a rule.
+//   - allowUnsandboxedCommands=false: the Bash tool's dangerouslyDisableSandbox
+//     parameter is ignored, so there is no way out of the sandbox from a
+//     single call.
+const claudeSandboxSettings = `{"sandbox":{"enabled":true,"failIfUnavailable":true,"autoAllowBashIfSandboxed":true,"allowUnsandboxedCommands":false}}`
+
+// claudeCertStoreEnv is set on every turn: TLS trusts Claude Code's bundled
+// roots AND the system store.
+//
+// A local cluster's MCP endpoint is signed by an mkcert CA that lives only in
+// the system keychain, so an app trusting its bundled roots alone reaches no
+// MemQL tool and says only that the server failed. It is PINNED, appended
+// after the worker's own environment -- the launcher starts the child with
+// os.Environ() and then this, and the last value of a key is the one a
+// process gets -- because a narrower value inherited from the worker is that
+// same silent failure.
+const claudeCertStoreEnv = "CLAUDE_CODE_CERT_STORE=bundled,system"
+
+// claudeEnv is the environment one turn's process adds to the worker's:
+// the session's own entries, then the pinned certificate store.
+func claudeEnv(env []string) []string {
+	return append(append([]string(nil), env...), claudeCertStoreEnv)
 }
 
 // claudeTurn is one turn's mutable state.
@@ -385,6 +495,15 @@ type claudeTurn struct {
 	// cwd is the working directory every call this turn makes is recorded
 	// in: the workspace, until the app's own init event names it.
 	cwd string
+	// mcpFailure is why MemQL's MCP server cannot serve this turn, as the
+	// init event reported it; empty while it can.
+	mcpFailure string
+
+	// Set before the pumps start and only read after. mcpServer is the
+	// server whose status decides the turn -- empty for a session that
+	// configured none -- and stop ends the turn's process group.
+	mcpServer string
+	stop      func()
 
 	// Written by the stderr pump only.
 	stderrTail []byte
@@ -485,6 +604,7 @@ func (t *claudeTurn) route(line []byte) {
 		if decodeTolerant(trimmed, &env) && env.Subtype == claudeSubtypeInit && strings.TrimSpace(env.Cwd) != "" {
 			t.cwd = env.Cwd
 		}
+		t.checkMCP(trimmed)
 	}
 
 	switch ev.Type {
@@ -503,6 +623,65 @@ func (t *claudeTurn) route(line []byte) {
 		t.emit(StreamEvent, line)
 	default:
 		t.emit(StreamEvent, line)
+	}
+}
+
+// claudeMCPServers is the init event's `mcp_servers` (2.1.283:
+// `[{"name":"memql","status":"connected"}]`, the status one of connected,
+// failed, needs-auth, pending or disabled). It is decoded apart from every
+// other read of the init line, so a release that changed its shape costs
+// this check and nothing else.
+type claudeMCPServers struct {
+	Subtype    string `json:"subtype"`
+	MCPServers []struct {
+		Name   string `json:"name"`
+		Status string `json:"status"`
+	} `json:"mcp_servers"`
+}
+
+// claudeMCPUnservable is what each status that fails a turn means, in the
+// words the End carries.
+//
+// Exactly two statuses say MemQL's server cannot serve the turn. `pending`
+// is NOT one of them: it is a server still connecting when the init event
+// was printed, which Claude Code finishes on its own, and failing on it
+// would fail every turn whose endpoint answers a little slower than the app
+// starts. The rest leave the turn to say for itself what it had.
+var claudeMCPUnservable = map[string]string{
+	"failed": "Claude Code could not connect to it -- an endpoint it cannot reach, " +
+		"or a certificate it does not trust",
+	"needs-auth": "it did not accept the session's credential",
+}
+
+// checkMCP fails the turn when its init event says MemQL's server cannot
+// serve it.
+//
+// The process is STOPPED rather than left to finish: a turn with none of
+// MemQL's tools still runs, on somebody's subscription, and its answer would
+// be read as one made with them.
+func (t *claudeTurn) checkMCP(line []byte) {
+	if t.mcpServer == "" || t.mcpFailure != "" {
+		return
+	}
+	var init claudeMCPServers
+	if !decodeTolerant(line, &init) || init.Subtype != claudeSubtypeInit {
+		return
+	}
+	for _, server := range init.MCPServers {
+		if server.Name != t.mcpServer {
+			continue
+		}
+		status := strings.TrimSpace(server.Status)
+		why, ok := claudeMCPUnservable[status]
+		if !ok {
+			return
+		}
+		t.mcpFailure = fmt.Sprintf("harness: Claude Code reported MemQL's MCP server %q as %s when the turn "+
+			"started (%s), so the turn was stopped rather than run without MemQL's tools", server.Name, status, why)
+		if t.stop != nil {
+			t.stop()
+		}
+		return
 	}
 }
 

@@ -64,6 +64,17 @@ const (
 	HarnessCodexMCP = "codex-mcp"
 )
 
+// MCPServerName is what MemQL calls itself in every app's MCP
+// configuration.
+//
+// It lives here rather than beside the configuration writer
+// (appsession/mcpconfig.go) because a harness now reads it too: Claude
+// Code's permission grant names the server (`mcp__memql`) and its init
+// event reports the server's status by that name. Two spellings of one
+// name are two things a rename can pull apart in silence, and the
+// symptom would be a session whose MemQL tools are all refused.
+const MCPServerName = "memql"
+
 // Chunk streams a harness emits. The first three are new here; stdout and
 // stderr keep the meaning they had, so an operator reading a transcript
 // from before this change reads the same words after it.

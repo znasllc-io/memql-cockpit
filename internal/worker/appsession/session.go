@@ -187,8 +187,23 @@ type Options struct {
 	// CheckWorkspace vetoes a workspace path. The delegation policy
 	// picks the workspace root, but the cockpit still gets to refuse a
 	// path outside its own -- the engine is naming a directory on
-	// somebody else's machine.
+	// somebody else's machine. A directory this machine chose itself
+	// (workspace.go) passes through it too.
 	CheckWorkspace func(path string) error
+	// Home is the cluster home this manager serves (the fleet's home id).
+	// A workspace this machine chooses is filed under it, so two clusters
+	// enrolled on one machine never share a directory. Empty files it
+	// under "default", the id a home with no cluster URL gets.
+	Home string
+	// WorkspaceRoot is policy.yaml's fs.workspace_root, already expanded,
+	// or "" when it names none (tools.Policy.WorkspaceRoot). A function so
+	// a SIGHUP reaches the next session. When it names a root, a workspace
+	// this machine chooses goes under it.
+	WorkspaceRoot func() string
+	// ScratchRoot is where a workspace this machine chooses goes when
+	// fs.workspace_root names none. Empty is the platform's data directory
+	// (scratchRootFor); tests set it.
+	ScratchRoot string
 	// Detector resolves WHICH HARNESS drives an app on this machine.
 	//
 	// It is a field rather than a package call because the answer is a
@@ -261,6 +276,10 @@ func (m *Manager) Start(ctx context.Context, sender Sender, start *memqlv1.AppSe
 		manager: m,
 		logger:  m.logger.With("session_id", id, "app", start.GetApp(), "kind", start.GetKind()),
 		cancel:  cancel,
+		// From the first moment, so a session refused before it reaches
+		// the app still redacts the End it sends and the log line that
+		// says why.
+		redact: newRedactor(start.GetCredential()),
 		// Closed until a turn loop opens it. A session that is not
 		// driving turns -- the open kind, or one that failed before it
 		// started -- must REFUSE a follow-up rather than swallow it into
@@ -382,6 +401,12 @@ type session struct {
 	library       *Library
 	child         *child
 	cancelReason_ string
+	// workspace is the directory the session runs in, once resolved --
+	// the start's, or one this machine chose (workspace.go).
+	// ownsWorkspace is true only for a directory made for this session
+	// alone, which is removed when it ends.
+	workspace     string
+	ownsWorkspace bool
 	// policy decides which files the recording reads back (record.go);
 	// pulled are the Library inputs as they landed, for the fingerprint.
 	policy *contentPolicy
@@ -426,6 +451,7 @@ func (s *session) run(ctx context.Context) {
 			// that is already gone.
 			s.logger.Error("app session panicked", "panic", rec)
 			s.teardown()
+			s.releaseWorkspace()
 			s.sendEnd(-1, fmt.Sprintf("cockpit panic during session: %v", rec), nil)
 		}
 	}()
@@ -439,6 +465,9 @@ func (s *session) run(ctx context.Context) {
 	} else if pushErr != nil {
 		err = fmt.Errorf("%w; additionally: %v", err, pushErr)
 	}
+	// After the push, which reads the directory, and before the End, so
+	// nobody told the session is over can find it still on disk.
+	s.releaseWorkspace()
 
 	message := ""
 	if err != nil {
@@ -469,8 +498,6 @@ func (s *session) execute(ctx context.Context) (int, error) {
 	if err != nil {
 		return -1, err
 	}
-
-	s.redact = newRedactor(s.start.GetCredential())
 
 	// The MCP configuration first: an app that starts without it reaches
 	// nothing over MCP and reports that as "MemQL's tools are broken".
@@ -677,11 +704,18 @@ func levelNote(spec apps.Spec, p levelPlan) string {
 		p.level, spec.ID, harness.DescribeKnobs(spec.Harness, p.knobs), source)
 }
 
-// resolveWorkspace validates the directory the engine named.
+// resolveWorkspace settles the directory the session runs in: the one the
+// engine named, or -- when it named none -- one this machine chooses
+// (workspace.go). Either way it passes this machine's own check before
+// anything is written into it.
 func (s *session) resolveWorkspace() (string, error) {
 	workspace := strings.TrimSpace(s.start.GetWorkspace())
-	if workspace == "" {
-		return "", errors.New("app session: no workspace in AppSessionStart")
+	chosen, bySession := workspace == "", false
+	if chosen {
+		var err error
+		if workspace, bySession, err = s.chooseWorkspace(); err != nil {
+			return "", err
+		}
 	}
 	if !filepath.IsAbs(workspace) {
 		return "", fmt.Errorf("app session: workspace %q is not absolute", workspace)
@@ -693,6 +727,18 @@ func (s *session) resolveWorkspace() (string, error) {
 	}
 	if err := os.MkdirAll(workspace, configDirMode); err != nil {
 		return "", fmt.Errorf("app session: workspace: %w", err)
+	}
+	s.mu.Lock()
+	s.workspace = workspace
+	s.ownsWorkspace = chosen && bySession
+	s.mu.Unlock()
+	if chosen {
+		keyedBy := "run"
+		if bySession {
+			keyedBy = "session"
+		}
+		s.logger.Info("app session named no workspace; running in one this machine chose",
+			"workspace", workspace, "keyed_by", keyedBy)
 	}
 	return workspace, nil
 }

@@ -289,6 +289,13 @@ func (f *Fleet) buildHome(home Home, machineID string) (homeRun, error) {
 		// the built-in table.
 		Levels:         f.policy.AppLevels,
 		CheckWorkspace: f.policyCheckPath(),
+		// Where a session goes when the engine names no workspace: under
+		// fs.workspace_root when the owner set one, and under this home
+		// either way, so two clusters never share a directory
+		// (appsession/workspace.go). Safe on a nil policy for AppLevels'
+		// reason: WorkspaceRoot answers "", the platform's own directory.
+		Home:          home.ID,
+		WorkspaceRoot: f.policy.WorkspaceRoot,
 	})
 	// Per-home Calls so a disconnect on home A does not StopAll
 	// generations serving home B on the shared GPU -- over one Limiter,

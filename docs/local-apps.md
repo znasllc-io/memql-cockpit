@@ -90,6 +90,69 @@ reconnect.
 
 ---
 
+## Where a session runs
+
+The engine may name a workspace (from the owner's delegation policy). When it
+names **none**, this machine chooses one; the engine never invents a path on
+somebody else's computer.
+
+| `policy.yaml` | Directory |
+|---|---|
+| `fs.workspace_root` set | `<fs.workspace_root>/<home>/<key>` |
+| not set, macOS | `~/Library/Application Support/MemQL/workspaces/<home>/<key>` |
+| not set, elsewhere | `$XDG_DATA_HOME/memql/workspaces/<home>/<key>` (`~/.local/share/...` when unset) |
+
+`<home>` is the cluster home, so two clusters enrolled on one machine never
+share a directory. `<key>` is the **run** when the session belongs to one, and
+the **session** otherwise:
+
+- a **run's** directory is shared by that run's sessions, so a later step
+  finds what an earlier one made. It is kept when a session ends; only the
+  session's own scaffolding (the bearer's configuration, the transcript) goes;
+- a **session's** directory is removed when the session ends, after its
+  outputs have been pushed to the Library.
+
+The chosen directory goes through the same `fs.deny` / `fs.workspace_root`
+check as a path the engine named. It is **never under `~/.memql`**: that
+holds the worker's tokens and the consent file, and a session runs shell
+commands where it works.
+
+A workspace the engine named is used as named and never removed.
+
+## What Claude Code may do in a session
+
+The machine owner's grant, passed as flags on every `claude -p` turn —
+**not** read from anybody's `~/.claude/settings.json`:
+
+- **edit files and run shell commands inside the session workspace;**
+- **call MemQL's tools** over the session's own MCP server;
+- nothing else.
+
+| Flag | What it does |
+|---|---|
+| `--setting-sources=` | loads no settings file: not the user's, not the workspace's `.claude/settings.json`. The machine's **managed** settings still apply — they are its administrator's |
+| `--strict-mcp-config` | loads no MCP server but the session's own |
+| `--permission-mode dontAsk` | refuses anything not granted below — nobody is at a `claude -p` to ask |
+| `--allowedTools "Edit(/**) Read(/**) mcp__memql"` | the file tools under the workspace only (a command-line rule's `/` is the working directory), and every MemQL tool |
+| `--settings '{"sandbox":{...}}'` | runs every shell command in Claude Code's own sandbox (Seatbelt on macOS, bubblewrap on Linux): writes confined to the workspace and the temp directory, `.mcp.json`, `.git/hooks`, `.git/config` and shell rc files protected, network only through the sandbox's proxy, which this grant approves no domain for. `failIfUnavailable` makes a machine that cannot sandbox fail the turn at start; `allowUnsandboxedCommands: false` removes the per-call escape |
+
+Bash has **no** allow rule of its own: it is approved only because it runs
+sandboxed. Two limits, stated plainly: the sandbox confines **writes**, not
+reads — a sandboxed command can still read outside the workspace, and this
+machine's `fs.deny` list is not handed to it — and none of this has been
+exercised against a real prompt from the test suite, only against the flags
+and settings `claude` 2.1.275 / 2.1.283 document.
+
+Every turn also runs with `CLAUDE_CODE_CERT_STORE=bundled,system`, pinned over
+the worker's own environment: a local cluster's MCP endpoint is signed by an
+mkcert CA that is only in the system keychain.
+
+The turn's first event names each MCP server's status. MemQL's server
+reported as `failed` or `needs-auth` **stops the turn at once** with that
+status in the error; `pending` (still connecting) does not.
+
+---
+
 ## What a session writes on the machine
 
 | Path | What it is | Lifetime |
@@ -608,6 +671,12 @@ applied silently:
 | The machine never appears at all | `claude` / `codex` is not on the worker's `PATH`. A LaunchAgent's `PATH` is not your shell's |
 | `is not in this machine's policy.yaml apps.allow` | the engine routed here anyway; add it to `apps.allow` or ask why the label was derived |
 | `is allowed here but is not on this worker's PATH` | the binary moved, or the worker's `PATH` is not your shell's. A LaunchAgent inherits neither your shell profile nor a version manager's shims |
+| `workspace refused by this machine's policy` naming a directory under `workspaces/<home>/` | the engine named no workspace and the one this machine chose is outside `fs.workspace_root` or under `fs.deny`. Set `fs.workspace_root` (the choice then goes under it) or fix the deny entry |
+| `no workspace in AppSessionStart, and this machine has no home directory` | there is nowhere to choose one. Set `fs.workspace_root` in `policy.yaml` |
+| `reported MemQL's MCP server "memql" as failed` | Claude Code could not connect to the session's MCP endpoint: unreachable, or a certificate it does not trust. The mkcert CA must be in the system keychain |
+| `reported MemQL's MCP server "memql" as needs-auth` | the endpoint refused the session's bearer |
+| a turn fails at start saying the sandbox is unavailable | Claude Code cannot sandbox shell commands on this machine (on Linux, install bubblewrap). By design the session does not run them unconfined |
+| `Claude requested permissions to use …` in a transcript | a tool the session grant does not cover — outside the workspace, or not a file tool, shell command or MemQL tool. Correct refusal |
 | `kind=attach ... needs a prompt` | an attach that only wanted to watch. Send the turn you want run, or use `run` |
 | `this session is no longer taking turns` | a `message` control arrived after the last turn had already ended the session |
 | `a follow-up arrived with no prompt` | a `message` control with an empty `prompt`. The follow-up's text travels in `prompt`, never in `reason` |
