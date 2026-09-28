@@ -69,7 +69,7 @@ function source_lib() {
         rm -f "$tmp"
         echo "ERROR: failed to fetch $url" >&2
         echo "       Piped execution needs it; check network access or run from a repo clone." >&2
-        exit 1
+        exit 4
     fi
     # shellcheck disable=SC1090  # fetched at runtime; the static path is the sibling branch above
     source "$tmp"
@@ -316,11 +316,15 @@ function scoped_unpair() {
         local legacy_path="${HOME}/.config/systemd/user/${LEGACY_LABEL_LINUX}.service"
         if [[ -f "$legacy_path" ]]; then
             systemctl --user disable --now "${LEGACY_LABEL_LINUX}.service" >/dev/null 2>&1 || true
-            remove_path_if_present "$legacy_path"
+            remove_path_if_present "$legacy_path" || true
         fi
         if [[ "$was_active" == yes ]]; then
+            # The enrollment IS gone from here on: a worker that will not
+            # start again is recorded as such (Removed + the stopped
+            # service), never as a refusal that changed nothing.
             if ! systemctl --user start "$unit" >/dev/null 2>&1; then
-                echo "ERROR: enrollment removed but the worker for the remaining home(s) could not start; run: systemctl --user start ${unit}" >&2
+                echo "ERROR: enrollment removed but the worker for the remaining enrollment(s) could not start; start it with:  ${restart}" >&2
+                record_scoped_restart_failure "$restart"
                 return 5
             fi
             echo "INFO: started ${unit} for the remaining enrollment(s)"
@@ -376,9 +380,14 @@ function remove_systemd_unit() {
                 continue
             fi
         fi
-        rm -f "$path"
-        echo "INFO: removed ${path}"
-        record_removed "$path"
+        if rm -f "$path"; then
+            echo "INFO: removed ${path}"
+            record_removed "$path"
+        else
+            echo "WARN: could not remove ${path}; delete it by hand"
+            record_kept "$path (could not be removed; delete it by hand)"
+            unit_rc=5
+        fi
     done
     if [[ "$have_systemctl" == "yes" ]]; then
         systemctl --user daemon-reload >/dev/null 2>&1 || true
@@ -452,10 +461,12 @@ function finish() {
 function main() {
     parse_args "$@"
     # The flags a printed remedy must carry so it is the same run plus
-    # the missing piece: only --user-local, which stays valid whatever
-    # scope is chosen (--purge is added only where it is allowed).
+    # the missing piece: --user-local and --dry-run, which stay valid
+    # whatever scope is chosen (--purge is added only where it is
+    # allowed). Dropping --dry-run made a copied remedy run for real.
     CARRIED_FLAGS=""
-    [[ "$REMOVE_SCOPE" != user-local ]] || CARRIED_FLAGS=" --user-local"
+    [[ "$REMOVE_SCOPE" != user-local ]] || CARRIED_FLAGS="${CARRIED_FLAGS} --user-local"
+    [[ "$DRY_RUN" != yes ]] || CARRIED_FLAGS="${CARRIED_FLAGS} --dry-run"
     resolve_uninstall_scope "$SCRIPT_NAME" "$CARRIED_FLAGS" || exit $?
     detect_install_shapes
     # Read BEFORE the token files go: --purge deletes the directory the
@@ -490,15 +501,19 @@ function main() {
     # code carries the leftover.
     local binary_rc=0
     remove_binaries_for_modes || binary_rc=$?
-    remove_worker_config
-    remove_path_if_present "${HOME}/.memql/worker.env"
+    # The removers record a file they could not remove and carry on; the
+    # code such a leftover earns is folded in below, so the run still
+    # ends with the summary rather than aborting mid-purge under set -e.
+    remove_worker_config || true
+    remove_path_if_present "${HOME}/.memql/worker.env" || true
     if [[ "$PURGE" == "yes" && "$unit_rc" -eq 0 ]]; then
-        purge_worker_state "$state_dir"
+        purge_worker_state "$state_dir" || true
     else
         [[ "$PURGE" != yes ]] || echo "INFO: --purge skipped while a unit is retained; re-run with --purge once it is gone"
         report_kept_state "$state_dir"
     fi
     if [[ "$unit_rc" -ne 0 ]]; then binary_rc="$unit_rc"; fi
+    [[ "$binary_rc" -ne 0 ]] || binary_rc="$UNINSTALL_LEFTOVER_RC"
     finish "$binary_rc"
 }
 

@@ -131,7 +131,9 @@ and the person copying it need know nothing else.
 - **`--dry-run`** prints the whole plan — the matched enrollment, the shapes
   found, every path and service that would go, whether sudo would be
   needed — and changes nothing: exit 0, or the same refusal (same code,
-  same message) the real run would give before touching anything.
+  same message) the real run would give before touching anything. The
+  commands a refusal prints keep `--dry-run`, so a copied one is still a
+  dry run.
 - **Partial and older installs** are fine: a missing plist or unit, a
   missing binary, a legacy service label, an enrollment file from the
   older single-home layout (`worker.yaml`) — each step reports "removed"
@@ -146,9 +148,14 @@ and the person copying it need know nothing else.
   judged by one fence whatever the spelling: never `~/.memql` itself
   (`~/.memql/` and `~/.memql//` included), never the `credentials`,
   `backups`, `certs` or `certificates` trees in any letter case, never
-  outside `~/.memql`, never through a symlinked ancestor. A state
-  directory that is itself a symlink is removed as a link; what it points
-  at is not touched.
+  outside `~/.memql`, never through a symlinked ancestor, never a
+  `state_dir` that names a regular file. A state directory that is itself
+  a symlink is removed as a link; what it points at is not touched. A file
+  or tree that cannot be removed is reported under Kept and the run still
+  finishes (exit 5); it never aborts mid-purge. A registry whose `homes:`
+  the script cannot read as a block list (flow-style items, a half-edited
+  file) is refused (exit 5) with nothing touched; `--all-homes` is the way
+  past it.
 
 On macOS, last-home or full removal resets only the installed MemQL apps’
 Accessibility and Screen Recording decisions; shared sibling enrollments keep
@@ -163,11 +170,14 @@ cluster is not touched from here — revoke it from MemQL OS
 
 Exit codes, both scripts: 0 everything that existed was removed; 2 bad
 parameter (or several enrollments and none named); 3 refused (a URL nothing
-matches, `--purge` with siblings, an aliased enrollment file); 4 a
-prerequisite is missing (sudo for a system install; an installed `memql`
-0.15.0+ for a scoped removal while other enrollments exist); 5 a step failed
-(a service that would not stop, an unreadable registry). A non-zero exit
-always names what remains and what to do about it.
+matches, `--purge` with siblings, an aliased enrollment file, a loaded worker
+with no regular service plist to reload from); 4 a prerequisite is missing
+(sudo for a system install; an installed `memql` 0.15.0+ for a scoped removal
+while other enrollments exist; `lib.sh` unreachable when piped); 5 a step
+failed (a service that would not stop or start again, an unreadable registry,
+a file that could not be removed). A non-zero exit always names what remains
+and what to do about it, and a summary heading of PARTIAL or FAILED means
+something was changed -- REFUSED alone means nothing was.
 
 ## Commands
 

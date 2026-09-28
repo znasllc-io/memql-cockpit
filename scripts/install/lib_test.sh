@@ -41,6 +41,16 @@
 # byte-identical; and the exact piped one-liner shapes all parse.
 # And the installers' --version pin: the composed download base, the
 # space and = spellings, --download-base winning, and the bad-value exit.
+# And the second review pass: a registry of flow-mapping items refuses
+# (the pre-fix scripts deleted every token over it); the installer's
+# three registry readers accept the same block spellings as the
+# uninstaller's; a sibling-remaining unpair whose worker will not
+# reload is PARTIAL, never REFUSED; --dry-run makes the same pre-flight
+# refusals the real run makes and its remedies keep --dry-run; a failing
+# rm under --purge is a recorded leftover with the summary still
+# printed; and the five low findings (HOME with a trailing slash, the
+# lib.sh fetch failure's exit code, a user-local app rm that fails, a
+# `#` inside a state_dir, a state_dir that names a regular file).
 #
 # Run: bash scripts/install/lib_test.sh
 # Wired into CI by .github/workflows/install-scripts-lint.yml.
@@ -536,10 +546,13 @@ for _installer in install-mac.sh install-linux.sh uninstall-mac.sh uninstall-lin
 
     # Piped with a broken RAW_BASE: must die with an ERROR naming the
     # lib.sh URL it tried, not a cryptic bash sourcing error.
-    if _out="$(cd "$_piped_cwd" && MEMQL_INSTALL_RAW_BASE="file://${_tmp}/no-such-dir" \
-        bash -s -- --help < "${_script_dir}/${_installer}" 2>&1)"; then
-        fail "$_installer piped with broken RAW_BASE should fail; got: $_out"
-    elif [[ "$_out" == *"ERROR"* && "$_out" == *"file://${_tmp}/no-such-dir/lib.sh"* ]]; then
+    _out="$(cd "$_piped_cwd" && MEMQL_INSTALL_RAW_BASE="file://${_tmp}/no-such-dir" \
+        bash -s -- --help < "${_script_dir}/${_installer}" 2>&1)"
+    _rc=$?
+    # 4: a prerequisite (the helper library) is missing, in the table
+    # the scripts document; it was a bare 1 (a review finding).
+    expect_eq "$_installer piped fetch failure exits 4 (prerequisite missing)" "$_rc" "4"
+    if [[ "$_out" == *"ERROR"* && "$_out" == *"file://${_tmp}/no-such-dir/lib.sh"* ]]; then
         pass "$_installer piped fetch failure names the lib.sh URL"
     else
         fail "$_installer piped fetch failure should name the URL it tried; got: $_out"
@@ -1635,6 +1648,23 @@ for _platform in mac linux; do
     _rc=$?
     expect_eq "$_un --dry-run with two enrollments refuses with 2" "$_rc" "2"
     expect_eq "$_un --dry-run refusal leaves HOME byte-identical" "$(tree_fingerprint "$_h")" "$_before"
+    # The remedies are the same run plus the missing piece: a copied one
+    # must still be a dry run.
+    if [[ "$_out" == *"--dry-run --cluster=https://c.example"* && "$_out" == *"--dry-run --all-homes"* ]]; then
+        pass "$_un --dry-run refusal carries --dry-run into every printed remedy"
+    else
+        fail "$_un --dry-run refusal drops --dry-run from the remedy; got: $_out"
+    fi
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" --cluster=https://nomatch.example --dry-run $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un --cluster no-match --dry-run refuses with 3" "$_rc" "3"
+    if [[ "$_out" == *"--dry-run --cluster=https://c.example"* ]]; then
+        pass "$_un --cluster no-match --dry-run carries --dry-run into the remedy"
+    else
+        fail "$_un --cluster no-match --dry-run remedy; got: $_out"
+    fi
+    expect_eq "$_un --cluster no-match --dry-run leaves HOME byte-identical" "$(tree_fingerprint "$_h")" "$_before"
     # shellcheck disable=SC2086
     _out="$(run_uninstaller "$_un" "$_h" --cluster=https://c.example --dry-run $_auto_flag)"
     _rc=$?
@@ -1726,25 +1756,41 @@ function set_state_dir() {
 # running" branches under the reduced PATH.
 _review_launchctl_dir="${_tmp}/review-launchctl"
 mkdir -p "$_review_launchctl_dir"
+# MEMQL_TEST_STUBBORN names a label whose bootout does nothing (the
+# agent stays loaded); MEMQL_TEST_BOOTSTRAP_FAIL=1 makes bootstrap fail.
+# The state directory is required (:?), so an unset fixture path can
+# never make the stub touch anything outside it.
 cat > "${_review_launchctl_dir}/launchctl" <<'STUB'
 #!/usr/bin/env bash
+state="${MEMQL_TEST_AGENT_STATE:?}"
 case "$1" in
-    print)     test -f "$MEMQL_TEST_AGENT_STATE/${2##*/}" ;;
-    bootout)   rm -f "$MEMQL_TEST_AGENT_STATE/${2##*/}" ;;
-    bootstrap) : > "$MEMQL_TEST_AGENT_STATE/$(basename "$3" .plist)" ;;
+    print)     test -f "${state}/${2##*/}" ;;
+    bootout)   [[ "${2##*/}" == "${MEMQL_TEST_STUBBORN:-}" ]] || rm -f -- "${state:?}/${2##*/}" ;;
+    bootstrap) [[ "${MEMQL_TEST_BOOTSTRAP_FAIL:-}" != 1 ]] || exit 5; : > "${state}/$(basename "$3" .plist)" ;;
     *)         exit 98 ;;
 esac
 STUB
 chmod +x "${_review_launchctl_dir}/launchctl"
 
+# A systemctl whose `start` fails when MEMQL_TEST_START_FAIL=1 and
+# succeeds at everything else, for the linux sibling-remaining cases.
+_review_systemctl_dir="${_tmp}/review-systemctl"
+mkdir -p "$_review_systemctl_dir"
+cat > "${_review_systemctl_dir}/systemctl" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$*" == *" start "* && "${MEMQL_TEST_START_FAIL:-}" == 1 ]]; then exit 5; fi
+exit 0
+STUB
+chmod +x "${_review_systemctl_dir}/systemctl"
+
 # run_uninstaller_agent is run_uninstaller with the service stub for the
 # platform on the PATH: launchctl above for mac (state in $1), the
-# always-succeeding systemctl for linux.
+# configurable systemctl above for linux (default: everything succeeds).
 function run_uninstaller_agent() {
     local state="$1" script="$2" home="$3"
     shift 3
     local tool_path="${_review_launchctl_dir}:$_nobin"
-    if [[ "$script" == uninstall-linux.sh ]]; then tool_path="${_uninstall_systemctl_dir}:$_nobin"; fi
+    if [[ "$script" == uninstall-linux.sh ]]; then tool_path="${_review_systemctl_dir}:$_nobin"; fi
     (cd "$_script_dir" && HOME="$home" PATH="$tool_path" MEMQL_TEST_AGENT_STATE="$state" bash "./${script}" "$@" 2>&1)
 }
 
@@ -1812,6 +1858,77 @@ for _shape in column0 comment urlfirst; do
         "$(list_enrolled_cluster_urls "$_rs/${_shape}.yaml" /nonexistent | tr '\n' ' ')" "https://c.example https://d.example "
 done
 expect_eq "registry shape empty lists nothing" "$(list_enrolled_cluster_urls "$_rs/empty.yaml" /nonexistent)" ""
+
+# Second pass: a block sequence of FLOW mappings is valid YAML the binary
+# decodes, and the block reader cannot see inside it -- it read as zero
+# enrollments and the pre-fix scripts removed every token. The gate now
+# refuses (5) any item that opens a flow collection, on the dash line,
+# on a bare-dash continuation, or in the header.
+printf 'version: 1\nhomes:\n  - {id: c.example, cluster_url: https://c.example, token: mql_wkr_c, enabled: true}\n  - {id: d.example, cluster_url: https://d.example, token: mql_wkr_d}\n' > "$_rs/flow.yaml"
+printf 'version: 1\nhomes:\n  - {id: c.example,\n     cluster_url: https://c.example}\n  - {id: d.example, cluster_url: https://d.example}\n' > "$_rs/flowmulti.yaml"
+printf 'version: 1\nhomes:\n  -\n    {id: c.example, cluster_url: https://c.example}\n' > "$_rs/flowbare.yaml"
+printf 'version: 1\nhomes:\n  - [https://c.example]\n' > "$_rs/flowseq.yaml"
+printf 'version: 1\nhomes: [{id: c.example, cluster_url: https://c.example}]\n' > "$_rs/flowheader.yaml"
+for _shape in flow flowmulti flowbare flowseq flowheader; do
+    _out="$(list_enrolled_cluster_urls "$_rs/${_shape}.yaml" /nonexistent 2>/dev/null)"
+    _rc=$?
+    expect_eq "registry shape ${_shape} is refused with 5" "$_rc" "5"
+    expect_eq "registry shape ${_shape} lists nothing" "$_out" ""
+done
+# A `{` inside a quoted scalar is a value, not a flow collection.
+printf 'version: 1\nhomes:\n  - id: c.example\n    cluster_url: "https://c.example"\n    token: "{not a mapping}"\n' > "$_rs/quotedbrace.yaml"
+expect_eq "registry shape quotedbrace still reads" "$(list_enrolled_cluster_urls "$_rs/quotedbrace.yaml" /nonexistent)" "https://c.example"
+
+# The installer's three readers accept the same block spellings, so a
+# second install beside a commented header or a url-first item keeps the
+# siblings it could not see before (a review finding).
+for _shape in column0 comment urlfirst; do
+    expect_eq "find_home_id_by_cluster_url reads the ${_shape} spelling" \
+        "$(find_home_id_by_cluster_url "$_rs/${_shape}.yaml" https://C.EXAMPLE/)" "c.example"
+    expect_eq "find_home_cluster_url_by_id reads the ${_shape} spelling" \
+        "$(find_home_cluster_url_by_id "$_rs/${_shape}.yaml" d.example)" "https://d.example"
+    _wd="${_tmp}/review-writer-${_shape}"
+    mkdir -p "$_wd"
+    cp "$_rs/${_shape}.yaml" "$_wd/workers.yaml"
+    if write_worker_yaml "$_wd/worker.yaml" https://e.example mql_wkr_e host1 no HEADLESS >/dev/null 2>&1 \
+        && grep -q 'id: c.example' "$_wd/workers.yaml" && grep -q 'id: d.example' "$_wd/workers.yaml" \
+        && grep -q 'id: e.example' "$_wd/workers.yaml" && grep -q 'cluster_url: https://d.example' "$_wd/workers.yaml"; then
+        pass "write_worker_yaml keeps both siblings of the ${_shape} spelling"
+    else
+        fail "write_worker_yaml dropped a sibling of the ${_shape} spelling: $(cat "$_wd/workers.yaml" 2>&1)"
+    fi
+done
+
+# The registry writer ALSO keeps a `#` inside a header value: the scalar
+# reader stops only at a comment (whitespace, then `#`).
+_wd="${_tmp}/review-writer-hash"
+mkdir -p "$_wd"
+printf 'version: 1\nworker_name: h\nstate_dir: /custom/st#1\nhomes:\n  - id: c.example\n    cluster_url: https://c.example\n    token: t\n' > "$_wd/workers.yaml"
+write_worker_yaml "$_wd/worker.yaml" https://e.example mql_wkr_e host1 no HEADLESS >/dev/null 2>&1
+if grep -qx 'state_dir: /custom/st#1' "$_wd/workers.yaml"; then
+    pass "write_worker_yaml preserves a state_dir with a # in it"
+else
+    fail "write_worker_yaml cut the state_dir at #: $(grep state_dir "$_wd/workers.yaml")"
+fi
+
+# yaml_top_scalar: a `#` is a comment only after whitespace; quotes come off.
+_ys="${_tmp}/review-yaml-scalar"
+mkdir -p "$_ys"
+printf 'state_dir: ~/.memql/state#1\n' > "$_ys/hash.yaml"
+printf 'state_dir: ~/.memql/state # note\n' > "$_ys/comment.yaml"
+printf 'state_dir: "~/.memql/st ate"\n' > "$_ys/quoted.yaml"
+printf 'state_dir_other: /x\nlog_level: info\n' > "$_ys/absent.yaml"
+printf 'state_dir: # only a comment\n' > "$_ys/onlycomment.yaml"
+# shellcheck disable=SC2088  # the literal ~ IS the value under test; the reader does not expand it
+expect_eq "yaml_top_scalar keeps an unspaced #" "$(yaml_top_scalar "$_ys/hash.yaml" state_dir)" "~/.memql/state#1"
+# shellcheck disable=SC2088
+expect_eq "yaml_top_scalar drops a spaced # comment" "$(yaml_top_scalar "$_ys/comment.yaml" state_dir)" "~/.memql/state"
+# shellcheck disable=SC2088
+expect_eq "yaml_top_scalar strips quotes" "$(yaml_top_scalar "$_ys/quoted.yaml" state_dir)" "~/.memql/st ate"
+expect_eq "yaml_top_scalar ignores a longer key" "$(yaml_top_scalar "$_ys/absent.yaml" state_dir)" ""
+expect_eq "yaml_top_scalar reads a comment-only value as empty" "$(yaml_top_scalar "$_ys/onlycomment.yaml" state_dir)" ""
+printf 'state_dir: ~/.memql/state#1\n' > "$_ys/worker.yaml"
+expect_eq "state root keeps a # in the directory name" "$(worker_state_dir_from_yaml "$_ys/worker.yaml")" "${HOME}/.memql/state#1"
 
 # [8] The flag's shape is judged in the shell, once.
 for _good in https://api.example.com HTTPS://api.example.com/ "https://api.example.com/path" " https://c.example "; do
@@ -2095,6 +2212,203 @@ for _platform in mac linux; do
         fi
         expect_eq "$_un ${_shape} spelling changes nothing" "$(tree_fingerprint "$_h")" "$_before"
     done
+
+    # ---- second review pass ----
+
+    # Flow-mapping registry, end to end: refused (5) with every token
+    # still on disk, where the pre-fix scripts removed them all.
+    for _shape in flow flowmulti; do
+        _h="$(fixture_home "shape-${_shape}" "$_platform")"
+        cp "$_rs/${_shape}.yaml" "${_h}/.memql/workers.yaml"
+        _before="$(tree_fingerprint "$_h")"
+        # shellcheck disable=SC2086
+        _out="$(run_uninstaller "$_un" "$_h" $_auto_flag)"
+        _rc=$?
+        expect_eq "$_un no flags + a ${_shape} registry exits 5" "$_rc" "5"
+        if [[ "$_out" == *"not an enrollment registry this script can read"* && -f "${_h}/.memql/workers.yaml" ]]; then
+            pass "$_un ${_shape} registry is refused with the tokens still on disk"
+        else
+            fail "$_un ${_shape} registry; got: $_out"
+        fi
+        expect_eq "$_un ${_shape} registry changes nothing" "$(tree_fingerprint "$_h")" "$_before"
+        # shellcheck disable=SC2086
+        _out="$(run_uninstaller "$_un" "$_h" --cluster=https://c.example $_auto_flag)"
+        expect_eq "$_un --cluster + a ${_shape} registry exits 5" "$?" "5"
+        expect_eq "$_un --cluster + a ${_shape} registry changes nothing" "$(tree_fingerprint "$_h")" "$_before"
+    done
+
+    # A sibling-remaining unpair whose worker will not come back: the
+    # enrollment is gone and the worker is down, so PARTIAL with the
+    # restart command -- never REFUSED / "nothing was changed".
+    _h="$(fixture_home restart-fail "$_platform")"
+    add_second_home "$_h"
+    : > "${_state}/${SERVICE_LABEL_DARWIN}"
+    # shellcheck disable=SC2086  # _auto_flag is empty or one flag
+    case "$_platform" in
+        mac)   _out="$(MEMQL_TEST_BOOTSTRAP_FAIL=1 run_uninstaller_agent "$_state" "$_un" "$_h" --cluster=https://c.example $_auto_flag)" ;;
+        linux) _out="$(MEMQL_TEST_START_FAIL=1 run_uninstaller_agent "$_state" "$_un" "$_h" --cluster=https://c.example $_auto_flag)" ;;
+    esac
+    _rc=$?
+    expect_eq "$_un sibling unpair + failed worker restart exits 5" "$_rc" "5"
+    case "$_platform" in
+        mac)   _restart="launchctl bootstrap gui/$(id -u) ${_h}/${_svc}" ;;
+        linux) _restart="systemctl --user start ${SERVICE_LABEL_LINUX}.service" ;;
+    esac
+    if [[ "$_out" == *"PARTIAL:"* && "$_out" == *"the https://c.example enrollment"* && "$_out" == *"$_restart"* \
+        && "$_out" != *"nothing was changed"* && "$_out" != *"REFUSED"* ]]; then
+        pass "$_un failed restart reports PARTIAL with the removed enrollment and the restart command"
+    else
+        fail "$_un failed restart summary; got: $_out"
+    fi
+    if grep -q 'id: d.example' "${_h}/.memql/workers.yaml" && ! grep -q 'id: c.example' "${_h}/.memql/workers.yaml"; then
+        pass "$_un failed restart: the registry really was rewritten, as the summary says"
+    else
+        fail "$_un failed restart registry: $(cat "${_h}/.memql/workers.yaml" 2>&1)"
+    fi
+    if [[ "$_platform" == mac ]]; then
+        # ...and a legacy agent that will not unload after the unpair.
+        _h="$(fixture_home legacy-stubborn mac)"
+        add_second_home "$_h"
+        : > "${_state}/${SERVICE_LABEL_DARWIN}"
+        : > "${_state}/${LEGACY_LABEL_DARWIN}"
+        # shellcheck disable=SC2086
+        _out="$(MEMQL_TEST_STUBBORN="$LEGACY_LABEL_DARWIN" run_uninstaller_agent "$_state" "$_un" "$_h" --cluster=https://c.example $_auto_flag)"
+        _rc=$?
+        expect_eq "$_un sibling unpair + stubborn legacy agent exits 5" "$_rc" "5"
+        if [[ "$_out" == *"PARTIAL:"* && "$_out" == *"the https://c.example enrollment"* \
+            && "$_out" == *"launchctl bootout gui/$(id -u)/${LEGACY_LABEL_DARWIN}"* && "$_out" != *"nothing was changed"* ]]; then
+            pass "$_un stubborn legacy agent reports PARTIAL naming the agent to stop by hand"
+        else
+            fail "$_un stubborn legacy agent summary; got: $_out"
+        fi
+        rm -f "${_state:?}/${LEGACY_LABEL_DARWIN}"
+
+        # --dry-run makes the pre-flight refusal the real run makes: a
+        # loaded worker with no regular plist and a sibling remaining is
+        # 3 either way, with nothing touched.
+        _h="$(fixture_home noplist-dry mac)"
+        add_second_home "$_h"
+        rm -f "${_h:?}/${_svc}"
+        : > "${_state}/${SERVICE_LABEL_DARWIN}"
+        _before="$(tree_fingerprint "$_h")"
+        # shellcheck disable=SC2086
+        _out="$(run_uninstaller_agent "$_state" "$_un" "$_h" --cluster=https://c.example --dry-run $_auto_flag)"
+        _rc=$?
+        expect_eq "$_un --dry-run with a loaded worker and no plist refuses with 3" "$_rc" "3"
+        if [[ "$_out" == *"no regular service plist"* && "$_out" == *"REFUSED"* ]]; then
+            pass "$_un --dry-run names the missing plist"
+        else
+            fail "$_un --dry-run with no plist; got: $_out"
+        fi
+        expect_eq "$_un --dry-run with no plist leaves HOME byte-identical" "$(tree_fingerprint "$_h")" "$_before"
+        # shellcheck disable=SC2086
+        _out="$(run_uninstaller_agent "$_state" "$_un" "$_h" --cluster=https://c.example $_auto_flag)"
+        expect_eq "$_un the real run with a loaded worker and no plist refuses with 3 too" "$?" "3"
+        expect_eq "$_un the real run with no plist leaves HOME byte-identical" "$(tree_fingerprint "$_h")" "$_before"
+        if [[ -e "${_state}/${SERVICE_LABEL_DARWIN}" ]]; then
+            pass "$_un no-plist refusal leaves the worker loaded"
+        else
+            fail "$_un no-plist refusal stopped the worker"
+        fi
+        rm -f "${_state:?}/${SERVICE_LABEL_DARWIN}"
+        # With the plist in place, the dry run says it would reload the worker.
+        _h="$(fixture_home reload-dry mac)"
+        add_second_home "$_h"
+        : > "${_state}/${SERVICE_LABEL_DARWIN}"
+        # shellcheck disable=SC2086
+        _out="$(run_uninstaller_agent "$_state" "$_un" "$_h" --cluster=https://c.example --dry-run $_auto_flag)"
+        _rc=$?
+        if [[ "$_rc" == 0 && "$_out" == *"would reload:  ${SERVICE_LABEL_DARWIN}"* ]]; then
+            pass "$_un --dry-run with a loaded worker plans the reload"
+        else
+            fail "$_un --dry-run reload line (rc=$_rc); got: $_out"
+        fi
+        rm -f "${_state:?}/${SERVICE_LABEL_DARWIN}"
+    fi
+
+    # A failing rm under --purge is a leftover, not an abort: the rest of
+    # the purge runs, the summary prints, the exit is 5.
+    if [[ $EUID -eq 0 ]]; then
+        echo "INFO: running as root; skipping the locked-directory purge check"
+    else
+        _h="$(fixture_home purge-locked "$_platform")"
+        mkdir -p "${_h}/.memql/state/locked"
+        : > "${_h}/.memql/state/locked/f"
+        chmod 555 "${_h}/.memql/state/locked"
+        # shellcheck disable=SC2086
+        _out="$(run_uninstaller "$_un" "$_h" --purge $_auto_flag 2>/dev/null)"
+        _rc=$?
+        chmod 755 "${_h}/.memql/state/locked"
+        expect_eq "$_un --purge over an undeletable entry exits 5" "$_rc" "5"
+        if [[ "$_out" == *"PARTIAL:"* && "$_out" == *"could not be fully removed"* && "$_out" == *"Kept:"* \
+            && ! -e "${_h}/.memql/policy.yaml" && ! -e "${_h}/.memql/workers.yaml" && -e "${_h}/.memql/state/locked/f" ]]; then
+            pass "$_un --purge over an undeletable entry finishes, prints the summary and names the leftover"
+        else
+            fail "$_un --purge over an undeletable entry; got: $_out $(ls -laR "${_h}/.memql" 2>&1)"
+        fi
+    fi
+
+    # HOME spelled with a trailing slash: the fence is the same directory.
+    _h="$(fixture_home home-slash "$_platform")"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "${_h}/" --all-homes --purge $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un with HOME ending in a slash exits 0" "$_rc" "0"
+    if [[ ! -e "${_h}/.memql/state" && "$_out" != *"outside"* ]]; then
+        pass "$_un with HOME ending in a slash purges the state dir inside the fence"
+    else
+        fail "$_un with HOME ending in a slash; got: $_out"
+    fi
+
+    # A state_dir that names a regular FILE inside the fence is kept.
+    _h="$(fixture_home purge-file "$_platform")"
+    plant_protected "$_h"
+    set_state_dir "$_h" "${_h}/.memql/clusters.yaml"
+    _before="$(tree_fingerprint "$_h")"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" --purge --dry-run $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un --purge --dry-run with a file as state_dir exits 0" "$_rc" "0"
+    if [[ "$_out" == *"would keep:    ${_h}/.memql/clusters.yaml (not a directory)"* ]]; then
+        pass "$_un --purge --dry-run judges a file state_dir as not a directory"
+    else
+        fail "$_un --purge --dry-run with a file state_dir; got: $_out"
+    fi
+    expect_eq "$_un --purge --dry-run with a file state_dir leaves HOME byte-identical" "$(tree_fingerprint "$_h")" "$_before"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller "$_un" "$_h" --purge $_auto_flag)"
+    _rc=$?
+    expect_eq "$_un --purge with a file as state_dir exits 0" "$_rc" "0"
+    if protected_intact "$_h" && [[ "$_out" == *"not a directory"* ]]; then
+        pass "$_un --purge with a file as state_dir keeps the file"
+    else
+        fail "$_un --purge with a file as state_dir; got: $_out"
+    fi
+
+    # A user-local app whose rm -rf fails is kept and named, exit 5 (the
+    # bundle identifier needs PlistBuddy, so macOS only, and only where
+    # no real /Applications/MemQL.app would block the permission reset).
+    if [[ "$_platform" == mac && "$(uname -s)" == Darwin && ! -e /Applications/MemQL.app && $EUID -ne 0 ]]; then
+        _tcc="${_tmp}/review-tccutil"
+        mkdir -p "$_tcc"
+        printf '#!/usr/bin/env bash\nexit 0\n' > "${_tcc}/tccutil"
+        chmod +x "${_tcc}/tccutil"
+        _h="$(fixture_home app-locked mac)"
+        mkdir -p "${_h}/Applications/MemQL.app/Contents/MacOS" "${_h}/Applications/MemQL.app/Contents/locked"
+        printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>com.znasllc.memql-worker</string></dict></plist>\n' \
+            > "${_h}/Applications/MemQL.app/Contents/Info.plist"
+        : > "${_h}/Applications/MemQL.app/Contents/locked/f"
+        chmod 555 "${_h}/Applications/MemQL.app/Contents/locked"
+        _out="$(cd "$_script_dir" && HOME="$_h" PATH="${_tcc}:${_review_launchctl_dir}:$_nobin" MEMQL_TEST_AGENT_STATE="$_state" bash ./uninstall-mac.sh --all-homes --user-local 2>&1)"
+        _rc=$?
+        chmod 755 "${_h}/Applications/MemQL.app/Contents/locked"
+        expect_eq "$_un a user-local app that cannot be removed exits 5" "$_rc" "5"
+        if [[ "$_out" == *"PARTIAL:"* && "$_out" == *"MemQL.app (could not be fully removed"* ]]; then
+            pass "$_un a user-local app that cannot be removed is kept and named"
+        else
+            fail "$_un app rm failure; got: $_out"
+        fi
+    fi
 
     # [10] The space form never swallows the next flag or an empty word.
     _h="$(fixture_home cluster-swallow "$_platform")"

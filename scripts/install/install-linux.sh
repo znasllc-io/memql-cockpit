@@ -37,7 +37,7 @@ function source_lib() {
         rm -f "$tmp"
         echo "ERROR: failed to fetch $url" >&2
         echo "       Piped execution needs it; check network access or run from a repo clone." >&2
-        exit 1
+        exit 4
     fi
     # shellcheck disable=SC1090  # fetched at runtime; the static path is the sibling branch above
     source "$tmp"
