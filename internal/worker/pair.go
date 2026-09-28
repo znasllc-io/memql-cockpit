@@ -228,6 +228,9 @@ func runConfiguredWorker(clusterURL, token, name string, logger *slog.Logger) er
 		}
 	}()
 
+	// As `worker run` does, before anything resolves a binary.
+	ensureServicePath(logger)
+
 	discoverer := &models.Discoverer{}
 	modelInventory := NewModelInventory(policy, discoverer)
 	appInv := NewAppInventory(policy)

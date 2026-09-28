@@ -356,6 +356,10 @@ func handleRun(args []string) {
 		}
 	}
 
+	// Before the first lookup of any binary: a LaunchAgent's PATH has no
+	// directory an app installer uses (servicepath.go).
+	ensureServicePath(logger)
+
 	discoverer := &models.Discoverer{}
 	modelInventory := NewModelInventory(policy, discoverer)
 	appInv := NewAppInventory(policy)

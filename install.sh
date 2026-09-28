@@ -96,6 +96,8 @@ migrate_launch_agent() {
     rm -f "$plist"
 
     new_plist="${HOME}/Library/LaunchAgents/${SERVICE_LABEL_DARWIN}.plist"
+    # PATH as install-mac.sh writes it: the system directories first, then
+    # where the app installers put claude and codex.
     cat > "$new_plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -121,6 +123,8 @@ migrate_launch_agent() {
     <dict>
         <key>HOME</key>
         <string>${HOME}</string>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin:${HOME}/.local/bin:${HOME}/.claude/local:/opt/homebrew/bin:/usr/local/bin</string>
     </dict>
 </dict>
 </plist>

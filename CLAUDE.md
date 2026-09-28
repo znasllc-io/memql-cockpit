@@ -171,7 +171,14 @@ machine side.
 - **`internal/worker/apps`** detects `claude` / `codex` on PATH, their
   versions and their auth state, and the worker reports the inventory on
   `Register` and **every** `Heartbeat`. The engine derives `app:<id>` routing
-  labels from it and has no other way to learn any of it.
+  labels from it and has no other way to learn any of it. **Which PATH** is
+  the worker's own, extended once at start by `ensureServicePath`
+  (`servicepath.go`): a LaunchAgent gets launchd's four system directories
+  and nothing else, which found no app an installer put in `~/.local/bin`
+  or `/opt/homebrew/bin`. The app directories are APPENDED, never
+  prepended (the worker runs `launchctl`/`plutil` by bare name), and every
+  plist writer writes the same PATH. `ResolveSpec` returns the path it
+  resolved, so a session starts the very binary the inventory reported.
 - **`internal/worker/appsession`** runs the sessions:
   `AppSessionStart / Chunk / Control / End`, kinds `run` / `open` / `attach`,
   plus the MCP config writer, the Library pull/push, and the platform launch

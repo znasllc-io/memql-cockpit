@@ -605,9 +605,9 @@ applied silently:
 | What you see | What it means |
 |---|---|
 | `/machines` shows the app but not selectable | one of `allowed` / `signed in` is false; the badge says which |
-| The machine never appears at all | `claude` / `codex` is not on the worker's `PATH`. A LaunchAgent's `PATH` is not your shell's |
+| The machine never appears at all | `claude` / `codex` is in none of the directories the worker searches. A service does not get your shell's `PATH`: the worker searches its own, with `~/.local/bin`, `~/.claude/local`, `/opt/homebrew/bin` and `/usr/local/bin` appended at start, and logs the result once (`worker PATH extended`). An app installed anywhere else needs that directory in the service's own `PATH` |
 | `is not in this machine's policy.yaml apps.allow` | the engine routed here anyway; add it to `apps.allow` or ask why the label was derived |
-| `is allowed here but is not on this worker's PATH` | the binary moved, or the worker's `PATH` is not your shell's. A LaunchAgent inherits neither your shell profile nor a version manager's shims |
+| `is allowed here but is not on this worker's PATH` | the binary moved, or it lives outside the directories above. A service inherits neither your shell profile nor a version manager's shims |
 | `kind=attach ... needs a prompt` | an attach that only wanted to watch. Send the turn you want run, or use `run` |
 | `this session is no longer taking turns` | a `message` control arrived after the last turn had already ended the session |
 | `a follow-up arrived with no prompt` | a `message` control with an empty `prompt`. The follow-up's text travels in `prompt`, never in `reason` |

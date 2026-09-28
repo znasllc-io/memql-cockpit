@@ -624,6 +624,25 @@ func TestResolveSpec_IsTheSameAnswerTheInventoryReports(t *testing.T) {
 	}
 }
 
+// TestResolveSpec_NamesTheBinaryItResolved. The session starts the path
+// this lookup found, not the bare name: a second lookup at exec time is a
+// second answer, and under a LaunchAgent's PATH it was a different one --
+// the inventory said "claude-code" while the exec could find no claude.
+func TestResolveSpec_NamesTheBinaryItResolved(t *testing.T) {
+	env := newFakeEnv(t)
+	path := env.install(t, "claude", "2.1.283 (Claude Code)")
+	spec, ok := env.detector().ResolveSpec(context.Background(), IDClaudeCode)
+	if !ok {
+		t.Fatal("claude is installed, so ResolveSpec must find it")
+	}
+	if spec.Binary != path {
+		t.Errorf("Binary = %q, want the resolved %q", spec.Binary, path)
+	}
+	if floor, _ := SpecFor(IDClaudeCode); floor.Binary != "claude" {
+		t.Errorf("the closed set's own spec must keep the bare name, got %q", floor.Binary)
+	}
+}
+
 // TestResolveSpec_FalseMeansDoNotStartASession. An unknown id and a
 // binary that is not on PATH are the same answer to the only question the
 // caller has, and collapsing them keeps a caller from starting a session

@@ -219,6 +219,11 @@ func (d *Detector) Detect(ctx context.Context, allow []string) []Info {
 // ok=false means "do not start a session": the id is outside the closed
 // set, or the binary is not on PATH. The two are deliberately one answer,
 // because they are one answer to the only question the caller has.
+//
+// The returned Binary is the PATH IT RESOLVED, not the bare name. The
+// session starts exactly the binary this lookup found and the inventory
+// reported, rather than a second lookup at exec time that a different PATH
+// -- a LaunchAgent's is not the owner's shell's -- could answer differently.
 func (d *Detector) ResolveSpec(ctx context.Context, id string) (Spec, bool) {
 	spec, ok := SpecFor(strings.TrimSpace(id))
 	if !ok {
@@ -228,7 +233,9 @@ func (d *Detector) ResolveSpec(ctx context.Context, id string) (Spec, bool) {
 	if err != nil || strings.TrimSpace(path) == "" {
 		return Spec{}, false
 	}
-	return d.resolveHarness(ctx, spec, path), true
+	resolved := d.resolveHarness(ctx, spec, path)
+	resolved.Binary = path
+	return resolved, true
 }
 
 // Version returns the app's own version string, as Detect reports it and
