@@ -320,7 +320,14 @@ func TestCodexAppServerStartCompletesTheHandshake(t *testing.T) {
 	if !strings.Contains(strings.Join(wire, "\n"), "CODEX_HOME="+spec.Env[0][len("CODEX_HOME="):]) {
 		t.Fatalf("CODEX_HOME did not reach the process: %v", wire)
 	}
-	if !strings.Contains(strings.Join(wire, "\n"), "PWD="+spec.Workspace) {
+	// The workspace is compared after resolving symlinks: macOS's temp dir
+	// lives under /var, a link to /private/var, and the process reports the
+	// resolved path as PWD.
+	workspace, err := filepath.EvalSymlinks(spec.Workspace)
+	if err != nil {
+		t.Fatalf("resolve workspace: %v", err)
+	}
+	if !strings.Contains(strings.Join(wire, "\n"), "PWD="+workspace) {
 		t.Fatalf("the process did not run in the workspace: %v", wire)
 	}
 }
