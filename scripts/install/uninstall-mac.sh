@@ -68,7 +68,7 @@ function source_lib() {
         rm -f "$tmp"
         echo "ERROR: failed to fetch $url" >&2
         echo "       Piped execution needs it; check network access or run from a repo clone." >&2
-        exit 1
+        exit 4
     fi
     # shellcheck disable=SC1090  # fetched at runtime; the static path is the sibling branch above
     source "$tmp"
@@ -275,7 +275,7 @@ function remove_launch_agent() {
     for label in "$SERVICE_LABEL_DARWIN" "$LEGACY_LABEL_DARWIN" "com.visionarys.memql-cockpit-worker" "com.znasllc.memql-cockpit-menubar"; do
         plist="${plist_dir}/${label}.plist"
         stop_agent "$label" || return $?
-        remove_path_if_present "$plist"
+        remove_path_if_present "$plist" || true
     done
 }
 
@@ -346,8 +346,12 @@ function remove_menu_companion() {
         record_kept "$app"
         return 0
     fi
-    rm -rf "$app"
-    record_removed "$app"
+    if rm -rf "$app"; then
+        record_removed "$app"
+    else
+        record_kept "$app (could not be removed; delete it by hand)"
+        note_leftover 5
+    fi
 }
 
 # One shape's app. Only a bundle carrying OUR identifier is removed;
@@ -371,7 +375,7 @@ function remove_worker_app() {
             ;;
         *)
             if [[ ! -O "$app" ]]; then record_kept "$app (not owned by you; delete it by hand)"; return 5; fi
-            rm -rf "$app"
+            rm -rf "$app" || { record_kept "$app (could not be fully removed; delete what is left by hand)"; return 5; }
             ;;
     esac
     record_removed "$app"
@@ -489,11 +493,30 @@ function scoped_unpair() {
         echo "ERROR: --purge would erase state shared with other enrollments; no enrollment was removed. Omit --purge or explicitly use --all-homes." >&2
         return 3
     fi
+    # Read-only probe (launchctl print, -f / -L), and BEFORE the dry-run
+    # return: a running worker with no regular plist to reload from is a
+    # refusal the real run makes before touching anything, so the dry run
+    # must make the same one, with the same code (a review finding).
+    plist="$HOME/Library/LaunchAgents/$SERVICE_LABEL_DARWIN.plist"
+    target="gui/$(id -u)/$SERVICE_LABEL_DARWIN"
+    if command -v launchctl >/dev/null 2>&1 && launchctl print "$target" >/dev/null 2>&1; then
+        # Reload only a service that was running and has a retained plist.
+        if [[ "$remaining" -gt 0 && ( ! -f "$plist" || -L "$plist" ) ]]; then
+            rm -f "$result"
+            echo "ERROR: running worker has no regular service plist to reload safely; nothing was changed." >&2
+            echo "       Restore ${plist}, or pass --all-homes to remove every enrollment and the runtime." >&2
+            return 3
+        fi
+        was_loaded=yes
+    fi
     if [[ "$DRY_RUN" == yes ]]; then
         # The preview IS the dry run of this step: the binary matched the
         # enrollment(s) without writing anything.
         rm -f "$result"
         echo "  would unpair:  ${CLUSTER_URL} via ${binary} (${PREVIEW_REMOVED} home(s) match; ${remaining} other enrollment(s) would remain)"
+        if [[ "$was_loaded" == yes && "$remaining" -gt 0 ]]; then
+            echo "  would reload:  ${SERVICE_LABEL_DARWIN} (loaded) for the remaining enrollment(s)"
+        fi
         OTHER_HOMES="$remaining"
         return 0
     fi
@@ -505,15 +528,6 @@ function scoped_unpair() {
     # nothing system-owned and must keep working without sudo.
     if [[ "$remaining" -eq 0 ]]; then
         ensure_system_sudo || { rc=$?; rm -f "$result"; return "$rc"; }
-    fi
-    plist="$HOME/Library/LaunchAgents/$SERVICE_LABEL_DARWIN.plist"
-    target="gui/$(id -u)/$SERVICE_LABEL_DARWIN"
-    if command -v launchctl >/dev/null 2>&1 && launchctl print "$target" >/dev/null 2>&1; then
-        # Reload only a service that was running and has a retained plist.
-        if [[ "$remaining" -gt 0 && ( ! -f "$plist" || -L "$plist" ) ]]; then
-            rm -f "$result"; echo "ERROR: running worker has no regular service plist to reload safely" >&2; return 3
-        fi
-        was_loaded=yes
     fi
     stop_agent "$SERVICE_LABEL_DARWIN" || { rm -f "$result"; return 5; }
     # From here a failure is not "nothing was changed": the worker is
@@ -530,13 +544,20 @@ function scoped_unpair() {
     OTHER_HOMES="$(unpair_json_remaining "$result")" || { rm -f "$result"; record_scoped_unpair_failure "$restart"; return 5; }
     rm -f "$result"
     if [[ "$OTHER_HOMES" -gt 0 ]]; then
+        # The enrollment IS gone from here on: every failure below is
+        # recorded as such (Removed + the stopped worker), never as a
+        # refusal that changed nothing (a review finding).
         local legacy
         for legacy in "$LEGACY_LABEL_DARWIN" "com.visionarys.memql-cockpit-worker"; do
-            stop_agent "$legacy" || return $?
-            remove_path_if_present "$HOME/Library/LaunchAgents/$legacy.plist"
+            stop_agent "$legacy" || { rc=$?; record_scoped_restart_failure "$restart" "the legacy agent ${legacy} (still loaded; stop it by hand:  launchctl bootout gui/$(id -u)/${legacy})"; return "$rc"; }
+            remove_path_if_present "$HOME/Library/LaunchAgents/$legacy.plist" || true
         done
         if [[ "$was_loaded" == yes ]]; then
-            launchctl bootstrap "gui/$(id -u)" "$plist" || { echo "ERROR: enrollment removed but remaining-home worker could not reload" >&2; return 5; }
+            launchctl bootstrap "gui/$(id -u)" "$plist" || {
+                echo "ERROR: enrollment removed but the worker for the remaining enrollment(s) could not reload; start it with:  ${restart}" >&2
+                record_scoped_restart_failure "$restart"
+                return 5
+            }
         fi
         echo "SUCCESS: selected cluster enrollment removed; $OTHER_HOMES other enrollment(s) and the shared app, CLI, menu, policy and state retained."
     fi
@@ -663,10 +684,12 @@ function finish() {
 function main() {
     parse_args "$@"
     # The flags a printed remedy must carry so it is the same run plus
-    # the missing piece: only --user-local, which stays valid whatever
-    # scope is chosen (--purge is added only where it is allowed).
+    # the missing piece: --user-local and --dry-run, which stay valid
+    # whatever scope is chosen (--purge is added only where it is
+    # allowed). Dropping --dry-run made a copied remedy run for real.
     CARRIED_FLAGS=""
-    [[ "$REMOVE_SCOPE" != user-local ]] || CARRIED_FLAGS=" --user-local"
+    [[ "$REMOVE_SCOPE" != user-local ]] || CARRIED_FLAGS="${CARRIED_FLAGS} --user-local"
+    [[ "$DRY_RUN" != yes ]] || CARRIED_FLAGS="${CARRIED_FLAGS} --dry-run"
     resolve_uninstall_scope "$SCRIPT_NAME" "$CARRIED_FLAGS" || exit $?
     detect_install_shapes
     # Read BEFORE the token files go: --purge deletes the directory the
@@ -713,15 +736,19 @@ function main() {
         retain_runtime "retained after the error above; re-run this uninstaller once it is fixed"
         rc="$runtime_rc"
     fi
-    remove_worker_config
+    # The removers record a file they could not remove and carry on; the
+    # code such a leftover earns is folded in below, so the run still
+    # ends with the summary rather than aborting mid-purge under set -e.
+    remove_worker_config || true
     if [[ "$PURGE" == "yes" && "$runtime_rc" -eq 0 ]]; then
-        purge_worker_state "$state_dir"
+        purge_worker_state "$state_dir" || true
     else
         [[ "$PURGE" != yes ]] || echo "INFO: --purge skipped while runtime files are retained; re-run with --purge once they are gone"
         report_kept_state "$state_dir"
     fi
     echo "INFO: CLI credentials, cluster settings, certificates and rollback backups are retained."
     echo "INFO: shared credentials/backups were not purged, and no service-wide permission reset or direct privacy database edit was performed."
+    [[ "$rc" -ne 0 ]] || rc="$UNINSTALL_LEFTOVER_RC"
     finish "$rc"
 }
 

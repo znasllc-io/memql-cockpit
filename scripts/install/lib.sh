@@ -247,6 +247,32 @@ function parse_version_flag() {
     printf '%s\n' "$ver"
 }
 
+# yaml_top_scalar prints the value of ONE top-level scalar key in a
+# worker YAML file (`state_dir: ...`), the way YAML reads it: a `#`
+# starts a comment only after whitespace (or right after the key), so
+# `~/.memql/state#1` is a directory name and `~/.memql/state # note` is
+# not; surrounding quotes come off. Empty when the key is absent. The
+# earlier sed cut the value at any `#`, and a purge then aimed at a
+# sibling of the directory the worker used (a review finding).
+function yaml_top_scalar() {
+    local file="$1" key="$2" value
+    value="$(awk -v key="$key" '
+        index($0, key ":") == 1 && substr($0, length(key) + 2) ~ /^([[:space:]]|$)/ {
+            v = substr($0, length(key) + 2)
+            sub(/^[[:space:]]+/, "", v)
+            if (v ~ /^#/) v = ""
+            sub(/[[:space:]]+#.*$/, "", v)
+            sub(/[[:space:]]+$/, "", v)
+            print v
+            exit
+        }' "$file")"
+    case "$value" in
+        \"*\") value="${value#\"}"; value="${value%\"}" ;;
+        \'*\') value="${value#\'}"; value="${value%\'}" ;;
+    esac
+    printf '%s\n' "$value"
+}
+
 # home_id_from_cluster_url mirrors Go HomeIDFromURL: host only, lowercased.
 function home_id_from_cluster_url() {
     local cluster_url="$1"
@@ -327,16 +353,16 @@ function find_home_id_by_cluster_url() {
             if (byhost == "" && wanth != "" && host(url) == wanth) byhost = id
         }
         BEGIN { wantn = norm(want); wanth = host(want); in_homes=0; cur=""; curl=""; exact=""; byhost="" }
-        /^homes:[[:space:]]*$/ { in_homes=1; next }
+        /^homes:[[:space:]]*(#.*)?$/ { in_homes=1; next }
         !in_homes { next }
-        /^[[:space:]]*-[[:space:]]*id:[[:space:]]*/ {
-            consider(cur, curl)
-            cur=$0; sub(/^[[:space:]]*-[[:space:]]*id:[[:space:]]*/, "", cur)
-            curl=""
+        /^[^[:space:]#-]/ { consider(cur, curl); cur=""; curl=""; in_homes=0; next }
+        /^[[:space:]]*-[[:space:]]*/ { consider(cur, curl); cur=""; curl=""; sub(/^[[:space:]]*-[[:space:]]*/, "") }
+        /^[[:space:]]*id:[[:space:]]*/ {
+            cur=$0; sub(/^[[:space:]]*id:[[:space:]]*/, "", cur); sub(/[[:space:]]+(#.*)?$/, "", cur)
             next
         }
         /^[[:space:]]*cluster_url:[[:space:]]*/ {
-            curl=$0; sub(/^[[:space:]]*cluster_url:[[:space:]]*/, "", curl)
+            curl=$0; sub(/^[[:space:]]*cluster_url:[[:space:]]*/, "", curl); sub(/[[:space:]]+(#.*)?$/, "", curl)
             next
         }
         END {
@@ -348,22 +374,33 @@ function find_home_id_by_cluster_url() {
 }
 
 # find_home_cluster_url_by_id prints cluster_url for a given home id.
+#
+# Every registry reader in this file (this one, find_home_id_by_cluster_url,
+# the sibling walk in write_worker_yaml, list_enrolled_cluster_urls) reads
+# the block-list spellings yaml.v3 accepts the same way: the `homes:` line
+# may carry a comment, items may sit indented or at column 0, any `- ` opens
+# an item whatever key follows the dash, `id:` / `cluster_url:` are read on
+# the dash line or an inner line, and the next column-0 key closes the list.
+# A review found the installer's readers behind the uninstaller's: a
+# commented header or a url-first item made the next install DROP every
+# sibling home it could not see.
 function find_home_cluster_url_by_id() {
     local workers_path="$1"
     local home_id="$2"
     [[ -f "$workers_path" ]] || { echo ""; return 0; }
     awk -v want="$home_id" '
+        function settle() { if (cur == want && curl != "") { print curl; found=1; exit } cur=""; curl="" }
         BEGIN { in_homes=0; cur=""; curl=""; found=0 }
-        /^homes:[[:space:]]*$/ { in_homes=1; next }
+        /^homes:[[:space:]]*(#.*)?$/ { in_homes=1; next }
         !in_homes { next }
-        /^[[:space:]]*-[[:space:]]*id:[[:space:]]*/ {
-            if (cur == want && curl != "") { print curl; found=1; exit }
-            cur=$0; sub(/^[[:space:]]*-[[:space:]]*id:[[:space:]]*/, "", cur)
-            curl=""
+        /^[^[:space:]#-]/ { settle(); in_homes=0; next }
+        /^[[:space:]]*-[[:space:]]*/ { settle(); sub(/^[[:space:]]*-[[:space:]]*/, "") }
+        /^[[:space:]]*id:[[:space:]]*/ {
+            cur=$0; sub(/^[[:space:]]*id:[[:space:]]*/, "", cur); sub(/[[:space:]]+(#.*)?$/, "", cur)
             next
         }
         /^[[:space:]]*cluster_url:[[:space:]]*/ {
-            curl=$0; sub(/^[[:space:]]*cluster_url:[[:space:]]*/, "", curl)
+            curl=$0; sub(/^[[:space:]]*cluster_url:[[:space:]]*/, "", curl); sub(/[[:space:]]+(#.*)?$/, "", curl)
             next
         }
         END { if (!found && cur == want && curl != "") print curl }
@@ -910,7 +947,7 @@ function write_worker_yaml() {
         local existing
         existing="$(sed -n -E 's/^worker_name:[[:space:]]*//p' "$workers_path" | head -1)"
         [[ -n "$existing" ]] && out_name="$existing"
-        existing="$(sed -n -E 's/^state_dir:[[:space:]]*"?([^"#]*[^"#[:space:]])"?[[:space:]]*(#.*)?$/\1/p' "$workers_path" | head -1)"
+        existing="$(yaml_top_scalar "$workers_path" state_dir)"
         [[ -n "$existing" ]] && out_state="$existing"
         existing="$(sed -n -E 's/^log_level:[[:space:]]*//p' "$workers_path" | head -1)"
         [[ -n "$existing" ]] && out_log="$existing"
@@ -942,24 +979,33 @@ function write_worker_yaml() {
             # Go yaml.Marshal uses four spaces; shell installs use two. Keeping
             # siblings verbatim makes the next additive install invalid YAML.
             awk -v keep_id="$match_id" '
-                BEGIN { in_homes=0; skip=0; buf="" }
-                /^homes:[[:space:]]*$/ { in_homes=1; next }
+                function emit() { if (buf != "" && !skip) printf "%s", buf; buf = ""; skip = 0 }
+                function note_id(line,    id) {
+                    if (line !~ /^id:[[:space:]]*/) return
+                    id = line; sub(/^id:[[:space:]]*/, "", id); sub(/[[:space:]]+(#.*)?$/, "", id)
+                    skip = (id == keep_id) ? 1 : 0
+                }
+                BEGIN { in_homes=0; skip=0; buf=""; indent=0 }
+                /^homes:[[:space:]]*(#.*)?$/ { in_homes=1; next }
                 !in_homes { next }
-                /^[[:space:]]*-[[:space:]]*id:[[:space:]]*/ {
-                    if (buf != "" && !skip) printf "%s", buf
+                /^[^[:space:]#-]/ { emit(); in_homes=0; next }
+                /^[[:space:]]*-[[:space:]]*/ {
+                    emit()
                     match($0, /[^[:space:]]/)
                     indent = RSTART - 1
                     buf = "  " substr($0, indent + 1) "\n"
-                    id=$0; sub(/^[[:space:]]*-[[:space:]]*id:[[:space:]]*/, "", id)
-                    skip = (id == keep_id) ? 1 : 0
+                    rest = $0; sub(/^[[:space:]]*-[[:space:]]*/, "", rest)
+                    note_id(rest)
                     next
                 }
-                in_homes {
+                {
                     if (buf == "") next
                     # Preserve relative indentation inside each home.
                     buf = buf "  " substr($0, indent + 1) "\n"
+                    rest = $0; sub(/^[[:space:]]+/, "", rest)
+                    note_id(rest)
                 }
-                END { if (buf != "" && !skip) printf "%s", buf }
+                END { emit() }
             ' "$workers_path"
         elif [[ -e "$path" ]]; then
             # Promote legacy single-home when present and URL differs.
@@ -1054,6 +1100,19 @@ function setup_inference() {
 UNINSTALL_REMOVED=""
 UNINSTALL_KEPT=""
 
+# The third ledger: the exit code a leftover earns. A file or tree that
+# could not be removed is recorded as Kept by the helper that tried and
+# noted here, so the step that found it can carry on (every remover is
+# called `|| true` from the drivers) and the run still ends non-zero
+# with the summary printed. Without it a failing rm -rf under `set -e`
+# aborted the script mid-purge, with no summary and the later steps
+# never attempted (a review finding). First failure wins.
+UNINSTALL_LEFTOVER_RC=0
+
+function note_leftover() {
+    [[ "$UNINSTALL_LEFTOVER_RC" -ne 0 ]] || UNINSTALL_LEFTOVER_RC="$1"
+}
+
 function record_removed() {
     UNINSTALL_REMOVED="${UNINSTALL_REMOVED}  $1"$'\n'
 }
@@ -1076,6 +1135,20 @@ function record_scoped_unpair_failure() {
     [[ -z "$restart" ]] || record_kept "the worker service (stopped by this run and NOT restarted; once repaired, start it with:  ${restart})"
 }
 
+# record_scoped_restart_failure is for the failures AFTER the real
+# unpair SUCCEEDED with siblings remaining: the worker for them would
+# not start again, or a legacy agent would not stop. The enrollment is
+# gone (Removed) and the worker is down (Kept, with the command that
+# starts it), so the summary reads PARTIAL -- never REFUSED over a
+# rewritten registry and a stopped service (a review finding). $2 is an
+# extra Kept line for what else the person has to do.
+function record_scoped_restart_failure() {
+    local restart="${1:-}" extra="${2:-}"
+    record_removed "the ${CLUSTER_URL} enrollment from ${HOME}/.memql/workers.yaml (${OTHER_HOMES} other enrollment(s) remain, with the shared runtime)"
+    [[ -z "$restart" ]] || record_kept "the worker service for the remaining enrollment(s) (stopped by this run and NOT restarted; start it with:  ${restart})"
+    [[ -z "$extra" ]] || record_kept "$extra"
+}
+
 # under_memql_home answers whether $1 lies inside ${HOME}/.memql, the
 # ONLY tree the uninstallers delete recursively. It is strict about
 # shape on purpose -- absolute, no `..` segment -- because a state_dir
@@ -1083,8 +1156,10 @@ function record_scoped_unpair_failure() {
 # an uninstaller must never do is `rm -rf` wherever a file it did not
 # write points.
 function under_memql_home() {
-    local path="$1"
-    local fence="${HOME}/.memql"
+    local path="$1" fence
+    # HOME itself may carry a trailing slash; the fence is compared as a
+    # string, so it is spelled the one way the paths are.
+    fence="$(normalize_tree_path "${HOME}/.memql")"
     [[ "$path" == /* ]] || return 1
     [[ "$path" != *"/../"* && "$path" != *"/.." ]] || return 1
     [[ "$path" == "$fence" || "$path" == "$fence"/* ]]
@@ -1105,9 +1180,15 @@ function remove_path_if_present() {
         echo "INFO: $path not present; nothing to remove"
         return 0
     fi
-    rm -f "$path"
-    echo "INFO: removed $path"
-    record_removed "$path"
+    if rm -f "$path"; then
+        echo "INFO: removed $path"
+        record_removed "$path"
+    else
+        echo "WARN: could not remove $path; delete it by hand"
+        record_kept "$path (could not be removed; delete it by hand)"
+        note_leftover 5
+        return 5
+    fi
 }
 
 # remove_worker_config deletes the worker token files on a full
@@ -1116,8 +1197,8 @@ function remove_path_if_present() {
 # tokens, so both always go -- not only under --purge. clusters.yaml
 # and credentials/ stay: they belong to `memql cluster`, not the worker.
 function remove_worker_config() {
-    remove_path_if_present "${HOME}/.memql/workers.yaml"
-    remove_path_if_present "${HOME}/.memql/worker.yaml"
+    remove_path_if_present "${HOME}/.memql/workers.yaml" || true
+    remove_path_if_present "${HOME}/.memql/worker.yaml" || true
 }
 
 # normalize_tree_path prints $1 with every `//` collapsed and every
@@ -1146,18 +1227,27 @@ function normalize_tree_path() {
 # credential / certificate / backup trees, whatever a state_dir says.
 # Every guard judges ONE normalized spelling (normalize_tree_path).
 function tree_removal_verdict() {
-    local dir
+    local dir fence
     dir="$(normalize_tree_path "$1")"
+    fence="$(normalize_tree_path "${HOME}/.memql")"
     if [[ ! -e "$dir" && ! -L "$dir" ]]; then
         echo "absent"
         return 0
     fi
     if ! under_memql_home "$dir"; then
-        echo "keep:outside ${HOME}/.memql; not touched"
+        echo "keep:outside ${fence}; not touched"
+        return 0
+    fi
+    # A state_dir is a DIRECTORY. One that names a regular file inside
+    # the fence (clusters.yaml, say) is a file this script must not
+    # rm -rf on the strength of a config line. A symlink is judged as a
+    # link (removed as one, below), whatever it points at.
+    if [[ ! -L "$dir" && ! -d "$dir" ]]; then
+        echo "keep:not a directory"
         return 0
     fi
     local cursor="$dir" protected
-    while [[ "$cursor" != "$HOME/.memql" && "$cursor" != / ]]; do
+    while [[ "$cursor" != "$fence" && "$cursor" != / ]]; do
         if [[ -L "$cursor" && "$cursor" != "$dir" ]]; then
             echo "keep:symlinked ancestor"
             return 0
@@ -1165,7 +1255,7 @@ function tree_removal_verdict() {
         cursor="$(dirname "$cursor")"
     done
     case "$dir" in
-        "$HOME/.memql"|*/./*|*/.) echo "keep:unsafe purge target"; return 0 ;;
+        "$fence"|*/./*|*/.) echo "keep:unsafe purge target"; return 0 ;;
     esac
     # Case-folded: macOS's default APFS is case-insensitive, so
     # ~/.memql/Credentials IS ~/.memql/credentials there. On a
@@ -1174,7 +1264,7 @@ function tree_removal_verdict() {
     # in the summary. bash 3.2 has no ${var,,}; tr does the folding.
     local dir_folded fence_folded
     dir_folded="$(printf '%s' "$dir" | tr '[:upper:]' '[:lower:]')"
-    fence_folded="$(printf '%s' "${HOME}/.memql" | tr '[:upper:]' '[:lower:]')"
+    fence_folded="$(printf '%s' "$fence" | tr '[:upper:]' '[:lower:]')"
     for protected in backups credentials certs certificates; do
         case "$dir_folded" in
             "$fence_folded/$protected"|"$fence_folded/$protected/"*) echo "keep:protected data"; return 0 ;;
@@ -1199,13 +1289,23 @@ function remove_tree_if_present() {
             ;;
         remove)
             if [[ -L "$dir" ]]; then
-                rm -f "$dir"
-                echo "INFO: removed the symlink $dir (what it pointed at was not touched)"
-                record_removed "$dir (the symlink only)"
-            else
-                rm -rf "$dir"
+                if rm -f "$dir"; then
+                    echo "INFO: removed the symlink $dir (what it pointed at was not touched)"
+                    record_removed "$dir (the symlink only)"
+                else
+                    echo "WARN: could not remove the symlink $dir; delete it by hand"
+                    record_kept "$dir (could not be removed; delete it by hand)"
+                    note_leftover 5
+                    return 5
+                fi
+            elif rm -rf "$dir"; then
                 echo "INFO: removed $dir"
                 record_removed "$dir"
+            else
+                echo "WARN: could not fully remove $dir; delete what is left by hand"
+                record_kept "$dir (could not be fully removed; delete what is left by hand)"
+                note_leftover 5
+                return 5
             fi
             ;;
         keep:outside*)
@@ -1237,7 +1337,7 @@ function worker_state_dir_from_yaml() {
     local dir="" try parent
     for try in "$(dirname "$path")/workers.yaml" "$path"; do
         if [[ -f "$try" ]]; then
-            dir="$(sed -n -E 's/^state_dir:[[:space:]]*"?([^"#]*[^"#[:space:]])"?[[:space:]]*(#.*)?$/\1/p' "$try" | head -1)"
+            dir="$(yaml_top_scalar "$try" state_dir)"
             [[ -n "$dir" ]] && break
         fi
     done
@@ -1376,13 +1476,15 @@ function remove_binaries_with_mode() {
 # kept it.
 function purge_worker_state() {
     local state_dir="$1"
-    remove_path_if_present "${HOME}/.memql/policy.yaml"
-    remove_tree_if_present "$state_dir"
-    remove_path_if_present "${HOME}/.memql/worker.sock"
+    # Every step runs whatever the one before it left: a leftover is in
+    # the ledger and UNINSTALL_LEFTOVER_RC, never a reason to stop.
+    remove_path_if_present "${HOME}/.memql/policy.yaml" || true
+    remove_tree_if_present "$state_dir" || true
+    remove_path_if_present "${HOME}/.memql/worker.sock" || true
     # The native model runtime and its models (Linux): gigabytes under
     # the fence, kept without --purge because the models were pulled on
     # purpose and cost hours to pull again.
-    remove_tree_if_present "${HOME}/.memql/ollama"
+    remove_tree_if_present "${HOME}/.memql/ollama" || true
     remove_memql_home_if_empty
 }
 
@@ -1493,8 +1595,28 @@ function list_enrolled_cluster_urls() {
         # half-edited list) is a file the shell must not decide from --
         # "no enrollment" over an unreadable registry would delete a
         # token file nobody could read. 5, the binary's own code for it.
-        if ! awk 'BEGIN { ok = 1 }
-                  /^homes:/ { ok = ($0 ~ /^homes:[[:space:]]*(\[[[:space:]]*\])?[[:space:]]*(#.*)?$/) }
+        # The gate judges the ITEMS too, not only the header: a block
+        # sequence of flow mappings (`- {id: ..., cluster_url: ...}`) is
+        # valid YAML the binary decodes and read as ZERO enrollments by
+        # the block reader below, and a no-flag run then removed every
+        # token (a review finding). Inside the block, only a block-mapping
+        # item (`- key:`), a continuation (`key:`), a bare `-`, a blank or
+        # a comment may appear; anything else refuses the whole file.
+        if ! awk 'BEGIN { ok = 1; in_homes = 0 }
+                  /^homes:/ {
+                      if ($0 !~ /^homes:[[:space:]]*(\[[[:space:]]*\])?[[:space:]]*(#.*)?$/) ok = 0
+                      in_homes = ($0 ~ /^homes:[[:space:]]*(#.*)?$/)
+                      next
+                  }
+                  !in_homes { next }
+                  /^[^[:space:]#-]/ { in_homes = 0; next }
+                  /^[[:space:]]*(#.*)?$/ { next }
+                  {
+                      line = $0
+                      sub(/^[[:space:]]+/, "", line)
+                      sub(/^-([[:space:]]+|$)/, "", line)
+                      if (line != "" && line !~ /^[A-Za-z_][A-Za-z0-9_]*:([[:space:]]|$)/) ok = 0
+                  }
                   END { exit ok ? 0 : 1 }' "$workers_path"; then
             echo "ERROR: $workers_path is not an enrollment registry this script can read; nothing was changed." >&2
             echo "       Restore it, or pass --all-homes to remove everything on this machine." >&2
@@ -1595,8 +1717,9 @@ function uninstall_invocation() {
 # print_enrollment_commands prints, for every enrolled cluster, the
 # exact command that removes just it, then the one that removes them
 # all -- so the person copies rather than guesses. $2 carries the flags
-# that stay valid for a one-cluster removal (--user-local); --purge is
-# only offered on the --all-homes line, because a scoped removal
+# that stay valid for a one-cluster removal (--user-local, and --dry-run
+# when this run was one, so a copied remedy is still a dry run); --purge
+# is only offered on the --all-homes line, because a scoped removal
 # refuses it while another enrollment remains.
 function print_enrollment_commands() {
     local script_name="$1" carried="$2" urls="$3"
