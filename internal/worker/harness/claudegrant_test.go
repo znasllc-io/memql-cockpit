@@ -231,3 +231,132 @@ func TestClaudeHeadlessOnlyMemQLsServerDecides(t *testing.T) {
 		t.Fatalf("another server's failure failed the turn: %v", err)
 	}
 }
+
+// claudeToolRules splits a --allowedTools / --disallowedTools value the way
+// Claude Code 2.1.283 does (its exported `Hp`, read from the binary): on
+// commas and spaces OUTSIDE parentheses, so a rule whose path holds a space
+// stays one rule. A path holding a parenthesis would not, which is why the
+// grant writes no rule for one.
+func claudeToolRules(value string) []string {
+	var rules []string
+	var cur strings.Builder
+	inside := false
+	flush := func() {
+		if s := strings.TrimSpace(cur.String()); s != "" {
+			rules = append(rules, s)
+		}
+		cur.Reset()
+	}
+	for _, r := range value {
+		switch {
+		case r == '(':
+			inside = true
+			cur.WriteRune(r)
+		case r == ')':
+			inside = false
+			cur.WriteRune(r)
+		case (r == ',' || r == ' ') && !inside:
+			flush()
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	flush()
+	return rules
+}
+
+// TestClaudeHeadlessArgvDeniesTheProtectedPaths: the paths a session must
+// never touch -- this worker's own directory (the worker tokens, and
+// policy.yaml, whose apps.allow is the app consent gate) and this machine's
+// fs.deny list -- are denied to the app for READING as well as writing, on
+// both of the app's surfaces:
+//
+//   - the file tools, as Read and Edit deny rules (a deny rule beats the
+//     workspace's allow rule, and a bare path covers everything under it,
+//     as a gitignore entry does);
+//   - every shell command, as the sandbox's own filesystem.denyRead and
+//     denyWrite, in the plain absolute form the sandbox documents. The
+//     sandbox confines writes to the workspace already; reads it confines
+//     only here, and without this a sandboxed `cat ~/.memql/worker.yaml >
+//     out.txt` would leave the worker token in a file the session then
+//     pushes to the Library.
+//
+// All of it before `--`, where it is an option and not part of the prompt.
+func TestClaudeHeadlessArgvDeniesTheProtectedPaths(t *testing.T) {
+	deny := []string{
+		"/home/ada/.memql",
+		"/home/ada/.ssh",
+		"/home/ada/Library/Application Support/Google/Chrome",
+		"/etc/passwd",
+		"/home/ada/odd (dir)",
+	}
+	bin, log := fakeClaude(t, prints(claudePongTurn))
+	spec := claudeSpec(t, bin)
+	spec.DenyPaths = deny
+	h := startClaude(t, spec)
+
+	if _, err := h.Turn(context.Background(), "say pong", &recorder{}); err != nil {
+		t.Fatalf("turn: %v", err)
+	}
+	argv := recordedArgv(t, log)[0]
+	options := argv[:separatorAt(t, argv)]
+
+	rules := map[string]bool{}
+	for _, rule := range claudeToolRules(argValue(t, options, "--disallowedTools")) {
+		rules[rule] = true
+	}
+	for _, path := range deny[:4] {
+		for _, tool := range []string{"Read", "Edit"} {
+			// A rule's "//" prefix is an absolute path; a single "/" would
+			// be the working directory, which is the workspace.
+			if want := tool + "(/" + path + ")"; !rules[want] {
+				t.Errorf("no %s deny rule %q in %v", tool, want, rules)
+			}
+		}
+	}
+	for rule := range rules {
+		if strings.Contains(rule, "odd") {
+			t.Errorf("a path holding a parenthesis became rule %q; Claude Code's splitter would cut it apart", rule)
+		}
+	}
+
+	var settings struct {
+		Sandbox struct {
+			Filesystem struct {
+				DenyRead  []string `json:"denyRead"`
+				DenyWrite []string `json:"denyWrite"`
+			} `json:"filesystem"`
+		} `json:"sandbox"`
+	}
+	raw := argValue(t, options, "--settings")
+	if err := json.Unmarshal([]byte(raw), &settings); err != nil {
+		t.Fatalf("--settings is not inline JSON: %q: %v", raw, err)
+	}
+	// Every path, the parenthesised one included: JSON carries it whole.
+	fs := settings.Sandbox.Filesystem
+	if strings.Join(fs.DenyRead, "\n") != strings.Join(deny, "\n") {
+		t.Errorf("sandbox.filesystem.denyRead = %q, want %q", fs.DenyRead, deny)
+	}
+	if strings.Join(fs.DenyWrite, "\n") != strings.Join(deny, "\n") {
+		t.Errorf("sandbox.filesystem.denyWrite = %q, want %q", fs.DenyWrite, deny)
+	}
+}
+
+// TestClaudeHeadlessNoDenyPathsAddsNoDenyRules: a session with nothing to
+// deny carries no deny flag at all, rather than an empty one Claude Code
+// would have to read as "deny nothing".
+func TestClaudeHeadlessNoDenyPathsAddsNoDenyRules(t *testing.T) {
+	bin, log := fakeClaude(t, prints(claudePongTurn))
+	h := startClaude(t, claudeSpec(t, bin))
+
+	if _, err := h.Turn(context.Background(), "say pong", &recorder{}); err != nil {
+		t.Fatalf("turn: %v", err)
+	}
+	argv := recordedArgv(t, log)[0]
+	if hasArg(argv, "--disallowedTools") {
+		t.Errorf("--disallowedTools with nothing to deny: %v", argv)
+	}
+	if strings.Contains(argValue(t, argv, "--settings"), "filesystem") {
+		t.Errorf("a sandbox filesystem block with nothing in it: %v", argv)
+	}
+}

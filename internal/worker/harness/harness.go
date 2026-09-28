@@ -232,6 +232,16 @@ type Spec struct {
 	// built-in table with the machine owner's policy.yaml entries laid
 	// over it.
 	Levels Table
+	// DenyPaths are absolute paths the app must neither READ nor write:
+	// this worker's own files (its tokens, and policy.yaml, whose
+	// apps.allow is the app consent gate) and this machine's fs.deny list.
+	// The session refuses a workspace that overlaps one, so none is ever
+	// inside the directory the app works in.
+	//
+	// Claude Code's harness hands them to the app as deny rules and as its
+	// sandbox's own filesystem lists (claudeGrantArgs). The Codex harnesses
+	// do not yet: Codex runs under the sandbox its own configuration names.
+	DenyPaths []string
 	// Launch forks every process this harness needs. Required: a nil
 	// Launch is a programming error rather than a reason to fall back
 	// to os/exec, because falling back would silently lose the process

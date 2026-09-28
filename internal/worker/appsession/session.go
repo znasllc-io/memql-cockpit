@@ -204,6 +204,20 @@ type Options struct {
 	// fs.workspace_root names none. Empty is the platform's data directory
 	// (scratchRootFor); tests set it.
 	ScratchRoot string
+	// WorkerPaths are this worker's own files and directories: its
+	// configuration (the worker tokens), policy.yaml (apps.allow, the app
+	// consent gate), its state. DenyPaths is policy.yaml's fs.deny, already
+	// expanded (tools.Policy.DenyPaths); a function so a SIGHUP reaches the
+	// next session.
+	//
+	// A session may not run in, above or below any of them, and the app is
+	// told to neither read nor write one (protected.go).
+	WorkerPaths []string
+	DenyPaths   func() []string
+	// OpenCommand is how the open kind puts a terminal in front of a
+	// person. Nil is the platform's (platformOpenCommand); tests set it, so
+	// a test does not open a window on the machine running it.
+	OpenCommand func(script string) (argv []string, note string, err error)
 	// Detector resolves WHICH HARNESS drives an app on this machine.
 	//
 	// It is a field rather than a package call because the answer is a
@@ -407,6 +421,9 @@ type session struct {
 	// alone, which is removed when it ends.
 	workspace     string
 	ownsWorkspace bool
+	// deny is what the app may neither read nor write (protected.go),
+	// read once with the workspace check so the two agree.
+	deny []string
 	// policy decides which files the recording reads back (record.go);
 	// pulled are the Library inputs as they landed, for the fingerprint.
 	policy *contentPolicy
@@ -451,7 +468,7 @@ func (s *session) run(ctx context.Context) {
 			// that is already gone.
 			s.logger.Error("app session panicked", "panic", rec)
 			s.teardown()
-			s.releaseWorkspace()
+			s.keepWorkspace("the session panicked before its outputs were pushed")
 			s.sendEnd(-1, fmt.Sprintf("cockpit panic during session: %v", rec), nil)
 		}
 	}()
@@ -466,8 +483,14 @@ func (s *session) run(ctx context.Context) {
 		err = fmt.Errorf("%w; additionally: %v", err, pushErr)
 	}
 	// After the push, which reads the directory, and before the End, so
-	// nobody told the session is over can find it still on disk.
-	s.releaseWorkspace()
+	// nobody told the session is over can find it still on disk -- unless
+	// the push failed, when the directory holds the only copy of what the
+	// app made.
+	if pushErr != nil {
+		s.keepWorkspace("its outputs could not all be pushed to the Library")
+	} else {
+		s.releaseWorkspace()
+	}
 
 	message := ""
 	if err != nil {
@@ -725,12 +748,24 @@ func (s *session) resolveWorkspace() (string, error) {
 			return "", fmt.Errorf("app session: workspace refused by this machine's policy: %w", err)
 		}
 	}
+	// The workspace is the app's write grant, so it may not reach what the
+	// session must never touch (protected.go) -- a check CheckWorkspace does
+	// not make, for the engine's path or this machine's own choice.
+	protected := s.protectedPaths()
+	if err := checkWorkspaceOverlap(workspace, protected); err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(workspace, configDirMode); err != nil {
 		return "", fmt.Errorf("app session: workspace: %w", err)
 	}
+	// An open session's directory is never this machine's to remove: the
+	// person it was handed to can still be working in it after the session
+	// ends (a cancel stops the launcher, not their terminal).
+	owns := chosen && bySession && s.start.GetKind() != KindOpen
 	s.mu.Lock()
 	s.workspace = workspace
-	s.ownsWorkspace = chosen && bySession
+	s.ownsWorkspace = owns
+	s.deny = appDenyPaths(protected)
 	s.mu.Unlock()
 	if chosen {
 		keyedBy := "run"
@@ -738,7 +773,7 @@ func (s *session) resolveWorkspace() (string, error) {
 			keyedBy = "session"
 		}
 		s.logger.Info("app session named no workspace; running in one this machine chose",
-			"workspace", workspace, "keyed_by", keyedBy)
+			"workspace", workspace, "keyed_by", keyedBy, "removed_at_end", owns)
 	}
 	return workspace, nil
 }
@@ -813,6 +848,7 @@ func (s *session) runTurns(ctx context.Context, spec apps.Spec, workspace, resum
 		ResumeRef:      resumeRef,
 		Level:          plan.level,
 		Levels:         plan.table,
+		DenyPaths:      s.denyPaths(),
 		Launch:         s.launcher(),
 	}
 	if err := h.Start(ctx, hspec); err != nil {
@@ -949,6 +985,14 @@ func (s *session) nextFollowUp() (string, bool) {
 	return next, true
 }
 
+// denyPaths is what the app may neither read nor write, as resolveWorkspace
+// settled it.
+func (s *session) denyPaths() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.deny...)
+}
+
 // mcpEnv is the environment the app must run with -- CODEX_HOME for
 // Codex, nothing for Claude Code.
 func (s *session) mcpEnv() []string {
@@ -998,7 +1042,11 @@ func (s *session) pump(c *child, onStdout, onStderr func(string, []byte) error) 
 
 // runOpen hands the app to the human -- the open kind.
 func (s *session) runOpen(ctx context.Context, spec apps.Spec, workspace string) (int, error) {
-	c, note, err := launchOpen(ctx, spec, workspace, s.start.GetPrompt(), s.mcpEnv())
+	openCommand := s.manager.opts.OpenCommand
+	if openCommand == nil {
+		openCommand = platformOpenCommand
+	}
+	c, note, err := launchOpen(ctx, spec, workspace, s.start.GetPrompt(), s.mcpEnv(), openCommand)
 	if err != nil {
 		// Immediately, with a reason, and with no fallback to headless:
 		// the user asked to drive it themselves.

@@ -1903,3 +1903,242 @@ func TestSessionEndLogsWhyItFailed(t *testing.T) {
 		}
 	})
 }
+
+// --- what a session may never touch ------------------------------------------
+
+// protectedRig is a rig whose manager knows a home directory holding this
+// worker's own directory (~/.memql: the worker tokens, and policy.yaml, whose
+// apps.allow is the app consent gate) and one fs.deny entry (~/.ssh).
+func protectedRig(t *testing.T) (h *rig, home, workerDir, sshDir string) {
+	t.Helper()
+	h = newRig(t)
+	home = t.TempDir()
+	workerDir = filepath.Join(home, ".memql")
+	sshDir = filepath.Join(home, ".ssh")
+	for _, dir := range []string{workerDir, sshDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	h.manager.opts.WorkerPaths = []string{workerDir}
+	h.manager.opts.DenyPaths = func() []string { return []string{sshDir} }
+	return h, home, workerDir, sshDir
+}
+
+// TestWorkspaceOverlappingAProtectedPathIsRefused: THE WORKSPACE IS THE WRITE
+// GRANT -- the app may edit anything in it and run shell commands that write
+// anywhere in it -- so a workspace that contains this worker's own directory
+// or an fs.deny entry would hand the session the worker tokens and the
+// consent file, however the engine came to name it (a delegation policy's
+// workspace root of "~" names the home directory). One inside such a path is
+// refused as well: that is the path itself. Refused before anything is
+// written, the bearer's configuration included.
+func TestWorkspaceOverlappingAProtectedPathIsRefused(t *testing.T) {
+	cases := []struct {
+		name      string
+		workspace func(home, workerDir, sshDir string) string
+		names     func(home, workerDir, sshDir string) string
+	}{
+		{"the home directory", func(home, _, _ string) string { return home },
+			func(_, workerDir, _ string) string { return workerDir }},
+		{"the worker's own directory", func(_, workerDir, _ string) string { return workerDir },
+			func(_, workerDir, _ string) string { return workerDir }},
+		{"inside the worker's own directory", func(_, workerDir, _ string) string { return filepath.Join(workerDir, "state", "x") },
+			func(_, workerDir, _ string) string { return workerDir }},
+		{"the root", func(_, _, _ string) string { return "/" },
+			func(_, workerDir, _ string) string { return workerDir }},
+		{"the fs.deny entry", func(_, _, sshDir string) string { return sshDir },
+			func(_, _, sshDir string) string { return sshDir }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cwdFile := scratchApp(t)
+			h, home, workerDir, sshDir := protectedRig(t)
+			workspace := c.workspace(home, workerDir, sshDir)
+
+			end := h.start(t, func(s *memqlv1.AppSessionStart) { s.Workspace = workspace })
+
+			if !strings.Contains(end.GetError(), "overlaps") ||
+				!strings.Contains(end.GetError(), c.names(home, workerDir, sshDir)) {
+				t.Errorf("error = %q, want the refusal naming the protected path", end.GetError())
+			}
+			if got := ranIn(t, cwdFile); got != "" {
+				t.Errorf("the app ran in %q", got)
+			}
+			if _, err := os.Stat(filepath.Join(workspace, ".mcp.json")); !os.IsNotExist(err) {
+				t.Errorf("the bearer's configuration was written into a refused workspace (stat: %v)", err)
+			}
+		})
+	}
+
+	t.Run("a directory above an fs.deny entry", func(t *testing.T) {
+		cwdFile := scratchApp(t)
+		h, home, _, _ := protectedRig(t)
+		projects := filepath.Join(home, "projects")
+		secrets := filepath.Join(projects, "secrets")
+		h.manager.opts.DenyPaths = func() []string { return []string{secrets} }
+
+		end := h.start(t, func(s *memqlv1.AppSessionStart) { s.Workspace = projects })
+
+		if !strings.Contains(end.GetError(), "overlaps") || !strings.Contains(end.GetError(), "fs.deny") ||
+			!strings.Contains(end.GetError(), secrets) {
+			t.Errorf("error = %q, want the refusal naming the fs.deny entry it contains", end.GetError())
+		}
+		if got := ranIn(t, cwdFile); got != "" {
+			t.Errorf("the app ran in %q", got)
+		}
+	})
+
+	t.Run("a directory beside them runs", func(t *testing.T) {
+		cwdFile := scratchApp(t)
+		h, home, _, _ := protectedRig(t)
+		work := filepath.Join(home, "work")
+
+		end := h.start(t, func(s *memqlv1.AppSessionStart) { s.Workspace = work })
+
+		if end.GetError() != "" {
+			t.Fatalf("end error = %q, want a session that ran", end.GetError())
+		}
+		if got := ranIn(t, cwdFile); got != realPath(t, work) {
+			t.Errorf("the app ran in %q, want %q", got, work)
+		}
+	})
+}
+
+// TestSessionDeniesTheProtectedPathsToTheApp: the same paths reach the app as
+// paths it may neither read nor write -- the worker's own directory from the
+// manager's options, and fs.deny as policy.yaml says it NOW (a SIGHUP reaches
+// the next session). Refusing the workspace keeps them out of what the app
+// may write; only this keeps a sandboxed `cat` from reading them into a file
+// that is then pushed to the Library.
+func TestSessionDeniesTheProtectedPathsToTheApp(t *testing.T) {
+	argvFile := filepath.Join(t.TempDir(), "argv")
+	fakeApp(t, "claude", fmt.Sprintf("printf '%%s\\n' \"$@\" > %q\n", argvFile)+quietClaude)
+	h, _, workerDir, sshDir := protectedRig(t)
+	deny := sshDir
+	h.manager.opts.DenyPaths = func() []string { return []string{deny, "relative/entry"} }
+
+	end := h.start(t, nil)
+
+	if end.GetError() != "" {
+		t.Fatalf("end error = %q", end.GetError())
+	}
+	argv := readArgv(t, argvFile)
+	rules := argvValue(argv, "--disallowedTools")
+	for _, path := range []string{workerDir, sshDir} {
+		for _, tool := range []string{"Read", "Edit"} {
+			if want := tool + "(/" + path + ")"; !strings.Contains(rules, want) {
+				t.Errorf("--disallowedTools = %q, want %s", rules, want)
+			}
+		}
+	}
+	var settings struct {
+		Sandbox struct {
+			Filesystem struct {
+				DenyRead []string `json:"denyRead"`
+			} `json:"filesystem"`
+		} `json:"sandbox"`
+	}
+	if err := json.Unmarshal([]byte(argvValue(argv, "--settings")), &settings); err != nil {
+		t.Fatalf("--settings: %v", err)
+	}
+	denied := strings.Join(settings.Sandbox.Filesystem.DenyRead, "\n")
+	for _, path := range []string{workerDir, sshDir} {
+		if !strings.Contains(denied, path) {
+			t.Errorf("sandbox.filesystem.denyRead = %q, want %s in it", denied, path)
+		}
+	}
+	// A relative entry names no place on this machine; CheckPath never
+	// matches one either.
+	if strings.Contains(denied, "relative/entry") || strings.Contains(rules, "relative/entry") {
+		t.Errorf("a relative fs.deny entry reached the app: %q / %q", denied, rules)
+	}
+}
+
+// failingLibrary is a Library that refuses every upload, as one that is
+// unreachable would.
+func failingLibrary(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "the library is down", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestSessionScratchKeptWhenThePushFails: a directory made for the session
+// alone holds the only copy of what the app made until the push lands. When
+// the push fails it is KEPT, and the machine's log says where -- deleting it
+// would turn "the Library was unreachable" into "the work is gone".
+func TestSessionScratchKeptWhenThePushFails(t *testing.T) {
+	scratchApp(t)
+	h := newRig(t)
+	scratch := t.TempDir()
+	logs := &logBuffer{}
+	h.manager.logger = slog.New(slog.NewTextHandler(logs, nil))
+	h.manager.opts.Home = rigHome
+	h.manager.opts.ScratchRoot = scratch
+	down := failingLibrary(t)
+	h.manager.opts.LibraryBase = down.URL
+	h.manager.opts.HTTPClient = down.Client()
+
+	end := h.start(t, func(s *memqlv1.AppSessionStart) { s.Workspace = "" })
+
+	if !strings.Contains(end.GetError(), "pushing outputs to the Library failed") {
+		t.Fatalf("end error = %q, want the failed push", end.GetError())
+	}
+	dir := filepath.Join(scratch, rigHome, "sess-test")
+	if body, err := os.ReadFile(filepath.Join(dir, "notes.md")); err != nil || string(body) != "made here\n" {
+		t.Errorf("what the app made is gone with the push failed: %q, %v", body, err)
+	}
+	h.settled(t)
+	if out := logs.String(); !strings.Contains(out, "level=WARN") || !strings.Contains(out, dir) {
+		t.Errorf("the machine's log does not say where the kept workspace is:\n%s", out)
+	}
+}
+
+// TestOpenSessionKeepsItsScratchDir: an `open` session hands the app to a
+// PERSON, whose terminal can outlive the session -- a cancel or the
+// wall-clock ceiling stops the launcher, not the shell or the app in the
+// window, and a forking Linux terminal returns at once. The directory they
+// are working in is not removed from under them.
+func TestOpenSessionKeepsItsScratchDir(t *testing.T) {
+	fakeApp(t, "claude", "exit 0\n")
+	h := newRig(t)
+	scratch := t.TempDir()
+	h.manager.opts.Home = rigHome
+	h.manager.opts.ScratchRoot = scratch
+	// The person's terminal: it writes into the workspace and stays up.
+	h.manager.opts.OpenCommand = func(string) ([]string, string, error) {
+		return []string{"/bin/sh", "-c", "echo 'still working' > person.md; exec sleep 60"}, "opened in the test terminal", nil
+	}
+	dir := filepath.Join(scratch, rigHome, "sess-open")
+
+	h.manager.Start(context.Background(), h.sender, &memqlv1.AppSessionStart{
+		SessionId:   "sess-open",
+		App:         apps.IDClaudeCode,
+		Kind:        KindOpen,
+		Prompt:      "have a look",
+		Credential:  testBearer,
+		McpEndpoint: "https://mcp.example.com/mcp",
+	})
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "person.md")); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the open session never started its terminal")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	h.manager.Control(&memqlv1.AppSessionControl{SessionId: "sess-open", Action: ActionCancel, Reason: "done watching"})
+	end := h.sender.wait(t)
+
+	if !strings.Contains(end.GetError(), "cancelled") {
+		t.Errorf("end error = %q, want the cancel", end.GetError())
+	}
+	if body, err := os.ReadFile(filepath.Join(dir, "person.md")); err != nil || string(body) != "still working\n" {
+		t.Errorf("the person's working directory was removed from under them: %q, %v", body, err)
+	}
+}

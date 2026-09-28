@@ -363,7 +363,7 @@ func claudeArgv(spec Spec, knobs Knobs, prompt, ref string) []string {
 	if knobs.Effort != "" {
 		argv = append(argv, "--effort", knobs.Effort)
 	}
-	argv = append(argv, claudeGrantArgs()...)
+	argv = append(argv, claudeGrantArgs(spec.DenyPaths)...)
 	if path := strings.TrimSpace(spec.MCPConfigPath); path != "" {
 		argv = append(argv, "--mcp-config", path)
 	}
@@ -414,6 +414,12 @@ func claudeArgv(spec Spec, knobs Knobs, prompt, ref string) []string {
 //     (claudeSandboxSettings), and approves a command BECAUSE it runs
 //     sandboxed -- so a command the sandbox did not take has no approval
 //     in this grant, and dontAsk refuses it.
+//   - `--disallowedTools` denies the file tools every one of deny --
+//     Spec.DenyPaths: this worker's own files and this machine's fs.deny
+//     list -- for reading and for writing (claudeDenyRules). A deny rule
+//     beats the workspace's allow rule, so a path reached through a
+//     symlink the session made in its workspace is refused all the same.
+//     Absent when there is nothing to deny.
 //
 // `--tools` is deliberately NOT passed. It would narrow the built-in set to
 // the grant's tools, but it would take ToolSearch with it -- the tool Claude
@@ -421,14 +427,45 @@ func claudeArgv(spec Spec, knobs Knobs, prompt, ref string) []string {
 // turn in claudeactions_test.go) -- and whether it spares the synthetic
 // StructuredOutput tool a --json-schema answer rides could not be verified
 // without a real run. The permission mode is what refuses everything else.
-func claudeGrantArgs() []string {
-	return []string{
+func claudeGrantArgs(deny []string) []string {
+	args := []string{
 		"--setting-sources=",
 		"--strict-mcp-config",
 		"--permission-mode", "dontAsk",
 		"--allowedTools", "Edit(/**) Read(/**) mcp__" + MCPServerName,
-		"--settings", claudeSandboxSettings,
 	}
+	if rules := claudeDenyRules(deny); rules != "" {
+		args = append(args, "--disallowedTools", rules)
+	}
+	return append(args, "--settings", claudeSandboxSettings(deny))
+}
+
+// claudeDenyRules is the file tools' half of the deny list: a Read and an
+// Edit rule for every path, space-separated as --disallowedTools takes them.
+//
+// `//` is an absolute path in a rule (a single `/` would be the working
+// directory). The path is written BARE, not as `path/**`: a rule matches the
+// way a gitignore entry does, so a directory's rule covers everything under
+// it and a file's covers the file -- and a glob rule is what the Linux
+// sandbox cannot use (it merges these rules into its own lists, and skips or
+// expands a glob there).
+//
+// A path the rule syntax would misread gets NO rule rather than a wrong
+// one: a parenthesis ends the rule early (Claude Code splits the list on
+// spaces and commas outside parentheses, 2.1.283), and a glob character
+// matches more or less than the path. Such a path is still denied to every
+// shell command by the sandbox's own list, which is JSON and carries any
+// path whole; that the file tools could reach it depends on the workspace
+// overlapping it, which the session refuses.
+func claudeDenyRules(deny []string) string {
+	var rules []string
+	for _, path := range deny {
+		if !strings.HasPrefix(path, "/") || strings.ContainsAny(path, "()*?[]\\") {
+			continue
+		}
+		rules = append(rules, "Read(/"+path+")", "Edit(/"+path+")")
+	}
+	return strings.Join(rules, " ")
 }
 
 // claudeSandboxSettings turns on Claude Code's own sandbox for every shell
@@ -439,9 +476,11 @@ func claudeGrantArgs() []string {
 // directory it always allows), keeps the app's mandatory write protections
 // (.mcp.json -- this session's bearer --, .git/hooks, .git/config, shell rc
 // files), and sends a command's network through its own proxy, which
-// approves domains one at a time; this grant approves none. It does NOT
-// confine reads: a sandboxed command can read outside the workspace, and
-// this machine's fs.deny list is not handed to it.
+// approves domains one at a time; this grant approves none. READS it
+// confines only away from deny (Spec.DenyPaths), and that is what keeps a
+// sandboxed `cat ~/.memql/worker.yaml > out.txt` from leaving the worker
+// token in a file the session then pushes to the Library. Elsewhere a
+// sandboxed command can still read outside the workspace.
 //
 //   - failIfUnavailable: a machine that cannot sandbox fails the turn at
 //     start in the app's own words (a Linux box without bubblewrap, say),
@@ -450,7 +489,40 @@ func claudeGrantArgs() []string {
 //   - allowUnsandboxedCommands=false: the Bash tool's dangerouslyDisableSandbox
 //     parameter is ignored, so there is no way out of the sandbox from a
 //     single call.
-const claudeSandboxSettings = `{"sandbox":{"enabled":true,"failIfUnavailable":true,"autoAllowBashIfSandboxed":true,"allowUnsandboxedCommands":false}}`
+//   - filesystem.denyRead / denyWrite: deny, in the plain absolute form the
+//     sandbox's settings document (Claude Code's own test harness passes
+//     its lists the same way). Denied for writing as well, although writes
+//     stop at the workspace already: the temporary directory is writable by
+//     every sandboxed command, and a deny entry there stays unwritten. The
+//     workspace itself never overlaps one (the session refuses it), so this
+//     takes nothing from the grant. On Linux a denied directory is covered
+//     by an empty one and a denied FILE by /dev/null -- the default
+//     fs.deny's /etc/passwd included, so a sandboxed command there cannot
+//     look up a user name. On macOS a denied read fails with EPERM, which
+//     git treats as fatal for an XDG config under a denied ~/.config
+//     (checked with sandbox-exec; docs/local-apps.md says what to do).
+func claudeSandboxSettings(deny []string) string {
+	type filesystem struct {
+		DenyRead  []string `json:"denyRead"`
+		DenyWrite []string `json:"denyWrite"`
+	}
+	type sandbox struct {
+		Enabled                  bool        `json:"enabled"`
+		FailIfUnavailable        bool        `json:"failIfUnavailable"`
+		AutoAllowBashIfSandboxed bool        `json:"autoAllowBashIfSandboxed"`
+		AllowUnsandboxedCommands bool        `json:"allowUnsandboxedCommands"`
+		Filesystem               *filesystem `json:"filesystem,omitempty"`
+	}
+	sb := sandbox{Enabled: true, FailIfUnavailable: true, AutoAllowBashIfSandboxed: true}
+	if len(deny) > 0 {
+		sb.Filesystem = &filesystem{DenyRead: deny, DenyWrite: deny}
+	}
+	// Strings and booleans only, which Marshal cannot fail on.
+	body, _ := json.Marshal(struct {
+		Sandbox sandbox `json:"sandbox"`
+	}{sb})
+	return string(body)
+}
 
 // claudeCertStoreEnv is set on every turn: TLS trusts Claude Code's bundled
 // roots AND the system store.

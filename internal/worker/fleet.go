@@ -24,6 +24,9 @@ type FleetOptions struct {
 	WorkersPath string
 	Policy      *tools.Policy
 	PolicyPath  string
+	// WorkerPaths are this worker's own files, which no app session may
+	// touch (sessionWorkerPaths).
+	WorkerPaths []string
 	// ToolsFor builds the dispatcher one home's stream serves tool calls
 	// through. PER HOME, because the consent gate inside it is per home
 	// (memql-cockpit#433): a window opened for one cluster must admit
@@ -53,6 +56,7 @@ type Fleet struct {
 	machineID   string
 	policy      *tools.Policy
 	policyPath  string
+	workerPaths []string
 	toolsFor    func(homeID string) ToolDispatcher
 	apps        AppInventory
 	modelsInv   ModelInventory
@@ -89,6 +93,7 @@ func NewFleet(opts FleetOptions) (*Fleet, error) {
 		managed:     make(map[string]*managedHome),
 		policy:      opts.Policy,
 		policyPath:  opts.PolicyPath,
+		workerPaths: opts.WorkerPaths,
 		toolsFor:    opts.ToolsFor,
 		apps:        opts.Apps,
 		modelsInv:   opts.Models,
@@ -296,6 +301,11 @@ func (f *Fleet) buildHome(home Home, machineID string) (homeRun, error) {
 		// reason: WorkspaceRoot answers "", the platform's own directory.
 		Home:          home.ID,
 		WorkspaceRoot: f.policy.WorkspaceRoot,
+		// What a session may neither run in nor let its app read or write
+		// (appsession/protected.go). DenyPaths is nil-safe for AppLevels'
+		// reason: a nil policy denies nothing beyond the worker's own.
+		WorkerPaths: f.workerPaths,
+		DenyPaths:   f.policy.DenyPaths,
 	})
 	// Per-home Calls so a disconnect on home A does not StopAll
 	// generations serving home B on the shared GPU -- over one Limiter,

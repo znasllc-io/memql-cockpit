@@ -330,6 +330,14 @@ func handleRun(args []string) {
 	}
 	logLevelProblems(logger, policy)
 
+	// What no app session may touch because it is this worker's own: the
+	// tokens, policy.yaml's consent gate, the state (apppaths.go).
+	stateDirs := []string{legacyCfg.StateDir}
+	if !singleHome {
+		stateDirs = append(stateDirs, workers.machineRoot())
+	}
+	workerPaths := sessionWorkerPaths(*configPath, *workersPath, stateDirs, *tokenFile, consent.DefaultSocketPath())
+
 	// Consent gate (memql-cockpit#64). ONE socket for the whole
 	// supervisor, and one window PER CLUSTER behind it (memql-cockpit
 	// #433): each home's dispatcher asks its own home's Manager, so a
@@ -394,6 +402,10 @@ func handleRun(args []string) {
 			// this home either way (appsession/workspace.go).
 			Home:          legacyCfg.Home,
 			WorkspaceRoot: policy.WorkspaceRoot,
+			// What a session may neither run in nor let its app read or
+			// write (appsession/protected.go).
+			WorkerPaths: workerPaths,
+			DenyPaths:   policy.DenyPaths,
 		})
 		stopSessions = sessions.StopAll
 		calls := modelcall.NewManager(modelcall.Options{
@@ -442,6 +454,7 @@ func handleRun(args []string) {
 			WorkersPath: *workersPath,
 			Policy:      policy,
 			PolicyPath:  policyPath,
+			WorkerPaths: workerPaths,
 			ToolsFor:    toolsFor,
 			Apps:        appInv,
 			Models:      modelInventory,

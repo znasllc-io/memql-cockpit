@@ -227,15 +227,26 @@ Four rules here are load-bearing, and each is the kind that fails silently:
 refusal: the engine cannot know a path here. `appsession/workspace.go` makes
 `<fs.workspace_root or the platform data dir>/<home>/<run_id or session_id>`,
 passes it through `CheckWorkspace` like an engine-named path, and removes it
-at End only when it was keyed by the session. Never under `~/.memql` (tokens,
+at End only when it was keyed by the session -- and not when the push failed
+or the kind is `open` (kept, logged). Never under `~/.memql` (tokens,
 consent). Read the RESOLVED workspace (`session.workspace`), not the start's
 field: the start's is empty for a chosen directory, and the output push reading
 it pushes nothing the app made.
 
+**THE WORKSPACE IS THE APP'S WRITE GRANT** (`appsession/protected.go`): any
+workspace, engine-named or chosen, that is, contains or lies inside the
+worker's own files (`sessionWorkerPaths`: the config dir, state, token file,
+consent socket) or an `fs.deny` entry is refused -- `CheckPath` alone accepts
+`$HOME` and `/`. The same paths reach the app as `harness.Spec.DenyPaths`,
+denied for READING too: without them the sandbox confines writes alone.
+
 **CLAUDE CODE'S PERMISSIONS ARE IN THE ARGV, NOT IN ~/.claude**
 (`claudeGrantArgs`): `--setting-sources=` (no settings file),
 `--strict-mcp-config`, `--permission-mode dontAsk`, `--allowedTools
-"Edit(/**) Read(/**) mcp__memql"`, and the sandbox inline via `--settings`.
+"Edit(/**) Read(/**) mcp__memql"`, `--disallowedTools` with a bare
+`Read(//path) Edit(//path)` per deny path (no `/**`: the Linux sandbox
+expands or skips a glob), and the sandbox inline via `--settings` with the
+same paths as `filesystem.denyRead`/`denyWrite`.
 Bash has no rule -- the sandbox's auto-allow is its only approval, so a
 command the sandbox did not take has none. `--tools` is NOT passed: it would
 drop ToolSearch, which loads deferred MCP tools. Every flag before `--`.

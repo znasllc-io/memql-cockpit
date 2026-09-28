@@ -30,11 +30,17 @@ import (
 // own scaffolding (the bearer's configuration, the transcript) and leaves the
 // run's files.
 //
+// Two session-keyed directories are KEPT, and nothing collects them yet:
+// one whose outputs did not reach the Library (it holds the only copy of what
+// the app made; keepWorkspace says where), and an open session's, which a
+// person may still be working in after the session ends.
+//
 // NEVER UNDER ~/.memql. That directory holds the worker's tokens and the
 // consent file, and a session runs shell commands where it works.
 //
-// The chosen path goes through CheckWorkspace like a path the engine named:
-// this machine's fs.deny list binds its own choice as well.
+// The chosen path goes through CheckWorkspace and the protected-path check
+// (protected.go) like a path the engine named: this machine's fs.deny list
+// binds its own choice as well.
 
 // scratchSegmentMax bounds one directory name built from an id.
 const scratchSegmentMax = 128
@@ -139,7 +145,8 @@ func (s *session) chooseWorkspace() (path string, bySession bool, err error) {
 
 // releaseWorkspace removes the directory this machine made for this session
 // alone, once its outputs have been pushed. A workspace the engine named is
-// never touched -- it can be a real project -- and neither is a run's.
+// never touched -- it can be a real project -- and neither is a run's or an
+// open session's.
 func (s *session) releaseWorkspace() {
 	s.mu.Lock()
 	path := ""
@@ -155,4 +162,23 @@ func (s *session) releaseWorkspace() {
 		s.logger.Warn("app session: the workspace this machine made for it could not be removed",
 			"workspace", path, "error", err)
 	}
+}
+
+// keepWorkspace leaves the directory this machine made for this session on
+// disk, and says where in the machine's log: its outputs are not in the
+// Library, so it holds the only copy of what the app made. Nothing removes it
+// afterwards; the owner does, once the files are recovered.
+func (s *session) keepWorkspace(why string) {
+	s.mu.Lock()
+	path := ""
+	if s.ownsWorkspace {
+		path = s.workspace
+	}
+	s.ownsWorkspace = false
+	s.mu.Unlock()
+	if path == "" {
+		return
+	}
+	s.logger.Warn("app session: keeping the workspace this machine made for it, because "+why+
+		"; recover its files from there and remove it by hand", "workspace", path)
 }
