@@ -3,11 +3,13 @@
 package config
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/znasllc-io/memql/core/filetxn"
 	"gopkg.in/yaml.v3"
 )
 
@@ -53,7 +55,7 @@ type ClusterConfig struct {
 	// only reaches clusters cut after znasllc-io/memql#3998.
 	//
 	// The cockpit does not act on the value; it models the key for the same
-	// reason it models Local. SaveClusters marshals this struct over the
+	// reason it models Local. Registry updates marshal this struct over the
 	// file, so a key that is not a field here is DROPPED on the cockpit's
 	// next write -- asserted by TestClusterVersionFieldRoundTrip below. A
 	// plugin-recorded version silently vanishing the first time an operator
@@ -212,18 +214,27 @@ func LoadClusters() (*ClustersFile, error) {
 	return &file, nil
 }
 
-// SaveClusters writes the cluster registry to ~/.memql/clusters.yaml.
-func SaveClusters(file *ClustersFile) error {
-	dir := ConfigDir()
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return fmt.Errorf("create config dir: %w", err)
-	}
+// UpdateClusters reads and writes under the same kernel lock as the MemQL
+// desktop extension. The callback must contain only local metadata edits;
+// discovery and sign-in happen outside the transaction.
+func UpdateClusters(ctx context.Context, edit func(*ClustersFile) error) error {
+	return updateClustersAt(ctx, filepath.Join(ConfigDir(), "clusters.yaml"), edit)
+}
 
-	data, err := yaml.Marshal(file)
-	if err != nil {
-		return fmt.Errorf("marshal clusters: %w", err)
-	}
-
-	path := filepath.Join(dir, "clusters.yaml")
-	return os.WriteFile(path, data, 0600)
+func updateClustersAt(ctx context.Context, path string, edit func(*ClustersFile) error) error {
+	return filetxn.Update(ctx, path, func(data []byte) ([]byte, error) {
+		if data != nil {
+			if err := VerifyCredentialFileMode(path); err != nil {
+				return nil, err
+			}
+		}
+		var file ClustersFile
+		if err := yaml.Unmarshal(data, &file); err != nil {
+			return nil, fmt.Errorf("parse registry: %w", err)
+		}
+		if err := edit(&file); err != nil {
+			return nil, err
+		}
+		return yaml.Marshal(&file)
+	})
 }

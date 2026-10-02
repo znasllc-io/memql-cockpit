@@ -184,18 +184,14 @@ func handleClusterAdd(args []string) {
 		os.Exit(1)
 	}
 
-	clusters, err := config.LoadClusters()
+	err = config.UpdateClusters(context.Background(), func(clusters *config.ClustersFile) error {
+		if _, exists := clusters.Get(cfg.Name); exists {
+			return fmt.Errorf("cluster %q already exists; use `memql login` to sign in or choose another name", cfg.Name)
+		}
+		clusters.Clusters = append(clusters.Clusters, cfg)
+		return nil
+	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-		os.Exit(1)
-	}
-	if _, exists := clusters.Get(cfg.Name); exists {
-		fmt.Fprintf(os.Stderr, "ERROR: cluster %q already exists\n", cfg.Name)
-		fmt.Fprintf(os.Stderr, "  `memql login %s` re-authenticates it; `memql cluster remove %s` frees the slot; --name picks another.\n", cfg.Name, cfg.Name)
-		os.Exit(1)
-	}
-	clusters.Clusters = append(clusters.Clusters, cfg)
-	if err := config.SaveClusters(clusters); err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 		os.Exit(1)
 	}
@@ -336,28 +332,20 @@ func handleClusterRemove(args []string) {
 	}
 	installCredStore()
 
-	clusters, err := config.LoadClusters()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-		os.Exit(1)
-	}
-
-	found := false
-	var remaining []config.ClusterConfig
-	for _, c := range clusters.Clusters {
-		if c.Name == name {
-			found = true
-			continue
+	err := config.UpdateClusters(context.Background(), func(clusters *config.ClustersFile) error {
+		for i, c := range clusters.Clusters {
+			if c.Name != name {
+				continue
+			}
+			clusters.Clusters = append(clusters.Clusters[:i], clusters.Clusters[i+1:]...)
+			if clusters.SelectedCluster == name {
+				clusters.SelectedCluster = ""
+			}
+			return nil
 		}
-		remaining = append(remaining, c)
-	}
-	if !found {
-		fmt.Fprintf(os.Stderr, "ERROR: cluster %q not found\n", name)
-		os.Exit(1)
-	}
-
-	clusters.Clusters = remaining
-	if err := config.SaveClusters(clusters); err != nil {
+		return fmt.Errorf("cluster %q not found", name)
+	})
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
 		os.Exit(1)
 	}

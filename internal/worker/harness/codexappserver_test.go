@@ -320,7 +320,21 @@ func TestCodexAppServerStartCompletesTheHandshake(t *testing.T) {
 	if !strings.Contains(strings.Join(wire, "\n"), "CODEX_HOME="+spec.Env[0][len("CODEX_HOME="):]) {
 		t.Fatalf("CODEX_HOME did not reach the process: %v", wire)
 	}
-	if !strings.Contains(strings.Join(wire, "\n"), "PWD="+spec.Workspace) {
+	// macOS may report /private/var where t.TempDir returned /var. The
+	// process must be in the same directory, including through such aliases.
+	workspace, err := os.Stat(spec.Workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var inWorkspace bool
+	for _, line := range wire {
+		if path, ok := strings.CutPrefix(line, "PWD="); ok {
+			actual, err := os.Stat(path)
+			inWorkspace = err == nil && os.SameFile(workspace, actual)
+			break
+		}
+	}
+	if !inWorkspace {
 		t.Fatalf("the process did not run in the workspace: %v", wire)
 	}
 }

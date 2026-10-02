@@ -240,3 +240,8 @@ Computer-use setup and permissions: [docs/computer-use.md](docs/computer-use.md)
 ## License
 
 [MIT](LICENSE)
+
+## Editor integration
+
+See [Cockpit and the editor extensions](docs/editor-boundaries.md) for ownership,
+shared registry transactions, separate credentials, and backup/edit conflicts.
