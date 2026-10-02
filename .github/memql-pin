@@ -3,4 +3,4 @@
 # are consumed by internal/worker/modelcall and checked by wire_media_test.go.
 # Keep mappings and this pin together; workflows read this file through
 # .github/actions/checkout-memql. The Go require pseudo-versions are not pins.
-9a8f529813771a3ffb471740e9dbc15ecc6db670
+456da151fbf9c970e74ee198e86a1385fa538abb
