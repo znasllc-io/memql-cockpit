@@ -84,7 +84,10 @@ when both are given. Re-running the installer over an older install upgrades
 the binary in place and refreshes the enrollment for the same cluster (the
 same token and cluster is a no-op refresh); a newer installed version is
 never downgraded. The closing block prints the installed version and the
-cluster.
+cluster. An existing `~/.memql/workers.yaml` the installer cannot read is
+refused (exit 5) before anything is downloaded or written, rather than
+rewritten without the enrollments it holds (see the registry bullet under
+Uninstall).
 
 ### Uninstall
 
@@ -138,7 +141,10 @@ and the person copying it need know nothing else.
   missing binary, a legacy service label, an enrollment file from the
   older single-home layout (`worker.yaml`) — each step reports "removed"
   or "nothing to do", none aborts the rest, and the closing summary says
-  what was removed, what was kept and why. Its heading is SUCCESS,
+  what was removed, what was kept and why. That includes a scoped removal
+  whose legacy service file will not delete: the enrollment is gone, the
+  worker for the others is back up, and the file is under Kept with the
+  remedy (PARTIAL, exit 5). Its heading is SUCCESS,
   PARTIAL (something removed, something left), FAILED (a step ran and
   failed; Kept names what it left, such as a worker this run stopped) or
   REFUSED (nothing was changed).
@@ -152,10 +158,21 @@ and the person copying it need know nothing else.
   `state_dir` that names a regular file. A state directory that is itself
   a symlink is removed as a link; what it points at is not touched. A file
   or tree that cannot be removed is reported under Kept and the run still
-  finishes (exit 5); it never aborts mid-purge. A registry whose `homes:`
-  the script cannot read as a block list (flow-style items, a half-edited
-  file) is refused (exit 5) with nothing touched; `--all-homes` is the way
-  past it.
+  finishes (exit 5); it never aborts mid-purge.
+- **An enrollment registry the script cannot read.** The scripts read
+  `~/.memql/workers.yaml` the way the worker and the installer write it:
+  `homes:` at the start of a line, then a block list of `- id: ...` items
+  (or `homes: []`), in LF or CRLF lines. Every other spelling the worker
+  would still accept -- a flow or JSON document, a quoted, spaced,
+  explicit, anchored, tagged or escaped `homes` key, an indented document,
+  a byte-order mark or UTF-16, CR-only / NEL / LS / PS line breaks,
+  flow-style items, a second document -- is refused (exit 5, "not an
+  enrollment registry this script can read; nothing was changed") with
+  nothing touched, by the no-flag run, `--cluster` and `--dry-run` alike.
+  It is never read as "no enrollment", which would remove every token.
+  `--all-homes` is the way past it, because it reads nothing; the
+  installer refuses the same files rather than rewrite them. A registry
+  with no `homes` key anywhere in it reads as no enrollment.
 
 On macOS, last-home or full removal resets only the installed MemQL apps’
 Accessibility and Screen Recording decisions; shared sibling enrollments keep
