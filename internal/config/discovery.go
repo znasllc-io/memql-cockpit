@@ -63,9 +63,10 @@ func FetchDiscovery(ctx context.Context, base string) (*DiscoveryDocument, error
 
 // ComposeFromDomain builds a ClusterConfig from one domain by the
 // front-door convention: api.<domain> is the gRPC front door,
-// identity.<domain> the issuer, "cockpit" the registered client. The
-// discovery document is authoritative when reachable; this is the
-// fallback for clusters that predate the endpoint.
+// identity.<domain> the issuer. The client is the Cockpit's compiled
+// DefaultClientId, which is deliberately NOT stored on the entry (see
+// ClusterConfig.ClientId). The discovery document is authoritative when
+// reachable; this is the fallback for clusters that predate the endpoint.
 func ComposeFromDomain(domain string) ClusterConfig {
 	domain = strings.TrimSpace(domain)
 	return ClusterConfig{
@@ -74,7 +75,6 @@ func ComposeFromDomain(domain string) ClusterConfig {
 		Domain:      domain,
 		Endpoint:    "https://api." + domain,
 		Issuer:      "https://identity." + domain,
-		ClientId:    "cockpit",
 	}
 }
 

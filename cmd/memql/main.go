@@ -253,17 +253,17 @@ func clusterFromDiscovery(doc *config.DiscoveryDocument, domain string) config.C
 	if endpoint == "" && domain != "" {
 		endpoint = "https://api." + domain
 	}
-	clientId := strings.TrimSpace(doc.ClientId)
-	if clientId == "" {
-		clientId = "cockpit"
-	}
+	// The discovery document names the client the cockpit should present.
+	// When that is the cockpit's own default -- or nothing -- the entry
+	// carries no client_id at all: clusters.yaml is shared with other
+	// tools, and the default is compiled in (config.ClusterConfig.ClientId).
 	return config.ClusterConfig{
 		Name:        config.DomainToName(nameSource),
 		DisplayName: display,
 		Domain:      domain,
 		Endpoint:    endpoint,
 		Issuer:      strings.TrimSpace(doc.IdentityURL),
-		ClientId:    clientId,
+		ClientId:    config.StoredClientId(doc.ClientId),
 	}
 }
 
@@ -311,7 +311,8 @@ func clusterAuthLabel(c config.ClusterConfig) string {
 	switch {
 	case c.PAT != "":
 		return "PAT"
-	case c.Issuer != "" && c.ClientId != "":
+	case c.Issuer != "":
+		// The client is EffectiveClientId, which is never empty.
 		return "OIDC"
 	default:
 		return "not configured"
