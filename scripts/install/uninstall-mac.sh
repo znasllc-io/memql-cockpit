@@ -547,6 +547,11 @@ function scoped_unpair() {
         # The enrollment IS gone from here on: every failure below is
         # recorded as such (Removed + the stopped worker), never as a
         # refusal that changed nothing (a review finding).
+        # A legacy plist that will not unlink is recorded Kept, with its
+        # remedy, by remove_path_if_present, and earns the leftover code;
+        # the worker for the siblings still reloads, and the run then ends
+        # in the PARTIAL summary rather than the SUCCESS line (a
+        # verification finding: the `|| true` alone dropped it).
         local legacy
         for legacy in "$LEGACY_LABEL_DARWIN" "com.visionarys.memql-cockpit-worker"; do
             stop_agent "$legacy" || { rc=$?; record_scoped_restart_failure "$restart" "the legacy agent ${legacy} (still loaded; stop it by hand:  launchctl bootout gui/$(id -u)/${legacy})"; return "$rc"; }
@@ -559,6 +564,7 @@ function scoped_unpair() {
                 return 5
             }
         fi
+        record_scoped_leftovers || return $?
         echo "SUCCESS: selected cluster enrollment removed; $OTHER_HOMES other enrollment(s) and the shared app, CLI, menu, policy and state retained."
     fi
 }

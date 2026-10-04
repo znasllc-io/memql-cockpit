@@ -51,6 +51,16 @@
 # printed; and the five low findings (HOME with a trailing slash, the
 # lib.sh fetch failure's exit code, a user-local app rm that fails, a
 # `#` inside a state_dir, a state_dir that names a regular file).
+# And the third pass: every registry the binary decodes as two homes but
+# the text readers saw no block `homes:` header in (a flow/JSON root, a
+# quoted/spaced/tabbed/explicit/anchored/tagged/escaped key, an indented
+# root, a BOM, UTF-16, CR-only / NEL / LS / PS line breaks) is refused
+# (5) by all four readers -- the uninstaller's no-flag, --cluster and
+# --dry-run runs on both drivers (and piped) leave HOME byte-identical,
+# and the installer refuses before its download with workers.yaml
+# unchanged -- while a file with provably no homes key still reads as
+# zero; and a legacy service file that will not unlink after a
+# sibling-remaining unpair ends in the PARTIAL summary, exit 5.
 #
 # Run: bash scripts/install/lib_test.sh
 # Wired into CI by .github/workflows/install-scripts-lint.yml.
@@ -2511,6 +2521,294 @@ for _installer in install-mac.sh install-linux.sh; do
         fail "$_installer help should document --version"
     fi
 done
+
+# ---------------------------------------------------------------
+# Third pass -- a registry the text readers cannot see into
+# ---------------------------------------------------------------
+#
+# Every reader engaged only on a literal `^homes:` at column 0, so a
+# workers.yaml the binary's yaml.v3 decodes as two homes but spelled
+# any other way read as ZERO: the no-flag and --cluster uninstalls took
+# the --all-homes path and deleted every token under exit 0, and the
+# next install rewrote the registry holding only its own home. Each
+# shape below was decoded with gopkg.in/yaml.v3 into the WorkersFile
+# struct (internal/worker/homes.go) as the two homes c.example and
+# d.example. All four readers must now refuse (5), and a file with
+# provably no homes key must still read as zero.
+
+_ur_items=$'- id: c.example\n  cluster_url: https://c.example\n  token: mql_wkr_c\n- id: d.example\n  cluster_url: https://d.example\n  token: mql_wkr_d\n'
+
+# utf16be prints $1 (ASCII) as UTF-16BE behind its byte-order mark,
+# which yaml.v3 detects and decodes.
+function utf16be() {
+    local text="$1" i
+    printf '\376\377'
+    for (( i = 0; i < ${#text}; i++ )); do
+        printf '\000%s' "${text:i:1}"
+    done
+}
+
+# join_lines prints stdin's lines each followed by the byte string $1
+# instead of a newline; awk's -v turns its octal escapes into bytes.
+function join_lines() {
+    LC_ALL=C awk -v sep="$1" '{ printf "%s%s", $0, sep }'
+}
+
+# write_unreadable_registry writes registry shape $1 at $2.
+function write_unreadable_registry() {
+    local shape="$1" path="$2"
+    case "$shape" in
+        jsonline)
+            printf '{"version": 1, "homes": [{"id": "c.example", "cluster_url": "https://c.example", "token": "mql_wkr_c"}, {"id": "d.example", "cluster_url": "https://d.example", "token": "mql_wkr_d"}]}\n' ;;
+        jsonpretty)
+            printf '{\n  "version": 1,\n  "homes": [\n    {\n      "id": "c.example",\n      "cluster_url": "https://c.example",\n      "token": "mql_wkr_c"\n    },\n    {\n      "id": "d.example",\n      "cluster_url": "https://d.example",\n      "token": "mql_wkr_d"\n    }\n  ]\n}\n' ;;
+        flowroot)
+            printf '{version: 1, homes: [{id: c.example, cluster_url: https://c.example, token: mql_wkr_c}, {id: d.example, cluster_url: https://d.example, token: mql_wkr_d}]}\n' ;;
+        dquoted)     printf 'version: 1\n"homes":\n%s' "$_ur_items" ;;
+        squoted)     printf "version: 1\n'homes':\n%s" "$_ur_items" ;;
+        spacecolon)  printf 'version: 1\nhomes :\n%s' "$_ur_items" ;;
+        tabcolon)    printf 'version: 1\nhomes\t:\n%s' "$_ur_items" ;;
+        explicitkey) printf 'version: 1\n? homes\n:\n%s' "$_ur_items" ;;
+        anchored)    printf 'version: 1\n&h homes:\n%s' "$_ur_items" ;;
+        tagged)      printf 'version: 1\n!!str homes:\n%s' "$_ur_items" ;;
+        escaped)     printf 'version: 1\n"hom\\x65s":\n%s' "$_ur_items" ;;
+        contkey)
+            printf 'version: 1\n? "hom\\\n  es"\n: - id: c.example\n    cluster_url: https://c.example\n  - id: d.example\n    cluster_url: https://d.example\n' ;;
+        merge)
+            printf 'version: 1\nbase: &b\n  "hom\\x65s":\n  - id: c.example\n    cluster_url: https://c.example\n  - id: d.example\n    cluster_url: https://d.example\n<<: *b\n' ;;
+        docflow)
+            printf -- '--- {"homes": [{"id": "c.example", "cluster_url": "https://c.example"}, {"id": "d.example", "cluster_url": "https://d.example"}]}\n' ;;
+        indented)    printf 'version: 1\nhomes:\n%s' "$_ur_items" | sed 's/^/ /' ;;
+        bom)         printf '\357\273\277homes:\n%s' "$_ur_items" ;;
+        utf16)       utf16be "version: 1"$'\n'"homes:"$'\n'"$_ur_items" ;;
+        cronly)      printf 'version: 1\nhomes:\n%s' "$_ur_items" | tr '\n' '\r' ;;
+        nel)         printf 'version: 1\nhomes:\n%s' "$_ur_items" | join_lines '\302\205' ;;
+        ls)          printf 'version: 1\nhomes:\n%s' "$_ur_items" | join_lines '\342\200\250' ;;
+        ps)          printf 'version: 1\nhomes:\n%s' "$_ur_items" | join_lines '\342\200\251' ;;
+        crinside)
+            printf 'version: 1\nhomes:\n- id: c.example\n  cluster_url: https://c.example\r- id: d.example\r  cluster_url: https://d.example\n' ;;
+        nelinside)
+            printf 'version: 1\nhomes:\n- id: c.example\n  cluster_url: https://c.example\302\205- id: d.example\302\205  cluster_url: https://d.example\n' ;;
+        *) echo "unknown shape $shape" >&2; return 1 ;;
+    esac > "$path"
+}
+
+_ur_shapes="jsonline jsonpretty flowroot dquoted squoted spacecolon tabcolon explicitkey anchored tagged escaped contkey merge docflow indented bom utf16 cronly nel ls ps crinside nelinside"
+_ur="${_tmp}/unreadable-registries"
+mkdir -p "$_ur"
+for _shape in $_ur_shapes; do
+    write_unreadable_registry "$_shape" "$_ur/${_shape}.yaml"
+    _sum="$(shasum -a 256 < "$_ur/${_shape}.yaml")"
+    _out="$(list_enrolled_cluster_urls "$_ur/${_shape}.yaml" /nonexistent 2>&1 >/dev/null)"
+    _rc=$?
+    expect_eq "list_enrolled_cluster_urls refuses the ${_shape} registry with 5" "$_rc" "5"
+    if [[ "$_out" == *"is not an enrollment registry this script can read; nothing was changed."* && "$_out" == *"--all-homes"* ]]; then
+        pass "list_enrolled_cluster_urls ${_shape} refusal names --all-homes"
+    else
+        fail "list_enrolled_cluster_urls ${_shape} refusal; got: $_out"
+    fi
+    expect_eq "list_enrolled_cluster_urls prints no cluster for ${_shape}" \
+        "$(list_enrolled_cluster_urls "$_ur/${_shape}.yaml" /nonexistent 2>/dev/null)" ""
+    _out="$(find_home_id_by_cluster_url "$_ur/${_shape}.yaml" https://c.example 2>/dev/null)"
+    _rc=$?
+    expect_eq "find_home_id_by_cluster_url refuses the ${_shape} registry with 5" "$_rc:$_out" "5:"
+    _out="$(find_home_cluster_url_by_id "$_ur/${_shape}.yaml" d.example 2>/dev/null)"
+    _rc=$?
+    expect_eq "find_home_cluster_url_by_id refuses the ${_shape} registry with 5" "$_rc:$_out" "5:"
+    # The installer's writer: refuses, and neither file is written.
+    _wd="${_tmp}/unreadable-writer-${_shape}"
+    mkdir -p "$_wd"
+    cp "$_ur/${_shape}.yaml" "$_wd/workers.yaml"
+    _out="$(write_worker_yaml "$_wd/worker.yaml" https://e.example mql_wkr_e host1 no HEADLESS 2>&1)"
+    _rc=$?
+    expect_eq "write_worker_yaml refuses the ${_shape} registry with 5" "$_rc" "5"
+    if [[ "$_out" == *"is not an enrollment registry this script can read"* && "$_out" == *"will not rewrite it"* ]]; then
+        pass "write_worker_yaml ${_shape} refusal says it will not rewrite the registry"
+    else
+        fail "write_worker_yaml ${_shape} refusal; got: $_out"
+    fi
+    expect_eq "write_worker_yaml leaves the ${_shape} registry unchanged" \
+        "$(shasum -a 256 < "$_wd/workers.yaml")" "$_sum"
+    if [[ ! -e "$_wd/worker.yaml" ]]; then
+        pass "write_worker_yaml writes no legacy mirror beside the ${_shape} registry"
+    else
+        fail "write_worker_yaml wrote worker.yaml beside the ${_shape} registry"
+    fi
+done
+# yaml.v3 decodes the FIRST document only; a second one is refused
+# rather than read as the registry.
+printf -- '---\n---\nhomes:\n- id: c.example\n  cluster_url: https://c.example\n' > "$_ur/twodocs.yaml"
+list_enrolled_cluster_urls "$_ur/twodocs.yaml" /nonexistent >/dev/null 2>&1
+expect_eq "list_enrolled_cluster_urls refuses a second document with 5" "$?" "5"
+# Deliberately conservative: with no `homes:` header, the word anywhere
+# else is enough to refuse, even where yaml.v3 would find no homes key.
+printf 'version: 1\nlabels:\n  homes: x\n' > "$_ur/nestedtoken.yaml"
+list_enrolled_cluster_urls "$_ur/nestedtoken.yaml" /nonexistent >/dev/null 2>&1
+expect_eq "list_enrolled_cluster_urls refuses the word homes outside a header with 5" "$?" "5"
+
+# Controls: provably no homes key reads as zero (and the writer still
+# writes); CRLF endings and a leading `---` still read their homes.
+_urc="${_tmp}/readable-registries"
+mkdir -p "$_urc"
+: > "$_urc/emptyfile.yaml"
+printf '# nothing here yet\n\n' > "$_urc/comments.yaml"
+printf 'version: 1\nworker_name: host1\nlabels:\n  os: darwin\ncapabilities:\n- HEADLESS\n' > "$_urc/nohomeskey.yaml"
+for _shape in emptyfile comments nohomeskey; do
+    _out="$(list_enrolled_cluster_urls "$_urc/${_shape}.yaml" /nonexistent 2>&1)"
+    _rc=$?
+    expect_eq "list_enrolled_cluster_urls reads the ${_shape} registry as zero" "$_rc:$_out" "0:"
+    _wd="${_tmp}/readable-writer-${_shape}"
+    mkdir -p "$_wd"
+    cp "$_urc/${_shape}.yaml" "$_wd/workers.yaml"
+    if write_worker_yaml "$_wd/worker.yaml" https://e.example mql_wkr_e host1 no HEADLESS >/dev/null 2>&1 \
+        && grep -q 'id: e.example' "$_wd/workers.yaml"; then
+        pass "write_worker_yaml writes over the homes-free ${_shape} registry"
+    else
+        fail "write_worker_yaml over the ${_shape} registry: $(cat "$_wd/workers.yaml" 2>&1)"
+    fi
+done
+printf 'version: 1\r\nhomes:\r\n- id: c.example\r\n  cluster_url: https://c.example\r\n- id: d.example\r\n  cluster_url: https://d.example\r\n' > "$_urc/crlf.yaml"
+printf -- '---\nversion: 1\nhomes:\n%s' "$_ur_items" > "$_urc/docstart.yaml"
+printf 'version: 1\nstate_dir: /x/homes/y\nhomes:\n%s' "$_ur_items" > "$_urc/tokenwithheader.yaml"
+for _shape in crlf docstart tokenwithheader; do
+    expect_eq "list_enrolled_cluster_urls still reads the ${_shape} registry" \
+        "$(list_enrolled_cluster_urls "$_urc/${_shape}.yaml" /nonexistent 2>&1 | tr -d '\r' | tr '\n' ' ')" "https://c.example https://d.example "
+    expect_eq "find_home_cluster_url_by_id still reads the ${_shape} registry" \
+        "$(find_home_cluster_url_by_id "$_urc/${_shape}.yaml" d.example 2>&1 | tr -d '\r')" "https://d.example"
+done
+
+# End to end: every shape, both drivers -- the no-flag line MemQL OS
+# shows, --cluster=URL and the no-flag --dry-run all refuse with 5 and
+# leave HOME byte-identical (the pre-fix scripts removed every token).
+for _platform in mac linux; do
+    _un="uninstall-${_platform}.sh"
+    for _shape in $_ur_shapes; do
+        _h="$(fixture_home "unreadable-${_shape}" "$_platform")"
+        add_second_home "$_h"
+        write_unreadable_registry "$_shape" "${_h}/.memql/workers.yaml"
+        _before="$(tree_fingerprint "$_h")"
+        # shellcheck disable=SC2086  # _auto_flag is empty or one flag
+        _out="$(run_uninstaller "$_un" "$_h" $_auto_flag)"
+        _rc=$?
+        expect_eq "$_un no flags + a ${_shape} registry exits 5" "$_rc" "5"
+        if [[ "$_out" == *"not an enrollment registry this script can read; nothing was changed."* \
+            && "$_out" == *"--all-homes"* ]]; then
+            pass "$_un no flags + a ${_shape} registry is refused naming --all-homes"
+        else
+            fail "$_un no flags + a ${_shape} registry; got: $_out"
+        fi
+        expect_eq "$_un no flags + a ${_shape} registry leaves HOME byte-identical" "$(tree_fingerprint "$_h")" "$_before"
+        # shellcheck disable=SC2086
+        _out="$(run_uninstaller "$_un" "$_h" --cluster=https://c.example $_auto_flag)"
+        _rc=$?
+        expect_eq "$_un --cluster + a ${_shape} registry exits 5" "$_rc" "5"
+        if [[ "$_out" == *"not an enrollment registry this script can read"* && "$_out" == *"REFUSED"* ]]; then
+            pass "$_un --cluster + a ${_shape} registry ends REFUSED"
+        else
+            fail "$_un --cluster + a ${_shape} registry; got: $_out"
+        fi
+        expect_eq "$_un --cluster + a ${_shape} registry leaves HOME byte-identical" "$(tree_fingerprint "$_h")" "$_before"
+        # shellcheck disable=SC2086
+        _out="$(run_uninstaller "$_un" "$_h" --dry-run $_auto_flag)"
+        expect_eq "$_un --dry-run + a ${_shape} registry exits 5" "$?" "5"
+        if [[ "$_out" == *"not an enrollment registry this script can read"* && "$_out" != *"would remove"* ]]; then
+            pass "$_un --dry-run + a ${_shape} registry plans nothing"
+        else
+            fail "$_un --dry-run + a ${_shape} registry; got: $_out"
+        fi
+        expect_eq "$_un --dry-run + a ${_shape} registry leaves HOME byte-identical" "$(tree_fingerprint "$_h")" "$_before"
+    done
+    # The exact piped shape MemQL OS's line runs.
+    _h="$(fixture_home unreadable-piped "$_platform")"
+    write_unreadable_registry jsonpretty "${_h}/.memql/workers.yaml"
+    _before="$(tree_fingerprint "$_h")"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller_piped "$_un" "$_h" $_auto_flag)"
+    expect_eq "$_un piped + a JSON registry exits 5" "$?" "5"
+    expect_eq "$_un piped + a JSON registry leaves HOME byte-identical" "$(tree_fingerprint "$_h")" "$_before"
+    # shellcheck disable=SC2086
+    _out="$(run_uninstaller_piped "$_un" "$_h" --dry-run $_auto_flag)"
+    expect_eq "$_un piped --dry-run + a JSON registry exits 5" "$?" "5"
+    expect_eq "$_un piped --dry-run + a JSON registry leaves HOME byte-identical" "$(tree_fingerprint "$_h")" "$_before"
+done
+
+# The installers refuse BEFORE the download, with nothing under HOME
+# changed: a registry they cannot read is one they would rewrite
+# holding only the new home.
+for _installer in install-mac.sh install-linux.sh; do
+    _ih="${_tmp}/unreadable-install-${_installer}"
+    mkdir -p "${_ih}/.memql"
+    write_unreadable_registry jsonline "${_ih}/.memql/workers.yaml"
+    chmod 600 "${_ih}/.memql/workers.yaml"
+    _before="$(tree_fingerprint "$_ih")"
+    _out="$(cd "$_script_dir" && HOME="$_ih" "./${_installer}" \
+        --token mql_wkr_test --cluster https://e.example \
+        --user-local --no-service \
+        --download-base "file://${_pf_assets}" 2>&1)"
+    _rc=$?
+    expect_eq "$_installer over an unreadable registry exits 5" "$_rc" "5"
+    if [[ "$_out" == *"not an enrollment registry this script can read; nothing was changed."* \
+        && "$_out" != *"INFO: downloading"* ]]; then
+        pass "$_installer refuses an unreadable registry before the download"
+    else
+        fail "$_installer over an unreadable registry; got: $_out"
+    fi
+    expect_eq "$_installer over an unreadable registry leaves HOME byte-identical" "$(tree_fingerprint "$_ih")" "$_before"
+done
+
+# A legacy service file that will not unlink after a sibling-remaining
+# unpair: the enrollment is gone and the worker is back up for the
+# sibling, but the file is a leftover -- Kept with its remedy, exit 5,
+# the PARTIAL summary rather than the SUCCESS line.
+if [[ $EUID -eq 0 ]]; then
+    echo "INFO: running as root; skipping the locked legacy service file check"
+else
+    for _platform in mac linux; do
+        _un="uninstall-${_platform}.sh"
+        _lstate="${_tmp}/legacy-locked-state-${_platform}"
+        mkdir -p "$_lstate"
+        _h="$(fixture_home "legacy-locked" "$_platform")"
+        add_second_home "$_h"
+        case "$_platform" in
+            mac)
+                _ldir="${_h}/Library/LaunchAgents"
+                _lfile="${_ldir}/${LEGACY_LABEL_DARWIN}.plist"
+                : > "${_lstate}/${SERVICE_LABEL_DARWIN}"
+                ;;
+            linux)
+                _ldir="${_h}/.config/systemd/user"
+                _lfile="${_ldir}/${LEGACY_LABEL_LINUX}.service"
+                ;;
+        esac
+        printf 'legacy\n' > "$_lfile"
+        chmod 555 "$_ldir"
+        # shellcheck disable=SC2086
+        _out="$(run_uninstaller_agent "$_lstate" "$_un" "$_h" --cluster=https://c.example $_auto_flag)"
+        _rc=$?
+        chmod 755 "$_ldir"
+        expect_eq "$_un sibling unpair + a legacy service file that will not unlink exits 5" "$_rc" "5"
+        if [[ "$_out" == *"PARTIAL:"* && "$_out" == *"the https://c.example enrollment"* \
+            && "$_out" == *"${_lfile} (could not be removed; delete it by hand)"* \
+            && "$_out" != *"SUCCESS: selected cluster enrollment removed"* ]]; then
+            pass "$_un a legacy service file that will not unlink is Kept with its remedy in the PARTIAL summary"
+        else
+            fail "$_un locked legacy service file; got: $_out"
+        fi
+        if [[ -e "$_lfile" ]] && grep -q 'id: d.example' "${_h}/.memql/workers.yaml" \
+            && ! grep -q 'id: c.example' "${_h}/.memql/workers.yaml"; then
+            pass "$_un locked legacy service file: the enrollment really was removed, the file really is still there"
+        else
+            fail "$_un locked legacy service file state: $(cat "${_h}/.memql/workers.yaml" 2>&1)"
+        fi
+        if [[ "$_platform" == mac ]]; then
+            if [[ -e "${_lstate}/${SERVICE_LABEL_DARWIN}" ]]; then
+                pass "$_un locked legacy plist: the worker for the sibling was reloaded"
+            else
+                fail "$_un locked legacy plist: the worker for the sibling was not reloaded"
+            fi
+        fi
+    done
+fi
 
 # ---------------------------------------------------------------
 # Summary

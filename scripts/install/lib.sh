@@ -319,6 +319,91 @@ function require_cluster_url_flag() {
     fi
 }
 
+# workers_registry_readable answers whether the text readers in this file
+# see every home the binary's decoder (gopkg.in/yaml.v3, into
+# internal/worker/homes.go's WorkersFile) sees in the workers.yaml at $1.
+# They read ONE shape: a mapping rooted at column 0, in LF or CRLF lines,
+# whose `homes:` key is a block list of block mappings (the spellings
+# find_home_cluster_url_by_id lists) or Go's `homes: []`. yaml.v3 decodes
+# a great deal more -- a flow or JSON root, a quoted, spaced, tabbed,
+# explicit (`? homes`), anchored, tagged or escaped ("hom\x65s") key, a
+# merge key, an indented root, a byte-order mark or UTF-16, a CR, NEL,
+# LS or PS line break -- and every one of those read here as NO homes: a
+# no-flag or --cluster uninstall took the --all-homes path over every
+# token, and the next install rewrote the registry holding only its own
+# home (a verification finding). So the answer is yes only for that one
+# shape, or for a file that provably holds no homes key at all: a root
+# of plain column-0 keys, none of them homes, and the word `homes`
+# nowhere else in it. Anything else is a no, and every caller turns a no
+# into a refusal (5, refuse_unreadable_registry), never into "zero
+# enrollments". Inside the block, only a block-mapping item (`- key:`),
+# a continuation (`key:`), a bare `-`, a blank or a comment may appear:
+# a sequence of flow mappings (`- {id: ..., cluster_url: ...}`) is valid
+# YAML the binary decodes and the block readers cannot see into. Bytes,
+# not characters (LC_ALL=C), so the line-break and BOM tests are exact
+# in every locale; awk alone, because the uninstallers run under a PATH
+# that holds little else.
+function workers_registry_readable() {
+    LC_ALL=C awk '
+        function plain_key(s) { return s ~ /^[A-Za-z_][A-Za-z0-9_-]*[ \t]*:([[:space:]]|$)/ }
+        BEGIN { ok = 1; headers = 0; in_homes = 0; content = 0; docstart = 0; word = 0 }
+        {
+            line = $0
+            if (NR == 1 && (substr(line, 1, 3) == "\357\273\277" || substr(line, 1, 2) == "\376\377" || substr(line, 1, 2) == "\377\376")) ok = 0
+            if (substr(line, length(line), 1) == "\r") line = substr(line, 1, length(line) - 1)
+            if (index(line, "\r") || index(line, "\302\205") || index(line, "\342\200\250") || index(line, "\342\200\251")) ok = 0
+            if (line ~ /^[[:space:]]*(#.*)?$/) { if (index(line, "homes")) word = 1; next }
+            # One leading document marker is harmless; any other marker
+            # starts a document yaml.v3 never reads.
+            if (!content && !docstart && line ~ /^---[[:space:]]*(#.*)?$/) { docstart = 1; next }
+            if (!content) { content = 1; if (!plain_key(line)) ok = 0 }
+            if (line ~ /^[^[:space:]]/ && line !~ /^-([[:space:]]|$)/) {
+                if (!plain_key(line)) { ok = 0; next }
+                key = line
+                sub(/[ \t]*:.*$/, "", key)
+                in_homes = 0
+                if (key == "homes") {
+                    if (line ~ /^homes:[[:space:]]*(#.*)?$/) { headers++; in_homes = 1; next }
+                    if (line ~ /^homes:[[:space:]]*\[[[:space:]]*\][[:space:]]*(#.*)?$/) { headers++; next }
+                    ok = 0
+                    next
+                }
+            }
+            if (index(line, "homes")) word = 1
+            if (!in_homes) next
+            item = line
+            sub(/^[[:space:]]+/, "", item)
+            sub(/^-([[:space:]]+|$)/, "", item)
+            if (item != "" && item !~ /^[A-Za-z_][A-Za-z0-9_]*:([[:space:]]|$)/) ok = 0
+        }
+        END { exit ((ok && headers <= 1 && (headers == 1 || !word)) ? 0 : 1) }
+    ' "$1"
+}
+
+# refuse_unreadable_registry prints the refusal for the workers.yaml at
+# $1 that workers_registry_readable said no to, then $2 -- the way past
+# it for this script -- and returns 5, the binary's own code for
+# enrollment files it cannot use.
+function refuse_unreadable_registry() {
+    echo "ERROR: $1 is not an enrollment registry this script can read; nothing was changed." >&2
+    echo "       $2" >&2
+    return 5
+}
+
+# The installer's way past an unreadable registry: it never writes one
+# (write_worker_yaml would keep only the homes it can see).
+INSTALL_REGISTRY_REMEDY="This installer will not rewrite it: the homes it holds would be dropped. Restore it to a block list (a homes: line, then one '- id:' item per cluster), then re-run."
+
+# preflight_registry refuses (5) before an install changes anything when
+# ~/.memql/workers.yaml exists and is not a registry the installer's
+# readers can read -- step 3 would refuse the same file after the
+# binary, the app and the state directory were already in place.
+function preflight_registry() {
+    local workers_path="${HOME}/.memql/workers.yaml"
+    [[ -e "$workers_path" ]] || return 0
+    workers_registry_readable "$workers_path" || refuse_unreadable_registry "$workers_path" "$INSTALL_REGISTRY_REMEDY"
+}
+
 # find_home_id_by_cluster_url prints the id of a home whose cluster_url
 # matches, or empty. Used so install (URL-host id) and pair (--home-id
 # local) refresh the same enrollment without --force.
@@ -329,11 +414,16 @@ function require_cluster_url_flag() {
 # one cluster. An exact match wins over a host match. Matching on the
 # exact string alone appended a second home for the same cluster whenever
 # the URL was spelled differently, and one machine then held two streams
-# to one cluster with two tokens.
+# to one cluster with two tokens. A registry it cannot see into is a
+# refusal (5), never "no home matches" (workers_registry_readable).
 function find_home_id_by_cluster_url() {
     local workers_path="$1"
     local cluster_url="$2"
     [[ -f "$workers_path" ]] || { echo ""; return 0; }
+    if ! workers_registry_readable "$workers_path"; then
+        refuse_unreadable_registry "$workers_path" "$INSTALL_REGISTRY_REMEDY"
+        return 5
+    fi
     awk -v want="$cluster_url" '
         function norm(s) {
             gsub(/^[[:space:]]+|[[:space:]]+$/, "", s)
@@ -383,11 +473,17 @@ function find_home_id_by_cluster_url() {
 # the dash line or an inner line, and the next column-0 key closes the list.
 # A review found the installer's readers behind the uninstaller's: a
 # commented header or a url-first item made the next install DROP every
-# sibling home it could not see.
+# sibling home it could not see. Every one of them asks
+# workers_registry_readable first and refuses (5) a file it says no to:
+# any other spelling of the registry read as no homes at all.
 function find_home_cluster_url_by_id() {
     local workers_path="$1"
     local home_id="$2"
     [[ -f "$workers_path" ]] || { echo ""; return 0; }
+    if ! workers_registry_readable "$workers_path"; then
+        refuse_unreadable_registry "$workers_path" "$INSTALL_REGISTRY_REMEDY"
+        return 5
+    fi
     awk -v want="$home_id" '
         function settle() { if (cur == want && curl != "") { print curl; found=1; exit } cur=""; curl="" }
         BEGIN { in_homes=0; cur=""; curl=""; found=0 }
@@ -878,6 +974,15 @@ function write_worker_yaml() {
     # changes nothing), or "remapped" one under --force.
     WORKER_YAML_ACTION="created"
 
+    # A registry the readers below cannot see into would be rewritten
+    # holding only this home, every sibling dropped: refuse it before
+    # anything is written. preflight_registry makes the same call before
+    # an install changes anything; this is the writer's own guard.
+    if [[ -e "$workers_path" ]] && ! workers_registry_readable "$workers_path"; then
+        refuse_unreadable_registry "$workers_path" "$INSTALL_REGISTRY_REMEDY"
+        return 5
+    fi
+
     mkdir -p "$dir"
 
     # Match semantics (aligned with Go UpsertHome):
@@ -889,14 +994,14 @@ function write_worker_yaml() {
     # --force never means "binary exists" and never wipes sibling homes.
     if [[ -e "$workers_path" ]]; then
         local by_url
-        by_url="$(find_home_id_by_cluster_url "$workers_path" "$cluster_url")"
+        by_url="$(find_home_id_by_cluster_url "$workers_path" "$cluster_url")" || return $?
         by_url="$(printf '%s' "$by_url" | tr -d '\r' | head -1)"
         if [[ -n "$by_url" ]]; then
             match_id="$by_url"
             WORKER_YAML_ACTION="refreshed"
             echo "INFO: refreshing existing home ${match_id} for ${cluster_url} (token upsert; --force not required)"
         else
-            existing_url="$(find_home_cluster_url_by_id "$workers_path" "$home_id")"
+            existing_url="$(find_home_cluster_url_by_id "$workers_path" "$home_id")" || return $?
             if [[ -n "$existing_url" ]]; then
                 if same_cluster_url "$existing_url" "$cluster_url"; then
                     match_id="$home_id"
@@ -978,6 +1083,8 @@ function write_worker_yaml() {
             # Emit sibling home blocks at the same indentation as the new home.
             # Go yaml.Marshal uses four spaces; shell installs use two. Keeping
             # siblings verbatim makes the next additive install invalid YAML.
+            # The guard at the top of this function already refused a file
+            # workers_registry_readable says this walk cannot see into.
             awk -v keep_id="$match_id" '
                 function emit() { if (buf != "" && !skip) printf "%s", buf; buf = ""; skip = 0 }
                 function note_id(line,    id) {
@@ -1147,6 +1254,18 @@ function record_scoped_restart_failure() {
     record_removed "the ${CLUSTER_URL} enrollment from ${HOME}/.memql/workers.yaml (${OTHER_HOMES} other enrollment(s) remain, with the shared runtime)"
     [[ -z "$restart" ]] || record_kept "the worker service for the remaining enrollment(s) (stopped by this run and NOT restarted; start it with:  ${restart})"
     [[ -z "$extra" ]] || record_kept "$extra"
+}
+
+# record_scoped_leftovers settles a sibling-remaining removal that
+# SUCCEEDED but left a file behind (a legacy service file that would not
+# unlink, recorded Kept by remove_path_if_present): the enrollment is
+# gone (Removed), and the leftover code is returned so the driver's
+# finish prints the PARTIAL summary instead of the SUCCESS line. 0 when
+# nothing was left over.
+function record_scoped_leftovers() {
+    [[ "$UNINSTALL_LEFTOVER_RC" -ne 0 ]] || return 0
+    record_removed "the ${CLUSTER_URL} enrollment from ${HOME}/.memql/workers.yaml (${OTHER_HOMES} other enrollment(s) remain, with the shared runtime)"
+    return "$UNINSTALL_LEFTOVER_RC"
 }
 
 # under_memql_home answers whether $1 lies inside ${HOME}/.memql, the
@@ -1579,47 +1698,28 @@ function count_lines() {
 # host, however the URL is spelled -- print once, because unpairing by
 # URL removes them together and they are one enrollment to the person.
 # Disabled homes count: they are enrollments a scoped removal keeps.
-# Neither file, or `homes: []`, prints nothing. The reader accepts
-# every block-list spelling yaml.v3 does (a review found three it
-# missed, each read as ZERO enrollments): items indented under the key
-# or at column 0 (a mapping-rooted document has no other column-0
-# dash, so one cannot start a new top-level key), a comment on the
-# `homes:` line, and an item whose first key is cluster_url rather
-# than id -- any `- ` starts an item, whatever key follows it.
+# Neither file, `homes: []`, or a registry with provably no homes key
+# prints nothing. The reader accepts every block-list spelling yaml.v3
+# does (a review found three it missed, each read as ZERO
+# enrollments): items indented under the key or at column 0 (a
+# mapping-rooted document has no other column-0 dash, so one cannot
+# start a new top-level key), a comment on the `homes:` line, and an
+# item whose first key is cluster_url rather than id -- any `- ` starts
+# an item, whatever key follows it. Every OTHER spelling of the
+# registry is a refusal (5), never zero: see workers_registry_readable.
 function list_enrolled_cluster_urls() {
     local workers_path="$1" legacy_path="$2"
     if [[ -f "$workers_path" && ! -L "$workers_path" ]]; then
-        # The registry's `homes:` key comes in two shapes this reader
-        # understands: a block list, or Go's `homes: []` for a machine
-        # that unpaired its last cluster. Anything else (a flow-style or
-        # half-edited list) is a file the shell must not decide from --
-        # "no enrollment" over an unreadable registry would delete a
-        # token file nobody could read. 5, the binary's own code for it.
-        # The gate judges the ITEMS too, not only the header: a block
-        # sequence of flow mappings (`- {id: ..., cluster_url: ...}`) is
-        # valid YAML the binary decodes and read as ZERO enrollments by
-        # the block reader below, and a no-flag run then removed every
-        # token (a review finding). Inside the block, only a block-mapping
-        # item (`- key:`), a continuation (`key:`), a bare `-`, a blank or
-        # a comment may appear; anything else refuses the whole file.
-        if ! awk 'BEGIN { ok = 1; in_homes = 0 }
-                  /^homes:/ {
-                      if ($0 !~ /^homes:[[:space:]]*(\[[[:space:]]*\])?[[:space:]]*(#.*)?$/) ok = 0
-                      in_homes = ($0 ~ /^homes:[[:space:]]*(#.*)?$/)
-                      next
-                  }
-                  !in_homes { next }
-                  /^[^[:space:]#-]/ { in_homes = 0; next }
-                  /^[[:space:]]*(#.*)?$/ { next }
-                  {
-                      line = $0
-                      sub(/^[[:space:]]+/, "", line)
-                      sub(/^-([[:space:]]+|$)/, "", line)
-                      if (line != "" && line !~ /^[A-Za-z_][A-Za-z0-9_]*:([[:space:]]|$)/) ok = 0
-                  }
-                  END { exit ok ? 0 : 1 }' "$workers_path"; then
-            echo "ERROR: $workers_path is not an enrollment registry this script can read; nothing was changed." >&2
-            echo "       Restore it, or pass --all-homes to remove everything on this machine." >&2
+        # The registry comes in the shapes workers_registry_readable
+        # accepts, or this script does not decide from it: "no
+        # enrollment" over a registry the block reader below cannot see
+        # into took the --all-homes path and deleted every token, the
+        # siblings' too, under exit 0 (a flow or JSON root, a quoted or
+        # spaced key, a BOM, CR-only lines ... -- review and verification
+        # findings). 5, the binary's own code for it; --all-homes is the
+        # way past, because it reads nothing.
+        if ! workers_registry_readable "$workers_path"; then
+            refuse_unreadable_registry "$workers_path" "Restore it, or pass --all-homes to remove everything on this machine."
             return 5
         fi
         awk '
