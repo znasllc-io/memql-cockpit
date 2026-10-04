@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/znasllc-io/memql-cockpit/internal/worker/apps"
+	"github.com/znasllc-io/memql-cockpit/internal/worker/harness"
 )
 
 // mcpconfig.go writes the app's MCP configuration so a delegated run can
@@ -39,7 +40,9 @@ import (
 
 const (
 	// mcpServerName is what MemQL calls itself inside the app's config.
-	mcpServerName = "memql"
+	// Aliased from the harness, which names it in Claude Code's
+	// permission grant and reads it back off the init event.
+	mcpServerName = harness.MCPServerName
 
 	// configFileMode is 0600 on every file this writes. The bearer is in
 	// there.

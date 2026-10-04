@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -24,12 +23,18 @@ type FleetOptions struct {
 	WorkersPath string
 	Policy      *tools.Policy
 	PolicyPath  string
+	// WorkerPaths are this worker's own files, which no app session may
+	// touch (sessionWorkerPaths).
+	WorkerPaths []string
 	// ToolsFor builds the dispatcher one home's stream serves tool calls
 	// through. PER HOME, because the consent gate inside it is per home
 	// (memql-cockpit#433): a window opened for one cluster must admit
 	// nothing another cluster dispatches.
-	ToolsFor   func(homeID string) ToolDispatcher
-	Apps       AppInventory
+	ToolsFor func(homeID string) ToolDispatcher
+	// AppsFor builds the app inventory one home reports. PER HOME, because
+	// app consent is per cluster (policy.yaml apps.homes): the same app is
+	// allowed for one cluster and blocked for another. Nil reports no apps.
+	AppsFor    func(homeID string) AppInventory
 	Models     ModelInventory
 	Discoverer *models.Discoverer
 	Metrics    *Metrics
@@ -53,8 +58,9 @@ type Fleet struct {
 	machineID   string
 	policy      *tools.Policy
 	policyPath  string
+	workerPaths []string
 	toolsFor    func(homeID string) ToolDispatcher
-	apps        AppInventory
+	appsFor     func(homeID string) AppInventory
 	modelsInv   ModelInventory
 	discoverer  *models.Discoverer
 	metrics     *Metrics
@@ -89,8 +95,9 @@ func NewFleet(opts FleetOptions) (*Fleet, error) {
 		managed:     make(map[string]*managedHome),
 		policy:      opts.Policy,
 		policyPath:  opts.PolicyPath,
+		workerPaths: opts.WorkerPaths,
 		toolsFor:    opts.ToolsFor,
-		apps:        opts.Apps,
+		appsFor:     opts.AppsFor,
 		modelsInv:   opts.Models,
 		discoverer:  opts.Discoverer,
 		metrics:     opts.Metrics,
@@ -273,22 +280,25 @@ func (f *Fleet) buildHome(home Home, machineID string) (homeRun, error) {
 		Logger:     homeLogger,
 		StateDir:   cfg.StateDir,
 		ClusterURL: cfg.ClusterURL,
-		Allowed: func(appID string) bool {
-			if f.policy == nil {
-				return false
-			}
-			for _, allowed := range f.policy.AppsAllow() {
-				if strings.EqualFold(strings.TrimSpace(allowed), appID) {
-					return true
-				}
-			}
-			return false
-		},
+		// This cluster's own consent, never another's (apps.homes).
+		Allowed: appsAllowedFor(f.policy, home.ID),
 		// The owner's apps.levels (memql-cockpit#438). The method value is
 		// safe on a nil policy: AppLevels answers "no entries", which is
 		// the built-in table.
 		Levels:         f.policy.AppLevels,
 		CheckWorkspace: f.policyCheckPath(),
+		// Where a session goes when the engine names no workspace: under
+		// fs.workspace_root when the owner set one, and under this home
+		// either way, so two clusters never share a directory
+		// (appsession/workspace.go). Safe on a nil policy for AppLevels'
+		// reason: WorkspaceRoot answers "", the platform's own directory.
+		Home:          home.ID,
+		WorkspaceRoot: f.policy.WorkspaceRoot,
+		// What a session may neither run in nor let its app read or write
+		// (appsession/protected.go). DenyPaths is nil-safe for AppLevels'
+		// reason: a nil policy denies nothing beyond the worker's own.
+		WorkerPaths: f.workerPaths,
+		DenyPaths:   f.policy.DenyPaths,
 	})
 	// Per-home Calls so a disconnect on home A does not StopAll
 	// generations serving home B on the shared GPU -- over one Limiter,
@@ -315,6 +325,10 @@ func (f *Fleet) buildHome(home Home, machineID string) (homeRun, error) {
 	if f.toolsFor != nil {
 		dispatcher = f.toolsFor(home.ID)
 	}
+	var appInventory AppInventory
+	if f.appsFor != nil {
+		appInventory = f.appsFor(home.ID)
+	}
 	newRunner := f.newRunner
 	if newRunner == nil {
 		newRunner = NewRunner
@@ -323,7 +337,7 @@ func (f *Fleet) buildHome(home Home, machineID string) (homeRun, error) {
 		Logger:         homeLogger,
 		Config:         cfg,
 		Tools:          dispatcher,
-		Apps:           f.apps,
+		Apps:           appInventory,
 		Models:         f.modelsInv,
 		Calls:          calls,
 		Sessions:       sessions,

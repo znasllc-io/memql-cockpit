@@ -64,6 +64,17 @@ const (
 	HarnessCodexMCP = "codex-mcp"
 )
 
+// MCPServerName is what MemQL calls itself in every app's MCP
+// configuration.
+//
+// It lives here rather than beside the configuration writer
+// (appsession/mcpconfig.go) because a harness now reads it too: Claude
+// Code's permission grant names the server (`mcp__memql`) and its init
+// event reports the server's status by that name. Two spellings of one
+// name are two things a rename can pull apart in silence, and the
+// symptom would be a session whose MemQL tools are all refused.
+const MCPServerName = "memql"
+
 // Chunk streams a harness emits. The first three are new here; stdout and
 // stderr keep the meaning they had, so an operator reading a transcript
 // from before this change reads the same words after it.
@@ -221,6 +232,16 @@ type Spec struct {
 	// built-in table with the machine owner's policy.yaml entries laid
 	// over it.
 	Levels Table
+	// DenyPaths are absolute paths the app must neither READ nor write:
+	// this worker's own files (its tokens, and policy.yaml, whose
+	// apps.allow is the app consent gate) and this machine's fs.deny list.
+	// The session refuses a workspace that overlaps one, so none is ever
+	// inside the directory the app works in.
+	//
+	// Claude Code's harness hands them to the app as deny rules and as its
+	// sandbox's own filesystem lists (claudeGrantArgs). The Codex harnesses
+	// do not yet: Codex runs under the sandbox its own configuration names.
+	DenyPaths []string
 	// Launch forks every process this harness needs. Required: a nil
 	// Launch is a programming error rather than a reason to fall back
 	// to os/exec, because falling back would silently lose the process

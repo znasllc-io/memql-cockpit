@@ -165,15 +165,15 @@ func TestModelRuntimes_ReloadReplacesRatherThanMerges(t *testing.T) {
 // a policy.yaml that never mentions it behaves exactly as before.
 func TestModelsPolicy_DoesNotDisturbTheRest(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "policy.yaml")
-	if err := os.WriteFile(path, []byte("apps:\n  allow:\n    - claude-code\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("apps:\n  homes:\n    local:\n      allow:\n        - claude-code\n"), 0o600); err != nil {
 		t.Fatalf("write policy: %v", err)
 	}
 	p, err := LoadPolicy(path)
 	if err != nil {
 		t.Fatalf("LoadPolicy: %v", err)
 	}
-	if got := p.AppsAllow(); len(got) != 1 || got[0] != "claude-code" {
-		t.Errorf("apps.allow = %v", got)
+	if got := p.AppsAllowFor("local"); len(got) != 1 || got[0] != "claude-code" {
+		t.Errorf("app consent = %v", got)
 	}
 	if got := p.ModelsAllow(); len(got) != 0 {
 		t.Errorf("models.allow = %v, want empty", got)
@@ -215,7 +215,7 @@ func TestModelsPull_ThreeStatesOverAPolicyFile(t *testing.T) {
 			want: true,
 		},
 		"absent because the file has no models block": {
-			doc:  "apps:\n  allow:\n    - claude-code\n",
+			doc:  "apps:\n  homes:\n    local:\n      allow:\n        - claude-code\n",
 			want: true,
 		},
 		"said out loud": {

@@ -19,14 +19,14 @@ import (
 // back to the built-in one, it REFUSES its level with a sentence naming the
 // line to fix.
 
-// THE BUILT-IN TABLE IS THE DEFAULT. apps.allow is default-deny because it
+// THE BUILT-IN TABLE IS THE DEFAULT. App consent is default-deny because it
 // decides WHETHER an app runs here; levels decide HOW it runs once it may,
 // and the cockpit ships an answer for that. Every policy.yaml written before
 // this key existed must keep working, at the built-in table.
 func TestAppLevels_AbsentBlockMeansTheBuiltInTable(t *testing.T) {
 	for name, p := range map[string]*tools.Policy{
 		"the default policy":      tools.DefaultPolicy(),
-		"a file with no levels":   policyFrom(t, "apps:\n  allow: [claude-code]\n"),
+		"a file with no levels":   policyFrom(t, "apps:\n  homes:\n    local:\n      allow: [claude-code]\n"),
 		"a file with no apps key": policyFrom(t, "shell:\n  allow: []\n"),
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -84,10 +84,10 @@ func TestAppLevels_LoadsTheDocumentedShape(t *testing.T) {
 	}
 }
 
-// The ids are the engine's, and apps.allow already reads them without
+// The ids are the engine's, and app consent already reads them without
 // regard to case or surrounding space; a level entry does the same, so the
 // two keys an owner writes side by side agree about what they name.
-func TestAppLevels_AppIDsReadLikeAppsAllow(t *testing.T) {
+func TestAppLevels_AppIDsReadLikeAppConsent(t *testing.T) {
 	p := policyFrom(t, "apps:\n  levels:\n    Claude-Code:\n      strong:\n        model: opus\n")
 	table, _ := p.AppLevels("claude-code")
 	if table["strong"].Model != "opus" {
@@ -202,14 +202,16 @@ func TestAppLevels_AScalarEntryRefusesItsLevelNotTheFile(t *testing.T) {
 	p := policyFrom(t, `shell:
   allow: [terraform]
 apps:
-  allow: [claude-code]
+  homes:
+    local:
+      allow: [claude-code]
   levels:
     claude-code:
       reasoning: opus
       fast: {model: haiku}
 `)
-	if got := p.AppsAllow(); len(got) != 1 || got[0] != "claude-code" {
-		t.Fatalf("apps.allow = %v; one bad level entry took the rest of the file with it", got)
+	if got := p.AppsAllowFor("local"); len(got) != 1 || got[0] != "claude-code" {
+		t.Fatalf("app consent = %v; one bad level entry took the rest of the file with it", got)
 	}
 	if err := p.CheckShell("terraform plan"); err != nil {
 		t.Errorf("the owner's shell allow list was lost to a level entry: %v", err)
@@ -225,13 +227,13 @@ apps:
 
 func TestAppLevels_ABlockOfTheWrongShapeIsAProblem(t *testing.T) {
 	for name, body := range map[string]string{
-		"a list of apps":   "apps:\n  allow: [codex]\n  levels:\n    - claude-code\n",
-		"a word for a app": "apps:\n  allow: [codex]\n  levels:\n    claude-code: opus\n",
+		"a list of apps":   "apps:\n  homes:\n    local:\n      allow: [codex]\n  levels:\n    - claude-code\n",
+		"a word for a app": "apps:\n  homes:\n    local:\n      allow: [codex]\n  levels:\n    claude-code: opus\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			p := policyFrom(t, body)
-			if got := p.AppsAllow(); len(got) != 1 {
-				t.Fatalf("apps.allow = %v; the file was lost to the levels block", got)
+			if got := p.AppsAllowFor("local"); len(got) != 1 {
+				t.Fatalf("app consent = %v; the file was lost to the levels block", got)
 			}
 			if problems := p.AppLevelProblems(); len(problems) != 1 || !strings.Contains(problems[0], "is ignored") {
 				t.Errorf("problems = %v, want one sentence saying the block is ignored", problems)
@@ -290,7 +292,7 @@ func TestAppLevels_ReplaceOnReload(t *testing.T) {
 		t.Errorf("fast = %+v, want the reloaded entry", table["fast"])
 	}
 
-	write("apps:\n  allow: [claude-code]\n")
+	write("apps:\n  homes:\n    local:\n      allow: [claude-code]\n")
 	if err := p.Reload(); err != nil {
 		t.Fatal(err)
 	}

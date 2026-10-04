@@ -37,7 +37,8 @@ import (
 //	memql worker setup             Re-run TCC permissions check (computeruse builds)
 //	memql worker setup --inference Install a model runtime, pull models, allow them
 //	memql worker config            Print effective config (all homes)
-//	memql worker apps              Print the local apps and what each level runs them at
+//	memql worker apps              Print the local apps, which clusters may use them, and each level
+//	memql worker apps --allow <id> --home <cluster>   Allow an app for one cluster (--deny withdraws)
 //	memql worker unpair --cluster  Remove or disable one home
 //
 // `pair` is the primary entry: it walks the user from "I have an
@@ -330,6 +331,14 @@ func handleRun(args []string) {
 	}
 	logLevelProblems(logger, policy)
 
+	// What no app session may touch because it is this worker's own: the
+	// tokens, policy.yaml's consent gate, the state (apppaths.go).
+	stateDirs := []string{legacyCfg.StateDir}
+	if !singleHome {
+		stateDirs = append(stateDirs, workers.machineRoot())
+	}
+	workerPaths := sessionWorkerPaths(*configPath, *workersPath, stateDirs, *tokenFile, consent.DefaultSocketPath())
+
 	// Consent gate (memql-cockpit#64). ONE socket for the whole
 	// supervisor, and one window PER CLUSTER behind it (memql-cockpit
 	// #433): each home's dispatcher asks its own home's Manager, so a
@@ -356,9 +365,13 @@ func handleRun(args []string) {
 		}
 	}
 
+	// Before the first lookup of any binary: a LaunchAgent's PATH has no
+	// directory an app installer uses (servicepath.go).
+	ensureServicePath(logger)
+
 	discoverer := &models.Discoverer{}
 	modelInventory := NewModelInventory(policy, discoverer)
-	appInv := NewAppInventory(policy)
+	appInventories := NewAppInventories(policy, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	sigCh := make(chan os.Signal, 1)
@@ -377,18 +390,20 @@ func handleRun(args []string) {
 			Logger:     logger,
 			StateDir:   legacyCfg.StateDir,
 			ClusterURL: legacyCfg.ClusterURL,
-			Allowed: func(appID string) bool {
-				for _, allowed := range policy.AppsAllow() {
-					if strings.EqualFold(strings.TrimSpace(allowed), appID) {
-						return true
-					}
-				}
-				return false
-			},
+			Allowed:    appsAllowedFor(policy, legacyCfg.Home),
 			// The owner's apps.levels, read per session so a SIGHUP
 			// reaches the next one (memql-cockpit#438).
 			Levels:         policy.AppLevels,
 			CheckWorkspace: policy.CheckPath,
+			// Where a session goes when the engine names no workspace:
+			// under fs.workspace_root when the owner set one, filed by
+			// this home either way (appsession/workspace.go).
+			Home:          legacyCfg.Home,
+			WorkspaceRoot: policy.WorkspaceRoot,
+			// What a session may neither run in nor let its app read or
+			// write (appsession/protected.go).
+			WorkerPaths: workerPaths,
+			DenyPaths:   policy.DenyPaths,
 		})
 		stopSessions = sessions.StopAll
 		calls := modelcall.NewManager(modelcall.Options{
@@ -407,7 +422,7 @@ func handleRun(args []string) {
 			Logger:         logger,
 			Config:         legacyCfg,
 			Tools:          toolsFor(legacyCfg.Home),
-			Apps:           appInv,
+			Apps:           appInventories.For(legacyCfg.Home),
 			Models:         modelInventory,
 			Calls:          calls,
 			Sessions:       sessions,
@@ -437,8 +452,9 @@ func handleRun(args []string) {
 			WorkersPath: *workersPath,
 			Policy:      policy,
 			PolicyPath:  policyPath,
+			WorkerPaths: workerPaths,
 			ToolsFor:    toolsFor,
-			Apps:        appInv,
+			AppsFor:     appInventories.For,
 			Models:      modelInventory,
 			Discoverer:  discoverer,
 			Metrics:     metrics,
@@ -983,9 +999,11 @@ func printUsage() {
 	fmt.Println("  memql worker models        Print the local models this machine would offer,")
 	fmt.Println("                                     or the reason it offers none. --pull <id>")
 	fmt.Println("                                     pulls one; --allow <id> offers one.")
-	fmt.Println("  memql worker apps          Print the local apps (Claude Code, Codex), whether")
-	fmt.Println("                                     the cluster can use them here and why not, and")
+	fmt.Println("  memql worker apps          Print the local apps (Claude Code, Codex), which")
+	fmt.Println("                                     clusters can use them here and why not, and")
 	fmt.Println("                                     the model and effort each level runs them at.")
+	fmt.Println("                                     --allow <id> [--home <cluster>] allows one for")
+	fmt.Println("                                     one cluster; --deny <id> withdraws it.")
 	fmt.Println("  memql worker hardware      Print what this machine reports about itself:")
 	fmt.Println("                                     chip, memory, GPU, runtimes, and the class")
 	fmt.Println("                                     that decides which models are recommended.")
@@ -1036,7 +1054,15 @@ func printUsage() {
 // names says so NOWHERE else -- and an owner's entry that silently did
 // nothing reads exactly like one that worked. `memql worker apps` prints the
 // same list for an owner who is not reading this log.
+// logLevelProblems logs every problem policy.yaml's apps block has, when
+// the file is read and on every SIGHUP: the consent entries that allow
+// nothing (including the retired machine-wide apps.allow) and the levels
+// the app would misread. A consent that silently did nothing looks, from
+// the cluster, exactly like a machine with no app.
 func logLevelProblems(logger *slog.Logger, policy *tools.Policy) {
+	for _, problem := range policy.AppConsentProblems() {
+		logger.Warn("policy.yaml app consent has a problem", "problem", problem)
+	}
 	for _, problem := range policy.AppLevelProblems() {
 		logger.Warn("policy.yaml apps.levels has a problem", "problem", problem)
 	}

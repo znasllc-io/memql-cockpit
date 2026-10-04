@@ -171,7 +171,14 @@ machine side.
 - **`internal/worker/apps`** detects `claude` / `codex` on PATH, their
   versions and their auth state, and the worker reports the inventory on
   `Register` and **every** `Heartbeat`. The engine derives `app:<id>` routing
-  labels from it and has no other way to learn any of it.
+  labels from it and has no other way to learn any of it. **Which PATH** is
+  the worker's own, extended once at start by `ensureServicePath`
+  (`servicepath.go`): a LaunchAgent gets launchd's four system directories
+  and nothing else, which found no app an installer put in `~/.local/bin`
+  or `/opt/homebrew/bin`. The app directories are APPENDED, never
+  prepended (the worker runs `launchctl`/`plutil` by bare name), and every
+  plist writer writes the same PATH. `ResolveSpec` returns the path it
+  resolved, so a session starts the very binary the inventory reported.
 - **`internal/worker/appsession`** runs the sessions:
   `AppSessionStart / Chunk / Control / End`, kinds `run` / `open` / `attach`,
   plus the MCP config writer, the Library pull/push, and the platform launch
@@ -213,15 +220,55 @@ Four rules here are load-bearing, and each is the kind that fails silently:
 2. **`apps_present` is always true on the beat.** proto3 cannot distinguish an
    empty repeated field from an absent one; `false` means "this build does not
    report apps", which is wrong for a machine that just uninstalled one.
-3. **`apps.allow` in `policy.yaml` is default-deny.** An app session does what
-   `workerHost.exec` does. An app present but unlisted is reported with
-   `allowed=false` rather than omitted -- the portal can then say "present,
-   blocked" instead of rendering it identically to "not installed".
+3. **App consent is default-deny, PER CLUSTER** (`policy.yaml
+   apps.homes.<home>.allow`). An app session does what `workerHost.exec`
+   does, and a machine-wide list meant consent given for a local test
+   cluster reached production too -- the crossing the per-home tool consent
+   windows (#433) rule out. Each home gets its own inventory and its own
+   session gate; a cluster the block does not name is allowed NOTHING. The
+   retired machine-wide `apps.allow` is not read: it is reported as a
+   problem naming `memql worker apps --allow <app> --home <cluster>`, which
+   writes the entry (a textual edit, `inference.MergeList`) and removes the
+   old list. The block REPLACES on SIGHUP, so a `--deny` needs no restart.
+   An app present but unlisted is reported with `allowed=false` rather than
+   omitted -- the portal can then say "present, blocked" instead of
+   rendering it identically to "not installed".
 4. **The MCP config file is deleted on every exit path.** The per-run bearer
    **cannot be revoked** (the engine's verify path is JWKS-only and DB-free),
    so deletion is the security control, not housekeeping. A `defer` is not
    enough: every write is recorded in a ledger under the state dir, and
    `appsession.Sweep` clears what a SIGKILL left behind at the next start.
+
+**AN EMPTY `AppSessionStart.workspace` IS THE MACHINE'S CHOICE**, never a
+refusal: the engine cannot know a path here. `appsession/workspace.go` makes
+`<fs.workspace_root or the platform data dir>/<home>/<run_id or session_id>`,
+passes it through `CheckWorkspace` like an engine-named path, and removes it
+at End only when it was keyed by the session -- and not when the push failed
+or the kind is `open` (kept, logged). Never under `~/.memql` (tokens,
+consent). Read the RESOLVED workspace (`session.workspace`), not the start's
+field: the start's is empty for a chosen directory, and the output push reading
+it pushes nothing the app made.
+
+**THE WORKSPACE IS THE APP'S WRITE GRANT** (`appsession/protected.go`): any
+workspace, engine-named or chosen, that is, contains or lies inside the
+worker's own files (`sessionWorkerPaths`: the config dir, state, token file,
+consent socket) or an `fs.deny` entry is refused -- `CheckPath` alone accepts
+`$HOME` and `/`. The same paths reach the app as `harness.Spec.DenyPaths`,
+denied for READING too: without them the sandbox confines writes alone.
+
+**CLAUDE CODE'S PERMISSIONS ARE IN THE ARGV, NOT IN ~/.claude**
+(`claudeGrantArgs`): `--setting-sources=` (no settings file),
+`--strict-mcp-config`, `--permission-mode dontAsk`, `--allowedTools
+"Edit(/**) Read(/**) mcp__memql"`, `--disallowedTools` with a bare
+`Read(//path) Edit(//path)` per deny path (no `/**`: the Linux sandbox
+expands or skips a glob), and the sandbox inline via `--settings` with the
+same paths as `filesystem.denyRead`/`denyWrite`.
+Bash has no rule -- the sandbox's auto-allow is its only approval, so a
+command the sandbox did not take has none. `--tools` is NOT passed: it would
+drop ToolSearch, which loads deferred MCP tools. Every flag before `--`.
+`CLAUDE_CODE_CERT_STORE=bundled,system` is pinned per turn (mkcert CA), and an
+init event reporting MemQL's server `failed`/`needs-auth` stops the turn;
+`pending` does not.
 
 **The app-server's frames carry no `"jsonrpc"` header** -- its README
 says so, and none of a real 0.153.4 turn's lines has one -- so
@@ -333,7 +380,7 @@ Five rules here are load-bearing, and each fails silently:
    would be granting itself a permission and revoking it whenever the lid
    closed.
 
-`policy.yaml models.allow` is default-deny like `apps.allow`, and a model
+`policy.yaml models.allow` is default-deny like app consent, and a model
 present but unlisted is REPORTED as blocked rather than omitted. Usage
 rides on `ModelCallEnd` exactly as the runtime reported it -- silence stays
 silence, which the engine records as billing "unknown".
