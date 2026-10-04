@@ -47,3 +47,44 @@ func TestModelCall_TheLevelNeverDisplacesTheModelAndNoEffortIsGuessed(t *testing
 			"the level is a request, not a report", u.GetEffort())
 	}
 }
+
+// The ENVELOPE'S level is what turns a fast call's thinking off, and this pins
+// the whole hop on this side: ModelCallStart.level through the Manager to the
+// body Ollama receives. The engine sends it on every fleet model call
+// (memql fix/fast-local-triage); before that, goalComplexityTriage -- a fast
+// prompt with no response schema -- reached a 4B model with thinking on and
+// spent 2,052-5,636 hidden tokens (26 s to 2 m 51 s) on a fifty-token answer.
+// A Manager that dropped the level would put that back with every client test
+// still green.
+func TestModelCall_AFastEnvelopeRunsWithThinkingOff(t *testing.T) {
+	for _, tc := range []struct {
+		level     string
+		wantThink *bool
+	}{
+		{level: "fast", wantThink: new(bool)},
+		{level: "", wantThink: nil},
+		{level: "strong", wantThink: nil},
+	} {
+		t.Run("level="+tc.level, func(t *testing.T) {
+			srv, seen := ollamaChatStub(t, []string{`{"complexity":"trivial"}`}, true)
+			m := managerFor(inventoryWith(ollamaModel(srv.URL, "qwen3.5:4b",
+				models.Attributes{ContextWindow: 8192, MaxConcurrent: 1})))
+			rec := newRecorder()
+
+			call := start("r-"+tc.level, "qwen3.5:4b", KindChat)
+			call.Level = tc.level
+			m.Start(context.Background(), rec, call)
+			if end := rec.wait(t); end.GetError() != "" {
+				t.Fatalf("call failed: %s", end.GetError())
+			}
+
+			got := thinkSent(t, *seen)
+			switch {
+			case tc.wantThink == nil && got != nil:
+				t.Errorf("think = %v, want the key absent: above fast the model's own default stands", *got)
+			case tc.wantThink != nil && (got == nil || *got != *tc.wantThink):
+				t.Errorf("think = %v, want false: a fast envelope must reach Ollama with thinking off", got)
+			}
+		})
+	}
+}
