@@ -5,6 +5,7 @@ package tools
 import (
 	"fmt"
 	"math"
+	"os"
 	"os/exec"
 	"os/user"
 	"strconv"
@@ -66,6 +67,39 @@ func applyResourceLimits(limits ShellLimits) {
 	if limits.MaxMemoryMB > 0 {
 		applyMemoryLimit(uint64(limits.MaxMemoryMB) * 1024 * 1024)
 	}
+}
+
+// ownProcessGroup starts cmd as the leader of a process group of its own,
+// so the group can be signalled whole (pipeline_step, memql#5494). Nothing
+// from the shell policy applies: a CI step is not an exec call.
+func ownProcessGroup(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+}
+
+// signalProcessGroup signals the process group cmd leads: SIGTERM, or
+// SIGKILL when kill is set. A group already gone is not an error.
+func signalProcessGroup(cmd *exec.Cmd, kill bool) {
+	if cmd.Process == nil {
+		return
+	}
+	sig := syscall.SIGTERM
+	if kill {
+		sig = syscall.SIGKILL
+	}
+	_ = syscall.Kill(-cmd.Process.Pid, sig)
+}
+
+// exitStatusOf reports how a process ended the way a shell -- and the
+// cluster's Job -- reports it: its exit code, or 128 plus the number of the
+// signal that ended it.
+func exitStatusOf(state *os.ProcessState) int {
+	if state == nil {
+		return -1
+	}
+	if ws, ok := state.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+		return 128 + int(ws.Signal())
+	}
+	return state.ExitCode()
 }
 
 func lookupUIDGID(name string) (int, int, error) {

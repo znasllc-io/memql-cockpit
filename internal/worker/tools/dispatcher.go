@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"runtime/debug"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	memqlv1 "github.com/znasllc-io/memql/component/grpc/gen"
@@ -74,7 +75,22 @@ func NewDispatcher(logger *slog.Logger, policy *Policy, consentGate ConsentGate)
 // recover here turns a panic into a structured Failure with
 // the stack on the cockpit's stderr so the operator can see
 // what went wrong without the worker dying.
-func (d *Dispatcher) Dispatch(ctx context.Context, dispatch *memqlv1.ToolDispatch) (success *memqlv1.Success, failure *memqlv1.Failure) {
+//
+// Dispatch has nowhere to put output while a call runs; a call that
+// streams it (workerHost.pipeline_step) runs here with its output
+// dropped. The worker's runner uses DispatchStream.
+func (d *Dispatcher) Dispatch(ctx context.Context, dispatch *memqlv1.ToolDispatch) (*memqlv1.Success, *memqlv1.Failure) {
+	return d.DispatchStream(ctx, dispatch, nil)
+}
+
+// DispatchStream is Dispatch for a caller that can carry a call's output
+// to the cluster while the call runs: send receives it as ToolStream
+// frames, stdout and stderr apart, each carrying the call id, in order
+// per stream and ALL BEFORE DispatchStream returns -- the engine relays a
+// chunk only while its call is pending, and drops one that arrives after
+// the result. Only workerHost.pipeline_step streams today. send may be
+// nil.
+func (d *Dispatcher) DispatchStream(ctx context.Context, dispatch *memqlv1.ToolDispatch, send func(*memqlv1.ToolStream) error) (success *memqlv1.Success, failure *memqlv1.Failure) {
 	if dispatch == nil {
 		return nil, &memqlv1.Failure{ErrorCode: "bad_request", ErrorMessage: "nil dispatch"}
 	}
@@ -128,7 +144,12 @@ func (d *Dispatcher) Dispatch(ctx context.Context, dispatch *memqlv1.ToolDispatc
 	// short-circuits with `consent_required` carrying the gate's
 	// hint about how to open one. When d.consent == nil (no gate
 	// wired, e.g. legacy tests) we behave the pre-#64 way.
-	if d.consent != nil {
+	//
+	// workerHost.pipeline_step does not ask the window (memql#5494):
+	// the owner's consent to it is STANDING, policy.yaml's pipelines
+	// block, which the step checks before it touches anything. Every
+	// other call asks exactly as before.
+	if d.consent != nil && !consent.AdmittedByPolicy(tool, action) {
 		// For workerComputer.mouse_click, resolve the live cursor
 		// position so the strict-mode region exemption can fire
 		// (memql-cockpit#131). mouse_click carries no coordinates of
@@ -162,7 +183,7 @@ func (d *Dispatcher) Dispatch(ctx context.Context, dispatch *memqlv1.ToolDispatc
 
 	switch tool {
 	case "workerHost":
-		success, failure = d.dispatchHost(ctx, action, args)
+		success, failure = d.dispatchHost(ctx, action, args, d.streamTo(callId, send))
 	case "workerComputer":
 		// `capabilities` is build-agnostic introspection
 		// (memql-cockpit#162): route it BEFORE the per-build
@@ -277,8 +298,37 @@ func isSecretKey(k string) bool {
 	return false
 }
 
-func (d *Dispatcher) dispatchHost(ctx context.Context, action string, args map[string]any) (*memqlv1.Success, *memqlv1.Failure) {
+// streamTo turns the runner's ToolStream sender into the output a running
+// call writes to: each piece becomes one frame carrying the call id. A
+// failed send is logged once and the call carries on -- the stream it
+// would report on is gone, and losing it is what ends the call (the runner
+// cancels every call in flight on a lost stream), not a chunk that did not
+// arrive.
+func (d *Dispatcher) streamTo(callID string, send func(*memqlv1.ToolStream) error) outputEmitter {
+	if send == nil {
+		return nil
+	}
+	var failed atomic.Bool
+	return func(stderr bool, data []byte) {
+		chunk := &memqlv1.ToolStream{CallId: callID}
+		if stderr {
+			chunk.Payload = &memqlv1.ToolStream_StderrChunk{StderrChunk: data}
+		} else {
+			chunk.Payload = &memqlv1.ToolStream_StdoutChunk{StdoutChunk: data}
+		}
+		if err := send(chunk); err != nil && !failed.Swap(true) {
+			d.logger.Warn("worker tool output could not be streamed to the cluster",
+				"call_id", callID,
+				"error", err,
+			)
+		}
+	}
+}
+
+func (d *Dispatcher) dispatchHost(ctx context.Context, action string, args map[string]any, emit outputEmitter) (*memqlv1.Success, *memqlv1.Failure) {
 	switch action {
+	case "pipeline_step":
+		return runPipelineStep(ctx, args, d.policy, emit)
 	case "exec":
 		return runExec(ctx, args, d.policy)
 	case "fs_read":

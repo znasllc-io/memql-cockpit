@@ -31,7 +31,7 @@ func TestHardwareInventorySurvivesWorkerEnvelopes(t *testing.T) {
 		ReportedAt: timestamppb.New(reportedAt),
 	}
 	t.Run("registration", func(t *testing.T) {
-		register := buildRegister(Config{Name: "hardware-test", Capabilities: []string{"HEADLESS"}}, nil, models.Inventory{}, inv, tools.ServeOwner)
+		register := buildRegister(Config{Name: "hardware-test", Capabilities: []string{"HEADLESS"}}, nil, models.Inventory{}, inv, tools.ServeOwner, false)
 		decoded := hardwareEnvelopeRoundTrip(t, &memqlv1.WorkerClientMessage{
 			Payload: &memqlv1.WorkerClientMessage_Register{Register: register},
 		})

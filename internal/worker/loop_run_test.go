@@ -712,3 +712,159 @@ func TestRunAWithdrawalTakenBackNeedsNoReconnect(t *testing.T) {
 		t.Fatalf("dialled %d times, want 1: nothing needed re-registering", got)
 	}
 }
+
+// toolDispatch is the cluster sending one workerHost call.
+func toolDispatch(callID string, timeout time.Duration) *memqlv1.WorkerServerMessage {
+	return &memqlv1.WorkerServerMessage{Payload: &memqlv1.WorkerServerMessage_ToolDispatch{ToolDispatch: &memqlv1.ToolDispatch{
+		CallId: callID, Tool: "workerHost", Action: "pipeline_step", Timeout: durationpb.New(timeout),
+	}}}
+}
+
+func resultFor(callID string) func(*memqlv1.WorkerClientMessage) bool {
+	return func(m *memqlv1.WorkerClientMessage) bool { return m.GetToolResult().GetCallId() == callID }
+}
+
+// streamingTools writes two chunks of output for every call, then answers.
+// Dispatch -- the path with nowhere to put output -- answers with a failure
+// a test can recognise, so a runner that took it instead of DispatchStream
+// shows.
+type streamingTools struct{}
+
+func (streamingTools) Dispatch(context.Context, *memqlv1.ToolDispatch) (*memqlv1.Success, *memqlv1.Failure) {
+	return nil, &memqlv1.Failure{ErrorCode: "not_streamed"}
+}
+
+func (streamingTools) DispatchStream(_ context.Context, d *memqlv1.ToolDispatch, send func(*memqlv1.ToolStream) error) (*memqlv1.Success, *memqlv1.Failure) {
+	_ = send(&memqlv1.ToolStream{CallId: d.GetCallId(), Payload: &memqlv1.ToolStream_StdoutChunk{StdoutChunk: []byte("one\n")}})
+	_ = send(&memqlv1.ToolStream{CallId: d.GetCallId(), Payload: &memqlv1.ToolStream_StderrChunk{StderrChunk: []byte("two\n")}})
+	return &memqlv1.Success{ResultJson: []byte(`{"exitCode":0}`)}, nil
+}
+
+// TestRunStreamsAToolCallsOutputBeforeItsResult (memql#5494). The engine
+// relays a ToolStream only while its call is pending: a chunk that arrives
+// after the ToolResult has no sink and is dropped. So a call's output is on
+// the wire, in order, before its result.
+func TestRunStreamsAToolCallsOutputBeforeItsResult(t *testing.T) {
+	cluster := newFakeCluster(func(int) answer { return accept() })
+	r := runnerAgainst(t, cluster, Options{Config: testHomeConfig(t, "prod"), Tools: streamingTools{}}, nil, &waitRecorder{})
+	runInBackground(t, r)
+	s := cluster.next(t)
+	awaitRegistered(t, r)
+
+	s.say(toolDispatch("call-s", time.Minute))
+	if res := s.await(t, "the result", resultFor("call-s")).GetToolResult(); res.GetFailure() != nil {
+		t.Fatalf("the call went through Dispatch, which has nowhere to put output: %+v", res.GetFailure())
+	}
+	var order []string
+	for _, m := range s.messages() {
+		if c := m.GetToolStream(); c != nil && c.GetCallId() == "call-s" {
+			order = append(order, "chunk:"+string(c.GetStdoutChunk())+string(c.GetStderrChunk()))
+		}
+		if m.GetToolResult().GetCallId() == "call-s" {
+			order = append(order, "result")
+		}
+	}
+	if got, want := strings.Join(order, " | "), "chunk:one\n | chunk:two\n | result"; got != want {
+		t.Fatalf("frames for the call arrived as %q, want %q", got, want)
+	}
+}
+
+// heldTools holds every call until its context ends, then answers with
+// how it ended.
+type heldTools struct{ started chan string }
+
+func (h *heldTools) Dispatch(ctx context.Context, d *memqlv1.ToolDispatch) (*memqlv1.Success, *memqlv1.Failure) {
+	h.started <- d.GetCallId()
+	<-ctx.Done()
+	return nil, &memqlv1.Failure{ErrorCode: "stopped", ErrorMessage: ctx.Err().Error()}
+}
+
+func (h *heldTools) awaitStart(t *testing.T, want string) {
+	t.Helper()
+	select {
+	case got := <-h.started:
+		if got != want {
+			t.Fatalf("call %q started, want %q", got, want)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("call %q never started", want)
+	}
+}
+
+// TestRunAToolCancelEndsTheCallItNames (memql#5494). The engine sends
+// ToolCancel when it stops waiting for a call -- a pipeline run cancelled, a
+// deadline on its side -- and a step left running would spend up to an hour
+// of this machine on output nobody will read. The cancel ends that call and
+// no other.
+func TestRunAToolCancelEndsTheCallItNames(t *testing.T) {
+	held := &heldTools{started: make(chan string, 4)}
+	cluster := newFakeCluster(func(int) answer { return accept() })
+	r := runnerAgainst(t, cluster, Options{Config: testHomeConfig(t, "prod"), Tools: held}, nil, &waitRecorder{})
+	runInBackground(t, r)
+	s := cluster.next(t)
+	awaitRegistered(t, r)
+
+	s.say(toolDispatch("call-a", time.Hour))
+	held.awaitStart(t, "call-a")
+	s.say(toolDispatch("call-b", time.Hour))
+	held.awaitStart(t, "call-b")
+
+	s.say(&memqlv1.WorkerServerMessage{Payload: &memqlv1.WorkerServerMessage_ToolCancel{ToolCancel: &memqlv1.ToolCancel{
+		CallId: "call-a", Reason: "context_cancelled",
+	}}})
+	res := s.await(t, "the cancelled call's result", resultFor("call-a")).GetToolResult()
+	if res.GetFailure().GetErrorMessage() != context.Canceled.Error() {
+		t.Fatalf("call-a ended with %+v, want its context cancelled", res)
+	}
+	time.Sleep(50 * time.Millisecond)
+	for _, m := range s.messages() {
+		if m.GetToolResult().GetCallId() == "call-b" {
+			t.Fatal("cancelling call-a ended call-b too")
+		}
+	}
+}
+
+// TestRunAStreamDropEndsTheToolCallsInFlight (memql#5494). A call whose
+// stream is gone has nobody waiting for its result -- the engine has already
+// answered worker_disconnected -- and the runner does not reconnect until
+// its calls have returned. A pipeline step left running would therefore keep
+// this machine off the cluster for as long as the step's own timeout.
+func TestRunAStreamDropEndsTheToolCallsInFlight(t *testing.T) {
+	held := &heldTools{started: make(chan string, 4)}
+	cluster := newFakeCluster(func(int) answer { return accept() })
+	r := runnerAgainst(t, cluster, Options{Config: testHomeConfig(t, "prod"), Tools: held}, nil, &waitRecorder{})
+	runInBackground(t, r)
+	first := cluster.next(t)
+	awaitRegistered(t, r)
+
+	first.say(toolDispatch("call-long", time.Hour))
+	held.awaitStart(t, "call-long")
+	first.drop(status.Error(codes.Unavailable, "transport is closing"))
+
+	second := cluster.next(t)
+	second.await(t, "a Register on the new stream", func(m *memqlv1.WorkerClientMessage) bool { return m.GetRegister() != nil })
+}
+
+// TestRunAGrantedPipelinesPolicyReRegistersWithTheLabel (memql#5494). The
+// SIGHUP path: the owner sets pipelines.allow, the policy reloads, and the
+// next Register carries pipelines=allowed -- the only way the cluster's
+// router can learn it.
+func TestRunAGrantedPipelinesPolicyReRegistersWithTheLabel(t *testing.T) {
+	var allowed atomic.Bool
+	cluster := newFakeCluster(func(int) answer { return accept() })
+	r := runnerAgainst(t, cluster, Options{Config: testHomeConfig(t, "prod"), PipelinesAllowed: allowed.Load}, nil, &waitRecorder{})
+	runInBackground(t, r)
+	first := cluster.next(t)
+	awaitRegistered(t, r)
+	if v, ok := first.register().GetLabels()["pipelines"]; ok {
+		t.Fatalf("a machine whose policy allows no pipelines registered pipelines=%q", v)
+	}
+
+	allowed.Store(true)
+	r.RequestImmediateReadvertise()
+	second := cluster.next(t)
+	reg := second.await(t, "a Register on the new stream", func(m *memqlv1.WorkerClientMessage) bool { return m.GetRegister() != nil }).GetRegister()
+	if got := reg.GetLabels()["pipelines"]; got != "allowed" {
+		t.Fatalf("the re-Register carried pipelines=%q, want \"allowed\"", got)
+	}
+}

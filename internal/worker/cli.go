@@ -404,15 +404,16 @@ func handleRun(args []string) {
 			HTTPClient: &http.Client{Timeout: 0},
 		})
 		runner, err = NewRunner(Options{
-			Logger:         logger,
-			Config:         legacyCfg,
-			Tools:          toolsFor(legacyCfg.Home),
-			Apps:           appInv,
-			Models:         modelInventory,
-			Calls:          calls,
-			Sessions:       sessions,
-			Metrics:        metrics,
-			InferenceServe: policy.InferenceServe,
+			Logger:           logger,
+			Config:           legacyCfg,
+			Tools:            toolsFor(legacyCfg.Home),
+			Apps:             appInv,
+			Models:           modelInventory,
+			Calls:            calls,
+			Sessions:         sessions,
+			Metrics:          metrics,
+			InferenceServe:   policy.InferenceServe,
+			PipelinesAllowed: policy.PipelinesAllowed,
 			ModelPull: &ModelPullOptions{
 				PolicyPath:   policyPath,
 				OllamaBase:   discoverer.ResolvedOllamaBaseURL,
@@ -469,6 +470,7 @@ func handleRun(args []string) {
 			switch sig {
 			case syscall.SIGHUP:
 				serveBefore := policy.InferenceServe()
+				pipelinesBefore := policy.PipelinesAllowed()
 				if err := policy.Reload(); err != nil {
 					logger.Warn("policy reload failed", "error", err)
 				} else {
@@ -481,6 +483,13 @@ func handleRun(args []string) {
 						// withdrawal refuses new model calls meanwhile.
 						logger.Info("inference.serve changed; every cluster stream re-registers to carry it",
 							"from", serveBefore, "to", after)
+					}
+					if after := policy.PipelinesAllowed(); after != pipelinesBefore {
+						// So does the pipelines label (memql#5494). A step
+						// already routed here on the old answer meets the
+						// new one when it arrives: the policy is read live.
+						logger.Info("pipelines.allow changed; every cluster stream re-registers to carry it",
+							"from", pipelinesBefore, "to", after)
 					}
 					// Fan out to every home stream.
 					if fleet != nil {

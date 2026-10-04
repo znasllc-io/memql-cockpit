@@ -69,7 +69,12 @@ type Runner struct {
 	pulls     *modelPuller
 	heartbeat time.Duration
 	serve     func() string
+	pipelines func() bool
 	metrics   *Metrics
+
+	// toolCalls is every tool call in flight, so a ToolCancel -- or the
+	// loss of the stream the call arrived on -- can end it (memql#5494).
+	toolCalls toolCallSet
 
 	conn            atomic.Pointer[Connection]
 	active          sync.WaitGroup
@@ -137,6 +142,71 @@ type ToolDispatcher interface {
 	Dispatch(ctx context.Context, dispatch *memqlv1.ToolDispatch) (*memqlv1.Success, *memqlv1.Failure)
 }
 
+// StreamingToolDispatcher is a ToolDispatcher that can carry a call's
+// output to the cluster while the call runs (memql#5494: a pipeline step's
+// stdout and stderr). send writes one ToolStream frame; the dispatcher
+// returns only once every frame of the call is sent, because the engine
+// drops a chunk that arrives after the call's result. The runner uses this
+// in preference to Dispatch when the dispatcher has it.
+type StreamingToolDispatcher interface {
+	DispatchStream(ctx context.Context, dispatch *memqlv1.ToolDispatch, send func(*memqlv1.ToolStream) error) (*memqlv1.Success, *memqlv1.Failure)
+}
+
+// toolCallSet is the set of tool calls in flight on one runner, each with the
+// cancel of its context.
+type toolCallSet struct {
+	mu    sync.Mutex
+	calls map[*toolCall]struct{}
+}
+
+type toolCall struct {
+	id     string
+	cancel context.CancelFunc
+}
+
+// add records a call and returns the function that forgets it.
+func (s *toolCallSet) add(id string, cancel context.CancelFunc) (forget func()) {
+	call := &toolCall{id: id, cancel: cancel}
+	s.mu.Lock()
+	if s.calls == nil {
+		s.calls = make(map[*toolCall]struct{})
+	}
+	s.calls[call] = struct{}{}
+	s.mu.Unlock()
+	return func() {
+		s.mu.Lock()
+		delete(s.calls, call)
+		s.mu.Unlock()
+	}
+}
+
+// cancel ends the calls carrying id and reports how many there were.
+func (s *toolCallSet) cancel(id string) int {
+	if id == "" {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for call := range s.calls {
+		if call.id == id {
+			call.cancel()
+			n++
+		}
+	}
+	return n
+}
+
+// cancelAll ends every call in flight and reports how many there were.
+func (s *toolCallSet) cancelAll() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for call := range s.calls {
+		call.cancel()
+	}
+	return len(s.calls)
+}
+
 // Options configures NewRunner.
 type Options struct {
 	Logger    *slog.Logger
@@ -158,6 +228,11 @@ type Options struct {
 	// Nil reports tools.ServeOwner, which is the fail-closed default a
 	// build that does not wire this should send.
 	InferenceServe func() string
+	// PipelinesAllowed reads policy.yaml's pipelines.allow from the live
+	// policy (memql#5494): this machine registers pipelines=allowed exactly
+	// when it is true. A FUNCTION for InferenceServe's reason -- a SIGHUP
+	// changes it. Nil reports false, the default-deny.
+	PipelinesAllowed func() bool
 	// ModelPull wires the cluster-driven pull (engine epic memql#5103;
 	// the install wizard's D13). Nil, or a Models of nil, means this
 	// build pulls nothing and answers every ModelPullStart with ok=false
@@ -191,6 +266,7 @@ func NewRunner(opts Options) (*Runner, error) {
 		heartbeat: hb,
 		metrics:   opts.Metrics,
 		serve:     opts.InferenceServe,
+		pipelines: opts.PipelinesAllowed,
 		stop:      make(chan struct{}),
 		closed:    make(chan struct{}),
 		// Room for one. A nil channel would be safe (both the send and
@@ -361,12 +437,12 @@ func (r *Runner) connect(ctx context.Context) (*Connection, error) {
 	if dial == nil {
 		dial = func(ctx context.Context, cfg Config) (stream, error) { return dialSDK(ctx, cfg, r.logger) }
 	}
-	inventory, modelInv, serve := r.inventory(ctx), r.modelInventory(ctx), r.inferenceServe()
+	inventory, modelInv, serve, pipelines := r.inventory(ctx), r.modelInventory(ctx), r.inferenceServe(), r.pipelinesAllowed()
 	s, err := dial(ctx, r.cfg)
 	if err != nil {
 		return nil, err
 	}
-	return handshake(ctx, s, r.cfg, inventory, modelInv, r.hardwareInventory(ctx), serve, r.logger)
+	return handshake(ctx, s, r.cfg, inventory, modelInv, r.hardwareInventory(ctx), serve, pipelines, r.logger)
 }
 
 // Close stops the runner: the loop ends at once, and the stream with it.
@@ -431,6 +507,15 @@ func (r *Runner) runStream(ctx context.Context, conn *Connection) (healthy bool,
 			// void. The blobs already fetched stay on disk for the next
 			// pull of the same model to resume.
 			r.pulls.StopAll("the worker's stream to the cluster was lost")
+			// And for tool calls (memql#5494). The engine has already
+			// answered every one of them worker_disconnected, and this
+			// loop does not reconnect until they return -- so a pipeline
+			// step left running would keep the machine off the cluster
+			// for as long as its own timeout, an hour, working for
+			// nobody.
+			if n := r.toolCalls.cancelAll(); n > 0 {
+				r.logger.Info("the worker's stream to the cluster was lost; stopping the tool calls in flight", "tool_calls", n)
+			}
 			r.active.Wait()
 			return beat.Load(), err
 		}
@@ -566,6 +651,11 @@ func (r *Runner) inferenceServe() string {
 	return tools.ServeOwner
 }
 
+// pipelinesAllowed reads the live pipelines consent, defaulting closed.
+func (r *Runner) pipelinesAllowed() bool {
+	return r.pipelines != nil && r.pipelines()
+}
+
 // modelInventory takes the current local model inventory, or the zero
 // value when this build reports none. The zero value advertises nothing,
 // which is what a cockpit that cannot serve models should say.
@@ -636,7 +726,12 @@ func (r *Runner) maybeReadvertiseModels(ctx context.Context, conn *Connection) b
 	if r.modelsInv != nil {
 		labelsChanged = advertisedFingerprint(r.modelInventory(ctx).Labels()) != conn.ModelFingerprint
 	}
-	if !serveChanged && !labelsChanged {
+	// The pipelines label is the advertisement's third part (memql#5494),
+	// and an ordinary one: no floor bypass of its own, because a step routed
+	// on a stale grant is refused by the live policy before it runs.
+	pipelines := r.pipelinesAllowed()
+	pipelinesChanged := pipelines != conn.AdvertisedPipelines
+	if !serveChanged && !labelsChanged && !pipelinesChanged {
 		// A withdrawal the owner took back before it landed: the
 		// advertisement on the wire is right again, so nothing is
 		// refused any longer.
@@ -651,6 +746,7 @@ func (r *Runner) maybeReadvertiseModels(ctx context.Context, conn *Connection) b
 		r.logger.Debug("this machine's advertisement changed; deferring re-registration until this worker is idle",
 			"models_changed", labelsChanged,
 			"consent_changed", serveChanged,
+			"pipelines_changed", pipelinesChanged,
 		)
 		return false
 	}
@@ -679,6 +775,9 @@ func (r *Runner) maybeReadvertiseModels(ctx context.Context, conn *Connection) b
 	case serveChanged:
 		r.logger.Info("inference.serve changed; reconnecting so the cluster sees it",
 			"from", conn.AdvertisedServe, "to", serve)
+	case pipelinesChanged:
+		r.logger.Info("pipelines.allow changed; reconnecting so the cluster routes pipeline steps by it",
+			"from", conn.AdvertisedPipelines, "to", pipelines)
 	default:
 		r.logger.Info("local model inventory changed; reconnecting to re-advertise",
 			"models_offered", len(r.modelInventory(ctx).Advertised()),
@@ -815,17 +914,30 @@ func (r *Runner) handleMessage(ctx context.Context, conn *Connection, msg *memql
 	}
 	switch payload := msg.GetPayload().(type) {
 	case *memqlv1.WorkerServerMessage_ToolDispatch:
+		// The call is recorded HERE, on the receive goroutine, before its
+		// own goroutine starts: a ToolCancel for it arrives on this same
+		// goroutine later, and finds it however soon it comes.
+		callCtx, cancelCall := context.WithCancel(ctx)
+		forget := r.toolCalls.add(payload.ToolDispatch.GetCallId(), cancelCall)
 		r.active.Add(1)
 		r.activeCalls.Add(1)
 		go func() {
 			defer r.active.Done()
 			defer r.activeCalls.Add(-1)
-			r.runToolDispatch(ctx, conn, payload.ToolDispatch)
+			defer forget()
+			defer cancelCall()
+			r.runToolDispatch(callCtx, conn, payload.ToolDispatch)
 		}()
 	case *memqlv1.WorkerServerMessage_ToolCancel:
+		// The engine sends this when it stops waiting for a call -- a
+		// pipeline run cancelled, a deadline on its side -- and ending the
+		// call is the only thing that stops a step it no longer wants
+		// (memql#5494). Its result is still sent; the engine drops it.
+		running := r.toolCalls.cancel(payload.ToolCancel.GetCallId())
 		r.logger.Info("worker received tool cancel",
 			"call_id", payload.ToolCancel.GetCallId(),
 			"reason", payload.ToolCancel.GetReason(),
+			"running", running > 0,
 		)
 	case *memqlv1.WorkerServerMessage_AppSessionStart:
 		if r.sessions == nil {
@@ -915,7 +1027,15 @@ func (r *Runner) runToolDispatch(ctx context.Context, conn *Connection, dispatch
 	dispatchCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	startedAt := time.Now()
-	success, failure := r.tools.Dispatch(dispatchCtx, dispatch)
+	var success *memqlv1.Success
+	var failure *memqlv1.Failure
+	if streaming, ok := r.tools.(StreamingToolDispatcher); ok {
+		// The call's output goes out as it is produced, on this stream,
+		// and all of it before the result below.
+		success, failure = streaming.DispatchStream(dispatchCtx, dispatch, conn.SendToolStream)
+	} else {
+		success, failure = r.tools.Dispatch(dispatchCtx, dispatch)
+	}
 	durationMs := time.Since(startedAt).Milliseconds()
 
 	if r.metrics != nil {

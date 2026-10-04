@@ -254,6 +254,9 @@ section in [CLAUDE.md](CLAUDE.md) before touching `go.mod`.
 
 Computer-use setup and permissions: [docs/computer-use.md](docs/computer-use.md).
 
+Running the cluster's CI pipeline steps on this machine (off unless
+`policy.yaml` says `pipelines.allow: true`): [docs/pipelines.md](docs/pipelines.md).
+
 ## License
 
 [MIT](LICENSE)

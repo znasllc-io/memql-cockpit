@@ -159,6 +159,9 @@ func TestEveryWriterKindReachesTheSeamConcurrently(t *testing.T) {
 		{"model call end", func(i int) error {
 			return conn.SendModelCallEnd(&memqlv1.ModelCallEnd{RequestId: "call-" + strconv.Itoa(i), FinishReason: "stop"})
 		}, func(m *memqlv1.WorkerClientMessage) bool { return m.GetModelCallEnd() != nil }},
+		{"tool stream", func(i int) error {
+			return conn.SendToolStream(&memqlv1.ToolStream{CallId: "call-1", Payload: &memqlv1.ToolStream_StdoutChunk{StdoutChunk: []byte(strconv.Itoa(i))}})
+		}, func(m *memqlv1.WorkerClientMessage) bool { return m.GetToolStream() != nil }},
 		{"tool result", func(i int) error {
 			return conn.SendToolResult("call-"+strconv.Itoa(i), &memqlv1.Success{ExitCode: 0}, nil)
 		}, func(m *memqlv1.WorkerClientMessage) bool { return m.GetToolResult() != nil }},

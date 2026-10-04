@@ -2,7 +2,10 @@
 
 package tools
 
-import "os/exec"
+import (
+	"os"
+	"os/exec"
+)
 
 // applyShellSysProcAttr on non-Unix platforms is a no-op. Setpgid,
 // Credential, and rlimits all live under syscall packages that
@@ -15,3 +18,22 @@ func applyShellSysProcAttr(_ *exec.Cmd, _ ShellLimits) error {
 }
 
 func applyResourceLimits(_ ShellLimits) {}
+
+// ownProcessGroup has no process group to make here; see exec_unix.go.
+func ownProcessGroup(_ *exec.Cmd) {}
+
+// signalProcessGroup can reach only the process itself here, and only to
+// kill it.
+func signalProcessGroup(cmd *exec.Cmd, _ bool) {
+	if cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+}
+
+// exitStatusOf is the process's exit code.
+func exitStatusOf(state *os.ProcessState) int {
+	if state == nil {
+		return -1
+	}
+	return state.ExitCode()
+}

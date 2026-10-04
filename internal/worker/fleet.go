@@ -320,16 +320,17 @@ func (f *Fleet) buildHome(home Home, machineID string) (homeRun, error) {
 		newRunner = NewRunner
 	}
 	runner, err := newRunner(Options{
-		Logger:         homeLogger,
-		Config:         cfg,
-		Tools:          dispatcher,
-		Apps:           f.apps,
-		Models:         f.modelsInv,
-		Calls:          calls,
-		Sessions:       sessions,
-		Metrics:        f.metrics,
-		InferenceServe: f.inferenceServe(),
-		ModelPull:      pull,
+		Logger:           homeLogger,
+		Config:           cfg,
+		Tools:            dispatcher,
+		Apps:             f.apps,
+		Models:           f.modelsInv,
+		Calls:            calls,
+		Sessions:         sessions,
+		Metrics:          f.metrics,
+		InferenceServe:   f.inferenceServe(),
+		PipelinesAllowed: f.pipelinesAllowed(),
+		ModelPull:        pull,
 	})
 	if err != nil {
 		return homeRun{}, err
@@ -357,6 +358,16 @@ func (f *Fleet) inferenceServe() func() string {
 		return nil
 	}
 	return f.policy.InferenceServe
+}
+
+// pipelinesAllowed is the live pipelines consent, shared by every home: the
+// machine's owner allows CI steps on the machine, whichever cluster sends
+// them (memql#5494). Nil, read as false, when no policy is loaded.
+func (f *Fleet) pipelinesAllowed() func() bool {
+	if f.policy == nil {
+		return nil
+	}
+	return f.policy.PipelinesAllowed
 }
 
 func (f *Fleet) policyCheckPath() func(string) error {
