@@ -5,7 +5,6 @@ package worker
 import (
 	"errors"
 	"fmt"
-	"html"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -65,37 +64,7 @@ func InstallLaunchAgent(binaryPath string) error {
 		_ = os.Remove(legacy)
 	}
 
-	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>%s</string>
-    %s
-    <key>ProgramArguments</key>
-    <array>
-        <string>%s</string>
-        <string>worker</string>
-        <string>run</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>%s/worker.log</string>
-    <key>StandardErrorPath</key>
-    <string>%s/worker.log</string>
-    <key>ThrottleInterval</key>
-    <integer>5</integer>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>HOME</key>
-        <string>%s</string>
-    </dict>
-</dict>
-</plist>
-`, launchAgentLabel, association, html.EscapeString(binaryPath), html.EscapeString(stateDir), html.EscapeString(stateDir), html.EscapeString(home))
+	plist := launchAgentPlist(launchAgentLabel, binaryPath, association, stateDir, home)
 
 	if err := os.WriteFile(plistPath, []byte(plist), 0o644); err != nil {
 		return fmt.Errorf("launch agent: write plist: %w", err)

@@ -160,11 +160,17 @@ main "$@"
         (state / 'com.znasllc.memql-worker').touch()
         (state / 'com.znasllc.memql-worker.retry').touch()
         activate = ['bash', str(source / 'scripts/macos/activate-app.sh'), '--app=' + str(destination)]
+        service_path = ':'.join(['/usr/bin', '/bin', '/usr/sbin', '/sbin', str(user / '.local/bin'),
+                                 str(user / '.claude/local'), '/opt/homebrew/bin', '/usr/local/bin'])
         assert json.loads(run(activate, env).stdout)['changed'] is True
         after = plistlib.loads(worker_plist.read_bytes())
         expected = dict(before)
         expected['ProgramArguments'] = [str(destination / 'Contents/MacOS/MemQL'), *before['ProgramArguments'][1:]]
         expected['AssociatedBundleIdentifiers'] = ['com.znasllc.memql-worker']
+        # A plist from before the service carried a PATH gains one -- the
+        # system directories first, then where the app installers put claude
+        # and codex -- and nothing else in its environment moves.
+        expected['EnvironmentVariables'] = dict(before['EnvironmentVariables'], PATH=service_path)
         assert after == expected, (after, expected)
         menu = plistlib.loads((agents / 'com.znasllc.memql-cockpit-menubar.plist').read_bytes())
         assert menu['ProgramArguments'] == [str(destination / 'Contents/Library/LoginItems/MemQL Menu.app/Contents/MacOS/MemQLCockpit')]
@@ -177,6 +183,12 @@ main "$@"
         assert json.loads(run(activate, env).stdout)['changed'] is False
         assert calls.read_text().count('bootout') == count, 'idempotent activation restarted a service'
         assert all(path.read_bytes() == data for path, data in protected.items())
+        # A PATH the owner set is theirs: activation keeps it as written.
+        custom = plistlib.loads(worker_plist.read_bytes())
+        custom['EnvironmentVariables']['PATH'] = '/Users/someone/bin:/usr/bin:/bin'
+        worker_plist.write_bytes(plistlib.dumps(custom))
+        run(activate, env)
+        assert plistlib.loads(worker_plist.read_bytes())['EnvironmentVariables']['PATH'] == '/Users/someone/bin:/usr/bin:/bin'
         # Matching files/marker must recover an unloaded service, not kickstart it.
         (state / 'com.znasllc.memql-worker').unlink()
         assert json.loads(run(activate, env).stdout)['changed'] is True
@@ -204,7 +216,7 @@ main "$@"
         assert json.loads(run(activate, env).stdout)['changed'] is True
         fresh = plistlib.loads(worker_plist.read_bytes())
         assert fresh['ProgramArguments'] == [str(destination / 'Contents/MacOS/MemQL'), 'worker', 'run']
-        assert fresh['EnvironmentVariables'] == {'HOME': str(user)}
+        assert fresh['EnvironmentVariables'] == {'HOME': str(user), 'PATH': service_path}
         assert fresh['AssociatedBundleIdentifiers'] == ['com.znasllc.memql-worker']
         # Full uninstall is tested only in this disposable fixture home.
         run(['bash', str(repo / 'scripts/install/uninstall-mac.sh'), '--user-local', '--all-homes'], env)

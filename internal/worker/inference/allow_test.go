@@ -36,8 +36,10 @@ http:
   block_private_net: true
 
 apps:
-  allow:
-    - claude-code
+  homes:
+    api.memql.localhost:
+      allow:
+        - claude-code
 
 backup:
   roots:
@@ -176,8 +178,10 @@ func TestAllowCreatesAMissingFile(t *testing.T) {
 // state docs/local-models.md describes.
 func TestAllowOnAModelsBlockWithNoAllowKey(t *testing.T) {
 	before := `apps:
-  allow:
-    - codex
+  homes:
+    api.memql.localhost:
+      allow:
+        - codex
 
 models:
   runtimes:
@@ -353,5 +357,165 @@ func assertPolicyServes(t *testing.T, path string, want ...string) {
 		if !found {
 			t.Errorf("models.allow = %v, want %q in it\n%s", got, id, read(t, path))
 		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// The editor addressed by a key path: apps.homes.<home>.allow
+// -----------------------------------------------------------------------------
+
+var homeAllow = []string{"apps", "homes", "api.memql.localhost", "allow"}
+
+// TestMergeListCreatesTheMappingsItNeeds. Each missing mapping is created
+// under the deepest one that exists, at the indentation that mapping's own
+// children already use, and nothing already there moves.
+func TestMergeListCreatesTheMappingsItNeeds(t *testing.T) {
+	for name, tc := range map[string]struct{ before, want string }{
+		"no apps block": {
+			"shell:\n  allow: [rustc]\n",
+			"shell:\n  allow: [rustc]\n\napps:\n  homes:\n    api.memql.localhost:\n      allow:\n        - claude-code\n",
+		},
+		"apps with levels only": {
+			"apps:\n  levels:\n    codex: {}\n",
+			"apps:\n  homes:\n    api.memql.localhost:\n      allow:\n        - claude-code\n  levels:\n    codex: {}\n",
+		},
+		"homes with nothing under it": {
+			"apps:\n  homes:\n",
+			"apps:\n  homes:\n    api.memql.localhost:\n      allow:\n        - claude-code\n",
+		},
+		"another cluster already there": {
+			"apps:\n  homes:\n    other:\n      allow: [codex]\n",
+			"apps:\n  homes:\n    api.memql.localhost:\n      allow:\n        - claude-code\n    other:\n      allow: [codex]\n",
+		},
+		"four-space indentation stays four-space": {
+			"apps:\n    levels: {}\n",
+			"apps:\n    homes:\n      api.memql.localhost:\n        allow:\n          - claude-code\n    levels: {}\n",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, changed, err := MergeList(tc.before, homeAllow, []string{"claude-code"})
+			if err != nil || !changed {
+				t.Fatalf("changed=%v err=%v", changed, err)
+			}
+			if got != tc.want {
+				t.Errorf("--- got ---\n%s\n--- want ---\n%s", got, tc.want)
+			}
+			assertListAt(t, got, homeAllow, "claude-code")
+		})
+	}
+}
+
+// A key YAML could misread is quoted rather than assumed safe: a colon one
+// character from ending a key is a file the worker then cannot parse.
+func TestMergeListQuotesAKeyYAMLCouldMisread(t *testing.T) {
+	path := []string{"apps", "homes", "localhost:8443", "allow"}
+	got, _, err := MergeList("", path, []string{"codex"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, `"localhost:8443":`) {
+		t.Errorf("the key was not quoted:\n%s", got)
+	}
+	assertListAt(t, got, path, "codex")
+}
+
+func TestRemoveFromList(t *testing.T) {
+	for name, tc := range map[string]struct{ before, want string }{
+		"one of several, block": {
+			"apps:\n  homes:\n    api.memql.localhost:\n      allow:\n        - claude-code  # keep me out\n        - codex\n",
+			"apps:\n  homes:\n    api.memql.localhost:\n      allow:\n        - codex\n",
+		},
+		"a list level with its key": {
+			"apps:\n  homes:\n    api.memql.localhost:\n      allow:\n      - claude-code\n      - codex\n",
+			"apps:\n  homes:\n    api.memql.localhost:\n      allow:\n      - codex\n",
+		},
+		"the last one, flow": {
+			"apps:\n  homes:\n    api.memql.localhost:\n      allow: [claude-code]\n",
+			"apps:\n  homes:\n    api.memql.localhost:\n      allow: []\n",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, changed, err := RemoveFromList(tc.before, homeAllow, []string{"Claude-Code"})
+			if err != nil || !changed {
+				t.Fatalf("changed=%v err=%v", changed, err)
+			}
+			if got != tc.want {
+				t.Errorf("--- got ---\n%s\n--- want ---\n%s", got, tc.want)
+			}
+		})
+	}
+}
+
+// Nothing listed is nothing to remove -- not a refusal, and not a write.
+func TestRemoveFromListOfWhatIsNotThere(t *testing.T) {
+	for _, before := range []string{
+		"",
+		"shell:\n  allow: [rustc]\n",
+		"apps:\n  homes:\n",
+		"apps:\n  homes:\n    api.memql.localhost:\n      allow: [codex]\n",
+	} {
+		got, changed, err := RemoveFromList(before, homeAllow, []string{"claude-code"})
+		if err != nil || changed || got != before {
+			t.Errorf("%q: changed=%v err=%v", before, changed, err)
+		}
+	}
+}
+
+func TestRemoveFromListRefusesWhatItCannotBound(t *testing.T) {
+	for _, before := range []string{
+		// A flow list over two lines: which text is which entry is a guess.
+		"apps:\n  homes:\n    api.memql.localhost:\n      allow: [claude-code,\n        codex]\n",
+		// A flow mapping on the path, and a word where the list belongs.
+		"apps:\n  homes:\n    api.memql.localhost: {allow: [claude-code]}\n",
+		"apps:\n  homes:\n    api.memql.localhost:\n      allow: claude-code\n",
+	} {
+		_, _, err := RemoveFromList(before, homeAllow, []string{"claude-code"})
+		if !errors.Is(err, ErrPolicyNotEditable) || !strings.Contains(err.Error(), "claude-code from apps.homes.api.memql.localhost.allow by hand") {
+			t.Errorf("%q: err = %v, want a refusal naming the change", before, err)
+		}
+	}
+}
+
+func TestRemoveKey(t *testing.T) {
+	path := []string{"apps", "allow"}
+	for name, tc := range map[string]struct {
+		before, want string
+		values       []string
+	}{
+		"a block list": {
+			"apps:\n  allow:\n    - claude-code\n    - codex\n  levels: {}\n", "apps:\n  levels: {}\n", []string{"claude-code", "codex"},
+		},
+		"a flow list": {"apps:\n  allow: [claude-code]\nmodels: {}\n", "apps:\nmodels: {}\n", []string{"claude-code"}},
+		"a bare key":  {"apps:\n  allow:\n  levels: {}\n", "apps:\n  levels: {}\n", nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, values, changed, err := RemoveKey(tc.before, path)
+			if err != nil || !changed {
+				t.Fatalf("changed=%v err=%v", changed, err)
+			}
+			if got != tc.want || strings.Join(values, ",") != strings.Join(tc.values, ",") {
+				t.Errorf("got %q values %v, want %q values %v", got, values, tc.want, tc.values)
+			}
+		})
+	}
+	if got, _, changed, err := RemoveKey("apps:\n  levels: {}\n", path); err != nil || changed || got != "apps:\n  levels: {}\n" {
+		t.Errorf("a key that is not there: changed=%v err=%v", changed, err)
+	}
+	if _, _, _, err := RemoveKey("apps:\n  allow: |\n    claude-code\n", path); !errors.Is(err, ErrPolicyNotEditable) {
+		t.Errorf("a block scalar cannot be bounded by lines; err = %v, want a refusal", err)
+	}
+}
+
+// assertListAt reads the list back through a YAML parse, so a write this
+// package thought valid but no parser could read fails here.
+func assertListAt(t *testing.T, body string, path []string, want ...string) {
+	t.Helper()
+	root, err := parseRoot(body)
+	if err != nil {
+		t.Fatalf("the result does not parse: %v\n%s", err, body)
+	}
+	_, v, _, ok := walkTo(root, path)
+	if !ok || strings.Join(sequenceValues(v), ",") != strings.Join(want, ",") {
+		t.Errorf("%s = %v, want %v\n%s", strings.Join(path, "."), sequenceValues(v), want, body)
 	}
 }
