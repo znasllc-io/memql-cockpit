@@ -1866,6 +1866,10 @@ func (h *rig) settled(t *testing.T) {
 // redacted exactly as the End's is.
 func TestSessionEndLogsWhyItFailed(t *testing.T) {
 	t.Run("a refusal", func(t *testing.T) {
+		// The app must be found, or the PATH refusal comes first and the
+		// workspace refusal this asserts is never reached -- which is what a
+		// runner without Claude Code installed does.
+		fakeApp(t, "claude", "exit 0\n")
 		h := newRig(t)
 		logs := &logBuffer{}
 		h.manager.logger = slog.New(slog.NewTextHandler(logs, nil))
