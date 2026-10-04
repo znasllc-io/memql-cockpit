@@ -318,6 +318,52 @@ func consentConnection(serve string) *Connection {
 	return &Connection{ModelFingerprint: advertisedFingerprint(oneModel().Labels()), AdvertisedServe: serve}
 }
 
+// pipelinesConnection registered with the one-model label set, the closed
+// sharing consent, and the given pipelines consent.
+func pipelinesConnection(pipelines bool) *Connection {
+	c := consentConnection(tools.ServeOwner)
+	c.AdvertisedPipelines = pipelines
+	return c
+}
+
+// TestAChangedPipelinesPolicyIsAChangedAdvertisement (memql#5494). The
+// pipelines label rides Register and nothing else, so a policy reload that
+// grants or withdraws pipelines has to re-register for the cluster's router
+// to see it -- under the same guards every other change of advertisement
+// obeys: never while work is in flight, never twice inside the floor unless
+// a reload asked.
+func TestAChangedPipelinesPolicyIsAChangedAdvertisement(t *testing.T) {
+	clock := time.Unix(1_700_000_000, 0)
+	inv := &fakeModelInventory{}
+	inv.serve(oneModel())
+	allowed := false
+	r := testRunner(inv, &clock)
+	r.pipelines = func() bool { return allowed }
+
+	if r.maybeReadvertiseModels(context.Background(), pipelinesConnection(false)) {
+		t.Fatal("an unchanged pipelines policy is no reason to reconnect")
+	}
+	allowed = true
+	if !r.maybeReadvertiseModels(context.Background(), pipelinesConnection(false)) {
+		t.Fatal("a GRANTED pipelines policy must be re-registered")
+	}
+	clock = clock.Add(10 * time.Second)
+	allowed = false
+	if r.maybeReadvertiseModels(context.Background(), pipelinesConnection(true)) {
+		t.Fatal("inside the floor, a change with no request waits")
+	}
+	r.RequestImmediateReadvertise()
+	if !r.maybeReadvertiseModels(context.Background(), pipelinesConnection(true)) {
+		t.Fatal("a WITHDRAWN pipelines policy, asked for by the reload, must be re-registered")
+	}
+	clock = clock.Add(modelReadvertiseMinInterval)
+	allowed = true
+	r.activeCalls.Add(1)
+	if r.maybeReadvertiseModels(context.Background(), pipelinesConnection(false)) {
+		t.Fatal("work in flight is never cut short for a re-registration")
+	}
+}
+
 // TestAChangedConsentIsAChangedAdvertisement (memql-cockpit#428). The
 // consent rides Register and nothing else, so a consent the live policy
 // no longer states has to be re-registered -- it used to wait for an

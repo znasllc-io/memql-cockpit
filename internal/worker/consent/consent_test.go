@@ -172,6 +172,9 @@ func TestClassify(t *testing.T) {
 		{"workerHost", "http_fetch", ClassObserve},
 		{"workerHost", "exec", ClassInteract},
 		{"workerHost", "fs_write", ClassInteract},
+		// A CI step runs a repository's own commands here (memql#5494):
+		// interact, whoever admits it.
+		{"workerHost", "pipeline_step", ClassInteract},
 		// The full workerComputer action vocabulary, pinned
 		// explicitly so a new action can't silently ride the
 		// unknown->interact default (memql-cockpit#179).
@@ -200,6 +203,33 @@ func TestClassify(t *testing.T) {
 		got := Classify(tc.tool, tc.action)
 		if got != tc.want {
 			t.Errorf("Classify(%q, %q) = %q, want %q", tc.tool, tc.action, got, tc.want)
+		}
+	}
+}
+
+// A pipeline step is admitted by the owner's standing consent in
+// policy.yaml, not by a consent window (memql#5494) -- and it is the only
+// pair that is. Everything else, the unknown included, still asks the
+// window.
+func TestOnlyAPipelineStepIsAdmittedByPolicyRatherThanAWindow(t *testing.T) {
+	for _, pair := range [][2]string{
+		{"workerHost", "pipeline_step"},
+		{"  WORKERHOST  ", "  PIPELINE_STEP  "},
+	} {
+		if !AdmittedByPolicy(pair[0], pair[1]) {
+			t.Errorf("AdmittedByPolicy(%q, %q) = false, want true", pair[0], pair[1])
+		}
+	}
+	for _, pair := range [][2]string{
+		{"workerHost", "exec"},
+		{"workerHost", "fs_write"},
+		{"workerHost", "fs_read"},
+		{"workerHost", "experimental_new_action"},
+		{"workerComputer", "pipeline_step"},
+		{"workerComputer", "mouse_click"},
+	} {
+		if AdmittedByPolicy(pair[0], pair[1]) {
+			t.Errorf("AdmittedByPolicy(%q, %q) = true: that call would skip the consent window", pair[0], pair[1])
 		}
 	}
 }

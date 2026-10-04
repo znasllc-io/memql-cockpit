@@ -42,7 +42,7 @@ const DefaultApprovalTimeout = 30 * time.Second
 // http_fetch / workerComputer.{screenshot,cursor_position,
 // display_info,capabilities,window_list,wait}.
 //
-// ClassInteract is the write-side: exec / fs_write /
+// ClassInteract is the write-side: exec / fs_write / pipeline_step /
 // workerComputer.{mouse_click,mouse_down,mouse_up,mouse_move,
 // mouse_drag,mouse_scroll,key_type,key_press,key_hold,key_combo,
 // window_focus}.
@@ -510,7 +510,11 @@ func Classify(tool, action string) Class {
 		switch strings.ToLower(strings.TrimSpace(action)) {
 		case "fs_read", "fs_list", "fs_stat", "http_fetch":
 			return ClassObserve
-		case "exec", "fs_write":
+		// pipeline_step (memql#5494) runs a repository's own commands
+		// here: interact, made explicit. It is admitted by policy.yaml's
+		// pipelines block rather than by a window -- see AdmittedByPolicy
+		// -- but its class does not change with who admits it.
+		case "exec", "fs_write", "pipeline_step":
 			return ClassInteract
 		}
 	case "workercomputer":
@@ -546,6 +550,21 @@ func Classify(tool, action string) Class {
 		}
 	}
 	return ClassUnknown
+}
+
+// AdmittedByPolicy reports whether (tool, action) is admitted by the machine
+// owner's STANDING consent in policy.yaml rather than by a consent window, so
+// the dispatcher does not ask the window about it.
+//
+// workerHost.pipeline_step (memql#5494) is the one such pair. A CI step
+// arrives when a push lands, not while somebody is at the machine to open a
+// window, so the owner's consent is the pipelines block -- default-deny, and
+// enforced by the step itself before anything runs. Every other pair,
+// unknown ones included, keeps asking the window: answering true here for a
+// pair whose handler checks no policy would run it on nobody's say-so.
+func AdmittedByPolicy(tool, action string) bool {
+	return strings.EqualFold(strings.TrimSpace(tool), "workerHost") &&
+		strings.EqualFold(strings.TrimSpace(action), "pipeline_step")
 }
 
 // isHighRiskAction names the strict-mode per-action approval subset.

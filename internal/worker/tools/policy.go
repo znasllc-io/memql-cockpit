@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -35,6 +36,7 @@ type Policy struct {
 	models     ModelsPolicy
 	inference  InferencePolicy
 	backup     BackupPolicy
+	pipelines  PipelinesPolicy
 	configPath string
 }
 
@@ -240,6 +242,81 @@ type BackupPolicy struct {
 	Roots []string `yaml:"roots"`
 }
 
+// PipelinesPolicy controls workerHost.pipeline_step: whether the cluster may
+// run one of its CI pipeline steps on this machine (memql#5494).
+//
+//	pipelines:
+//	  allow: true
+//	  repos:
+//	    - acme/widgets
+//	  workspace_root: ~/ci
+//	  max_timeout_sec: 3600
+//
+// DEFAULT-DENY, and this is the owner's STANDING CONSENT: a step is admitted
+// by this block and never by a consent window, because a CI run arrives when a
+// push lands, not while somebody is at the machine to grant one. Nothing about
+// a laptop is a default place for CI. The cluster's router only picks a
+// machine that advertises pipelines=allowed, and the worker advertises it
+// exactly when allow is true -- the refusal here is the second consent, not
+// the only one.
+//
+// THE TRUST, PLAINLY: allow lets the cluster's pipeline runner run commands
+// it chooses, as the user the worker runs as, with that user's environment
+// and files, for the repositories it names. This machine cannot see the
+// pipeline the command came from. repos, when it lists any, narrows which
+// repositories (owner/name, compared without regard to case or a .git
+// suffix) -- and the clone URL must name the same repository, so the list
+// filters what is cloned rather than a name the request states. A step an
+// agent dispatched is refused whatever this block says: the runner
+// dispatches with no agent.
+//
+// workspace_root is where each step's fresh checkout is made and removed
+// again; absent, it is fs.workspace_root/pipelines, else ~/.memql/pipelines.
+// max_timeout_sec caps the timeout a step asks for (default 3600).
+//
+// The whole block REPLACES on reload, unlike the allow lists above: it is a
+// consent, and one a SIGHUP could not take back would be a grant the file no
+// longer states.
+type PipelinesPolicy struct {
+	Allow         bool     `yaml:"allow"`
+	Repos         []string `yaml:"repos"`
+	WorkspaceRoot string   `yaml:"workspace_root"`
+	MaxTimeoutSec int      `yaml:"max_timeout_sec"`
+}
+
+// DefaultPipelineMaxTimeoutSec is the longest a pipeline step may run when
+// policy.yaml names no max_timeout_sec.
+const DefaultPipelineMaxTimeoutSec = 3600
+
+// Check decides whether this machine runs a pipeline step of repository. The
+// refusal is a sentence naming the setting that changes it: it reaches the
+// run's log, and it is the only account of the refusal anybody will read.
+func (pp PipelinesPolicy) Check(repository string) error {
+	if !pp.Allow {
+		return errors.New("this machine runs no pipeline steps: its owner has not set pipelines.allow: true in policy.yaml")
+	}
+	if len(pp.Repos) == 0 {
+		return nil
+	}
+	want := normalRepository(repository)
+	if want == "" {
+		return errors.New("this machine runs pipeline steps only for the repositories in pipelines.repos, and the step names no repository")
+	}
+	for _, listed := range pp.Repos {
+		if normalRepository(listed) == want {
+			return nil
+		}
+	}
+	return fmt.Errorf("this machine's policy does not list %s: add it to pipelines.repos in policy.yaml to run its steps here", strings.TrimSpace(repository))
+}
+
+// normalRepository reads owner/name the way GitHub does: without regard to
+// case, surrounding space or a trailing .git.
+func normalRepository(r string) string {
+	r = strings.ToLower(strings.TrimSpace(r))
+	return strings.TrimSuffix(r, ".git")
+}
+
 // HTTPPolicy controls workerHost.http_fetch.
 type HTTPPolicy struct {
 	AllowURLs       []string `yaml:"allow_urls"`
@@ -288,6 +365,7 @@ type rawPolicy struct {
 	Backup    BackupPolicy    `yaml:"backup"`
 	Models    ModelsPolicy    `yaml:"models"`
 	Inference InferencePolicy `yaml:"inference"`
+	Pipelines PipelinesPolicy `yaml:"pipelines"`
 }
 
 // DefaultPolicy returns the baseline allow/deny lists shipped with
@@ -455,7 +533,79 @@ func (p *Policy) reload() error {
 	// unrevokable without a restart, which is the wrong direction for
 	// the one setting here that hands a stranger this machine's GPU.
 	p.inference.Serve = raw.Inference.Serve
+	// pipelines REPLACES, whole, for the same reason: allow is a consent, and
+	// a narrowed repos list that kept the repository it dropped would admit a
+	// step the file no longer names.
+	p.pipelines = raw.Pipelines
 	return nil
+}
+
+// PipelinesAllowed reports pipelines.allow: whether this machine runs CI
+// pipeline steps at all. The worker advertises pipelines=allowed on Register
+// exactly when it is true.
+func (p *Policy) PipelinesAllowed() bool {
+	if p == nil {
+		return false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.pipelines.Allow
+}
+
+// Pipelines returns the pipelines block as it stands, with its defaults
+// applied: WorkspaceRoot resolved to an absolute directory and MaxTimeoutSec
+// defaulted. Read once per step, under one lock, so a SIGHUP mid-step cannot
+// hand it half of one file and half of another. Repos is the caller's own
+// copy, for AppsAllow's reason.
+func (p *Policy) Pipelines() PipelinesPolicy {
+	if p == nil {
+		return PipelinesPolicy{
+			WorkspaceRoot: pipelinesWorkspaceRoot("", ""),
+			MaxTimeoutSec: DefaultPipelineMaxTimeoutSec,
+		}
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := p.pipelines
+	if len(out.Repos) > 0 {
+		out.Repos = append([]string(nil), out.Repos...)
+	}
+	out.WorkspaceRoot = pipelinesWorkspaceRoot(p.pipelines.WorkspaceRoot, p.fs.WorkspaceRoot)
+	if out.MaxTimeoutSec <= 0 {
+		out.MaxTimeoutSec = DefaultPipelineMaxTimeoutSec
+	}
+	return out
+}
+
+// pipelinesWorkspaceRoot is where pipeline steps make their checkouts:
+// pipelines.workspace_root when set, else the shell's workspace root plus
+// /pipelines, else ~/.memql/pipelines -- under the Linux user unit, ~/.memql
+// is the one directory in the home the worker may write.
+func pipelinesWorkspaceRoot(pipelinesRoot, shellRoot string) string {
+	if root, ok := absoluteRoot(pipelinesRoot); ok {
+		return root
+	}
+	if root, ok := absoluteRoot(shellRoot); ok {
+		return filepath.Join(root, "pipelines")
+	}
+	if home := homeDir(); home != "" {
+		return filepath.Join(home, ".memql", "pipelines")
+	}
+	return filepath.Join(os.TempDir(), "memql-pipelines")
+}
+
+// absoluteRoot resolves a configured root (~ expanded, made absolute), or
+// reports that none is configured.
+func absoluteRoot(p string) (string, bool) {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return "", false
+	}
+	root, err := canonicalPath(p)
+	if err != nil {
+		return "", false
+	}
+	return root, true
 }
 
 // InferenceServe reports this machine's sharing consent: ServeOwner or

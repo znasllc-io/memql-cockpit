@@ -52,6 +52,12 @@ type Connection struct {
 	// The runner compares the live policy against it (memql-cockpit#428).
 	AdvertisedServe string
 
+	// AdvertisedPipelines is whether this connection registered with the
+	// pipelines=allowed label (memql#5494): policy.yaml's pipelines.allow
+	// when it registered. Bound at Register like the rest of the
+	// advertisement, so the runner compares the live policy against it.
+	AdvertisedPipelines bool
+
 	// cancel ends the context this connection's stream was opened on (the
 	// runner opens each stream on its own); Close uses it when a graceful
 	// close cannot finish.
@@ -113,12 +119,12 @@ func dialSDK(ctx context.Context, cfg Config, logger *slog.Logger) (stream, erro
 
 // handshake runs Register / RegisterAck over an open stream and returns
 // the live connection, or closes the stream and returns why it failed.
-func handshake(ctx context.Context, s stream, cfg Config, inventory []apps.Info, modelInv models.Inventory, hw hardware.Inventory, inferenceServe string, logger *slog.Logger) (*Connection, error) {
+func handshake(ctx context.Context, s stream, cfg Config, inventory []apps.Info, modelInv models.Inventory, hw hardware.Inventory, inferenceServe string, pipelinesAllowed bool, logger *slog.Logger) (*Connection, error) {
 	c := &Connection{
 		conn:   s,
 		logger: logger,
 	}
-	if err := c.register(ctx, cfg, inventory, modelInv, hw, inferenceServe); err != nil {
+	if err := c.register(ctx, cfg, inventory, modelInv, hw, inferenceServe, pipelinesAllowed); err != nil {
 		c.Close()
 		return nil, err
 	}
@@ -143,12 +149,42 @@ func (e *RegisterRefusedError) Error() string {
 	return fmt.Sprintf("worker.register: %s: %s", e.Code, e.Message)
 }
 
+// LabelPipelines / LabelPipelinesAllowed are the label a machine whose
+// owner allows CI pipeline steps registers with (memql#5494). The engine's
+// router requires exactly pipelines=allowed of any machine it sends a
+// pipeline step to, so nothing about a laptop is a default place for CI.
+const (
+	LabelPipelines        = "pipelines"
+	LabelPipelinesAllowed = "allowed"
+)
+
+// withPipelinesLabel returns labels with the pipelines label set exactly
+// when this machine's policy allows pipeline steps, never editing the map it
+// was given.
+//
+// THE POLICY WINS over worker.yaml's own labels here, the opposite of the
+// model labels' rule. An operator label claiming pipelines=allowed on a
+// machine whose policy.yaml does not would route every step to a machine
+// that then refuses it -- and a refusal by the worker fails the step rather
+// than moving it to another machine.
+func withPipelinesLabel(labels map[string]string, allowed bool) map[string]string {
+	out := make(map[string]string, len(labels)+1)
+	for k, v := range labels {
+		out[k] = v
+	}
+	delete(out, LabelPipelines)
+	if allowed {
+		out[LabelPipelines] = LabelPipelinesAllowed
+	}
+	return out
+}
+
 // buildRegister assembles the worker-protocol Register handshake
 // message. Pulled out of register() so tests can assert the wire
 // shape -- in particular that capability_descriptor_json always
 // satisfies the server-side validation rules (memql#1331: raw size,
 // schemaVersion, action-name pattern) -- without a live stream.
-func buildRegister(cfg Config, inventory []apps.Info, modelInv models.Inventory, hw hardware.Inventory, inferenceServe string) *memqlv1.Register {
+func buildRegister(cfg Config, inventory []apps.Info, modelInv models.Inventory, hw hardware.Inventory, inferenceServe string, pipelinesAllowed bool) *memqlv1.Register {
 	hostname, _ := os.Hostname()
 	// Local models (memql-cockpit#361). They ride the EXISTING
 	// registration mechanism -- `model:<id>` and `runtime:<kind>` labels
@@ -158,6 +194,10 @@ func buildRegister(cfg Config, inventory []apps.Info, modelInv models.Inventory,
 	// nothing here: no capability, no labels, no concurrency entry.
 	modelReg := modelRegistrationFor(modelInv)
 	labels := mergeModelLabels(cfg.Labels, modelReg.Labels)
+	// The owner's consent to CI pipeline steps (memql#5494), from the live
+	// policy. Also a copy, so the machine id below never lands in the
+	// config's own map.
+	labels = withPipelinesLabel(labels, pipelinesAllowed)
 	if mid, err := machineIDFor(cfg); err == nil && mid != "" {
 		if labels == nil {
 			labels = map[string]string{}
@@ -201,10 +241,11 @@ func buildRegister(cfg Config, inventory []apps.Info, modelInv models.Inventory,
 }
 
 // register sends the Register message and waits for the RegisterAck.
-func (c *Connection) register(ctx context.Context, cfg Config, inventory []apps.Info, modelInv models.Inventory, hw hardware.Inventory, inferenceServe string) error {
-	register := buildRegister(cfg, inventory, modelInv, hw, inferenceServe)
+func (c *Connection) register(ctx context.Context, cfg Config, inventory []apps.Info, modelInv models.Inventory, hw hardware.Inventory, inferenceServe string, pipelinesAllowed bool) error {
+	register := buildRegister(cfg, inventory, modelInv, hw, inferenceServe, pipelinesAllowed)
 	c.ModelFingerprint = advertisedFingerprint(modelInv.Labels())
 	c.AdvertisedServe = inferenceServe
+	c.AdvertisedPipelines = pipelinesAllowed
 	if err := c.Send(&memqlv1.WorkerClientMessage{
 		Payload: &memqlv1.WorkerClientMessage_Register{Register: register},
 	}); err != nil {
@@ -246,6 +287,7 @@ func (c *Connection) register(ctx context.Context, cfg Config, inventory []apps.
 			"owner_user_id", c.OwnerUserId,
 			"models_offered", len(modelInv.Advertised()),
 			"inference_serve", inferenceServe,
+			"pipelines_allowed", pipelinesAllowed,
 		)
 	}
 	return nil
@@ -437,6 +479,19 @@ func (c *Connection) SendModelCallDelta(requestID string, seq uint64, content st
 func (c *Connection) SendModelCallEnd(end *memqlv1.ModelCallEnd) error {
 	return c.Send(&memqlv1.WorkerClientMessage{
 		Payload: &memqlv1.WorkerClientMessage_ModelCallEnd{ModelCallEnd: end},
+	})
+}
+
+// SendToolStream emits one piece of a running tool call's output
+// (memql#5494: a pipeline step's stdout and stderr).
+//
+// Every chunk of a call goes out BEFORE its ToolResult: the engine relays a
+// chunk only while the call is pending and drops one that arrives after the
+// result (component/worker handleToolStream). The dispatcher returns only
+// once its output is sent, and the runner sends the result after that.
+func (c *Connection) SendToolStream(chunk *memqlv1.ToolStream) error {
+	return c.Send(&memqlv1.WorkerClientMessage{
+		Payload: &memqlv1.WorkerClientMessage_ToolStream{ToolStream: chunk},
 	})
 }
 

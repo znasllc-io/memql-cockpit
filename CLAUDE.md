@@ -137,7 +137,8 @@ memql-cockpit/
 │                           releases
 ├── deploy/systemd/         memql-worker.service template (user systemd)
 ├── docs/                   access.md, computer-use.md, local-apps.md,
-│                           local-models.md, watched-folders.md;
+│                           local-models.md, pipelines.md,
+│                           watched-folders.md;
 │                           docs/superpowers/specs/ designs (the plans
 │                           beside them are deleted by the PR that
 │                           finishes them; the specs are the record)
@@ -669,6 +670,72 @@ an `errors` array, so a client that only checked the status would read "you may
 not see these rows" as "you are watching nothing" -- and a backup with nothing
 to do looks exactly like one that is up to date. Every call reads `errors`
 first.
+
+## CI pipeline steps (memql#5494)
+
+`workerHost.pipeline_step` runs one of the cluster's CI pipeline steps on this
+machine with the clone-and-command contract of the cluster's Kubernetes Job.
+Engine half: epic memql#5478. `internal/worker/tools/pipeline_step.go`, the
+`pipelines` block in `policy.go`. Operator doc:
+[docs/pipelines.md](docs/pipelines.md).
+
+**ADMITTED BY POLICY, NEVER BY A WINDOW.** A step arrives when a push lands,
+so the owner's consent is STANDING: `pipelines.allow`, default-deny, checked
+by the step before it touches anything. `consent.AdmittedByPolicy` names the
+one pair the dispatcher does not ask the window about; adding a pair there
+whose handler checks no policy runs it on nobody's say-so. The block
+REPLACES on reload (a consent a SIGHUP could not withdraw is a grant the file
+no longer states).
+
+**WHAT `allow` GRANTS IS THE PIPELINE RUNNER'S CHOICE OF COMMAND, as the
+owner, for the repositories it names** -- the machine cannot see the pipeline.
+Two refusals hold a step to that: one whose `ToolDispatch.agent_id` is set
+(the engine's pipeline dispatch carries no agent; an agent's tool loop always
+does), and one whose clone URL's path does not name its `repository` (so
+`repos` filters what is CLONED, not a name the request states).
+
+**THE LABEL IS THE POLICY'S, NOT worker.yaml's.** Register carries
+`pipelines=allowed` exactly when `pipelines.allow` is true, and REMOVES an
+operator label of that name -- the opposite of the model labels' rule -- because
+the engine's router requires the label, and a machine that would refuse every
+step routed on it must not carry it. Like every label it binds at Register, so
+a changed policy re-registers (`maybeReadvertiseModels`, under the same busy
+and floor guards).
+
+**THE TOKEN NEVER TOUCHES DISK OR ARGV**: it is an `http.extraheader` in
+`GIT_CONFIG_COUNT/KEY/VALUE`. And the fetch is hermetic, because "an empty
+token is an anonymous fetch" is false otherwise: no global or system gitconfig
+(an `insteadOf` would fetch with the owner's SSH key), credential helpers
+reset, the machine's `GIT_` variables stripped, no prompt, https only. The
+COMMAND is the opposite -- it INHERITS the machine environment, unlike exec,
+because a CI step needs this machine's toolchains; only `MEMQL_WORKER_TOKEN`
+is held back.
+
+**EVERY CHUNK BEFORE THE RESULT.** The engine relays a `ToolStream` only while
+its call is pending and drops one that arrives after the result, so
+`Dispatcher.DispatchStream` returns only once its output is sent and the
+runner sends the result after. Output is MASKED AS THE CLUSTER MASKS IT
+(the engine's `pipelines.MaskSecrets`): every form of a value -- as stored,
+trimmed, each line of a multi-line one trimmed (a line ends at a newline OR A
+CARRIAGE RETURN, so each part of "user\rpass" masks alone), four bytes or
+more -- and values that overlap where printed as one mask, a LINE AT A TIME,
+as the cluster masks the lines it reassembles, so how the output was read
+changes nothing and a value stored with a line end never takes the line end
+with it.
+It is cut only at line ends (or, past 64 KiB of one line, where the line's
+masking is decided: a span's mask goes out where it starts and its reach is
+carried to the next part), because masking a chunk cannot see a value split
+across two -- and a line is HELD past 64 KiB, from the first byte of a value
+that may still be arriving, until all of it can be seen: sending it whole
+leaked such a value in full. The runner ENDS a tool call on
+`ToolCancel` and on the loss of its stream: it does not reconnect until its
+calls return, so a step left running would keep the machine off the cluster
+for its whole timeout.
+
+**ARTIFACTS FIT ONE MESSAGE OR DO NOT TRAVEL.** 64 MiB of files (the engine's
+limit), and 20 MiB compressed, because the result is one `ToolResult` on a
+stream capped at 32 MiB and base64 costs a third. Over either, the result says
+`artifactsTooLarge` and keeps the step's exit status.
 
 ## App-session recording (memql-cockpit#440)
 

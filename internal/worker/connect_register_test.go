@@ -39,7 +39,7 @@ func TestBuildRegister_CarriesValidCapabilityDescriptor(t *testing.T) {
 		Name:         "test-worker",
 		Capabilities: []string{"HEADLESS"},
 		Concurrency:  map[string]uint32{"HEADLESS": 1},
-	}, nil, models.Inventory{}, hardware.Inventory{}, tools.ServeOwner)
+	}, nil, models.Inventory{}, hardware.Inventory{}, tools.ServeOwner, false)
 
 	raw := register.GetCapabilityDescriptorJson()
 	if raw == "" {
@@ -87,6 +87,46 @@ func TestBuildRegister_CarriesValidCapabilityDescriptor(t *testing.T) {
 	}
 }
 
+// The pipelines label is how the cluster's router knows this machine's
+// owner opted in to running CI steps (memql#5494). It is advertised exactly
+// when policy.yaml says pipelines.allow -- and never otherwise, not even
+// when worker.yaml's own labels claim it, because a machine that would
+// refuse every step routed on the label must not carry it.
+func TestRegisterAdvertisesPipelinesOnlyWhenThePolicyAllows(t *testing.T) {
+	cfg := Config{
+		Name:         "test-worker",
+		Capabilities: []string{"HEADLESS"},
+		StateDir:     t.TempDir(),
+		Labels:       map[string]string{"team": "core"},
+	}
+	on := buildRegister(cfg, nil, models.Inventory{}, hardware.Inventory{}, tools.ServeOwner, true)
+	// The literal pair is the wire contract: the engine requires exactly
+	// pipelines=allowed of a machine it routes a pipeline step to.
+	if got := on.GetLabels()["pipelines"]; got != "allowed" {
+		t.Fatalf("pipelines.allow: true advertised pipelines=%q, want \"allowed\" (labels %v)", got, on.GetLabels())
+	}
+	if on.GetLabels()["team"] != "core" {
+		t.Errorf("the operator's own labels were lost: %v", on.GetLabels())
+	}
+
+	off := buildRegister(cfg, nil, models.Inventory{}, hardware.Inventory{}, tools.ServeOwner, false)
+	if v, ok := off.GetLabels()["pipelines"]; ok {
+		t.Fatalf("a machine whose policy allows no pipelines advertised pipelines=%q", v)
+	}
+
+	cfg.Labels = map[string]string{"pipelines": "allowed", "team": "core"}
+	claimed := buildRegister(cfg, nil, models.Inventory{}, hardware.Inventory{}, tools.ServeOwner, false)
+	if v, ok := claimed.GetLabels()["pipelines"]; ok {
+		t.Fatalf("a worker.yaml label claimed pipelines=%q that policy.yaml does not grant", v)
+	}
+	if claimed.GetLabels()["team"] != "core" {
+		t.Errorf("the operator's own labels were lost: %v", claimed.GetLabels())
+	}
+	if cfg.Labels["pipelines"] != "allowed" {
+		t.Error("buildRegister edited the config's own label map")
+	}
+}
+
 // The sharing consent reaches the wire through the descriptor, and the
 // Register path is the only place it is read from the live policy.
 func TestRegisterCarriesTheSharingConsent(t *testing.T) {
@@ -94,7 +134,7 @@ func TestRegisterCarriesTheSharingConsent(t *testing.T) {
 		register := buildRegister(Config{
 			Name:         "test-worker",
 			Capabilities: []string{"HEADLESS"},
-		}, nil, models.Inventory{}, hardware.Inventory{}, serve)
+		}, nil, models.Inventory{}, hardware.Inventory{}, serve, false)
 
 		var got map[string]any
 		if err := json.Unmarshal([]byte(register.GetCapabilityDescriptorJson()), &got); err != nil {
