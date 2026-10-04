@@ -39,7 +39,11 @@ const openWatchInterval = 250 * time.Millisecond
 
 // launchOpen puts the app in front of the human and waits for it to
 // finish. Returns the app's real exit code.
-func launchOpen(ctx context.Context, spec apps.Spec, workspace, prompt string, env []string) (*child, string, error) {
+//
+// openCommand resolves the platform's way of showing a window
+// (platformOpenCommand, unless a test says otherwise).
+func launchOpen(ctx context.Context, spec apps.Spec, workspace, prompt string, env []string,
+	openCommand func(script string) ([]string, string, error)) (*child, string, error) {
 	// Preflight 1: the app itself. `open -a Terminal` succeeds whether
 	// or not the command inside the window exists, so without this the
 	// failure would surface as a window that flashes and closes -- which
@@ -62,7 +66,7 @@ func launchOpen(ctx context.Context, spec apps.Spec, workspace, prompt string, e
 	// Preflight 2: the platform's way of showing a window. On a headless
 	// Linux box this is where the session fails, by name, instead of
 	// pretending a window appeared.
-	argv, note, err := platformOpenCommand(script)
+	argv, note, err := openCommand(script)
 	if err != nil {
 		return nil, "", fmt.Errorf("open %s: %w", spec.ID, err)
 	}

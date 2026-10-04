@@ -1604,7 +1604,7 @@ function remove_binaries_with_mode() {
 }
 
 # purge_worker_state is what --purge adds: policy.yaml (the owner's
-# apps.allow / models.allow / backup.roots -- kept by default because
+# apps.homes / models.allow / backup.roots -- kept by default because
 # it is authored, not generated), the state dir (logs, ledgers, the
 # recorded registration id), the consent socket, and then ~/.memql
 # itself once nothing is left in it. The CLI's clusters.yaml and

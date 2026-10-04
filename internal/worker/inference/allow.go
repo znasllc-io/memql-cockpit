@@ -12,7 +12,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// allow.go adds model ids to models.allow in policy.yaml.
+// allow.go edits the lists in policy.yaml: models.allow (`setup
+// --inference`, `worker models --allow`, the cluster's pull) and each
+// cluster's apps.homes.<home>.allow (`worker apps --allow/--deny`). One
+// editor, addressed by a key path, because the rules below are the same for
+// every list this machine's owner writes consent into.
 //
 // IT IS A TEXTUAL EDIT, AND THAT IS THE WHOLE DESIGN. The obvious
 // implementation -- unmarshal the file, append to a slice, marshal it back
@@ -25,22 +29,23 @@ import (
 // machine is allowed to do.
 //
 // So the YAML parse here decides only WHAT to write -- which ids are
-// already listed, where the models block is, which line the last entry
-// sits on -- and every byte outside the lines this file inserts is carried
+// already listed, where the block is, which line the last entry sits on --
+// and every byte outside the lines this file inserts or deletes is carried
 // through untouched. yaml.Node's Line and Column are what make that exact
 // rather than a regular expression's guess at where a block begins.
 //
-// WHERE IT CANNOT DO THAT, IT REFUSES. A flow mapping, an allow key that
-// is not a sequence, a root that is not a mapping: each of those could be
+// WHERE IT CANNOT DO THAT, IT REFUSES. A flow mapping, a list key that is
+// not a sequence, a root that is not a mapping: each of those could be
 // handled by falling back to a re-serialisation, and the price would be an
 // operator's comments deleted by a command they ran to add one model. A
 // refusal names the line and names the ids, which costs them thirty
 // seconds; the fallback costs them the file.
 //
-// MERGE, NEVER REPLACE. The ids already listed are the models this machine
-// is serving right now, and a rewrite that dropped one takes it out of the
-// fleet at the next reload -- with nothing in the output of the command
-// that did it saying so.
+// ADDING MERGES, NEVER REPLACES. The ids already listed are the models
+// this machine is serving, or the apps a cluster may run, right now, and a
+// rewrite that dropped one takes it away at the next reload -- with nothing
+// in the output of the command that did it saying so. Removing is its own
+// call (RemoveFromList), and only ever removes the ids it was given.
 
 const (
 	// policyFileMode is the care worker.yaml gets (persistence.go).
@@ -56,6 +61,9 @@ const (
 // the change by hand in the shape they already chose.
 var ErrPolicyNotEditable = errors.New("this policy.yaml is written in a shape this command will not edit without reformatting the whole file")
 
+// modelsAllowPath is where Allow writes.
+var modelsAllowPath = []string{"models", "allow"}
+
 // Allow merges model ids into models.allow, creating the file if needed.
 //
 // Nothing is written when there is nothing to add, which is the ordinary
@@ -63,20 +71,32 @@ var ErrPolicyNotEditable = errors.New("this policy.yaml is written in a shape th
 // the file every time would churn its mtime, its mode and any backup
 // watching it for no change at all.
 func Allow(policyPath string, ids ...string) error {
-	if strings.TrimSpace(policyPath) == "" {
-		return errors.New("no policy.yaml path was given, so there is nowhere to record the model")
-	}
 	wanted := cleanIDs(ids)
 	if len(wanted) == 0 {
+		if strings.TrimSpace(policyPath) == "" {
+			return errors.New("no policy.yaml path was given, so there is nowhere to record the model")
+		}
 		return nil
 	}
+	return EditPolicy(policyPath, func(body string) (string, bool, error) {
+		return MergeList(body, modelsAllowPath, wanted)
+	})
+}
 
+// EditPolicy applies edit to policy.yaml's text and writes the result back
+// -- atomically, and only when edit reports a change. A missing file is
+// the empty string, which is what a fresh machine has. Several edits that
+// must land together compose inside one edit function, so the file is
+// never left with half of them.
+func EditPolicy(policyPath string, edit func(body string) (string, bool, error)) error {
+	if strings.TrimSpace(policyPath) == "" {
+		return errors.New("no policy.yaml path was given, so there is nowhere to record the change")
+	}
 	raw, err := os.ReadFile(policyPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("reading %s: %w", policyPath, err)
 	}
-
-	updated, changed, err := mergeAllow(string(raw), wanted)
+	updated, changed, err := edit(string(raw))
 	if err != nil {
 		return fmt.Errorf("%s: %w", policyPath, err)
 	}
@@ -86,84 +106,97 @@ func Allow(policyPath string, ids ...string) error {
 	return writePolicyAtomic(policyPath, []byte(updated))
 }
 
-// mergeAllow returns the new file, and whether anything changed.
+// MergeList returns body with ids merged into the list at path -- for
+// example models.allow, or apps.homes.<home>.allow -- and whether anything
+// changed. Every mapping on the path that does not exist yet is created,
+// nested under the deepest one that does.
 //
-// Split out from Allow so the whole decision is a pure function of the
-// bytes: every shape below is asserted on a string in the tests rather
-// than on a file, which is what makes "byte for byte outside models.allow"
-// something a test can actually claim.
-func mergeAllow(body string, wanted []string) (string, bool, error) {
-	lines := splitLines(body)
-
-	var doc yaml.Node
-	if strings.TrimSpace(body) != "" {
-		if err := yaml.Unmarshal([]byte(body), &doc); err != nil {
-			// The worker cannot read this file either, so it is already
-			// broken. Overwriting it would delete whatever the operator is
-			// halfway through fixing.
-			return "", false, fmt.Errorf("it does not parse as YAML, so nothing was changed: %w", err)
-		}
+// A pure function of the bytes, so every shape below is asserted on a
+// string in the tests rather than on a file, which is what makes "byte for
+// byte outside the list" something a test can actually claim.
+func MergeList(body string, path []string, wanted []string) (string, bool, error) {
+	if len(path) == 0 {
+		return "", false, errors.New("no key path to merge into")
 	}
-
-	root := documentRoot(&doc)
+	wanted = cleanIDs(wanted)
+	if len(wanted) == 0 {
+		return body, false, nil
+	}
+	lines := splitLines(body)
+	root, err := parseRoot(body)
+	if err != nil {
+		return "", false, err
+	}
 	if root == nil {
 		// Empty, missing, or comments only. The comments survive, because
 		// the fresh block is appended to the lines that are there.
-		return joinLines(appendModelsBlock(lines, wanted, len(lines) == 0)), true, nil
+		return joinLines(appendBlock(lines, path, wanted, len(lines) == 0)), true, nil
 	}
+	refuse := func(line int) (string, bool, error) { return notEditable(line, "add", wanted, "to", path) }
 	if root.Kind != yaml.MappingNode || root.Style&yaml.FlowStyle != 0 {
-		return notEditable(root.Line, wanted)
+		return refuse(root.Line)
 	}
 
-	modelsKey, modelsVal := findKey(root, "models")
-	if modelsKey == nil {
-		return joinLines(appendModelsBlock(lines, wanted, false)), true, nil
-	}
-	if isNull(modelsVal) {
-		return joinLines(insertLines(lines, modelsKey.Line, allowBlock(2, wanted))), true, nil
-	}
-	if modelsVal.Kind != yaml.MappingNode || modelsVal.Style&yaml.FlowStyle != 0 {
-		return notEditable(modelsKey.Line, wanted)
-	}
-
-	// The indentation of models' own children, taken from a child rather
-	// than assumed: a file indented with four spaces must stay indented
-	// with four spaces.
-	childIndent := 2
-	if len(modelsVal.Content) > 0 {
-		childIndent = modelsVal.Content[0].Column - 1
+	// Walk the mappings on the path, stopping at the first one missing.
+	parent, parentKey := root, (*yaml.Node)(nil)
+	for i, key := range path[:len(path)-1] {
+		k, v := findKey(parent, key)
+		switch {
+		case k == nil:
+			return joinLines(insertUnder(lines, parent, parentKey, path[i:], wanted)), true, nil
+		case isNull(v):
+			return joinLines(insertLines(lines, k.Line, nestedBlock(k.Column-1+2, path[i+1:], wanted))), true, nil
+		case v.Kind != yaml.MappingNode || v.Style&yaml.FlowStyle != 0:
+			return refuse(k.Line)
+		}
+		parent, parentKey = v, k
 	}
 
-	allowKey, allowVal := findKey(modelsVal, "allow")
-	if allowKey == nil {
-		return joinLines(insertLines(lines, modelsKey.Line, allowBlock(childIndent, wanted))), true, nil
+	listKey := path[len(path)-1]
+	k, v := findKey(parent, listKey)
+	if k == nil {
+		return joinLines(insertUnder(lines, parent, parentKey, path[len(path)-1:], wanted)), true, nil
 	}
 
-	add := missing(wanted, sequenceValues(allowVal))
+	add := missing(wanted, sequenceValues(v))
 	if len(add) == 0 {
 		return body, false, nil
 	}
 
 	switch {
-	case isNull(allowVal):
+	case isNull(v):
 		// `allow:` with nothing under it -- what somebody leaves behind
-		// after deleting the last model.
-		return joinLines(insertLines(lines, allowKey.Line, items(allowKey.Column-1+2, add))), true, nil
+		// after deleting the last entry, and what RemoveFromList leaves.
+		return joinLines(insertLines(lines, k.Line, items(k.Column-1+2, add))), true, nil
 
-	case allowVal.Kind == yaml.SequenceNode && allowVal.Style&yaml.FlowStyle != 0:
-		return appendToFlowSequence(lines, allowKey.Line, add, wanted)
+	case v.Kind == yaml.SequenceNode && v.Style&yaml.FlowStyle != 0:
+		m := flowSequenceOn(lines, k.Line, listKey)
+		if m == nil {
+			return refuse(k.Line)
+		}
+		quoted := make([]string, 0, len(add))
+		for _, id := range add {
+			quoted = append(quoted, yamlScalar(id))
+		}
+		inside := strings.Join(quoted, ", ")
+		if strings.TrimSpace(m[2]) != "" {
+			inside = strings.TrimRight(m[2], " ") + ", " + inside
+		}
+		out := append([]string(nil), lines...)
+		out[k.Line-1] = m[1] + inside + m[3]
+		return joinLines(out), true, nil
 
-	case allowVal.Kind == yaml.SequenceNode:
-		last := allowVal.Content[len(allowVal.Content)-1]
+	case v.Kind == yaml.SequenceNode:
+		last := v.Content[len(v.Content)-1]
 		if last.Kind != yaml.ScalarNode || last.Line < 1 || last.Line > len(lines) {
-			return notEditable(allowKey.Line, wanted)
+			return refuse(k.Line)
 		}
 		// The `- ` prefix is COPIED from the last entry rather than
 		// rebuilt, so a list indented under its key and one indented level
 		// with it both keep the shape they had.
 		prefix := blockItemPrefix.FindStringSubmatch(lines[last.Line-1])
 		if prefix == nil {
-			return notEditable(last.Line, wanted)
+			return refuse(last.Line)
 		}
 		out := make([]string, 0, len(add))
 		for _, id := range add {
@@ -171,71 +204,235 @@ func mergeAllow(body string, wanted []string) (string, bool, error) {
 		}
 		return joinLines(insertLines(lines, last.Line, out)), true, nil
 	}
-	return notEditable(allowKey.Line, wanted)
+	return refuse(k.Line)
+}
+
+// RemoveFromList returns body with ids removed from the list at path, and
+// whether anything changed. Ids match without regard to case or
+// surrounding space. A list, or any mapping above it, that does not exist
+// removes nothing: what is not listed is not allowed.
+//
+// Only the removed entries' lines go. A list left empty is left as its key
+// with nothing under it (or `[]`), which reads as nothing listed -- the
+// same default-deny as no key at all, and MergeList fills it back in.
+func RemoveFromList(body string, path []string, unwanted []string) (string, bool, error) {
+	if len(path) == 0 {
+		return "", false, errors.New("no key path to remove from")
+	}
+	unwanted = cleanIDs(unwanted)
+	if len(unwanted) == 0 {
+		return body, false, nil
+	}
+	lines := splitLines(body)
+	root, err := parseRoot(body)
+	if err != nil {
+		return "", false, err
+	}
+	if root == nil {
+		return body, false, nil
+	}
+	refuse := func(line int) (string, bool, error) { return notEditable(line, "remove", unwanted, "from", path) }
+	k, v, line, ok := walkTo(root, path)
+	if !ok {
+		return refuse(line)
+	}
+	if k == nil || isNull(v) {
+		return body, false, nil
+	}
+	if v.Kind != yaml.SequenceNode {
+		return refuse(k.Line)
+	}
+
+	drop := map[int]bool{}
+	var keep []string
+	for i, item := range v.Content {
+		if item.Kind == yaml.ScalarNode && containsFold(unwanted, item.Value) {
+			drop[i] = true
+			continue
+		}
+		keep = append(keep, item.Value)
+	}
+	if len(drop) == 0 {
+		return body, false, nil
+	}
+
+	if v.Style&yaml.FlowStyle != 0 {
+		m := flowSequenceOn(lines, k.Line, path[len(path)-1])
+		// The line must hold exactly the entries the parse found, each a
+		// plain value, or the rewrite below would be a guess about which
+		// text is which entry.
+		if m == nil || len(splitFlow(m[2])) != len(v.Content) {
+			return refuse(k.Line)
+		}
+		for _, item := range v.Content {
+			if !singleLineScalar(item) {
+				return refuse(k.Line)
+			}
+		}
+		quoted := make([]string, 0, len(keep))
+		for _, id := range keep {
+			quoted = append(quoted, yamlScalar(id))
+		}
+		out := append([]string(nil), lines...)
+		out[k.Line-1] = m[1] + strings.Join(quoted, ", ") + m[3]
+		return joinLines(out), true, nil
+	}
+
+	var gone []int
+	for i := range drop {
+		item := v.Content[i]
+		// One entry per line, and nothing but the entry on it: anything
+		// else and deleting the line deletes something that was not asked.
+		if item.Line < 1 || item.Line > len(lines) || !singleLineScalar(item) || sharesLine(v, i) ||
+			!blockItemPrefix.MatchString(lines[item.Line-1]) {
+			return refuse(item.Line)
+		}
+		gone = append(gone, item.Line)
+	}
+	return joinLines(deleteLines(lines, gone)), true, nil
+}
+
+// RemoveKey returns body with the key at path and its value deleted, the
+// values it held when that value was a list, and whether anything changed.
+// A key that is not there changes nothing. It removes whole lines only --
+// the key's own and, for a block list, its entries' -- and refuses a value
+// it cannot bound that way, rather than guessing where it ends.
+func RemoveKey(body string, path []string) (string, []string, bool, error) {
+	if len(path) == 0 {
+		return "", nil, false, errors.New("no key path to remove")
+	}
+	lines := splitLines(body)
+	root, err := parseRoot(body)
+	if err != nil {
+		return "", nil, false, err
+	}
+	if root == nil {
+		return body, nil, false, nil
+	}
+	refuse := func(line int) (string, []string, bool, error) {
+		_, _, err := notEditable(line, "remove", nil, "", path)
+		return "", nil, false, err
+	}
+	k, v, line, ok := walkTo(root, path)
+	if !ok {
+		return refuse(line)
+	}
+	if k == nil {
+		return body, nil, false, nil
+	}
+	end := k.Line
+	switch {
+	case isNull(v):
+	case v.Kind == yaml.ScalarNode && singleLineScalar(v) && v.Line == k.Line:
+	case v.Kind == yaml.SequenceNode && v.Style&yaml.FlowStyle != 0:
+		if flowSequenceOn(lines, k.Line, path[len(path)-1]) == nil {
+			return refuse(k.Line)
+		}
+	case v.Kind == yaml.SequenceNode:
+		for i, item := range v.Content {
+			if !singleLineScalar(item) || sharesLine(v, i) {
+				return refuse(item.Line)
+			}
+			end = max(end, item.Line)
+		}
+	default:
+		return refuse(k.Line)
+	}
+	if k.Line < 1 || end > len(lines) {
+		return refuse(k.Line)
+	}
+	gone := make([]int, 0, end-k.Line+1)
+	for l := k.Line; l <= end; l++ {
+		gone = append(gone, l)
+	}
+	return joinLines(deleteLines(lines, gone)), sequenceValues(v), true, nil
 }
 
 // blockItemPrefix captures the exact leading whitespace, dash and spacing
 // of an existing sequence entry.
 var blockItemPrefix = regexp.MustCompile(`^(\s*-\s+)\S`)
 
-// flowSequence matches a single-line flow sequence and nothing else. A
-// flow list spread over several lines, or one carrying a bracket inside a
-// quoted value, falls through to the refusal -- getting either wrong
-// writes a policy.yaml the worker can no longer parse, which takes the
-// machine out of the fleet entirely.
-var flowSequence = regexp.MustCompile(`^(\s*allow:\s*\[)([^\[\]]*)(\].*)$`)
-
-func appendToFlowSequence(lines []string, line int, add, wanted []string) (string, bool, error) {
+// flowSequenceOn matches a single-line flow sequence under key on the given
+// 1-based line, and nothing else: prefix through `[`, the entries, and `]`
+// with whatever follows it. A flow list spread over several lines, or one
+// carrying a bracket inside a quoted value, is nil -- and the caller
+// refuses, because getting either wrong writes a policy.yaml the worker can
+// no longer parse, which takes the machine out of the fleet entirely.
+func flowSequenceOn(lines []string, line int, key string) []string {
 	if line < 1 || line > len(lines) {
-		return notEditable(line, wanted)
+		return nil
 	}
-	m := flowSequence.FindStringSubmatch(lines[line-1])
-	if m == nil {
-		return notEditable(line, wanted)
-	}
-	quoted := make([]string, 0, len(add))
-	for _, id := range add {
-		quoted = append(quoted, yamlScalar(id))
-	}
-	inside := strings.Join(quoted, ", ")
-	if strings.TrimSpace(m[2]) != "" {
-		inside = strings.TrimRight(m[2], " ") + ", " + inside
-	}
-	out := append([]string(nil), lines...)
-	out[line-1] = m[1] + inside + m[3]
-	return joinLines(out), true, nil
+	re := regexp.MustCompile(`^(\s*` + regexp.QuoteMeta(key) + `:\s*\[)([^\[\]]*)(\].*)$`)
+	return re.FindStringSubmatch(lines[line-1])
 }
 
-func notEditable(line int, ids []string) (string, bool, error) {
-	return "", false, fmt.Errorf("%w (around line %d): add %s to models.allow by hand",
-		ErrPolicyNotEditable, line, strings.Join(ids, ", "))
+// splitFlow splits a flow sequence's inside into its entries.
+func splitFlow(inside string) []string {
+	if strings.TrimSpace(inside) == "" {
+		return nil
+	}
+	return strings.Split(inside, ",")
+}
+
+// notEditable is the refusal: the line, and the change to make by hand.
+func notEditable(line int, verb string, ids []string, prep string, path []string) (string, bool, error) {
+	where := strings.Join(path, ".")
+	if len(ids) == 0 {
+		return "", false, fmt.Errorf("%w (around line %d): %s %s by hand", ErrPolicyNotEditable, line, verb, where)
+	}
+	return "", false, fmt.Errorf("%w (around line %d): %s %s %s %s by hand",
+		ErrPolicyNotEditable, line, verb, strings.Join(ids, ", "), prep, where)
 }
 
 // -----------------------------------------------------------------------------
-// The block this file writes
+// The blocks this file writes
 // -----------------------------------------------------------------------------
 
 // freshFileHeader goes only on a policy.yaml this command created. It is
 // not added to a file somebody else wrote: a command run to add one model
 // has no business leaving its own commentary in an operator's file.
 var freshFileHeader = []string{
-	"# MemQL Cockpit worker policy. models.allow is DEFAULT-DENY: only the",
-	"# models listed here are offered to the cluster (docs/local-models.md).",
+	"# MemQL Cockpit worker policy. Every allow list here is DEFAULT-DENY: only",
+	"# what is listed is offered (docs/local-models.md, docs/local-apps.md).",
 }
 
-func appendModelsBlock(lines, ids []string, fresh bool) []string {
+// appendBlock adds the whole path, as a fresh top-level block, at the end
+// of the file.
+func appendBlock(lines, path, ids []string, fresh bool) []string {
 	out := append([]string(nil), lines...)
 	if fresh {
 		out = append(out, freshFileHeader...)
 	} else if len(out) > 0 && strings.TrimSpace(out[len(out)-1]) != "" {
 		out = append(out, "")
 	}
-	out = append(out, "models:")
-	return append(out, allowBlock(2, ids)...)
+	return append(out, nestedBlock(0, path, ids)...)
 }
 
-func allowBlock(indent int, ids []string) []string {
-	return append([]string{strings.Repeat(" ", indent) + "allow:"}, items(indent+2, ids)...)
+// insertUnder adds the rest of a path under an existing mapping: at the
+// end of the file for the root, otherwise directly beneath parentKey's line
+// at the indentation parent's own children already use -- taken from a
+// child rather than assumed, so a file indented with four spaces stays
+// indented with four spaces.
+func insertUnder(lines []string, parent, parentKey *yaml.Node, rest, ids []string) []string {
+	if parentKey == nil {
+		return appendBlock(lines, rest, ids, false)
+	}
+	indent := parentKey.Column - 1 + 2
+	if len(parent.Content) > 0 {
+		indent = parent.Content[0].Column - 1
+	}
+	return insertLines(lines, parentKey.Line, nestedBlock(indent, rest, ids))
+}
+
+// nestedBlock renders keys, each two deeper than the last, ending in the
+// list: nestedBlock(0, [models allow], ids) is `models:`, `  allow:` and
+// its entries.
+func nestedBlock(indent int, keys, ids []string) []string {
+	out := make([]string, 0, len(keys)+len(ids))
+	for i, key := range keys {
+		out = append(out, strings.Repeat(" ", indent+2*i)+yamlKey(key)+":")
+	}
+	return append(out, items(indent+2*len(keys), ids)...)
 }
 
 func items(indent int, ids []string) []string {
@@ -245,6 +442,18 @@ func items(indent int, ids []string) []string {
 		out = append(out, pad+"- "+yamlScalar(id))
 	}
 	return out
+}
+
+// plainKey is the set of keys that need no quoting. Narrower than
+// plainScalar: a colon inside a KEY is one character away from ending it,
+// so a key with one is quoted rather than left to the reader's parser.
+var plainKey = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.@/+-]*$`)
+
+func yamlKey(s string) string {
+	if plainKey.MatchString(s) {
+		return s
+	}
+	return strconv.Quote(s)
 }
 
 // plainScalar is the set of ids that need no quoting. A model id is
@@ -280,6 +489,89 @@ func documentRoot(doc *yaml.Node) *yaml.Node {
 		return nil
 	}
 	return root
+}
+
+// parseRoot parses body and returns its root, or nil for a file with
+// nothing in it yet.
+func parseRoot(body string) (*yaml.Node, error) {
+	var doc yaml.Node
+	if strings.TrimSpace(body) != "" {
+		if err := yaml.Unmarshal([]byte(body), &doc); err != nil {
+			// The worker cannot read this file either, so it is already
+			// broken. Overwriting it would delete whatever the operator is
+			// halfway through fixing.
+			return nil, fmt.Errorf("it does not parse as YAML, so nothing was changed: %w", err)
+		}
+	}
+	return documentRoot(&doc), nil
+}
+
+// walkTo finds the key at path under root. A key missing anywhere on the
+// path is (nil, nil, _, true) -- there is nothing there -- while a node on
+// the path that is not a block mapping is (_, _, its line, false): there
+// may be something there, in a shape this file does not edit.
+func walkTo(root *yaml.Node, path []string) (key, value *yaml.Node, line int, ok bool) {
+	node := root
+	for i, name := range path {
+		if node.Kind != yaml.MappingNode || node.Style&yaml.FlowStyle != 0 {
+			return nil, nil, node.Line, false
+		}
+		k, v := findKey(node, name)
+		if k == nil {
+			return nil, nil, 0, true
+		}
+		if i == len(path)-1 {
+			return k, v, k.Line, true
+		}
+		if isNull(v) {
+			return nil, nil, 0, true
+		}
+		node = v
+	}
+	return nil, nil, 0, true
+}
+
+// singleLineScalar is an entry whose whole text sits on its own line: no
+// block scalar (`|`, `>`) and no quoted value folded over several lines.
+func singleLineScalar(n *yaml.Node) bool {
+	if n == nil || n.Kind != yaml.ScalarNode || n.Style&(yaml.LiteralStyle|yaml.FoldedStyle) != 0 {
+		return false
+	}
+	return !strings.Contains(n.Value, "\n")
+}
+
+// sharesLine reports whether sequence entry i shares a line with another.
+func sharesLine(seq *yaml.Node, i int) bool {
+	for j, other := range seq.Content {
+		if j != i && other.Line == seq.Content[i].Line {
+			return true
+		}
+	}
+	return false
+}
+
+// deleteLines removes the given 1-based line numbers.
+func deleteLines(lines []string, gone []int) []string {
+	drop := make(map[int]bool, len(gone))
+	for _, l := range gone {
+		drop[l] = true
+	}
+	out := make([]string, 0, len(lines))
+	for i, l := range lines {
+		if !drop[i+1] {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func containsFold(list []string, s string) bool {
+	for _, v := range list {
+		if strings.EqualFold(strings.TrimSpace(v), strings.TrimSpace(s)) {
+			return true
+		}
+	}
+	return false
 }
 
 func findKey(m *yaml.Node, key string) (*yaml.Node, *yaml.Node) {

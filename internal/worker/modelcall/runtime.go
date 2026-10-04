@@ -211,6 +211,10 @@ type ChatRequest struct {
 	// same request as offering an empty list, and some runtimes answer
 	// the two differently.
 	Tools []Tool
+	// Level is the engine's level for the call. It never changes the model
+	// the router chose; the Ollama client reads it only to turn thinking off
+	// for fast calls (ollamaThink).
+	Level string
 }
 
 // EmbedRequest is one embedding call.

@@ -25,7 +25,7 @@
 //     rather than an absence.
 //
 //   - `models.allow` IS DEFAULT-DENY. Serving a call spends this machine's
-//     own GPU on somebody else's prompt, so it gets the posture apps.allow
+//     own GPU on somebody else's prompt, so it gets the posture app consent
 //     has: nothing is offered until the owner says which model may be. A
 //     model that is present but unlisted is REPORTED as blocked rather than
 //     omitted -- "present, blocked" is a state an operator can fix, and

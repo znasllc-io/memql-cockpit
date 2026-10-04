@@ -278,6 +278,10 @@ function install_launch_agent() {
         rm -f "$legacy"
         echo "INFO: removed legacy com.znasllc.memql-cockpit-worker LaunchAgent"
     fi
+    # PATH is launchd's four system directories, then where the app
+    # installers put claude and codex -- appended, so nothing the user can
+    # write to shadows launchctl. Without it the worker finds no app on
+    # this machine. internal/worker/servicepath.go spells the same string.
     cat > "$plist" << PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -303,6 +307,8 @@ function install_launch_agent() {
     <dict>
         <key>HOME</key>
         <string>${HOME}</string>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin:${HOME}/.local/bin:${HOME}/.claude/local:/opt/homebrew/bin:/usr/local/bin</string>
     </dict>
 </dict>
 </plist>
