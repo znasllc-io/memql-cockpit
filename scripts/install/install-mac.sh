@@ -372,6 +372,10 @@ function main() {
     local asset_name
     asset_name="$(binary_name_for "$FLAVOUR")"
     echo "INFO: os=$(detect_os) arch=$(detect_arch) flavour=${FLAVOUR}"
+    # A workers.yaml this script cannot read is refused here, before
+    # anything is installed: step 3 would otherwise rewrite it holding
+    # only this cluster, dropping every sibling enrollment it held.
+    preflight_registry
     preflight_asset "${DOWNLOAD_BASE}/${asset_name}" "$FLAVOUR"
 
     install_step 2 "Download or skip binary (version-aware)"
