@@ -73,14 +73,14 @@ import (
 //
 // SECRETS ARE MASKED as the cluster masks them -- "***" for every value in
 // every form it is printed in: as stored, without the whitespace around it,
-// and each line of a multi-line one likewise, four bytes or more; values that
-// overlap where printed are one mask -- in every chunk streamed and in the
-// result. The stream is masked a line at a time, as the cluster masks the
-// lines it reassembles, and cut into chunks only at line ends -- or, for a
-// line longer than maxPendingOutput, where its masking is decided, holding a
-// value that may still be arriving from its first byte until all of it can
-// be seen -- so a value split across two reads, or across many, is whole when
-// it is masked.
+// and each line of a multi-line one likewise (a line ends at a newline or a
+// carriage return), four bytes or more; values that overlap where printed are
+// one mask -- in every chunk streamed and in the result. The stream is masked
+// a line at a time, as the cluster masks the lines it reassembles, and cut
+// into chunks only at line ends -- or, for a line longer than
+// maxPendingOutput, where its masking is decided, holding a value that may
+// still be arriving from its first byte until all of it can be seen -- so a
+// value split across two reads, or across many, is whole when it is masked.
 
 const (
 	// defaultPipelineStepTimeoutSec is a step's timeout when the request names
@@ -809,11 +809,12 @@ func (t *tailBuffer) String() string {
 // secretMasker replaces every secret in text with "***" as the cluster masks
 // it (the engine's pipelines.MaskSecrets): each value in every form it is
 // printed in -- as stored, without the whitespace around it, and, for a value
-// over several lines, each line without the whitespace around it -- of
-// minSecretLength bytes or more. Occurrences that overlap or touch, of one
-// value or of two, are one span under one mask, so no byte of either
-// survives between two masks. An indent-only line of a key trims to nothing,
-// and masks nothing.
+// over several lines, each line without the whitespace around it, a line
+// ending at a newline or a carriage return -- of minSecretLength bytes or
+// more. Occurrences that overlap or touch, of one value or of two, are one
+// span under one mask, so no byte of either survives between two masks. An
+// indent-only line of a key trims to nothing, and masks nothing; each part of
+// a value a bare carriage return breaks ("user\rpass") is masked alone.
 type secretMasker struct {
 	starts  [256]bool         // the bytes a form starts with
 	byFirst map[byte][]string // the forms by their first byte
@@ -833,14 +834,17 @@ func newSecretMasker(values []string) *secretMasker {
 	for _, v := range values {
 		add(v)
 		add(strings.TrimSpace(v))
-		if strings.Contains(v, "\n") {
-			for _, line := range strings.Split(v, "\n") {
+		if strings.ContainsAny(v, "\r\n") {
+			for _, line := range strings.FieldsFunc(v, isLineBreak) {
 				add(strings.TrimSpace(line))
 			}
 		}
 	}
 	return m
 }
+
+// isLineBreak is what ends a line of a value: a newline or a carriage return.
+func isLineBreak(r rune) bool { return r == '\n' || r == '\r' }
 
 // mask is s with every secret masked, s taken as one text.
 func (m *secretMasker) mask(s string) string {

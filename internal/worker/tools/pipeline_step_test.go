@@ -1169,6 +1169,21 @@ func TestSecretMaskerMasksAsTheClusterDoes(t *testing.T) {
 			want:    "***\nx ***mnop *** y\n",
 			leaks:   []string{"ijkl", "efgh"},
 		},
+		{
+			// A carriage return breaks a value into parts as a newline does.
+			name:    "a value whose parts a bare carriage return separates, each printed alone",
+			secrets: []string{"user-name-abcd\rpass-word-efgh"},
+			output:  "pass-word-efgh\nuser-name-abcd\n",
+			want:    "***\n***\n",
+			leaks:   []string{"pass-word-efgh", "user-name-abcd"},
+		},
+		{
+			name:    "a value stored with CRLF line ends, its lines printed alone",
+			secrets: []string{"line-one-abcd\r\nline-two-efgh\r\n"},
+			output:  "x line-two-efgh\r\nline-one-abcd y\r\n",
+			want:    "x ***\r\n*** y\r\n",
+			leaks:   []string{"line-one-abcd", "line-two-efgh"},
+		},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			m := newSecretMasker(c.secrets)
@@ -1212,11 +1227,13 @@ func TestOutputChunkerMasksAPaddedValueAcrossItsCut(t *testing.T) {
 }
 
 // TestOutputChunkerMasksRandomLongLinesAsTheClusterDoes: values drawn from a
-// small alphabet -- so they overlap, nest and repeat -- stored padded or over
-// lines with an indent-only one among them; lines longer than the chunker
-// holds, their forms whole and cut short placed around the cut it must make,
-// written in reads of every size. The stream is each line as the cluster
-// masks it.
+// small alphabet -- so they overlap, nest and repeat -- stored padded, over
+// lines with an indent-only one among them, or in parts a carriage return
+// separates, bare or before a newline; lines longer than the chunker holds,
+// their forms whole and cut short placed around the cut it must make, written
+// in reads of every size. The stream is each line as the cluster masks it,
+// and -- apart from that reference -- holds no part of a value between its
+// line breaks, trimmed and four bytes or more.
 func TestOutputChunkerMasksRandomLongLinesAsTheClusterDoes(t *testing.T) {
 	rng := mrand.New(mrand.NewSource(20261004))
 	alphabet := []string{"a", "b", "c", "a", "b", "é", " ", "\t"}
@@ -1231,7 +1248,7 @@ func TestOutputChunkerMasksRandomLongLinesAsTheClusterDoes(t *testing.T) {
 		var values []string
 		for k := 0; k < 1+rng.Intn(3); k++ {
 			v := word(4 + rng.Intn(8))
-			switch rng.Intn(4) {
+			switch rng.Intn(6) {
 			case 0: // stored padded
 				v = strings.Repeat(" ", rng.Intn(3)) + v + strings.Repeat(" ", rng.Intn(3)) + []string{"", "\n"}[rng.Intn(2)]
 			case 1: // over lines, an indent-only one among them
@@ -1241,19 +1258,25 @@ func TestOutputChunkerMasksRandomLongLinesAsTheClusterDoes(t *testing.T) {
 					prev := strings.TrimSpace(values[rng.Intn(len(values))])
 					v = prev[len(prev)/2:] + word(3)
 				}
+			case 3: // in parts a bare carriage return separates
+				v += "\r" + word(4+rng.Intn(6))
+			case 4: // over lines CRLF ends
+				v += "\r\n" + word(4+rng.Intn(6)) + "\r\n"
 			}
 			values = append(values, v)
 		}
-		var printable []string
+		var parts, printable []string
 		for _, v := range values {
-			for _, f := range []string{v, strings.TrimSpace(v)} {
-				for _, line := range strings.Split(f, "\n") {
-					if line = strings.TrimSpace(line); len(line) >= minSecretLength {
-						printable = append(printable, line)
-					}
+			for _, part := range strings.FieldsFunc(v, isLineBreakForTest) {
+				if part = strings.TrimSpace(part); len(part) >= minSecretLength {
+					parts = append(parts, part)
 				}
 			}
+			if whole := strings.TrimSpace(v); len(whole) >= minSecretLength && !strings.Contains(whole, "\n") {
+				printable = append(printable, whole)
+			}
 		}
+		printable = append(printable, parts...)
 		var line strings.Builder
 		line.WriteString(strings.Repeat("x", maxPendingOutput-rng.Intn(80)))
 		for size := line.Len() + 40 + rng.Intn(200); line.Len() < size; {
@@ -1269,12 +1292,23 @@ func TestOutputChunkerMasksRandomLongLinesAsTheClusterDoes(t *testing.T) {
 		}
 		read := []int{1, 3, 7, 64, 4096, 32 << 10}[rng.Intn(6)]
 		m := newSecretMasker(values)
-		if got, want := chunkLine(m, line.String()+"\nnext\n", read), clusterMask(line.String(), values)+"\nnext\n"; got != want {
+		got := chunkLine(m, line.String()+"\nnext\n", read)
+		if want := clusterMask(line.String(), values) + "\nnext\n"; got != want {
 			t.Fatalf("case %d, values %q, reads of %d: the stream ends\n  %q\nwant the line as the cluster masks it, ending\n  %q",
 				n, values, read, got[max(0, len(got)-300):], want[max(0, len(want)-300):])
 		}
+		for _, part := range parts {
+			if strings.Contains(got, part) {
+				t.Fatalf("case %d, values %q, reads of %d: the stream holds %q, a part of a value", n, values, read, part)
+			}
+		}
 	}
 }
+
+// isLineBreakForTest is what ends a line of a value: a newline or a carriage
+// return. It is the test's own, apart from the masker's isLineBreak, so the
+// reference and the independent check do not lean on the code they check.
+func isLineBreakForTest(r rune) bool { return r == '\n' || r == '\r' }
 
 // clusterMask is the cluster's masking (the engine's pipelines.MaskSecrets),
 // written out the way the engine writes it -- every occurrence of every form
@@ -1292,8 +1326,8 @@ func clusterMask(text string, values []string) string {
 	for _, v := range values {
 		add(v)
 		add(strings.TrimSpace(v))
-		if strings.Contains(v, "\n") {
-			for _, l := range strings.Split(v, "\n") {
+		if strings.ContainsAny(v, "\r\n") {
+			for _, l := range strings.FieldsFunc(v, isLineBreakForTest) {
 				add(strings.TrimSpace(l))
 			}
 		}

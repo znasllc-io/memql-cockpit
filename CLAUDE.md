@@ -669,10 +669,12 @@ its call is pending and drops one that arrives after the result, so
 `Dispatcher.DispatchStream` returns only once its output is sent and the
 runner sends the result after. Output is MASKED AS THE CLUSTER MASKS IT
 (the engine's `pipelines.MaskSecrets`): every form of a value -- as stored,
-trimmed, each line of a multi-line one trimmed, four bytes or more -- and
-values that overlap where printed as one mask, a LINE AT A TIME, as the
-cluster masks the lines it reassembles, so how the output was read changes
-nothing and a value stored with a line end never takes the line end with it.
+trimmed, each line of a multi-line one trimmed (a line ends at a newline OR A
+CARRIAGE RETURN, so each part of "user\rpass" masks alone), four bytes or
+more -- and values that overlap where printed as one mask, a LINE AT A TIME,
+as the cluster masks the lines it reassembles, so how the output was read
+changes nothing and a value stored with a line end never takes the line end
+with it.
 It is cut only at line ends (or, past 64 KiB of one line, where the line's
 masking is decided: a span's mask goes out where it starts and its reach is
 carried to the next part), because masking a chunk cannot see a value split
