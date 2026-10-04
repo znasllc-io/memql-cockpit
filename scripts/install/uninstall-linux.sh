@@ -312,7 +312,12 @@ function scoped_unpair() {
     rm -f "$result"
     if [[ "$OTHER_HOMES" -gt 0 ]]; then
         # The pre-rename unit is retired even when the worker stays: two
-        # units would run two workers for the remaining homes.
+        # units would run two workers for the remaining homes. A unit file
+        # that will not unlink is recorded Kept, with its remedy, by
+        # remove_path_if_present, and earns the leftover code; the worker
+        # for the siblings still starts, and the run then ends in the
+        # PARTIAL summary rather than the SUCCESS line (a verification
+        # finding: the `|| true` alone dropped it).
         local legacy_path="${HOME}/.config/systemd/user/${LEGACY_LABEL_LINUX}.service"
         if [[ -f "$legacy_path" ]]; then
             systemctl --user disable --now "${LEGACY_LABEL_LINUX}.service" >/dev/null 2>&1 || true
@@ -329,6 +334,7 @@ function scoped_unpair() {
             fi
             echo "INFO: started ${unit} for the remaining enrollment(s)"
         fi
+        record_scoped_leftovers || return $?
         echo "SUCCESS: selected cluster enrollment removed; $OTHER_HOMES other enrollment(s) and the shared CLI, unit, policy and state retained."
     fi
 }
