@@ -271,13 +271,14 @@ func runConfiguredWorker(clusterURL, token, name string, logger *slog.Logger) er
 			return fmt.Errorf("pair-run: %w", err)
 		}
 		runner, err = NewRunner(Options{
-			Logger:         logger,
-			Config:         cfg,
-			Tools:          toolsFor(cfg.Home),
-			Apps:           appInv,
-			Models:         modelInventory,
-			Metrics:        metrics,
-			InferenceServe: policy.InferenceServe,
+			Logger:           logger,
+			Config:           cfg,
+			Tools:            toolsFor(cfg.Home),
+			Apps:             appInv,
+			Models:           modelInventory,
+			Metrics:          metrics,
+			InferenceServe:   policy.InferenceServe,
+			PipelinesAllowed: policy.PipelinesAllowed,
 		})
 		if err != nil {
 			return err
@@ -290,11 +291,7 @@ func runConfiguredWorker(clusterURL, token, name string, logger *slog.Logger) er
 		for sig := range sigCh {
 			switch sig {
 			case syscall.SIGHUP:
-				if err := policy.Reload(); err != nil {
-					logger.Warn("policy reload failed", "error", err)
-				} else {
-					logger.Info("policy reloaded")
-					logLevelProblems(logger, policy)
+				if reloadPolicy(logger, policy) {
 					if fleet != nil {
 						fleet.RequestImmediateReadvertise()
 					} else if runner != nil {

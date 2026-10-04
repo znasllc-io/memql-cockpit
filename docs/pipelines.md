@@ -29,10 +29,17 @@ lands, not while somebody is at the machine, so `memql worker consent grant`
 has nothing to do with it, and `memql worker consent revoke` does not stop it.
 Withdraw by removing `allow` (see below).
 
-**A step runs as you.** It is the repository's own command, run as the user
-the worker runs as, with that user's environment and files. This is not a
-sandbox. `pipelines.allow` says you trust the repositories routed here with
-that; `pipelines.repos` says which repositories those are.
+**What `allow` grants, plainly.** It lets the cluster's pipeline runner run
+commands it chooses, as you, for the repositories it names. The command is
+whatever the cluster sends -- this machine cannot see the pipeline it came
+from -- and it runs as the user the worker runs as, with that user's
+environment and files. This is not a sandbox. `pipelines.repos` narrows which
+repositories; the clone URL must name the same repository, so the list filters
+what is actually cloned rather than a name the request states.
+
+**Only the pipeline runner.** The cluster's pipeline runner dispatches a step
+with no agent; an agent's tool calls always name theirs. A step an agent
+dispatched is refused whatever the policy says.
 
 ---
 
@@ -53,7 +60,7 @@ pipelines:
 | Key | Default | Meaning |
 |---|---|---|
 | `allow` | `false` | Whether this machine runs pipeline steps at all. |
-| `repos` | empty: any repository | When it lists any, only these repositories' steps run here. `owner/name`, compared without regard to case or a `.git` suffix. |
+| `repos` | empty: any repository | When it lists any, only these repositories' steps run here. `owner/name`, compared without regard to case or a `.git` suffix -- and the clone URL must name the same repository. |
 | `workspace_root` | `fs.workspace_root/pipelines`, else `~/.memql/pipelines` | Where each step's fresh checkout is made, and removed again. |
 | `max_timeout_sec` | `3600` | The longest a step may run, whatever it asks for. A step that names no timeout gets the cluster's own default, 1200 seconds, under this cap. |
 
@@ -68,8 +75,11 @@ here on the old answer in the meantime is refused by the new one.
 
 ## What a step does
 
-1. **Admission.** `allow`, then `repos`. Refused -> `denied_by_policy`, with a
-   sentence naming the setting to change. Nothing is created.
+1. **Admission.** A step an agent dispatched is refused first. Then `allow`,
+   then `repos`; refused -> `denied_by_policy`, with a sentence naming the
+   setting to change. Then the request itself: an https clone URL whose path
+   names the step's `repository` (`https://github.com/o/r.git` names `o/r`),
+   and so on (`bad_request`). Nothing is created before all of it passes.
 2. **A fresh directory**, `step-*` under `workspace_root`, readable only by
    you.
 3. **The checkout**, the cluster Job's own clone script: `git init`, a depth-1
@@ -92,6 +102,9 @@ here on the old answer in the meantime is refused by the new one.
 5. **Output**, streamed to the cluster as it is written, stdout and stderr
    apart. Every secret value of four characters or more -- and each line of a
    multi-line one -- is replaced with `***` before it leaves this machine.
+   Output leaves in whole lines; a line longer than 64 KiB is sent in parts cut
+   where no secret straddles, and held back for as long as a secret longer than
+   that may still be arriving in it.
 6. **The timeout.** Past it, the whole process group is sent `SIGTERM`, and
    `SIGKILL` ten seconds later; the step fails as `timeout`. When the command
    ends, anything it left running in its group is killed, the way a pod's
@@ -116,8 +129,8 @@ shell reports it), its duration, the artifacts and the missing paths:
 
 | Failure | When |
 |---|---|
-| `denied_by_policy` | `pipelines.allow` is off, or `pipelines.repos` does not list the repository. |
-| `bad_request` | The request is malformed: not an https clone URL, not a full 40-character sha, no command, an environment name that is not one, a secret that shadows an environment variable, an artifact path that is absolute or contains `..`. |
+| `denied_by_policy` | An agent dispatched the step, `pipelines.allow` is off, or `pipelines.repos` does not list the repository. |
+| `bad_request` | The request is malformed: not an https clone URL, a clone URL that names another repository than `repository` (or no repository), not a full 40-character sha, no command, an environment name that is not one, a secret that shadows an environment variable, an artifact path that is absolute or contains `..`. |
 | `pipeline_clone_failed` | git is missing (or is the macOS install stub), or the fetch or checkout failed; git's own reason is quoted. |
 | `timeout` | The step ran past its timeout and was stopped. |
 | `cancelled` | The cluster cancelled the step, the worker's stream to it was lost, or the worker is shutting down. |
@@ -149,7 +162,7 @@ A step inherits the **worker's** environment, which is not your login shell's.
   decision about this machine to make deliberately.
 
 `shell.allow`, `shell.deny`, `shell.run_as_user` and the shell's `max_*`
-limits do not apply to a step: the command is the repository's own,
+limits do not apply to a step: the command is the pipeline runner's,
 `pipelines` is its consent, and `max_timeout_sec` its limit. One caveat: the
 worker applies the shell's `max_*` limits to its own process the first time it
 runs a `workerHost.exec` call, and every process it starts after that -- a
@@ -159,8 +172,8 @@ step included -- inherits them until the worker restarts.
 
 ## Not doing this
 
-- **A sandbox.** A step runs as you; choose the repositories in
-  `pipelines.repos` accordingly.
+- **A sandbox.** A step runs the pipeline runner's command as you; choose the
+  repositories in `pipelines.repos` accordingly.
 - **A consent window for steps.** The policy is the consent.
 - **Leftover cleanup after a crash.** A worker killed mid-step leaves that
   step's `step-*` directory behind. Anything under `workspace_root` that no

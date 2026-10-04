@@ -640,6 +640,13 @@ whose handler checks no policy runs it on nobody's say-so. The block
 REPLACES on reload (a consent a SIGHUP could not withdraw is a grant the file
 no longer states).
 
+**WHAT `allow` GRANTS IS THE PIPELINE RUNNER'S CHOICE OF COMMAND, as the
+owner, for the repositories it names** -- the machine cannot see the pipeline.
+Two refusals hold a step to that: one whose `ToolDispatch.agent_id` is set
+(the engine's pipeline dispatch carries no agent; an agent's tool loop always
+does), and one whose clone URL's path does not name its `repository` (so
+`repos` filters what is CLONED, not a name the request states).
+
 **THE LABEL IS THE POLICY'S, NOT worker.yaml's.** Register carries
 `pipelines=allowed` exactly when `pipelines.allow` is true, and REMOVES an
 operator label of that name -- the opposite of the model labels' rule -- because
@@ -662,7 +669,10 @@ its call is pending and drops one that arrives after the result, so
 `Dispatcher.DispatchStream` returns only once its output is sent and the
 runner sends the result after. Output is cut only at line ends (or, past
 64 KiB of one line, where no secret straddles the cut), because masking a
-chunk cannot see a value split across two. The runner ENDS a tool call on
+chunk cannot see a value split across two -- and a line is HELD past 64 KiB
+while a secret longer than it may still be arriving: a buffer shorter than the
+longest value has no safe cut at all, and sending it whole leaked such a
+value in full. The runner ENDS a tool call on
 `ToolCancel` and on the loss of its stream: it does not reconnect until its
 calls return, so a step left running would keep the machine off the cluster
 for its whole timeout.

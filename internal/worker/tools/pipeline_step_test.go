@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -30,7 +31,9 @@ import (
 // network: production refuses anything but an https clone URL, and these tests
 // open the file:// door through allowLocalClones.
 
-// pipelineFixture is a bare repository with three commits.
+// pipelineFixture is a bare repository with three commits, at a path that
+// ends in o/r.git -- a local clone URL names its repository by ending in it,
+// and stepArgs names o/r.
 type pipelineFixture struct {
 	url  string   // file:// URL of the bare repository
 	shas []string // oldest first
@@ -43,7 +46,7 @@ func newPipelineFixture(t *testing.T) pipelineFixture {
 		t.Skip("git is not installed; pipeline_step fetches with it")
 	}
 	dir := t.TempDir()
-	bare := filepath.Join(dir, "origin.git")
+	bare := filepath.Join(dir, "o", "r.git")
 	src := filepath.Join(dir, "src")
 	run := func(cwd string, args ...string) string {
 		t.Helper()
@@ -270,7 +273,7 @@ func TestPipelineStepRefusedUnlessThisMachineAllowsPipelines(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			out := &recordedOutput{}
-			success, fail := runPipelineStep(context.Background(), stepArgs(t, fx, "echo ran", nil), policyWith(t, body), out.emit)
+			success, fail := runPipelineStep(context.Background(), "", stepArgs(t, fx, "echo ran", nil), policyWith(t, body), out.emit)
 			if success != nil || fail == nil {
 				t.Fatalf("a machine that allows no pipelines ran a step: %+v", success)
 			}
@@ -299,7 +302,7 @@ func TestPipelineStepRefusedUnlessThisMachineAllowsPipelines(t *testing.T) {
 func runPipelineStepQuietly(t *testing.T, args map[string]any, p *Policy) (*memqlv1.Success, *memqlv1.Failure) {
 	t.Helper()
 	out := &recordedOutput{}
-	return runPipelineStep(context.Background(), args, p, out.emit)
+	return runPipelineStep(context.Background(), "", args, p, out.emit)
 }
 
 func TestPipelineStepRefusesARepositoryThePolicyDoesNotList(t *testing.T) {
@@ -351,7 +354,7 @@ func TestPipelineStepRefusesMalformedRequests(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			out := &recordedOutput{}
-			_, fail := runPipelineStep(context.Background(), stepArgs(t, fx, "echo ran", extra), p, out.emit)
+			_, fail := runPipelineStep(context.Background(), "", stepArgs(t, fx, "echo ran", extra), p, out.emit)
 			if fail == nil || fail.GetErrorCode() != "bad_request" {
 				t.Fatalf("want bad_request, got %+v", fail)
 			}
@@ -373,6 +376,81 @@ func TestPipelineStepClonesOnlyOverHTTPSInProduction(t *testing.T) {
 	assertNoStepDirs(t, root)
 }
 
+// A pipeline step comes from the cluster's pipeline runner, which dispatches
+// with no agent. One an agent dispatched is refused whatever the policy says:
+// pipelines.allow admits a command with no consent window, and an agent's
+// tool loop -- which always names its agent -- must not reach that door.
+func TestPipelineStepDispatchedByAnAgentIsRefused(t *testing.T) {
+	allowLocalClones(t)
+	fx := newPipelineFixture(t)
+	p, root := pipelineTestPolicy(t, "")
+	out := &recordedOutput{}
+	_, fail := runPipelineStep(context.Background(), "v1:agents:agent:abc123", stepArgs(t, fx, "echo ran", nil), p, out.emit)
+	if fail == nil || fail.GetErrorCode() != "denied_by_policy" {
+		t.Fatalf("a step an agent dispatched must be refused by policy, got %+v", fail)
+	}
+	if !strings.Contains(fail.GetErrorMessage(), "pipeline runner") {
+		t.Errorf("the refusal must say where pipeline steps come from: %s", fail.GetErrorMessage())
+	}
+	if out.count() != 0 {
+		t.Errorf("a refused step produced output: %q", out.all())
+	}
+	assertNoStepDirs(t, root)
+
+	// The reachable positive: the same request from the runner runs.
+	if res := decoded(t)(runPipelineStep(context.Background(), "", stepArgs(t, fx, "echo ran", nil), p, out.emit)); res.ExitCode != 0 {
+		t.Fatalf("the runner's step exited %d", res.ExitCode)
+	}
+}
+
+// pipelines.repos filters what is CLONED, not a name the request states: the
+// clone URL must name the step's repository.
+func TestPipelineStepClonesOnlyTheRepositoryItNames(t *testing.T) {
+	allowLocalClones(t)
+	fx := newPipelineFixture(t) // its URL names o/r
+	listed, root := pipelineTestPolicy(t, "  repos: [o/other]\n")
+	_, fail := runPipelineStepQuietly(t, stepArgs(t, fx, "echo ran", map[string]any{"repository": "o/other"}), listed)
+	if fail == nil || fail.GetErrorCode() != "bad_request" {
+		t.Fatalf("a listed repository over another repository's clone URL must be refused, got %+v", fail)
+	}
+	if msg := fail.GetErrorMessage(); !strings.Contains(msg, "o/other") || !strings.Contains(msg, "o/r") {
+		t.Errorf("the refusal must name both repositories: %s", msg)
+	}
+	assertNoStepDirs(t, root)
+
+	open, _ := pipelineTestPolicy(t, "")
+	if _, fail := runPipelineStepQuietly(t, stepArgs(t, fx, "echo ran", map[string]any{"repository": ""}), open); fail == nil || fail.GetErrorCode() != "bad_request" {
+		t.Errorf("a step naming no repository must be refused, got %+v", fail)
+	}
+	if res := decoded(t)(runPipelineStepQuietly(t, stepArgs(t, fx, "echo ran", map[string]any{"repository": "O/R"}), open)); res.ExitCode != 0 {
+		t.Fatalf("the repository its URL names, in another case, exited %d", res.ExitCode)
+	}
+}
+
+func TestCloneURLNamesTheRepository(t *testing.T) {
+	for _, tc := range []struct {
+		url, repository string
+		want            bool
+	}{
+		{"https://github.com/o/r.git", "o/r", true},
+		{"https://github.com/o/r", "o/r", true},
+		{"https://github.com/O/R.git/", "o/r", true},
+		{"https://ghe.example.com/acme/widgets.git", "Acme/Widgets.git", true},
+		{"https://github.com/o/r.git", "o/other", false},
+		{"https://github.com/o/r.git", "o", false},
+		{"https://github.com/scm/o/r.git", "o/r", false}, // a longer path is another repository
+		{"https://github.com/o/r.git", "", false},
+		{"https://github.com/", "o/r", false},
+		// A local path -- the tests' door -- names a repository by ending in it.
+		{"file:///tmp/fixture/o/r.git", "o/r", true},
+		{"file:///tmp/fixture/o/r.git", "fixture/o", false},
+	} {
+		if got := cloneNamesRepository(tc.url, tc.repository); got != tc.want {
+			t.Errorf("cloneNamesRepository(%q, %q) = %v, want %v", tc.url, tc.repository, got, tc.want)
+		}
+	}
+}
+
 // --- the step ------------------------------------------------------------
 
 func TestPipelineStepFetchesTheShaAndRunsTheCommandThere(t *testing.T) {
@@ -380,7 +458,7 @@ func TestPipelineStepFetchesTheShaAndRunsTheCommandThere(t *testing.T) {
 	fx := newPipelineFixture(t)
 	p, root := pipelineTestPolicy(t, "")
 	out := &recordedOutput{}
-	success, fail := runPipelineStep(context.Background(),
+	success, fail := runPipelineStep(context.Background(), "",
 		stepArgs(t, fx, `cat file.txt; git rev-parse HEAD; git log --oneline | wc -l | tr -d ' '`, nil), p, out.emit)
 	res := decodeStep(t, success, fail)
 	if res.ExitCode != 0 {
@@ -440,7 +518,7 @@ func TestPipelineStepReportsTheCommandsOwnExitStatus(t *testing.T) {
 	p, _ := pipelineTestPolicy(t, "")
 
 	out := &recordedOutput{}
-	res := decoded(t)(runPipelineStep(context.Background(), stepArgs(t, fx, "echo out; echo err >&2; exit 7", nil), p, out.emit))
+	res := decoded(t)(runPipelineStep(context.Background(), "", stepArgs(t, fx, "echo out; echo err >&2; exit 7", nil), p, out.emit))
 	// A failing command is the step's own answer, not a failed call.
 	if res.ExitCode != 7 {
 		t.Errorf("exitCode %d, want 7", res.ExitCode)
@@ -463,7 +541,7 @@ func TestPipelineStepInheritsTheMachineEnvironment(t *testing.T) {
 	t.Setenv("MEMQL_PIPELINE_TEST_MACHINE", "from-the-machine")
 	t.Setenv("MEMQL_WORKER_TOKEN", "mql_wkr_must_not_reach_a_step")
 	out := &recordedOutput{}
-	res := decoded(t)(runPipelineStep(context.Background(), stepArgs(t, fx,
+	res := decoded(t)(runPipelineStep(context.Background(), "", stepArgs(t, fx,
 		`echo "machine=$MEMQL_PIPELINE_TEST_MACHINE"; echo "run=$MEMQL_RUN_ID"; `+
 			`[ -n "$DEPLOY_KEY" ] && echo "secret=present"; echo "worker=${MEMQL_WORKER_TOKEN:-unset}"; `+
 			`echo "path=${PATH:+set}"`,
@@ -496,7 +574,7 @@ func TestPipelineStepTimeoutIsClampedToThePolicyMaximum(t *testing.T) {
 	p, root := pipelineTestPolicy(t, "  max_timeout_sec: 1\n")
 	out := &recordedOutput{}
 	started := time.Now()
-	success, fail := runPipelineStep(context.Background(),
+	success, fail := runPipelineStep(context.Background(), "",
 		stepArgs(t, fx, "echo started; sleep 30; echo never", map[string]any{"timeoutSec": 600}), p, out.emit)
 	elapsed := time.Since(started)
 	if success != nil || fail == nil || fail.GetErrorCode() != "timeout" {
@@ -545,7 +623,7 @@ func TestPipelineStepAsksAStepToStopBeforeKillingIt(t *testing.T) {
 	t.Cleanup(func() { pipelineStopGrace = prev })
 
 	out := &recordedOutput{}
-	_, fail := runPipelineStep(context.Background(),
+	_, fail := runPipelineStep(context.Background(), "",
 		stepArgs(t, fx, "trap 'echo got-term; exit 0' TERM; echo started; sleep 30 & wait", nil), p, out.emit)
 	if fail == nil || fail.GetErrorCode() != "timeout" {
 		t.Fatalf("want timeout, got %+v", fail)
@@ -616,7 +694,7 @@ func TestPipelineStepStreamsOutputWhileTheCommandRuns(t *testing.T) {
 	// The command waits for a file the TEST writes only once it has seen the
 	// first line -- so a step that held its output until exit would never
 	// see the file, and would say so.
-	res := decoded(t)(runPipelineStep(context.Background(), stepArgs(t, fx,
+	res := decoded(t)(runPipelineStep(context.Background(), "", stepArgs(t, fx,
 		`echo first-line; i=0; while [ ! -f "$GATE" ]; do i=$((i+1)); [ $i -gt 200 ] && { echo held-back; exit 9; }; sleep 0.05; done; echo second-line`,
 		map[string]any{"env": map[string]any{"GATE": gate}}), p, out.emit))
 	if res.ExitCode != 0 || !strings.Contains(out.text(false), "second-line") {
@@ -629,7 +707,7 @@ func TestPipelineStepCloneFailureIsTyped(t *testing.T) {
 	fx := newPipelineFixture(t)
 	p, root := pipelineTestPolicy(t, "")
 	out := &recordedOutput{}
-	_, fail := runPipelineStep(context.Background(),
+	_, fail := runPipelineStep(context.Background(), "",
 		stepArgs(t, fx, "echo ran", map[string]any{"sha": strings.Repeat("0", 40)}), p, out.emit)
 	if fail == nil || fail.GetErrorCode() != "pipeline_clone_failed" {
 		t.Fatalf("a sha the repository does not have must fail as pipeline_clone_failed, got %+v", fail)
@@ -698,7 +776,7 @@ func TestPipelineStepNeverPutsTheTokenOnDiskOrInArgv(t *testing.T) {
 
 			p, _ := pipelineTestPolicy(t, "")
 			out := &recordedOutput{}
-			res := decoded(t)(runPipelineStep(context.Background(), stepArgs(t, fx,
+			res := decoded(t)(runPipelineStep(context.Background(), "", stepArgs(t, fx,
 				`if grep -rqF -e "$NEEDLE_TOKEN" -e "$NEEDLE_HEADER" .git; then echo on-disk=yes; else echo on-disk=no; fi; `+
 					`echo "step-git-config=$(env | grep -c '^GIT_CONFIG_' || true)"`,
 				map[string]any{
@@ -872,7 +950,7 @@ func TestPipelineStepArtifactsOverALimitAreReportedNotFailed(t *testing.T) {
 			}
 			p, _ := pipelineTestPolicy(t, "")
 			out := &recordedOutput{}
-			res := decoded(t)(runPipelineStep(context.Background(), stepArgs(t, fx,
+			res := decoded(t)(runPipelineStep(context.Background(), "", stepArgs(t, fx,
 				`cp "$SRC" big.bin; exit 4`,
 				map[string]any{
 					"env":       map[string]any{"SRC": src},
@@ -905,7 +983,7 @@ func TestPipelineStepMasksSecretsInEveryChunkAndTheResult(t *testing.T) {
 	const key = "s3cr3t-value-123"
 	pem := "-----BEGIN KEY-----\nline-two-of-the-key\n-----END KEY-----"
 	out := &recordedOutput{}
-	res := decoded(t)(runPipelineStep(context.Background(), stepArgs(t, fx,
+	res := decoded(t)(runPipelineStep(context.Background(), "", stepArgs(t, fx,
 		// The key once on stdout, once on stderr, and once split across two
 		// writes a fifth of a second apart -- two reads, one value.
 		`echo "key=$API_KEY"; echo "$API_KEY" >&2; printf '%s' "${API_KEY%????????}"; sleep 0.2; printf '%s\n' "${API_KEY#????????}"; `+
@@ -968,6 +1046,32 @@ func TestOutputChunkerHoldsAPartialLineUntilItEnds(t *testing.T) {
 	}
 }
 
+// chunkLine writes line through a fresh chunker in reads of read bytes and
+// returns everything it sent.
+func chunkLine(m *secretMasker, line string, read int) string {
+	var got strings.Builder
+	c := newLineChunker(m, func(b []byte) { got.WriteString(string(b)) })
+	for i := 0; i < len(line); i += read {
+		end := i + read
+		if end > len(line) {
+			end = len(line)
+		}
+		c.write([]byte(line[i:end]))
+	}
+	c.flush()
+	return got.String()
+}
+
+// distinctValue is n bytes no window of which repeats elsewhere in it, so a
+// leak of any part is a leak that can be seen.
+func distinctValue(n int) string {
+	var b strings.Builder
+	for i := 0; b.Len() < n; i++ {
+		fmt.Fprintf(&b, "%08d", i)
+	}
+	return b.String()[:n]
+}
+
 func TestOutputChunkerNeverCutsALongLineInsideASecret(t *testing.T) {
 	const secret = "0123456789-SECRET-VALUE"
 	m := newSecretMasker([]string{secret})
@@ -977,21 +1081,49 @@ func TestOutputChunkerNeverCutsALongLineInsideASecret(t *testing.T) {
 	for offset := -2 * len(secret); offset <= len(secret); offset++ {
 		for _, read := range []int{1, 7, 4096} {
 			line := strings.Repeat("x", maxPendingOutput+offset) + secret + strings.Repeat("y", 300)
-			var got strings.Builder
-			c := newLineChunker(m, func(b []byte) { got.WriteString(string(b)) })
-			for i := 0; i < len(line); i += read {
-				end := i + read
-				if end > len(line) {
-					end = len(line)
-				}
-				c.write([]byte(line[i:end]))
-			}
-			c.flush()
-			if strings.Contains(got.String(), secret[:10]) {
+			got := chunkLine(m, line, read)
+			if strings.Contains(got, secret[:10]) {
 				t.Fatalf("offset %d, reads of %d: part of the secret was sent unmasked", offset, read)
 			}
-			if want := m.mask(line); got.String() != want {
+			if want := m.mask(line); got != want {
 				t.Fatalf("offset %d, reads of %d: the chunks do not reassemble to the masked line", offset, read)
+			}
+		}
+	}
+
+	// A secret LONGER than the chunker holds -- a base64 keystore a `set -x`
+	// prints whole -- has no cut point until all of it has arrived: a value
+	// still arriving may begin anywhere in what is held, the first byte
+	// included. The chunker holds on until it can see the whole value.
+	for _, size := range []int{maxPendingOutput + 1, 2 * maxPendingOutput} {
+		long := distinctValue(size)
+		lm := newSecretMasker([]string{long})
+		for _, prefix := range []int{0, 7, maxPendingOutput - 3} {
+			for _, read := range []int{7, 4096, 32 << 10} {
+				line := strings.Repeat("x", prefix) + long + strings.Repeat("y", 300)
+				got := chunkLine(lm, line, read)
+				for _, window := range []string{long[:32], long[size/2 : size/2+32], long[size-32:]} {
+					if strings.Contains(got, window) {
+						t.Fatalf("a %d-byte secret after %d bytes, reads of %d: part of it was sent unmasked", size, prefix, read)
+					}
+				}
+				if want := lm.mask(line); got != want {
+					t.Fatalf("a %d-byte secret after %d bytes, reads of %d: the chunks do not reassemble to the masked line", size, prefix, read)
+				}
+			}
+		}
+	}
+
+	// Values that overlap one another, and a line that is one unbroken run of
+	// them: the cut still falls where the replacer's own decisions end.
+	om := newSecretMasker([]string{"abababab", "SECRET-ONE-xyz", "xyz-SECRET-TWO"})
+	for _, line := range []string{
+		strings.Repeat("ab", maxPendingOutput) + "tail",
+		strings.Repeat("x", maxPendingOutput-12) + "SECRET-ONE-xyz-SECRET-TWO" + strings.Repeat("y", 50),
+	} {
+		for _, read := range []int{1, 7, 4096} {
+			if got, want := chunkLine(om, line, read), om.mask(line); got != want {
+				t.Fatalf("overlapping values, reads of %d: the chunks do not reassemble to the masked line", read)
 			}
 		}
 	}
@@ -1039,6 +1171,26 @@ func TestDispatcher_PipelineStepIsAdmittedByPolicyNotByTheConsentWindow(t *testi
 	})
 	if fail == nil || fail.GetErrorCode() != "consent_required" || gate.calls != 1 {
 		t.Errorf("exec must still go through the consent window: %+v (gate calls %d)", fail, gate.calls)
+	}
+}
+
+// The agent the refusal is about is the one on the dispatch ENVELOPE, which
+// the engine stamps and the arguments cannot set.
+func TestDispatcher_PipelineStepFromAnAgentIsRefused(t *testing.T) {
+	allowLocalClones(t)
+	fx := newPipelineFixture(t)
+	p, _ := pipelineTestPolicy(t, "")
+	d := NewDispatcher(quietLogger(), p, nil)
+
+	dispatch := pipelineDispatch(t, "call-agent", stepArgs(t, fx, "echo ran", nil))
+	dispatch.AgentId = "v1:agents:agent:abc123"
+	if _, fail := d.Dispatch(context.Background(), dispatch); fail == nil || fail.GetErrorCode() != "denied_by_policy" {
+		t.Fatalf("a pipeline step an agent dispatched must be refused, got %+v", fail)
+	}
+
+	dispatch = pipelineDispatch(t, "call-runner", stepArgs(t, fx, "echo ran", nil))
+	if res := decoded(t)(d.Dispatch(context.Background(), dispatch)); res.ExitCode != 0 {
+		t.Fatalf("the runner's step exited %d", res.ExitCode)
 	}
 }
 

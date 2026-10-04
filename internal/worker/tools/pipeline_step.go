@@ -43,11 +43,18 @@ import (
 // plus "artifactsTooLarge":true, only when the artifacts were left out for
 // their size.
 //
-// THE ORDER IS THE CONTRACT. Admission by this machine's policy (pipelines.allow
-// and pipelines.repos) before anything else; then a fresh directory under the
-// pipelines workspace root; `git init`, a depth-1 fetch of the sha and a
-// checkout of FETCH_HEAD; `/bin/sh -c command` there; the artifacts packed; the
-// directory removed, whatever happened. Output streams while it runs.
+// THE ORDER IS THE CONTRACT. A step an agent dispatched is refused (only the
+// cluster's pipeline runner dispatches one, and it names no agent); then
+// admission by this machine's policy (pipelines.allow and pipelines.repos),
+// and a clone URL that names the admitted repository; then a fresh directory
+// under the pipelines workspace root; `git init`, a depth-1 fetch of the sha
+// and a checkout of FETCH_HEAD; `/bin/sh -c command` there; the artifacts
+// packed; the directory removed, whatever happened. Output streams while it
+// runs.
+//
+// The command is whatever the cluster sends, run with no consent window: the
+// policy is the owner's standing consent to the PIPELINE RUNNER, for the
+// repositories it names, and these refusals are what hold a step to that.
 //
 // THE TOKEN NEVER TOUCHES DISK OR ARGV. It travels to git as an
 // http.extraheader in GIT_CONFIG_COUNT/KEY/VALUE environment variables, which
@@ -67,8 +74,9 @@ import (
 // SECRETS ARE MASKED ("***", every value of four characters or more, and each
 // line of a multi-line one) in every chunk streamed and in the result. Output
 // is cut into chunks only at line ends -- or, for a line longer than
-// maxPendingOutput, at a point no secret straddles -- so a value split across
-// two reads is still whole when it is masked.
+// maxPendingOutput, at a point no secret straddles, holding the line for as
+// long as a value longer than what is held may still be arriving -- so a value
+// split across two reads, or across many, is whole when it is masked.
 
 const (
 	// defaultPipelineStepTimeoutSec is a step's timeout when the request names
@@ -150,9 +158,9 @@ type pipelineStepRequest struct {
 	timeoutSec int
 }
 
-// runPipelineStep implements workerHost.pipeline_step. emit may be nil, which
-// drops the output.
-func runPipelineStep(ctx context.Context, args map[string]any, policy *Policy, emit outputEmitter) (*memqlv1.Success, *memqlv1.Failure) {
+// runPipelineStep implements workerHost.pipeline_step. agentID is the
+// dispatch envelope's agent_id; emit may be nil, which drops the output.
+func runPipelineStep(ctx context.Context, agentID string, args map[string]any, policy *Policy, emit outputEmitter) (*memqlv1.Success, *memqlv1.Failure) {
 	started := time.Now()
 	if emit == nil {
 		emit = func(bool, []byte) {}
@@ -162,6 +170,15 @@ func runPipelineStep(ctx context.Context, args map[string]any, policy *Policy, e
 	mask := newSecretMasker(secretValuesOf(args))
 	refuse := func(code string, err error) (*memqlv1.Success, *memqlv1.Failure) {
 		return nil, failure(code, mask.mask(err.Error()))
+	}
+
+	// ONLY THE CLUSTER'S PIPELINE RUNNER DISPATCHES A STEP, and it dispatches
+	// with no agent; an agent's tool loop always names its agent. A step is
+	// a command run with no consent window, so one an agent asked for is
+	// refused whatever the policy says -- pipelines.allow is consent to the
+	// pipeline runner, not to every caller that can name the action.
+	if agent := strings.TrimSpace(agentID); agent != "" {
+		return refuse("denied_by_policy", fmt.Errorf("pipeline_step: pipeline steps come only from the cluster's pipeline runner, and this one was dispatched by agent %s", agent))
 	}
 
 	settings := policy.Pipelines()
@@ -261,6 +278,19 @@ func parsePipelineStep(args map[string]any) (pipelineStepRequest, error) {
 	if err := checkCloneURL(req.cloneURL); err != nil {
 		return req, err
 	}
+	// The repository the policy admitted (pipelines.repos) must be the one
+	// that is cloned: a listed name over another repository's URL would make
+	// the list a filter on what the request SAYS rather than on what runs.
+	if req.repository == "" {
+		return req, errors.New("pipeline_step: repository required")
+	}
+	if !cloneNamesRepository(req.cloneURL, req.repository) {
+		named := ""
+		if u, err := url.Parse(req.cloneURL); err == nil {
+			named = clonedRepository(u)
+		}
+		return req, fmt.Errorf("pipeline_step: cloneUrl names %s, not the step's repository %s; the repository this machine admits is the one it clones", named, req.repository)
+	}
 	if !shaPattern.MatchString(req.sha) {
 		return req, errors.New("pipeline_step: sha must be a full 40-character commit id")
 	}
@@ -311,6 +341,33 @@ func checkCloneURL(raw string) error {
 		}
 	}
 	return errors.New("pipeline_step: cloneUrl must be an https URL -- the fetch uses the step's token or nothing, never this machine's own credentials")
+}
+
+// cloneNamesRepository reports whether a clone URL's path names repository,
+// both read as owner/name without regard to case or a .git suffix. An https
+// URL names it with its whole path -- https://github.com/o/r.git names o/r,
+// and https://host/scm/o/r.git names scm/o/r, which is not o/r. A file:// URL
+// (the tests' door) names it by ending in it, since a local path has no
+// owner/name of its own.
+func cloneNamesRepository(rawURL, repository string) bool {
+	want := normalRepository(repository)
+	if want == "" {
+		return false
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	named := clonedRepository(u)
+	if strings.EqualFold(u.Scheme, "file") {
+		return named == want || strings.HasSuffix(named, "/"+want)
+	}
+	return named == want
+}
+
+// clonedRepository is the owner/name a clone URL's path names.
+func clonedRepository(u *url.URL) string {
+	return normalRepository(strings.Trim(u.Path, "/"))
 }
 
 // stringMap reads an object of environment variable names to strings.
@@ -799,35 +856,45 @@ func (m *secretMasker) mask(s string) string {
 	return m.replacer.Replace(s)
 }
 
-// cutPoint is where an over-long unfinished line may be cut: as late as
-// possible, but never inside a secret value, and never so late that a value
-// still arriving could begin before the cut. A buffer that is one unbroken
-// run of overlapping values has no such point and is sent whole.
+// cutPoint is where an over-long unfinished line may be cut, or 0, which
+// means HOLD ON: there is no safe cut in buf yet.
+//
+// strings.Replacer decides left to right, at each position taking the first
+// value (longest first) that begins there, and a decision at position p reads
+// at most m.longest bytes from p. So every decision at a position before
+// len(buf)-(longest-1) is the one the whole line will get however it goes on,
+// and a value that begins before that point is complete in buf. The cut goes
+// where the last of those decisions ends: never inside a value, and never
+// before a value that is still arriving. A buffer shorter than the longest
+// value has no final decision at all -- a value still arriving may begin at
+// its first byte -- so it is held until one exists, which bounds what the
+// chunker holds at maxPendingOutput plus the longest value.
 func (m *secretMasker) cutPoint(buf []byte) int {
 	if m == nil || len(m.values) == 0 {
 		return len(buf)
 	}
-	k := len(buf) - (m.longest - 1)
-	for moved := true; moved && k > 0; {
-		moved = false
-		for _, v := range m.values {
-			lo := k - len(v) + 1
-			if lo < 0 {
-				lo = 0
-			}
-			for j := lo; j < k; j++ {
-				if j+len(v) <= len(buf) && bytes.Equal(buf[j:j+len(v)], v) {
-					k = j
-					moved = true
-					break
-				}
-			}
+	final := len(buf) - (m.longest - 1)
+	p := 0
+	for p < final {
+		if n := m.matchAt(buf, p); n > 0 {
+			p += n
+		} else {
+			p++
 		}
 	}
-	if k <= 0 {
-		return len(buf)
+	return p
+}
+
+// matchAt is the length of the value strings.Replacer masks at p, or 0: the
+// first of m.values -- longest first, in the order the replacer was given
+// them -- that begins there.
+func (m *secretMasker) matchAt(buf []byte, p int) int {
+	for _, v := range m.values {
+		if bytes.HasPrefix(buf[p:], v) {
+			return len(v)
+		}
 	}
-	return k
+	return 0
 }
 
 // lineChunker cuts one output stream into masked chunks that end at a line
@@ -853,6 +920,11 @@ func (c *lineChunker) write(p []byte) {
 	}
 	for len(c.pending) > maxPendingOutput {
 		cut := c.mask.cutPoint(c.pending)
+		if cut == 0 {
+			// A value longer than what is held may still be arriving, from
+			// its first byte on: hold on until all of it can be seen.
+			break
+		}
 		c.send(c.pending[:cut])
 		c.pending = append(c.pending[:0], c.pending[cut:]...)
 	}

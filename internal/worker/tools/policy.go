@@ -238,11 +238,15 @@ type BackupPolicy struct {
 // exactly when allow is true -- the refusal here is the second consent, not
 // the only one.
 //
-// A step runs the repository's own command as the user the worker runs as,
-// with that user's environment and files. allow says "I trust the
-// repositories routed here with that"; repos, when it lists any, narrows
-// which repositories those are (owner/name, compared without regard to case
-// or a .git suffix).
+// THE TRUST, PLAINLY: allow lets the cluster's pipeline runner run commands
+// it chooses, as the user the worker runs as, with that user's environment
+// and files, for the repositories it names. This machine cannot see the
+// pipeline the command came from. repos, when it lists any, narrows which
+// repositories (owner/name, compared without regard to case or a .git
+// suffix) -- and the clone URL must name the same repository, so the list
+// filters what is cloned rather than a name the request states. A step an
+// agent dispatched is refused whatever this block says: the runner
+// dispatches with no agent.
 //
 // workspace_root is where each step's fresh checkout is made and removed
 // again; absent, it is fs.workspace_root/pipelines, else ~/.memql/pipelines.

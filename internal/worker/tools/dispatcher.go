@@ -183,7 +183,7 @@ func (d *Dispatcher) DispatchStream(ctx context.Context, dispatch *memqlv1.ToolD
 
 	switch tool {
 	case "workerHost":
-		success, failure = d.dispatchHost(ctx, action, args, d.streamTo(callId, send))
+		success, failure = d.dispatchHost(ctx, action, args, dispatch.GetAgentId(), d.streamTo(callId, send))
 	case "workerComputer":
 		// `capabilities` is build-agnostic introspection
 		// (memql-cockpit#162): route it BEFORE the per-build
@@ -325,10 +325,13 @@ func (d *Dispatcher) streamTo(callID string, send func(*memqlv1.ToolStream) erro
 	}
 }
 
-func (d *Dispatcher) dispatchHost(ctx context.Context, action string, args map[string]any, emit outputEmitter) (*memqlv1.Success, *memqlv1.Failure) {
+// dispatchHost routes a workerHost call. agentID is the envelope's agent_id,
+// which pipeline_step refuses when set: a step comes only from the cluster's
+// pipeline runner, which dispatches with no agent.
+func (d *Dispatcher) dispatchHost(ctx context.Context, action string, args map[string]any, agentID string, emit outputEmitter) (*memqlv1.Success, *memqlv1.Failure) {
 	switch action {
 	case "pipeline_step":
-		return runPipelineStep(ctx, args, d.policy, emit)
+		return runPipelineStep(ctx, agentID, args, d.policy, emit)
 	case "exec":
 		return runExec(ctx, args, d.policy)
 	case "fs_read":
