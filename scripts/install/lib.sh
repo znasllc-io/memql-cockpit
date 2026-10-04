@@ -339,7 +339,9 @@ function require_cluster_url_flag() {
 # enrollments". Inside the block, only a block-mapping item (`- key:`),
 # a continuation (`key:`), a bare `-`, a blank or a comment may appear:
 # a sequence of flow mappings (`- {id: ..., cluster_url: ...}`) is valid
-# YAML the binary decodes and the block readers cannot see into. Bytes,
+# YAML the binary decodes and the block readers cannot see into; nor may
+# a value there open with a tag, anchor, alias, block scalar or flow
+# collection, which the readers would take literally. Bytes,
 # not characters (LC_ALL=C), so the line-break and BOM tests are exact
 # in every locale; awk alone, because the uninstallers run under a PATH
 # that holds little else.
@@ -375,6 +377,16 @@ function workers_registry_readable() {
             sub(/^[[:space:]]+/, "", item)
             sub(/^-([[:space:]]+|$)/, "", item)
             if (item != "" && item !~ /^[A-Za-z_][A-Za-z0-9_]*:([[:space:]]|$)/) ok = 0
+            # A value opening with a node property (tag, anchor, alias), a
+            # block scalar or a flow collection is its literal text to the
+            # readers and something else to yaml.v3: two `!!str https://...`
+            # URLs both reduced to the host `!!str https:` and read as ONE
+            # enrollment (a review finding). (The empty test comes first:
+            # BWK awk answers index(s, "") with 1.)
+            value = item
+            sub(/^[A-Za-z_][A-Za-z0-9_]*:[[:space:]]*/, "", value)
+            first = substr(value, 1, 1)
+            if (first != "" && index("!&*|>{[", first)) ok = 0
         }
         END { exit ((ok && headers <= 1 && (headers == 1 || !word)) ? 0 : 1) }
     ' "$1"
@@ -449,10 +461,12 @@ function find_home_id_by_cluster_url() {
         /^[[:space:]]*-[[:space:]]*/ { consider(cur, curl); cur=""; curl=""; sub(/^[[:space:]]*-[[:space:]]*/, "") }
         /^[[:space:]]*id:[[:space:]]*/ {
             cur=$0; sub(/^[[:space:]]*id:[[:space:]]*/, "", cur); sub(/[[:space:]]+(#.*)?$/, "", cur)
+            gsub(/^["'"'"']|["'"'"']$/, "", cur)
             next
         }
         /^[[:space:]]*cluster_url:[[:space:]]*/ {
             curl=$0; sub(/^[[:space:]]*cluster_url:[[:space:]]*/, "", curl); sub(/[[:space:]]+(#.*)?$/, "", curl)
+            gsub(/^["'"'"']|["'"'"']$/, "", curl)
             next
         }
         END {
@@ -473,7 +487,10 @@ function find_home_id_by_cluster_url() {
 # the dash line or an inner line, and the next column-0 key closes the list.
 # A review found the installer's readers behind the uninstaller's: a
 # commented header or a url-first item made the next install DROP every
-# sibling home it could not see. Every one of them asks
+# sibling home it could not see. A quoted id or cluster_url reads as
+# what it says, as in list_enrolled_cluster_urls: one that kept its
+# quotes matched nothing, and the next install appended a second home
+# for the same cluster (a review finding). Every one of them asks
 # workers_registry_readable first and refuses (5) a file it says no to:
 # any other spelling of the registry read as no homes at all.
 function find_home_cluster_url_by_id() {
@@ -493,10 +510,12 @@ function find_home_cluster_url_by_id() {
         /^[[:space:]]*-[[:space:]]*/ { settle(); sub(/^[[:space:]]*-[[:space:]]*/, "") }
         /^[[:space:]]*id:[[:space:]]*/ {
             cur=$0; sub(/^[[:space:]]*id:[[:space:]]*/, "", cur); sub(/[[:space:]]+(#.*)?$/, "", cur)
+            gsub(/^["'"'"']|["'"'"']$/, "", cur)
             next
         }
         /^[[:space:]]*cluster_url:[[:space:]]*/ {
             curl=$0; sub(/^[[:space:]]*cluster_url:[[:space:]]*/, "", curl); sub(/[[:space:]]+(#.*)?$/, "", curl)
+            gsub(/^["'"'"']|["'"'"']$/, "", curl)
             next
         }
         END { if (!found && cur == want && curl != "") print curl }
@@ -1090,6 +1109,7 @@ function write_worker_yaml() {
                 function note_id(line,    id) {
                     if (line !~ /^id:[[:space:]]*/) return
                     id = line; sub(/^id:[[:space:]]*/, "", id); sub(/[[:space:]]+(#.*)?$/, "", id)
+                    gsub(/^["'"'"']|["'"'"']$/, "", id)
                     skip = (id == keep_id) ? 1 : 0
                 }
                 BEGIN { in_homes=0; skip=0; buf=""; indent=0 }

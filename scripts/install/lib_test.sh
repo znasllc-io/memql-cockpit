@@ -2589,11 +2589,18 @@ function write_unreadable_registry() {
             printf 'version: 1\nhomes:\n- id: c.example\n  cluster_url: https://c.example\r- id: d.example\r  cluster_url: https://d.example\n' ;;
         nelinside)
             printf 'version: 1\nhomes:\n- id: c.example\n  cluster_url: https://c.example\302\205- id: d.example\302\205  cluster_url: https://d.example\n' ;;
+        # A block header the readers do understand, with VALUES they do
+        # not: a tag the host dedup collapsed (both read as `!!str https:`,
+        # one enrollment), and an alias the readers took literally.
+        tagvalue)
+            printf 'version: 1\nhomes:\n- id: c.example\n  cluster_url: !!str https://c.example\n- id: d.example\n  cluster_url: !!str https://d.example\n' ;;
+        aliasvalue)
+            printf 'version: 1\nurl: &u https://d.example\nhomes:\n- id: c.example\n  cluster_url: https://c.example\n- id: d.example\n  cluster_url: *u\n' ;;
         *) echo "unknown shape $shape" >&2; return 1 ;;
     esac > "$path"
 }
 
-_ur_shapes="jsonline jsonpretty flowroot dquoted squoted spacecolon tabcolon explicitkey anchored tagged escaped contkey merge docflow indented bom utf16 cronly nel ls ps crinside nelinside"
+_ur_shapes="jsonline jsonpretty flowroot dquoted squoted spacecolon tabcolon explicitkey anchored tagged escaped contkey merge docflow indented bom utf16 cronly nel ls ps crinside nelinside tagvalue aliasvalue"
 _ur="${_tmp}/unreadable-registries"
 mkdir -p "$_ur"
 for _shape in $_ur_shapes; do
@@ -2676,6 +2683,24 @@ for _shape in crlf docstart tokenwithheader; do
     expect_eq "find_home_cluster_url_by_id still reads the ${_shape} registry" \
         "$(find_home_cluster_url_by_id "$_urc/${_shape}.yaml" d.example 2>&1 | tr -d '\r')" "https://d.example"
 done
+# Quoted values read as what they say, in the installer's readers as in
+# the uninstaller's: a quoted cluster_url once matched nothing, and the
+# next install appended a second home for the same cluster.
+printf 'version: 1\nhomes:\n  - id: "local"\n    cluster_url: "https://c.example"\n    token: mql_wkr_old\n' > "$_urc/quoted.yaml"
+expect_eq "find_home_id_by_cluster_url reads a quoted cluster_url" \
+    "$(find_home_id_by_cluster_url "$_urc/quoted.yaml" https://c.example)" "local"
+expect_eq "find_home_cluster_url_by_id reads a quoted id and cluster_url" \
+    "$(find_home_cluster_url_by_id "$_urc/quoted.yaml" local)" "https://c.example"
+_wd="${_tmp}/readable-writer-quoted"
+mkdir -p "$_wd"
+cp "$_urc/quoted.yaml" "$_wd/workers.yaml"
+write_worker_yaml "$_wd/worker.yaml" https://c.example mql_wkr_new host1 no HEADLESS >/dev/null 2>&1
+if [[ "$(grep -c -- '- id:' "$_wd/workers.yaml")" == 1 ]] && grep -q 'id: local' "$_wd/workers.yaml" \
+    && grep -q 'token: mql_wkr_new' "$_wd/workers.yaml" && ! grep -q 'mql_wkr_old' "$_wd/workers.yaml"; then
+    pass "write_worker_yaml refreshes the quoted home in place instead of appending a second"
+else
+    fail "write_worker_yaml over a quoted home: $(cat "$_wd/workers.yaml" 2>&1)"
+fi
 
 # End to end: every shape, both drivers -- the no-flag line MemQL OS
 # shows, --cluster=URL and the no-flag --dry-run all refuse with 5 and
