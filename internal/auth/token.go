@@ -44,6 +44,11 @@ func EnsureValidTokenWithLogger(ctx context.Context, cluster config.ClusterConfi
 	return ensureValidToken(ctx, cluster, logger)
 }
 
+// interactiveLogin is the browser / device sign-in EnsureValidToken falls
+// back to. A variable only so a test can stand in for the browser and
+// see which client the sign-in asked for.
+var interactiveLogin = InteractiveLogin
+
 // ErrLoginRequired is what the non-interactive path returns where the
 // interactive one would have opened a browser.
 var ErrLoginRequired = errors.New("this cluster needs a sign-in that cannot be done from here")
@@ -79,8 +84,11 @@ func ensureValidTokenMode(ctx context.Context, cluster config.ClusterConfig, log
 		return cluster.PAT, nil
 	}
 
-	if cluster.Issuer == "" || cluster.ClientId == "" {
-		return "", fmt.Errorf("cluster %q has no issuer / client_id / PAT configured. Re-run `memql cluster add <domain>` to register it against an identity service", cluster.Name)
+	// An absent client_id is the normal case, not a misconfiguration: the
+	// cockpit does not store its own default client in the shared
+	// registry, and EffectiveClientId supplies it.
+	if cluster.Issuer == "" {
+		return "", fmt.Errorf("cluster %q has no issuer / PAT configured. Re-run `memql cluster add <domain>` to register it against an identity service", cluster.Name)
 	}
 
 	stored, err := config.LoadToken(cluster.Name)
@@ -137,7 +145,7 @@ func ensureValidTokenMode(ctx context.Context, cluster config.ClusterConfig, log
 	if !interactive {
 		return "", fmt.Errorf("%w: run `memql login` on this machine (cluster %q)", ErrLoginRequired, cluster.Name)
 	}
-	result, err := InteractiveLogin(ctx, cluster.Issuer, cluster.ClientId)
+	result, err := interactiveLogin(ctx, cluster.Issuer, cluster.EffectiveClientId())
 	if err != nil {
 		return "", fmt.Errorf("login: %w", err)
 	}
