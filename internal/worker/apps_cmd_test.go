@@ -12,7 +12,7 @@ import (
 )
 
 // apps_cmd_test.go pins what `memql worker apps` tells an owner
-// (memql-cockpit#438): for each app, whether the cluster can use it here and
+// (memql-cockpit#438): for each app, which clusters can use it here and
 // why not, how it is driven, and what every level becomes -- with each row
 // saying whose entry it is, so an owner who edited apps.levels can see that
 // the edit took.
@@ -32,7 +32,9 @@ func appsCmdPolicy(t *testing.T, body string) (*tools.Policy, string) {
 
 func TestPrintAppInventory(t *testing.T) {
 	policy, path := appsCmdPolicy(t, `apps:
-  allow: [claude-code]
+  homes:
+    api.memql.localhost:
+      allow: [claude-code]
   levels:
     claude-code:
       reasoning:
@@ -49,12 +51,15 @@ func TestPrintAppInventory(t *testing.T) {
 	}}
 
 	var out bytes.Buffer
-	printAppInventory(&out, inventory, policy, path)
+	printAppInventory(&out, inventory, []string{"api.memql.localhost", "api.memql.example.com"}, policy, path)
 	got := out.String()
 
 	for _, want := range []string{
+		"Clusters: api.memql.localhost, api.memql.example.com",
 		"claude-code  2.1.270 (Claude Code)",
-		"allowed and signed in -- the cluster can send it sessions",
+		"signed in  yes",
+		"api.memql.localhost    allowed -- this cluster can send it sessions",
+		"api.memql.example.com  BLOCKED -- memql worker apps --allow claude-code --home api.memql.example.com",
 		"claude-headless: structured answers, follow-up turns",
 		"fast", "--model haiku", "built-in",
 		"reasoning", "--model opus --effort max", "policy.yaml",
@@ -78,20 +83,46 @@ func TestPrintAppInventory(t *testing.T) {
 	}
 }
 
-// Each state an owner can fix names the fix.
-func TestAppVerdict(t *testing.T) {
+// Each state an owner can fix names the fix: the sign-in is the app's own,
+// and consent is one cluster's, with the command that gives it.
+func TestClusterVerdict(t *testing.T) {
 	cases := []struct {
-		info apps.Info
-		want string
+		info    apps.Info
+		allowed bool
+		want    string
 	}{
-		{apps.Info{Allowed: true, SignedIn: true}, "the cluster can send it sessions"},
-		{apps.Info{Allowed: false, SignedIn: true}, "BLOCKED -- add it to apps.allow in /p/policy.yaml"},
-		{apps.Info{Allowed: true, SignedIn: false}, "NOT signed in -- sign in to the app itself"},
-		{apps.Info{Allowed: false, SignedIn: false}, "BLOCKED and NOT signed in"},
+		{apps.Info{Id: "codex", SignedIn: true}, true, "this cluster can send it sessions"},
+		{apps.Info{Id: "codex", SignedIn: true}, false, "BLOCKED -- memql worker apps --allow codex --home local"},
+		{apps.Info{Id: "codex", SignedIn: false}, true, "allowed, once the app is signed in"},
+		{apps.Info{Id: "codex", SignedIn: false}, false, "BLOCKED -- memql worker apps --allow codex --home local"},
 	}
 	for _, c := range cases {
-		if got := appVerdict(c.info, "/p/policy.yaml"); !strings.Contains(got, c.want) {
-			t.Errorf("appVerdict(%+v) = %q, want it to contain %q", c.info, got, c.want)
+		if got := clusterVerdict(c.info, c.allowed, "local"); !strings.Contains(got, c.want) {
+			t.Errorf("clusterVerdict(%+v, %v) = %q, want it to contain %q", c.info, c.allowed, got, c.want)
+		}
+	}
+	if got := signedInLine(apps.Info{}); !strings.Contains(got, "NO -- sign in to the app itself") {
+		t.Errorf("signedInLine = %q", got)
+	}
+}
+
+// The retired machine-wide list is shown as the problem it is, with the
+// command that migrates it; a machine with no cluster says so.
+func TestPrintAppInventory_RetiredListAndNoClusters(t *testing.T) {
+	policy, path := appsCmdPolicy(t, "apps:\n  allow: [claude-code]\n")
+	inventory := []apps.Info{{Id: apps.IDClaudeCode, SignedIn: true, Harness: apps.HarnessClaudeHeadless}}
+	var out bytes.Buffer
+	printAppInventory(&out, inventory, nil, policy, path)
+	got := out.String()
+	for _, want := range []string{
+		"app consent in " + path + " has 1 problem",
+		"apps.allow is no longer read",
+		"memql worker apps --allow claude-code --home <cluster>",
+		"Clusters: none enrolled -- pair this machine with a cluster first",
+		"clusters   none enrolled -- pair this machine with a cluster first",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output is missing %q:\n%s", want, got)
 		}
 	}
 }
@@ -106,13 +137,13 @@ func TestHarnessLine(t *testing.T) {
 // An owner with no apps.levels block reads the built-in table and no
 // problems section at all.
 func TestPrintAppInventory_NoLevelsBlock(t *testing.T) {
-	policy, path := appsCmdPolicy(t, "apps:\n  allow: [codex]\n")
+	policy, path := appsCmdPolicy(t, "apps:\n  homes:\n    local:\n      allow: [codex]\n")
 	inventory := []apps.Info{{
 		Id: apps.IDCodex, Version: "codex-cli 0.153.4", SignedIn: true, Allowed: true,
 		Harness: apps.HarnessCodexAppServer, StructuredResult: true, FollowUps: true,
 	}}
 	var out bytes.Buffer
-	printAppInventory(&out, inventory, policy, path)
+	printAppInventory(&out, inventory, []string{"local"}, policy, path)
 	got := out.String()
 
 	if !strings.Contains(got, "model_reasoning_effort=medium, on the account's default model") {

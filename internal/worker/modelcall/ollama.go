@@ -75,6 +75,9 @@ func (c *ollamaClient) Chat(ctx context.Context, req ChatRequest, emit emitFunc)
 	if len(req.Tools) > 0 {
 		body["tools"] = ollamaTools(req.Tools)
 	}
+	if !ollamaThink(req) {
+		body["think"] = false
+	}
 
 	resp, err := c.post(ctx, "/api/chat", body)
 	if err != nil {
@@ -83,6 +86,7 @@ func (c *ollamaClient) Chat(ctx context.Context, req ChatRequest, emit emitFunc)
 	defer resp.Body.Close()
 
 	out := Result{FinishReason: FinishStop}
+	answered, thought := false, 0
 	scanner := bufio.NewScanner(resp.Body)
 	// A single token is small, but a non-streaming fallback response can
 	// be the whole generation on one line. 4 MB is well past any answer a
@@ -106,7 +110,12 @@ func (c *ollamaClient) Chat(ctx context.Context, req ChatRequest, emit emitFunc)
 		if chunk.Message.Thinking != "" || len(chunk.Message.ToolCalls) > 0 {
 			reportRuntimeProgress(ctx)
 		}
+		thought += len(chunk.Message.Thinking)
+		if len(chunk.Message.ToolCalls) > 0 {
+			answered = true
+		}
 		if chunk.Message.Content != "" {
+			answered = true
 			if err := emit(chunk.Message.Content); err != nil {
 				return out, err
 			}
@@ -138,6 +147,13 @@ func (c *ollamaClient) Chat(ctx context.Context, req ChatRequest, emit emitFunc)
 				Known: chunk.PromptEvalCount > 0 || chunk.EvalCount > 0,
 				Model: chunk.Model,
 			}
+			if len(req.Schema) > 0 && !answered && thought > 0 {
+				// An empty structured answer after hidden thinking is the
+				// budget spent on thinking, not a clean stop. Named here, it
+				// reaches the engine as a model failure rather than as an
+				// empty draft the caller then fails to parse.
+				return out, fmt.Errorf("ollama: the model spent its output on thinking (%d characters) and gave no answer", thought)
+			}
 			return out, nil
 		}
 	}
@@ -149,6 +165,18 @@ func (c *ollamaClient) Chat(ctx context.Context, req ChatRequest, emit emitFunc)
 	// clean stop -- a caller that parses a truncated structured answer
 	// would otherwise blame the model.
 	return out, fmt.Errorf("ollama: stream ended without a completion frame")
+}
+
+// ollamaThink reports whether a chat call leaves the model's thinking at
+// its default. Thinking is hidden from the caller and counts against the
+// output budget: on qwen3.5:4b a structured triage spent 1,482 tokens (39 s)
+// thinking before a 216-character answer, and 41 tokens (1.2 s) without.
+// A structured answer is parsed from the content alone, and a fast call
+// must not spend minutes on it, so both send think:false. Free text above
+// fast keeps the model's own default. think:false is accepted by models
+// that cannot think; only think:true is refused by them.
+func ollamaThink(req ChatRequest) bool {
+	return len(req.Schema) == 0 && req.Level != "fast"
 }
 
 // ollamaEmbedResponse is /api/embed.

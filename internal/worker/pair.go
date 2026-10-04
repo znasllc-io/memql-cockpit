@@ -228,9 +228,12 @@ func runConfiguredWorker(clusterURL, token, name string, logger *slog.Logger) er
 		}
 	}()
 
+	// As `worker run` does, before anything resolves a binary.
+	ensureServicePath(logger)
+
 	discoverer := &models.Discoverer{}
 	modelInventory := NewModelInventory(policy, discoverer)
-	appInv := NewAppInventory(policy)
+	appInventories := NewAppInventories(policy, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -250,7 +253,7 @@ func runConfiguredWorker(clusterURL, token, name string, logger *slog.Logger) er
 			Policy:     policy,
 			PolicyPath: policyPath,
 			ToolsFor:   toolsFor,
-			Apps:       appInv,
+			AppsFor:    appInventories.For,
 			Models:     modelInventory,
 			Discoverer: discoverer,
 			Metrics:    metrics,
@@ -274,7 +277,7 @@ func runConfiguredWorker(clusterURL, token, name string, logger *slog.Logger) er
 			Logger:           logger,
 			Config:           cfg,
 			Tools:            toolsFor(cfg.Home),
-			Apps:             appInv,
+			Apps:             appInventories.For(cfg.Home),
 			Models:           modelInventory,
 			Metrics:          metrics,
 			InferenceServe:   policy.InferenceServe,

@@ -15,7 +15,7 @@ cap_spec_param "menu" "Start the embedded menu helper (true or false, default tr
 function main() {
     cap_handle_meta "$@"
     cap_parse_flags "$@"
-    local app menu plist helper stage uid_value backup legacy identifier fingerprint marker
+    local app menu plist helper stage uid_value backup legacy identifier fingerprint marker service_path
     app="$(cap_param app)"; menu="$(cap_param menu true)"
     [[ "$app" == /* && -x "$app/Contents/MacOS/MemQL" ]] || cap_fail 2 "app must be an installed MemQL bundle"
     [[ "$menu" == true || "$menu" == false ]] || cap_fail 2 "menu must be true or false"
@@ -25,6 +25,10 @@ function main() {
     helper="$app/Contents/Library/LoginItems/MemQL Menu.app"
     [[ -x "$helper/Contents/MacOS/MemQLCockpit" ]] || cap_fail 3 "menu helper is missing"
     uid_value="$(id -u)"
+    # launchd's four system directories, then where the app installers put
+    # claude and codex -- appended, so nothing the user can write to shadows
+    # launchctl. internal/worker/servicepath.go spells the same string.
+    service_path="/usr/bin:/bin:/usr/sbin:/sbin:${HOME}/.local/bin:${HOME}/.claude/local:/opt/homebrew/bin:/usr/local/bin"
     plist="$HOME/Library/LaunchAgents/com.znasllc.memql-worker.plist"
     [[ ! -L "$plist" ]] || cap_fail 3 "worker plist must not be a symlink"
     [[ ! -e "$plist" || -f "$plist" && -O "$plist" ]] || cap_fail 3 "worker plist must belong to the current user"
@@ -40,6 +44,14 @@ function main() {
         # then insert so the old executable cannot become an extra CLI arg.
         plutil -remove ProgramArguments.0 "$stage" >&2
         plutil -insert ProgramArguments.0 -string "$app/Contents/MacOS/MemQL" "$stage" >&2
+        # A plist written before the service carried a PATH gets one, or the
+        # worker finds no app on this machine. A PATH already there is the
+        # owner's and stays exactly as it is.
+        if ! /usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:PATH' "$stage" >/dev/null 2>&1; then
+            /usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables' "$stage" >/dev/null 2>&1 \
+                || plutil -insert EnvironmentVariables -dictionary "$stage" >&2
+            plutil -insert EnvironmentVariables.PATH -string "$service_path" "$stage" >&2
+        fi
     else
         plutil -create xml1 "$stage" >&2
         plutil -insert Label -string com.znasllc.memql-worker "$stage" >&2
@@ -53,6 +65,7 @@ function main() {
         plutil -insert StandardErrorPath -string "$HOME/.memql/state/worker.log" "$stage" >&2
         plutil -insert EnvironmentVariables -dictionary "$stage" >&2
         plutil -insert EnvironmentVariables.HOME -string "$HOME" "$stage" >&2
+        plutil -insert EnvironmentVariables.PATH -string "$service_path" "$stage" >&2
         chmod 600 "$stage"
     fi
     plutil -remove AssociatedBundleIdentifiers "$stage" >/dev/null 2>&1 || true
