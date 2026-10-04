@@ -71,12 +71,16 @@ import (
 // not print it into a log. This is not a sandbox: the step runs as the user
 // the worker runs as, which is what pipelines.allow consents to.
 //
-// SECRETS ARE MASKED ("***", every value of four characters or more, and each
-// line of a multi-line one) in every chunk streamed and in the result. Output
-// is cut into chunks only at line ends -- or, for a line longer than
-// maxPendingOutput, at a point no secret straddles, holding the line for as
-// long as a value longer than what is held may still be arriving -- so a value
-// split across two reads, or across many, is whole when it is masked.
+// SECRETS ARE MASKED as the cluster masks them -- "***" for every value in
+// every form it is printed in: as stored, without the whitespace around it,
+// and each line of a multi-line one likewise, four bytes or more; values that
+// overlap where printed are one mask -- in every chunk streamed and in the
+// result. The stream is masked a line at a time, as the cluster masks the
+// lines it reassembles, and cut into chunks only at line ends -- or, for a
+// line longer than maxPendingOutput, where its masking is decided, holding a
+// value that may still be arriving from its first byte until all of it can
+// be seen -- so a value split across two reads, or across many, is whole when
+// it is masked.
 
 const (
 	// defaultPipelineStepTimeoutSec is a step's timeout when the request names
@@ -96,8 +100,9 @@ const (
 	// pipelineFailureTail is how much of git's stderr a clone failure quotes.
 	pipelineFailureTail = 2 << 10
 
-	// minSecretLength is the shortest value masked. Masking "abc" would shred
-	// ordinary output; the cluster's capture draws the same line.
+	// minSecretLength is the shortest form of a value that is masked. Masking
+	// "abc" -- or the indent-only line of a key -- would shred ordinary
+	// output; the cluster draws the same line.
 	minSecretLength = 4
 
 	// workerTokenVariable is the worker's own credential when it is passed in
@@ -801,109 +806,158 @@ func (t *tailBuffer) String() string {
 
 // --- masking -------------------------------------------------------------
 
-// secretMasker replaces every secret value in text with "***".
+// secretMasker replaces every secret in text with "***" as the cluster masks
+// it (the engine's pipelines.MaskSecrets): each value in every form it is
+// printed in -- as stored, without the whitespace around it, and, for a value
+// over several lines, each line without the whitespace around it -- of
+// minSecretLength bytes or more. Occurrences that overlap or touch, of one
+// value or of two, are one span under one mask, so no byte of either
+// survives between two masks. An indent-only line of a key trims to nothing,
+// and masks nothing.
 type secretMasker struct {
-	// values are longest first, so a value that contains another is masked
-	// whole rather than leaving its remainder visible.
-	values   [][]byte
-	longest  int
-	replacer *strings.Replacer
+	starts  [256]bool         // the bytes a form starts with
+	byFirst map[byte][]string // the forms by their first byte
 }
 
-// newSecretMasker masks every value of minSecretLength characters or more,
-// and each line of a multi-line value as a value of its own: output is cut
-// at line ends, so a key whose lines arrive in separate chunks is still
-// masked line by line.
 func newSecretMasker(values []string) *secretMasker {
+	m := &secretMasker{byFirst: map[byte][]string{}}
 	seen := map[string]bool{}
-	var list []string
-	add := func(v string) {
-		if len(v) < minSecretLength || seen[v] {
+	add := func(form string) {
+		if len(form) < minSecretLength || seen[form] {
 			return
 		}
-		seen[v] = true
-		list = append(list, v)
+		seen[form] = true
+		m.starts[form[0]] = true
+		m.byFirst[form[0]] = append(m.byFirst[form[0]], form)
 	}
 	for _, v := range values {
 		add(v)
-		if strings.ContainsAny(v, "\r\n") {
-			for _, line := range strings.FieldsFunc(v, func(r rune) bool { return r == '\n' || r == '\r' }) {
-				add(line)
+		add(strings.TrimSpace(v))
+		if strings.Contains(v, "\n") {
+			for _, line := range strings.Split(v, "\n") {
+				add(strings.TrimSpace(line))
 			}
 		}
 	}
-	m := &secretMasker{}
-	if len(list) == 0 {
-		return m
-	}
-	sort.SliceStable(list, func(i, j int) bool { return len(list[i]) > len(list[j]) })
-	pairs := make([]string, 0, 2*len(list))
-	for _, v := range list {
-		pairs = append(pairs, v, "***")
-		m.values = append(m.values, []byte(v))
-	}
-	m.longest = len(list[0])
-	// strings.Replacer compares in argument order at each position, so the
-	// longest value present there wins.
-	m.replacer = strings.NewReplacer(pairs...)
 	return m
 }
 
+// mask is s with every secret masked, s taken as one text.
 func (m *secretMasker) mask(s string) string {
-	if m == nil || m.replacer == nil {
+	if m == nil || len(m.byFirst) == 0 {
 		return s
 	}
-	return m.replacer.Replace(s)
+	out, _ := m.scan(s, &maskState{}, true)
+	return out
 }
 
-// cutPoint is where an over-long unfinished line may be cut, or 0, which
-// means HOLD ON: there is no safe cut in buf yet.
-//
-// strings.Replacer decides left to right, at each position taking the first
-// value (longest first) that begins there, and a decision at position p reads
-// at most m.longest bytes from p. So every decision at a position before
-// len(buf)-(longest-1) is the one the whole line will get however it goes on,
-// and a value that begins before that point is complete in buf. The cut goes
-// where the last of those decisions ends: never inside a value, and never
-// before a value that is still arriving. A buffer shorter than the longest
-// value has no final decision at all -- a value still arriving may begin at
-// its first byte -- so it is held until one exists, which bounds what the
-// chunker holds at maxPendingOutput plus the longest value.
-func (m *secretMasker) cutPoint(buf []byte) int {
-	if m == nil || len(m.values) == 0 {
-		return len(buf)
+// maskState is where a scan of a line stopped: inside a span whose mask it
+// wrote, or where one ends -- which a value occurring there carries on --
+// with the span reaching reach bytes past the stop.
+type maskState struct {
+	span  bool
+	reach int
+}
+
+// scan masks s from where st says the last scan of its line stopped, and
+// answers the masked text and how much of s it covers. A span's mask is
+// written where the span starts, and how far it reaches is carried in st, so
+// a line can be masked in parts that join into the line masked whole. It
+// stops before the first position it cannot decide yet -- one where a value
+// may occur that s ends inside of -- unless complete says s ends where its
+// line does.
+func (m *secretMasker) scan(s string, st *maskState, complete bool) (string, int) {
+	if m == nil {
+		return s, len(s)
 	}
-	final := len(buf) - (m.longest - 1)
-	p := 0
-	for p < final {
-		if n := m.matchAt(buf, p); n > 0 {
-			p += n
-		} else {
-			p++
+	var out strings.Builder
+	out.Grow(len(s))
+	cover := st.reach // where the open span ends, in s
+	i := 0
+scan:
+	for i < len(s) {
+		if st.span && i < cover {
+			// Inside the span: nothing is written, and a value occurring
+			// here may carry the span further.
+			if m.starts[s[i]] {
+				end, decided := m.at(s, i, complete)
+				if !decided {
+					break
+				}
+				cover = max(cover, end)
+			}
+			i++
+			continue
+		}
+		if !m.starts[s[i]] {
+			// The text's own bytes, up to where a value could start; a span
+			// that ended here is over.
+			st.span = false
+			j := i + 1
+			for j < len(s) && !m.starts[s[j]] {
+				j++
+			}
+			out.WriteString(s[i:j])
+			i = j
+			continue
+		}
+		end, decided := m.at(s, i, complete)
+		switch {
+		case !decided:
+			break scan
+		case end >= 0 && st.span:
+			// A value occurring where the span ends carries it on.
+			cover = end
+		case end >= 0:
+			// A span starts here: its mask.
+			out.WriteString("***")
+			st.span, cover = true, end
+		default:
+			st.span = false
+			out.WriteByte(s[i])
+		}
+		i++
+	}
+	st.reach = 0
+	if st.span {
+		st.reach = cover - i
+	}
+	return out.String(), i
+}
+
+// at is where the longest form occurring at s[i] ends, or -1 when none does.
+// decided is false when a form s ends inside of may still occur there: s is
+// cut short of its line (complete is false), and that form's end decides how
+// far a span reaches.
+func (m *secretMasker) at(s string, i int, complete bool) (end int, decided bool) {
+	end, rest := -1, s[i:]
+	for _, form := range m.byFirst[s[i]] {
+		switch {
+		case strings.HasPrefix(rest, form):
+			end = max(end, i+len(form))
+		case !complete && len(rest) < len(form) && strings.HasPrefix(form, rest):
+			return -1, false
 		}
 	}
-	return p
+	return end, true
 }
 
-// matchAt is the length of the value strings.Replacer masks at p, or 0: the
-// first of m.values -- longest first, in the order the replacer was given
-// them -- that begins there.
-func (m *secretMasker) matchAt(buf []byte, p int) int {
-	for _, v := range m.values {
-		if bytes.HasPrefix(buf[p:], v) {
-			return len(v)
-		}
-	}
-	return 0
-}
-
-// lineChunker cuts one output stream into masked chunks that end at a line
-// end -- or, for a line longer than maxPendingOutput, at a cutPoint -- so a
-// secret split across two reads is whole when it is masked.
+// lineChunker cuts one output stream into masked chunks. The stream is
+// masked a line at a time, as the cluster masks the lines it reassembles from
+// these chunks: how the output happened to be read changes nothing, and a
+// value stored with a line end never takes a line end with it. A chunk ends
+// at a line end -- or, for a line longer than maxPendingOutput, where the
+// line's masking is decided: a span's mask goes out where the span starts,
+// how far the span reaches is carried to the next part, and only a value that
+// may still be arriving is held, from its first byte, until all of it can be
+// seen. A value split across two reads, or across many, is masked whole.
 type lineChunker struct {
-	mask    *secretMasker
-	emit    func([]byte)
+	mask *secretMasker
+	emit func([]byte)
+	// pending is the current line, not yet sent; it holds no line end.
 	pending []byte
+	// state is where the current line was cut when part of it was sent.
+	state maskState
 }
 
 func newLineChunker(mask *secretMasker, emit func([]byte)) *lineChunker {
@@ -911,36 +965,49 @@ func newLineChunker(mask *secretMasker, emit func([]byte)) *lineChunker {
 }
 
 func (c *lineChunker) write(p []byte) {
-	start := len(c.pending)
 	c.pending = append(c.pending, p...)
-	if i := bytes.LastIndexByte(p, '\n'); i >= 0 {
-		end := start + i + 1
-		c.send(c.pending[:end])
-		c.pending = append(c.pending[:0], c.pending[end:]...)
-	}
-	for len(c.pending) > maxPendingOutput {
-		cut := c.mask.cutPoint(c.pending)
-		if cut == 0 {
-			// A value longer than what is held may still be arriving, from
-			// its first byte on: hold on until all of it can be seen.
-			break
+	var out []byte
+	if bytes.IndexByte(p, '\n') >= 0 {
+		// pending held no line end before p: every line end is in p.
+		rest := c.pending
+		for {
+			i := bytes.IndexByte(rest, '\n')
+			if i < 0 {
+				break
+			}
+			line, _ := c.masked(rest[:i], true)
+			out = append(append(out, line...), '\n')
+			rest = rest[i+1:]
 		}
-		c.send(c.pending[:cut])
-		c.pending = append(c.pending[:0], c.pending[cut:]...)
+		c.pending = append(c.pending[:0], rest...)
+	}
+	if len(c.pending) > maxPendingOutput {
+		part, used := c.masked(c.pending, false)
+		out = append(out, part...)
+		c.pending = append(c.pending[:0], c.pending[used:]...)
+	}
+	if len(out) > 0 {
+		c.emit(out)
 	}
 }
 
 // flush sends what is left, line end or not: the stream has ended.
 func (c *lineChunker) flush() {
-	c.send(c.pending)
+	if rest, _ := c.masked(c.pending, true); rest != "" {
+		c.emit([]byte(rest))
+	}
 	c.pending = c.pending[:0]
 }
 
-func (c *lineChunker) send(b []byte) {
-	if len(b) == 0 {
-		return
+// masked masks b, the current line from where its last part was cut, and
+// answers that and how much of b it covers. complete says the line ends with
+// b: the next starts afresh.
+func (c *lineChunker) masked(b []byte, complete bool) (string, int) {
+	out, used := c.mask.scan(string(b), &c.state, complete)
+	if complete {
+		c.state = maskState{}
 	}
-	c.emit([]byte(c.mask.mask(string(b))))
+	return out, used
 }
 
 // --- artifacts -----------------------------------------------------------

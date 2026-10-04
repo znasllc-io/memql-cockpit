@@ -667,12 +667,18 @@ is held back.
 **EVERY CHUNK BEFORE THE RESULT.** The engine relays a `ToolStream` only while
 its call is pending and drops one that arrives after the result, so
 `Dispatcher.DispatchStream` returns only once its output is sent and the
-runner sends the result after. Output is cut only at line ends (or, past
-64 KiB of one line, where no secret straddles the cut), because masking a
-chunk cannot see a value split across two -- and a line is HELD past 64 KiB
-while a secret longer than it may still be arriving: a buffer shorter than the
-longest value has no safe cut at all, and sending it whole leaked such a
-value in full. The runner ENDS a tool call on
+runner sends the result after. Output is MASKED AS THE CLUSTER MASKS IT
+(the engine's `pipelines.MaskSecrets`): every form of a value -- as stored,
+trimmed, each line of a multi-line one trimmed, four bytes or more -- and
+values that overlap where printed as one mask, a LINE AT A TIME, as the
+cluster masks the lines it reassembles, so how the output was read changes
+nothing and a value stored with a line end never takes the line end with it.
+It is cut only at line ends (or, past 64 KiB of one line, where the line's
+masking is decided: a span's mask goes out where it starts and its reach is
+carried to the next part), because masking a chunk cannot see a value split
+across two -- and a line is HELD past 64 KiB, from the first byte of a value
+that may still be arriving, until all of it can be seen: sending it whole
+leaked such a value in full. The runner ENDS a tool call on
 `ToolCancel` and on the loss of its stream: it does not reconnect until its
 calls return, so a step left running would keep the machine off the cluster
 for its whole timeout.

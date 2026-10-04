@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	mrand "math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1115,7 +1116,8 @@ func TestOutputChunkerNeverCutsALongLineInsideASecret(t *testing.T) {
 	}
 
 	// Values that overlap one another, and a line that is one unbroken run of
-	// them: the cut still falls where the replacer's own decisions end.
+	// them -- one span, however long: the parts still join into the line
+	// masked whole.
 	om := newSecretMasker([]string{"abababab", "SECRET-ONE-xyz", "xyz-SECRET-TWO"})
 	for _, line := range []string{
 		strings.Repeat("ab", maxPendingOutput) + "tail",
@@ -1125,6 +1127,226 @@ func TestOutputChunkerNeverCutsALongLineInsideASecret(t *testing.T) {
 			if got, want := chunkLine(om, line, read), om.mask(line); got != want {
 				t.Fatalf("overlapping values, reads of %d: the chunks do not reassemble to the masked line", read)
 			}
+		}
+	}
+}
+
+// TestSecretMaskerMasksAsTheClusterDoes (memql#5478's final review, its three
+// probes): a value is masked in every form the cluster masks it in, and values
+// that overlap where printed are one span -- in the stream and in the result
+// alike. What the cluster cannot find again -- a value printed trimmed, the
+// remnant of two that overlap -- must not leave this machine, and an
+// indent-only line of a key is no value at all.
+func TestSecretMaskerMasksAsTheClusterDoes(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		secrets []string
+		output  string // what the step prints
+		want    string
+		leaks   []string
+	}{
+		{
+			// `echo $S` prints a value stored with whitespace around it
+			// without that whitespace.
+			name:    "a value stored padded and printed trimmed",
+			secrets: []string{"hunter2-token "},
+			output:  "token=hunter2-token\nhunter2-token\n",
+			want:    "token=***\n***\n",
+			leaks:   []string{"hunter2-token"},
+		},
+		{
+			name:    "a multi-line value with an indent-only line",
+			secrets: []string{"-----BEGIN KEY-----\n    \nMIIBOgIBAAJBAKj34GkxFhD90vcN\n-----END KEY-----\n"},
+			output:  "func main() {\n    return nil\n        MIIBOgIBAAJBAKj34GkxFhD90vcN\n",
+			want:    "func main() {\n    return nil\n        ***\n",
+			leaks:   []string{"MIIBOgIBAAJBAKj34GkxFhD90vcN"},
+		},
+		{
+			// Masking them one after the other leaves "***ijkl".
+			name:    "overlapping values",
+			secrets: []string{"abcdefgh", "efghijkl"},
+			output:  "abcdefghijkl\nx efghijklmnop abcdefgh y\n",
+			want:    "***\nx ***mnop *** y\n",
+			leaks:   []string{"ijkl", "efgh"},
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			m := newSecretMasker(c.secrets)
+			for _, read := range []int{1, 7, 4096} {
+				got := chunkLine(m, c.output, read)
+				if got != c.want {
+					t.Errorf("reads of %d: the stream is %q, want %q", read, got, c.want)
+				}
+				for _, leak := range c.leaks {
+					if strings.Contains(got, leak) {
+						t.Errorf("reads of %d: the stream holds %q", read, leak)
+					}
+				}
+			}
+			if got := m.mask(c.output); got != c.want {
+				t.Errorf("mask = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestOutputChunkerMasksAPaddedValueAcrossItsCut: a value stored with
+// whitespace around it, printed trimmed -- or printed whole, where its two
+// forms are one span -- across the point where the chunker must cut a line
+// longer than it holds, is masked whole: the parts are the line masked whole,
+// and none of the value is in either.
+func TestOutputChunkerMasksAPaddedValueAcrossItsCut(t *testing.T) {
+	m := newSecretMasker([]string{"  hunter2-token-0123456789 \n", "pad-value-9876  "})
+	for _, printed := range []string{"hunter2-token-0123456789", "pad-value-9876  ", "pad-value-9876"} {
+		for offset := -len(printed) - 2; offset <= 2; offset++ {
+			for _, read := range []int{1, 7, 4096} {
+				line := strings.Repeat("x", maxPendingOutput+offset) + printed + strings.Repeat("y", 300)
+				got := chunkLine(m, line, read)
+				if want := strings.Repeat("x", maxPendingOutput+offset) + "***" + strings.Repeat("y", 300); got != want {
+					head := strings.TrimLeft(got, "x")
+					t.Fatalf("%q at offset %d, reads of %d: the stream ends %.60q..., want the value masked whole", printed, offset, read, head)
+				}
+			}
+		}
+	}
+}
+
+// TestOutputChunkerMasksRandomLongLinesAsTheClusterDoes: values drawn from a
+// small alphabet -- so they overlap, nest and repeat -- stored padded or over
+// lines with an indent-only one among them; lines longer than the chunker
+// holds, their forms whole and cut short placed around the cut it must make,
+// written in reads of every size. The stream is each line as the cluster
+// masks it.
+func TestOutputChunkerMasksRandomLongLinesAsTheClusterDoes(t *testing.T) {
+	rng := mrand.New(mrand.NewSource(20261004))
+	alphabet := []string{"a", "b", "c", "a", "b", "é", " ", "\t"}
+	word := func(n int) string {
+		var b strings.Builder
+		for b.Len() < n {
+			b.WriteString(alphabet[rng.Intn(len(alphabet))])
+		}
+		return b.String()
+	}
+	for n := 0; n < 200; n++ {
+		var values []string
+		for k := 0; k < 1+rng.Intn(3); k++ {
+			v := word(4 + rng.Intn(8))
+			switch rng.Intn(4) {
+			case 0: // stored padded
+				v = strings.Repeat(" ", rng.Intn(3)) + v + strings.Repeat(" ", rng.Intn(3)) + []string{"", "\n"}[rng.Intn(2)]
+			case 1: // over lines, an indent-only one among them
+				v += "\n" + strings.Repeat(" ", 4+rng.Intn(3)) + "\n" + word(4+rng.Intn(6)) + "\n"
+			case 2: // the end of another, carried on
+				if len(values) > 0 {
+					prev := strings.TrimSpace(values[rng.Intn(len(values))])
+					v = prev[len(prev)/2:] + word(3)
+				}
+			}
+			values = append(values, v)
+		}
+		var printable []string
+		for _, v := range values {
+			for _, f := range []string{v, strings.TrimSpace(v)} {
+				for _, line := range strings.Split(f, "\n") {
+					if line = strings.TrimSpace(line); len(line) >= minSecretLength {
+						printable = append(printable, line)
+					}
+				}
+			}
+		}
+		var line strings.Builder
+		line.WriteString(strings.Repeat("x", maxPendingOutput-rng.Intn(80)))
+		for size := line.Len() + 40 + rng.Intn(200); line.Len() < size; {
+			if len(printable) == 0 || rng.Intn(3) == 0 {
+				line.WriteString(word(1 + rng.Intn(6)))
+				continue
+			}
+			f := printable[rng.Intn(len(printable))]
+			if rng.Intn(3) == 0 {
+				f = f[:rng.Intn(len(f))]
+			}
+			line.WriteString(f)
+		}
+		read := []int{1, 3, 7, 64, 4096, 32 << 10}[rng.Intn(6)]
+		m := newSecretMasker(values)
+		if got, want := chunkLine(m, line.String()+"\nnext\n", read), clusterMask(line.String(), values)+"\nnext\n"; got != want {
+			t.Fatalf("case %d, values %q, reads of %d: the stream ends\n  %q\nwant the line as the cluster masks it, ending\n  %q",
+				n, values, read, got[max(0, len(got)-300):], want[max(0, len(want)-300):])
+		}
+	}
+}
+
+// clusterMask is the cluster's masking (the engine's pipelines.MaskSecrets),
+// written out the way the engine writes it -- every occurrence of every form
+// found, spans that overlap or touch merged, each replaced once -- as what
+// the chunker's masking in parts is held to.
+func clusterMask(text string, values []string) string {
+	var forms []string
+	seen := map[string]bool{}
+	add := func(f string) {
+		if len(f) >= minSecretLength && !seen[f] {
+			seen[f] = true
+			forms = append(forms, f)
+		}
+	}
+	for _, v := range values {
+		add(v)
+		add(strings.TrimSpace(v))
+		if strings.Contains(v, "\n") {
+			for _, l := range strings.Split(v, "\n") {
+				add(strings.TrimSpace(l))
+			}
+		}
+	}
+	type span struct{ start, end int }
+	var spans []span
+	for _, f := range forms {
+		for from := 0; from+len(f) <= len(text); {
+			i := strings.Index(text[from:], f)
+			if i < 0 {
+				break
+			}
+			spans = append(spans, span{from + i, from + i + len(f)})
+			from += i + 1
+		}
+	}
+	if len(spans) == 0 {
+		return text
+	}
+	sort.Slice(spans, func(i, j int) bool { return spans[i].start < spans[j].start })
+	var b strings.Builder
+	written, cur := 0, spans[0]
+	flush := func() {
+		b.WriteString(text[written:cur.start])
+		b.WriteString("***")
+		written = cur.end
+	}
+	for _, s := range spans[1:] {
+		if s.start <= cur.end {
+			cur.end = max(cur.end, s.end)
+			continue
+		}
+		flush()
+		cur = s
+	}
+	flush()
+	return b.String() + text[written:]
+}
+
+// TestOutputChunkerMasksTheStreamLineByLine: the stream is masked a line at a
+// time, as the cluster masks the lines it reassembles from it -- so how the
+// output happened to be read changes nothing, and a value whose stored form
+// ends in a newline never takes the line end with it. Masked as one text, a
+// key printed whole is one span that swallows its line ends when its lines
+// arrive in one read, and is masked line by line when they do not.
+func TestOutputChunkerMasksTheStreamLineByLine(t *testing.T) {
+	key := "-----BEGIN KEY-----\nMIIBOgIBAAJBAKj34GkxFhD90vcN\n-----END KEY-----\n"
+	m := newSecretMasker([]string{key, "tok3n-value\n"})
+	output := "the key:\n" + key + "Authorization: tok3n-value\nnext line\n"
+	want := "the key:\n***\n***\n***\nAuthorization: ***\nnext line\n"
+	for _, read := range []int{1, 7, len(output)} {
+		if got := chunkLine(m, output, read); got != want {
+			t.Errorf("reads of %d: the stream is %q, want %q", read, got, want)
 		}
 	}
 }
