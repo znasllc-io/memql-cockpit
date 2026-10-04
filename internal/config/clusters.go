@@ -24,15 +24,28 @@ type ClusterConfig struct {
 	Name        string `yaml:"name"`
 	DisplayName string `yaml:"display_name,omitempty"` // Human-friendly name; falls back to Name when empty
 	// Domain is the single value the Add/Edit form collects (e.g.
-	// "staging.copresent.ai"). Endpoint / Issuer / ClientId below are
-	// composed from it by convention (cockpit.<domain> / identity.<domain>
-	// / client_id "cockpit"). Stored so the Edit form can round-trip
-	// the domain instead of reverse-engineering it from Endpoint.
-	// Empty for hand-edited / legacy rows that set the URLs directly.
+	// "staging.copresent.ai"). Endpoint / Issuer below are composed from
+	// it by convention (api.<domain> / identity.<domain>). Stored so the
+	// Edit form can round-trip the domain instead of reverse-engineering
+	// it from Endpoint. Empty for hand-edited / legacy rows that set the
+	// URLs directly.
 	Domain   string `yaml:"domain,omitempty"`
-	Endpoint string `yaml:"endpoint"`            // gRPC address (host:port)
-	Issuer   string `yaml:"issuer,omitempty"`    // OIDC issuer URL
-	ClientId string `yaml:"client_id,omitempty"` // OAuth2 client ID
+	Endpoint string `yaml:"endpoint"`         // gRPC address (host:port)
+	Issuer   string `yaml:"issuer,omitempty"` // OIDC issuer URL
+	// ClientId is an OPTIONAL override of the OAuth2 client the Cockpit
+	// signs in as. Absent means DefaultClientId; read it through
+	// EffectiveClientId, never directly.
+	//
+	// The cockpit never WRITES its own default here. clusters.yaml is
+	// SHARED with the memQL VS Code extension and other tools, and a
+	// client id is per TOOL, not per cluster: a `client_id: cockpit` the
+	// cockpit stamped on every entry was read by the editor as an
+	// override and broke its sign-in. So a composed entry leaves the key
+	// out, and only a value that differs from the default -- one a
+	// cluster's discovery document named, or an operator wrote by hand --
+	// lands on disk. An existing entry is preserved as found, like every
+	// other key in this file.
+	ClientId string `yaml:"client_id,omitempty"`
 	// PAT is an optional Personal Access Token (mql_pat_<...>) the
 	// CLI sends as `Authorization: Bearer <pat>` on every gRPC
 	// request. When set, it short-circuits the OIDC browser-login
@@ -101,6 +114,34 @@ type ClusterConfig struct {
 	Extra map[string]any `yaml:",inline"`
 }
 
+// DefaultClientId is the OAuth2 client the Cockpit registers as with an
+// identity service, compiled in so it never has to be stored. The engine
+// registers the cockpit under this id (component/identity/discovery.go:
+// "the canonical \"cockpit\" client").
+const DefaultClientId = "cockpit"
+
+// EffectiveClientId is the client the Cockpit signs in and refreshes as:
+// the entry's explicit client_id when it carries one, DefaultClientId
+// otherwise. It is never empty.
+func (c ClusterConfig) EffectiveClientId() string {
+	if id := strings.TrimSpace(c.ClientId); id != "" {
+		return id
+	}
+	return DefaultClientId
+}
+
+// StoredClientId is what an entry the Cockpit composes should carry for a
+// client id it resolved: nothing when that is the Cockpit's own default
+// (see ClusterConfig.ClientId for why the shared file must not carry it),
+// the value itself otherwise.
+func StoredClientId(id string) string {
+	id = strings.TrimSpace(id)
+	if id == DefaultClientId {
+		return ""
+	}
+	return id
+}
+
 // Display returns DisplayName if set, otherwise Name. Use this for
 // any UI surface that shows the cluster's human-readable label.
 func (c ClusterConfig) Display() string {
@@ -135,8 +176,8 @@ type ClustersFile struct {
 //
 // A cluster is "configured" when it has BOTH an endpoint AND one of:
 //   - a PAT (the token IS the credential, no OIDC dance needed)
-//   - an OIDC issuer + client_id pair (cockpit can run the auth-code
-//     flow against them and produce a token)
+//   - an OIDC issuer (cockpit can run the auth-code flow against it as
+//     EffectiveClientId, which is never empty, and produce a token)
 //
 // An empty endpoint also counts as not-configured: even with auth
 // fields set, there's nowhere to dial.
@@ -147,7 +188,7 @@ func (c ClusterConfig) NeedsAuth() bool {
 	if c.PAT != "" {
 		return false
 	}
-	return c.Issuer == "" || c.ClientId == ""
+	return c.Issuer == ""
 }
 
 // Get returns the cluster config with the given name.
