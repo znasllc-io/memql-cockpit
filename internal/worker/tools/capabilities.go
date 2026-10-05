@@ -81,6 +81,7 @@ var buildAgnosticComputerActions = []string{computerWaitAction}
 // key this side misspells is never rejected, never logged, and simply
 // never read.
 type CapabilityDescriptor struct {
+	Architecture string `json:"architecture"`
 	// ActionContracts comes from the implementation, never operator labels.
 	// Version 2 requires explicit execution/platform and executes image digests.
 	ActionContracts      map[string]int      `json:"actionContracts,omitempty"`
@@ -129,6 +130,7 @@ func computeCapabilities(goos string, getenv func(string) string) CapabilityDesc
 		displays = displayCount()
 	}
 	return CapabilityDescriptor{
+		Architecture:         runtime.GOARCH,
 		ActionContracts:      map[string]int{"workerHost.pipeline_step": 2},
 		Platform:             goos,
 		DisplayServer:        displayServer,

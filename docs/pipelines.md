@@ -90,7 +90,9 @@ here on the old answer in the meantime is refused by the new one.
    and so on (`bad_request`). Nothing is created before all of it passes.
 2. **Runtime and capacity.** `execution` is explicitly `native` or `container`.
    `platform` names `darwin/arm64`, `darwin/amd64`, `linux/arm64` or
-   `linux/amd64`. Native work must match the host. Container work requires a
+   `linux/amd64`. Native work must match the binary-reported host OS/architecture. A native
+   `needs: [docker]` request also probes the daemon before checkout. Host needs
+   never pass through a container boundary. Container work requires a
    Linux platform and an `image` pinned by `@sha256:...`; a live Docker probe
    must match it without emulation. No host-shell fallback occurs. Services
    and caches currently refuse on this fleet contract rather than being

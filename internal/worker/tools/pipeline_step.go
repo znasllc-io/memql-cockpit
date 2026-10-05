@@ -167,6 +167,7 @@ type pipelineStepRequest struct {
 	platform   string
 	image      string
 	dockerID   string
+	needs      []string
 }
 
 // runPipelineStep implements workerHost.pipeline_step. agentID is the

@@ -24,6 +24,8 @@ func TestPipelineExecutionRequiresAnHonestContract(t *testing.T) {
 		{"execution": "container", "platform": "linux/arm64", "image": "golang:latest"},
 		{"execution": "container", "platform": "darwin/arm64", "image": containerTestDigest},
 		{"services": []string{"postgres"}}, {"caches": []string{"go"}}, {"services": nil},
+		{"needs": "docker"}, {"needs": []any{"unknown"}},
+		{"execution": "container", "platform": "linux/arm64", "image": containerTestDigest, "needs": []any{"docker"}},
 	}
 	for _, extra := range cases {
 		if _, err := parsePipelineStep(stepArgs(t, fx, "exit 0", extra)); err == nil {
@@ -40,6 +42,20 @@ func TestPipelineExecutionRequiresAnHonestContract(t *testing.T) {
 	}
 	if err = checkPipelineRuntime(context.Background(), &req); err == nil {
 		t.Fatal("wrong native platform admitted")
+	}
+}
+
+func TestNativeDockerNeedChecksTheDaemonBeforeCheckout(t *testing.T) {
+	fx := newPipelineFixture(t)
+	allowLocalClones(t)
+	fakePipelineDocker(t, "exit 1")
+	policy, root := pipelineTestPolicy(t, "")
+	_, fail := runPipelineStep(context.Background(), "", stepArgs(t, fx, "exit 0", map[string]any{"needs": []any{"docker"}}), policy, nil)
+	if fail == nil || fail.GetErrorCode() != "pipeline_runtime_unavailable" {
+		t.Fatalf("failure: %v", fail)
+	}
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		t.Fatal("checkout started despite an unavailable Docker daemon")
 	}
 }
 

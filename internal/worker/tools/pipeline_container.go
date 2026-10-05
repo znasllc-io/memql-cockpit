@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -46,6 +47,22 @@ func parsePipelineExecution(args map[string]any, req *pipelineStepRequest) error
 	default:
 		return errors.New("pipeline_step: execution must explicitly be native or container")
 	}
+	if value := args["needs"]; value != nil {
+		list, ok := value.([]any)
+		if !ok || len(list) > 5 {
+			return errors.New("pipeline_step: needs must be a list of host requirements")
+		}
+		for _, item := range list {
+			need, ok := item.(string)
+			if !ok || !slices.Contains([]string{"docker", "gpu", "display", "macos_tooling", "user_files"}, need) {
+				return errors.New("pipeline_step: unknown host requirement")
+			}
+			req.needs = append(req.needs, need)
+		}
+	}
+	if req.execution == "container" && len(req.needs) > 0 {
+		return errors.New("pipeline_step: host requirements do not pass through the container boundary")
+	}
 	// These are not implemented on the fleet yet. Refuse instead of executing
 	// a different environment from the one the author declared.
 	for _, key := range []string{"services", "caches"} {
@@ -64,7 +81,12 @@ func checkPipelineRuntime(ctx context.Context, req *pipelineStepRequest) error {
 		if host := runtime.GOOS + "/" + runtime.GOARCH; req.platform != host {
 			return fmt.Errorf("pipeline_step: native step requires %s; this host is %s", req.platform, host)
 		}
-		return nil
+		if slices.Contains(req.needs, "macos_tooling") && runtime.GOOS != "darwin" {
+			return errors.New("pipeline_step: macOS tooling requires a Mac")
+		}
+		if !slices.Contains(req.needs, "docker") {
+			return nil
+		}
 	}
 	probe, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -79,6 +101,12 @@ func checkPipelineRuntime(ctx context.Context, req *pipelineStepRequest) error {
 	req.dockerID = daemonID
 	platform = strings.ReplaceAll(platform, "/aarch64", "/arm64")
 	platform = strings.ReplaceAll(platform, "/x86_64", "/amd64")
+	if req.execution == "native" {
+		if platform != "linux/amd64" && platform != "linux/arm64" {
+			return errors.New("pipeline_step: Docker must serve Linux containers")
+		}
+		return nil
+	}
 	if platform != req.platform {
 		return fmt.Errorf("pipeline_step: Docker serves %s; step requires %s (emulation is not admitted)", platform, req.platform)
 	}
