@@ -283,7 +283,7 @@ UNIT
 
 function main() {
     parse_args "$@"
-    install_ui_init
+    install_ui_init install
     # Preflight must run before privileges, worker configuration, or services.
     install_ui_stage "Checking the release" install_check_release
     install_ui_stage "Installing Cockpit" install_binary

@@ -87,7 +87,7 @@ function main() {
             return
             ;;
     esac
-    install_ui_init
+    install_ui_init install
     install_ui_stage 'Checking the release' preview_step 'Release available'
     install_ui_stage 'Installing Cockpit' preview_binary
     install_ui_stage 'Configuring this machine' preview_step 'Machine configured'
