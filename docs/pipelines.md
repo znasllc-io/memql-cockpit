@@ -166,10 +166,12 @@ A step inherits the **worker's** environment, which is not your login shell's.
 
 `shell.allow`, `shell.deny`, `shell.run_as_user` and the shell's `max_*`
 limits do not apply to a step: the command is the pipeline runner's,
-`pipelines` is its consent, and `max_timeout_sec` its limit. One caveat: the
-worker applies the shell's `max_*` limits to its own process the first time it
-runs a `workerHost.exec` call, and every process it starts after that -- a
-step included -- inherits them until the worker restarts.
+`pipelines` is its consent, and `max_timeout_sec` its limit. Shell resource
+limits are applied inside the exec call's child before its command starts;
+they do not change the worker or later pipeline steps. Limits imposed by the
+worker's launch service still apply to every child. Restart the worker when
+upgrading an older build that changed its own limits: lowered hard limits
+cannot be repaired in that running process.
 
 ---
 

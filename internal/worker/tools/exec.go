@@ -44,7 +44,11 @@ func runExec(ctx context.Context, args map[string]any, policy *Policy) (*memqlv1
 	if err := applyShellSysProcAttr(cmd, limits); err != nil {
 		return nil, failure("denied_by_policy", err.Error())
 	}
-	applyResourceLimits(limits)
+	if err := prepareShellLimits(cmd, limits); err != nil {
+		return nil, failure("denied_by_policy", err.Error())
+	}
+	cmd.Cancel = func() error { signalProcessGroup(cmd, true); return nil }
+	cmd.WaitDelay = time.Second
 	if cwd != "" {
 		cmd.Dir = cwd
 	}
@@ -66,6 +70,9 @@ func runExec(ctx context.Context, args map[string]any, policy *Policy) (*memqlv1
 	cmd.Stderr = &stderr
 
 	err := cmd.Run()
+	if execCtx.Err() != nil {
+		return nil, failure("timeout", "exec timed out or cancelled")
+	}
 	exitCode := 0
 	signalName := ""
 	if err != nil {
@@ -74,8 +81,8 @@ func runExec(ctx context.Context, args map[string]any, policy *Policy) (*memqlv1
 			if ws, ok := exitErr.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
 				signalName = ws.Signal().String()
 			}
-		} else if ctx.Err() != nil {
-			return nil, failure("timeout", "exec timed out or cancelled")
+		} else {
+			return nil, failure("exec_failed", fmt.Sprintf("exec could not complete: %v", err))
 		}
 	}
 

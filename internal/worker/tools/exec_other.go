@@ -17,7 +17,7 @@ func applyShellSysProcAttr(_ *exec.Cmd, _ ShellLimits) error {
 	return nil
 }
 
-func applyResourceLimits(_ ShellLimits) {}
+func prepareShellLimits(_ *exec.Cmd, _ ShellLimits) error { return nil }
 
 // ownProcessGroup has no process group to make here; see exec_unix.go.
 func ownProcessGroup(_ *exec.Cmd) {}

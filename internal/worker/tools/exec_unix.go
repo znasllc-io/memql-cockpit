@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/user"
 	"strconv"
+	"strings"
 	"syscall"
 )
 
@@ -41,32 +42,25 @@ func applyShellSysProcAttr(cmd *exec.Cmd, limits ShellLimits) error {
 	return nil
 }
 
-// applyResourceLimits applies the configured rlimits to the
-// CURRENT process before exec.Run. The child inherits these via
-// fork+exec semantics (copy-on-fork). This is the per-process
-// equivalent of putting the worker under a systemd MemoryMax or
-// macOS launchd ResourceLimits stanza, except it runs once per
-// dispatch -- the Set persists for the lifetime of the parent so
-// subsequent dispatches see tighter limits if the operator dials
-// the policy down via SIGHUP.
-func applyResourceLimits(limits ShellLimits) {
-	if limits.MaxCPUSeconds > 0 {
-		_ = syscall.Setrlimit(syscall.RLIMIT_CPU, &syscall.Rlimit{
-			Cur: uint64(limits.MaxCPUSeconds),
-			Max: uint64(limits.MaxCPUSeconds),
-		})
+// prepareShellLimits applies resource limits in a child shell before it execs
+// the requested command. No Setrlimit runs in the long-lived worker. Numeric
+// limits and the command are positional arguments, never interpolated code.
+// A limit the host refuses stops the wrapper before any command can run.
+func prepareShellLimits(cmd *exec.Cmd, limits ShellLimits) error {
+	memoryKiB, err := shellMemoryLimitKiB(limits.MaxMemoryMB)
+	if err != nil {
+		return err
 	}
-	if limits.MaxOpenFiles > 0 {
-		_ = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &syscall.Rlimit{
-			Cur: uint64(limits.MaxOpenFiles),
-			Max: uint64(limits.MaxOpenFiles),
-		})
-	}
-	// RLIMIT_AS is the address-space cap; macOS lacks it as a
-	// portable name. Linux honours it; macOS silently no-ops.
-	if limits.MaxMemoryMB > 0 {
-		applyMemoryLimit(uint64(limits.MaxMemoryMB) * 1024 * 1024)
-	}
+	script := strings.Join([]string{
+		`if [ "$1" -gt 0 ]; then ulimit -t "$1" || exit 125; fi`,
+		`if [ "$2" -gt 0 ]; then ulimit -n "$2" || exit 125; fi`,
+		`if [ "$3" -gt 0 ]; then ulimit -v "$3" || exit 125; fi`,
+		`exec /bin/sh -c "$4"`,
+	}, "\n")
+	command := cmd.Args[len(cmd.Args)-1]
+	cmd.Args = []string{cmd.Path, "-c", script, "memql-exec", strconv.Itoa(max(0, limits.MaxCPUSeconds)),
+		strconv.Itoa(max(0, limits.MaxOpenFiles)), strconv.Itoa(memoryKiB), command}
+	return nil
 }
 
 // ownProcessGroup starts cmd as the leader of a process group of its own,
