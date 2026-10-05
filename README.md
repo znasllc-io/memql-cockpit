@@ -83,13 +83,28 @@ latest release); `--download-base` still wins for *where* to download from
 when both are given. Re-running the installer over an older install upgrades
 the binary in place and refreshes the enrollment for the same cluster (the
 same token and cluster is a no-op refresh); a newer installed version is
-never downgraded. The closing block prints the installed version and the
-cluster. An existing `~/.memql/workers.yaml` the installer cannot read is
+never downgraded. The closing block shows the installed version, worker status,
+and any remaining model setup. Add `--verbose` for live diagnostic output or
+`--plain` for output without artwork, color, or animation. Each run saves a
+private, credential-redacted install log under `~/Library/Logs/MemQL` on macOS
+or `${XDG_STATE_HOME:-~/.local/state}/memql/install` on Linux; failures name the
+log to inspect. Worker runtime logs remain in `~/.memql/state/worker.log`.
+An existing `~/.memql/workers.yaml` the installer cannot read is
 refused (exit 5) before anything is downloaded or written, rather than
 rewritten without the enrollments it holds (see the registry bullet under
 Uninstall).
 
+The [installer design guide](scripts/install/README.md) describes the terminal
+conventions and includes a safe local preview command.
+
 ### Uninstall
+
+Uninstall uses the same terminal presentation as install. It distinguishes
+disconnecting one cluster while Cockpit stays for other enrollments from
+removing the shared runtime. Add `--verbose` for per-file diagnostics and the
+full removed/kept ledger, or `--plain` to disable artwork and animation. The
+summary names a private uninstall log; `--dry-run` uses temporary diagnostic
+storage and leaves the installation unchanged.
 
 One line, like the install. It stops and removes the service, removes the
 binary and its symlink, and removes `~/.memql/workers.yaml` and the legacy

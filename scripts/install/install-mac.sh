@@ -98,6 +98,8 @@ Options:
                               means "binary exists".
     --no-menu                 Skip the native menu companion
     --no-service              Skip worker and menu LaunchAgent installation
+    --verbose                 Show diagnostic output as it happens
+    --plain                   Disable color, logo artwork, and animation
     --help                    Print this help
 EOF
 }
@@ -115,6 +117,8 @@ function parse_args() {
     INFERENCE="no"
     PIN_VERSION=""
     DOWNLOAD_BASE_SET="no"
+    INSTALL_VERBOSE="no"
+    INSTALL_PLAIN="no"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -139,6 +143,8 @@ function parse_args() {
             --force)         FORCE="yes"; shift ;;
             --no-menu)       INSTALL_MENU="no"; shift ;;
             --no-service)    INSTALL_SERVICE="no"; shift ;;
+            --verbose)       INSTALL_VERBOSE="yes"; shift ;;
+            --plain)         INSTALL_PLAIN="yes"; shift ;;
             --help|-h)       show_help; exit 0 ;;
             *)
                 echo "ERROR: unknown flag $1" >&2
@@ -185,6 +191,7 @@ function install_binary() {
     target_ver="$(resolve_target_version "$DOWNLOAD_BASE")"
     install_binary_with_mode "$INSTALL_MODE" "$url" "$binary" "$INSTALLED_COMMAND" "$target_ver" "${MEMQL_INSTALL_VERSION:-}"
     INSTALLED_BINARY="$INSTALL_BINARY_FRIENDLY"
+    install_ui_binary_result
 }
 
 function write_config() {
@@ -196,6 +203,7 @@ function write_config() {
         capabilities="HEADLESS,COMPUTERUSE"
     fi
     write_worker_yaml "$path" "$CLUSTER_URL" "$TOKEN" "$NAME" "$FORCE" "$capabilities"
+    INSTALL_UI_RESULT="Machine configured"
 }
 
 # Computer-use releases from 0.15 carry the actual permission-bearing app.
@@ -205,7 +213,11 @@ function install_native_app() {
     [[ "$FLAVOUR" == computeruse ]] || return 0
     local version base source_app app_version old_requirement new_requirement transition alternate
     version="$(read_binary_version_exact "$INSTALLED_BINARY")"
-    [[ -n "$version" && "$(compare_semver "$version" 0.15.0)" != -1 ]] || return 0
+    if [[ -z "$version" || "$(compare_semver "$version" 0.15.0)" == -1 ]]; then
+        INSTALL_UI_STAGE_STATE=pending
+        INSTALL_UI_RESULT="Native app requires Cockpit 0.15.0 or later"
+        return 0
+    fi
     base="$DOWNLOAD_BASE"
     [[ "$base" != "$DEFAULT_DOWNLOAD_BASE" ]] || base="$(release_download_base "$version")"
     NATIVE_STAGE="$(mktemp -d)"
@@ -234,7 +246,7 @@ function install_native_app() {
     case "$INSTALL_MODE" in
         system)
             NATIVE_APP="/Applications/MemQL.app"
-            sudo bash "$NATIVE_STAGE/unpacked/scripts/macos/install-app-files.sh" --app="$source_app" --destination="$NATIVE_APP" --cli-path="$INSTALLED_BINARY"
+            install_sudo bash "$NATIVE_STAGE/unpacked/scripts/macos/install-app-files.sh" --app="$source_app" --destination="$NATIVE_APP" --cli-path="$INSTALLED_BINARY"
             ;;
         *)
             NATIVE_APP="$HOME/Applications/MemQL.app"
@@ -244,6 +256,7 @@ function install_native_app() {
     if [[ "$INSTALL_SERVICE" == yes ]]; then
         "$NATIVE_APP/Contents/Library/LoginItems/MemQL Menu.app/Contents/MacOS/MemQLCockpit" --register-bundles
     fi
+    INSTALL_UI_RESULT="MemQL app ready"
 }
 
 function cleanup_native_stage() {
@@ -265,11 +278,13 @@ function install_launch_agent() {
         # Match the raw-worker and Linux installers: reload saved enrollment
         # by restarting only the worker, preserving the menu and all home data.
         launchctl kickstart -k "gui/$(id -u)/com.znasllc.memql-worker"
+        INSTALL_SERVICE_STATE=started
+        INSTALL_UI_RESULT="Worker started"
         return
     fi
     local plist_dir="${HOME}/Library/LaunchAgents"
     local plist="${plist_dir}/com.znasllc.memql-worker.plist"
-    mkdir -p "$plist_dir"
+    mkdir -p "$plist_dir" "${HOME}/.memql/state"
     # Migrate: retire the pre-rename LaunchAgent so an upgraded machine
     # never runs two workers (znasllc-io/memql#4553).
     local legacy="${plist_dir}/com.znasllc.memql-cockpit-worker.plist"
@@ -318,6 +333,8 @@ PLIST
     launchctl unload "$plist" >/dev/null 2>&1 || true
     launchctl load "$plist"
     echo "INFO: launched memql-worker LaunchAgent"
+    INSTALL_SERVICE_STATE=started
+    INSTALL_UI_RESULT="Worker started"
 }
 
 function install_menu_companion() {
@@ -334,6 +351,8 @@ function install_menu_companion() {
     fi
     if [[ "$(compare_semver "$version" 0.14.0)" == -1 ]]; then
         echo "INFO: native menu companion requires Cockpit 0.14.0 or later; selected $version"
+        INSTALL_UI_STAGE_STATE=pending
+        INSTALL_UI_RESULT="Menu companion requires Cockpit 0.14.0 or later"
         return 0
     fi
     base="$DOWNLOAD_BASE"
@@ -356,90 +375,32 @@ function install_menu_companion() {
         echo "ERROR: menu companion could not be prepared from $base; worker installation already completed. Retry this installer to finish the menu installation." >&2
     fi
     rm -rf "$stage"
+    INSTALL_UI_RESULT="Menu companion ready"
     return "$rc"
 }
 
 function main() {
     parse_args "$@"
-    local target_ver
-    target_ver="$(resolve_target_version "$DOWNLOAD_BASE")"
-    memql_ascii_banner "$target_ver"
-
-    install_step 1 "Detect platform and release asset"
-    # Preflight the exact URL install_binary will fetch -- both derive
-    # it from the same (DOWNLOAD_BASE, binary_name_for "$FLAVOUR") pair,
-    # so the probe can never bless a different asset than the one
-    # downloaded, and --download-base overrides are honored. Runs BEFORE
-    # install_binary, and therefore before require_sudo and every file /
-    # service write: a flavour whose asset the release never published
-    # is a clean refusal here, not a curl 404 after the password prompt
-    # (#374). `local` and the assignment stay separate statements so a
-    # binary_name_for failure still aborts under set -e.
-    local asset_name
-    asset_name="$(binary_name_for "$FLAVOUR")"
-    echo "INFO: os=$(detect_os) arch=$(detect_arch) flavour=${FLAVOUR}"
-    # A workers.yaml this script cannot read is refused here, before
-    # anything is installed: step 3 would otherwise rewrite it holding
-    # only this cluster, dropping every sibling enrollment it held.
-    preflight_registry
-    preflight_asset "${DOWNLOAD_BASE}/${asset_name}" "$FLAVOUR"
-
-    install_step 2 "Download or skip binary (version-aware)"
-    install_binary
-
-    install_step app "Prepare native MemQL app identity"
-    trap cleanup_native_stage EXIT
-    install_native_app
-
-    install_step 3 "Write workers.yaml (upsert home; siblings kept)"
-    write_config
-
-    install_step 4 "Install and start LaunchAgent"
-    install_launch_agent
-    # AFTER the LaunchAgent, not before: `worker setup --inference` ends
-    # by signalling the running worker to re-read policy.yaml, and a
-    # worker that is not running yet is one it can only report it could
-    # not find. Its own refusals never fail this install -- see
-    # setup_inference.
-    if [[ "$INFERENCE" == "yes" ]]; then
-        install_step 5 "Set up local model serving (--inference)"
-        setup_inference "$INSTALLED_BINARY"
+    install_ui_init install
+    # Preflight must run before privileges, worker configuration, or services.
+    install_ui_stage "Checking the release" install_check_release
+    install_ui_stage "Installing Cockpit" install_binary
+    if [[ "$FLAVOUR" == computeruse ]]; then
+        install_ui_stage "Preparing the MemQL app" install_native_app
     fi
-
-    install_step menu "Install native menu companion"
-    install_menu_companion
-
-    install_step finish "Finished"
-    cat << EOF
-
-================================================================
-SUCCESS: memql-worker installed.
-
-Version:   $(read_binary_version "$INSTALLED_BINARY") (${FLAVOUR})
-Binary:    ${INSTALLED_BINARY}
-Cluster:   ${CLUSTER_URL}
-Home:      ${WORKER_YAML_HOME_ID} (${WORKER_YAML_ACTION})
-Config:    ${HOME}/.memql/workers.yaml (legacy mirror: worker.yaml)
-Logs:      ${HOME}/.memql/state/worker.log
-
-The worker is running as a LaunchAgent and will reconnect on
-boot. To check the status:
-
-  launchctl list | grep memql-worker
-
-To stop it:
-
-  launchctl unload ~/Library/LaunchAgents/com.znasllc.memql-worker.plist
-
-To uninstall this worker (keeps clusters.yaml / credentials):
-
-  curl -fsSL ${RAW_BASE}/uninstall-mac.sh | bash -s --
-  # or, from a clone:  ./scripts/install/uninstall-mac.sh
-  # with one enrollment on this machine that is the one removed;
-  # add --cluster=${CLUSTER_URL} to name it, --purge to also remove
-  # state + policy.yaml
-================================================================
-EOF
+    install_ui_stage "Configuring this machine" write_config
+    if [[ "$INSTALL_SERVICE" == yes ]]; then
+        install_ui_stage "Starting the worker" install_launch_agent
+    fi
+    # Setup signals the running worker to reload its policy, so service first.
+    # Runtime approval or model download failures do not undo enrollment.
+    if [[ "$INFERENCE" == "yes" ]]; then
+        install_ui_stage "Preparing local models" setup_inference "$INSTALLED_BINARY"
+    fi
+    if [[ -z "${NATIVE_APP:-}" && "$INSTALL_SERVICE" == yes && "$INSTALL_MENU" == yes ]]; then
+        install_ui_stage "Preparing the menu companion" install_menu_companion
+    fi
+    install_ui_finish
 }
 
 main "$@"

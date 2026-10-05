@@ -17,12 +17,14 @@ on:
     branches: [main]
     paths:
       - 'scripts/install/**'
+      - 'native/macos/mark.svg'
       - 'install.sh'
       - '.github/workflows/install-scripts-lint.yml'
   push:
     branches: [main]
     paths:
       - 'scripts/install/**'
+      - 'native/macos/mark.svg'
       - 'install.sh'
       - '.github/workflows/install-scripts-lint.yml'
 
@@ -32,7 +34,10 @@ permissions:
 jobs:
   lint:
     name: shellcheck + lib_test
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout memql-cockpit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -54,6 +59,7 @@ jobs:
       # points it at the install dir so the source= directives resolve.
       - name: shellcheck
         run: |
+          if ! command -v shellcheck >/dev/null; then brew install shellcheck; fi
           shellcheck --version
           shellcheck -x --source-path=scripts/install scripts/install/*.sh
           # POSIX sh dialect, matching install.sh's own shebang.
@@ -64,3 +70,8 @@ jobs:
 
       - name: Menu archive boundary tests
         run: bash scripts/install/menubar_test.sh
+
+      - name: Canonical terminal mark and installer presentation
+        run: |
+          python3 scripts/install/render-mark.py --check
+          python3 scripts/install/ui_test.py

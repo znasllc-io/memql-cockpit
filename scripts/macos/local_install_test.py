@@ -102,7 +102,7 @@ main "$@"
         seed.write_text('#!/bin/bash\nfunction main() { echo ' + shlex.quote('memql ' + previous + ' (computeruse)') + '; }\nmain "$@"\n')
         seed.chmod(0o755)
         token = 'mql_wkr_fixture_only_not_a_real_enrollment'
-        command = ['bash', '-s', '--', '--token', token, '--cluster', 'https://fixture.invalid',
+        command = ['bash', '-s', '--', '--verbose', '--token', token, '--cluster', 'https://fixture.invalid',
                    '--name', 'fresh-install-fixture', '--computeruse', '--user-local', '--no-service', '--no-menu',
                    '--download-base=' + base + '/releases/download/v' + version]
         result = subprocess.run(command, input=script, env=env, cwd=root, capture_output=True)
@@ -117,7 +117,7 @@ main "$@"
         registry = (user / '.memql/workers.yaml').read_text()
         assert token in registry and 'https://fixture.invalid' in registry
         assert not (user / 'Library/LaunchAgents').exists()
-        assert b'forbidden-live-service-call' not in result.stderr
+        assert b'forbidden-live-service-call' not in (result.stdout + result.stderr)
         assert token.encode() not in result.stdout and token.encode() not in result.stderr
         # The same command can enroll again without changing the installed app.
         before = (app / 'Contents/MacOS/MemQL').read_bytes()
@@ -132,7 +132,7 @@ main "$@"
         # no state directory behind, so give the plan one to judge.
         (user / '.memql/state').mkdir(exist_ok=True)
         (user / '.memql/state/worker.log').write_text('log line')
-        plan = subprocess.run(['bash', '-s', '--', '--user-local', '--purge', '--dry-run'], input=uninstaller, env=env, cwd=root, capture_output=True)
+        plan = subprocess.run(['bash', '-s', '--', '--verbose', '--user-local', '--purge', '--dry-run'], input=uninstaller, env=env, cwd=root, capture_output=True)
         assert plan.returncode == 0, plan.stdout.decode() + plan.stderr.decode()
         assert ('would remove:  ' + str(user / '.memql/state') + ' (recursively)').encode() in plan.stdout
         assert b'homes/fixture.invalid' not in plan.stdout
@@ -146,7 +146,7 @@ main "$@"
         failed_upgrade = subprocess.run(command, input=script,
             env=dict(env, MEMQL_TEST_TCC_FAIL='1'), cwd=root, capture_output=True)
         assert failed_upgrade.returncode == 5, failed_upgrade.stdout + failed_upgrade.stderr
-        assert b'could not clear obsolete MemQL permissions' in failed_upgrade.stderr
+        assert b'could not clear obsolete MemQL permissions' in (failed_upgrade.stdout + failed_upgrade.stderr)
         assert plistlib.loads(info_path.read_bytes())['CFBundleVersion'] == 'prior-local-build'
         assert token in (user / '.memql/workers.yaml').read_text()
         privacy_calls.unlink()
@@ -179,7 +179,7 @@ main "$@"
         assert paired.returncode == 0, paired.stdout.decode() + paired.stderr.decode()
 
         def uninstall(*flags, expected=0):
-            result = subprocess.run(['bash', '-s', '--', '--user-local', *flags], input=uninstaller, env=env, cwd=root, capture_output=True)
+            result = subprocess.run(['bash', '-s', '--', '--verbose', '--user-local', *flags], input=uninstaller, env=env, cwd=root, capture_output=True)
             assert result.returncode == expected, result.stdout.decode() + result.stderr.decode()
             for secret in [token.encode(), b'mql_wkr_other_fixture']:
                 assert secret not in result.stdout and secret not in result.stderr
@@ -191,7 +191,7 @@ main "$@"
         # Two enrollments and no --cluster/--all-homes: the run must say which
         # one, so it refuses (2) naming both and the command for each.
         ambiguous = uninstall(expected=2)
-        assert b'--cluster=https://fixture.invalid' in ambiguous.stderr and b'--cluster=https://other.invalid' in ambiguous.stderr
+        assert b'--cluster=https://fixture.invalid' in (ambiguous.stdout + ambiguous.stderr) and b'--cluster=https://other.invalid' in (ambiguous.stdout + ambiguous.stderr)
         assert (private / 'workers.yaml').read_bytes() == saved_registry
         # A --cluster value the binary would reject is refused as a bad
         # parameter (2) before anything runs; so is a space form whose URL
@@ -284,7 +284,7 @@ main "$@"
         # A URL no enrollment matches is refused (3) naming the enrolled one;
         # a wrong URL never removes someone else's enrollment.
         mismatch = uninstall('--cluster=https://fixture.invalid', expected=3)
-        assert b'--cluster=https://other.invalid' in mismatch.stderr
+        assert b'--cluster=https://other.invalid' in (mismatch.stdout + mismatch.stderr)
         assert 'mql_wkr_other_fixture' in (private / 'workers.yaml').read_text()
         env['MEMQL_TEST_FAIL_STOP'] = '1'
         uninstall('--cluster=https://other.invalid', expected=5)
@@ -292,14 +292,14 @@ main "$@"
         del env['MEMQL_TEST_FAIL_STOP']
         env['MEMQL_TEST_STUBBORN_STOP'] = '1'
         stubborn = uninstall('--cluster=https://other.invalid', expected=5)
-        assert b'still loaded after 10s' in stubborn.stderr
+        assert b'still loaded after 10s' in (stubborn.stdout + stubborn.stderr)
         assert cli.exists() and app.exists() and (agents / (worker_label + '.plist')).exists()
         assert 'mql_wkr_other_fixture' in (private / 'workers.yaml').read_text()
         del env['MEMQL_TEST_STUBBORN_STOP']
         assert not privacy_calls.exists(), 'failed stop reset permissions'
         env['MEMQL_TEST_TCC_FAIL'] = '1'
         failed_privacy = uninstall('--cluster=https://other.invalid', expected=5)
-        assert b'permission cleanup did not fully succeed' in failed_privacy.stderr
+        assert b'permission cleanup did not fully succeed' in (failed_privacy.stdout + failed_privacy.stderr)
         assert app.exists() and cli.exists(), 'reset failure deleted the resolvable app'
         del env['MEMQL_TEST_TCC_FAIL']
         env['MEMQL_TEST_DELAY_STOP'] = '1'

@@ -83,6 +83,8 @@ Options:
                               same cluster_url or re-run install; never
                               means "binary exists".
     --no-service              Skip systemd unit installation
+    --verbose                 Show diagnostic output as it happens
+    --plain                   Disable color, logo artwork, and animation
     --help                    Print this help
 EOF
 }
@@ -99,6 +101,8 @@ function parse_args() {
     INFERENCE="no"
     PIN_VERSION=""
     DOWNLOAD_BASE_SET="no"
+    INSTALL_VERBOSE="no"
+    INSTALL_PLAIN="no"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -122,6 +126,8 @@ function parse_args() {
                 shift 2 ;;
             --force)         FORCE="yes"; shift ;;
             --no-service)    INSTALL_SERVICE="no"; shift ;;
+            --verbose)       INSTALL_VERBOSE="yes"; shift ;;
+            --plain)         INSTALL_PLAIN="yes"; shift ;;
             --help|-h)       show_help; exit 0 ;;
             *)
                 echo "ERROR: unknown flag $1" >&2
@@ -168,10 +174,12 @@ function install_binary() {
     target_ver="$(resolve_target_version "$DOWNLOAD_BASE")"
     install_binary_with_mode "$INSTALL_MODE" "$url" "$binary" "$INSTALLED_COMMAND" "$target_ver" "${MEMQL_INSTALL_VERSION:-}"
     INSTALLED_BINARY="$INSTALL_BINARY_FRIENDLY"
+    install_ui_binary_result
 }
 
 function write_config() {
     local path="${HOME}/.memql/worker.yaml"
+    INSTALL_UI_RESULT="Machine configured"
     # The computer-use variant advertises COMPUTERUSE, but only on X11:
     # RobotGo can't drive Wayland, so a Wayland session downgrades to
     # HEADLESS-only. This platform-specific decision stays here; the
@@ -181,6 +189,8 @@ function write_config() {
     capabilities="$(linux_worker_capabilities "$FLAVOUR" "${WAYLAND_DISPLAY:-}" "${XDG_SESSION_TYPE:-}" "${DISPLAY:-}")"
     if [[ "$FLAVOUR" == computeruse && "$capabilities" == HEADLESS ]]; then
         echo "INFO: no supported X11 session detected; registering HEADLESS only (X11 required for COMPUTERUSE)"
+        INSTALL_UI_STAGE_STATE=pending
+        INSTALL_UI_RESULT="Machine configured without computer use (X11 required)"
     fi
     write_worker_yaml "$path" "$CLUSTER_URL" "$TOKEN" "$NAME" "$FORCE" "$capabilities"
 }
@@ -192,8 +202,11 @@ function install_systemd_unit() {
     fi
     if ! command -v systemctl >/dev/null 2>&1; then
         echo "WARN: systemctl not found; skipping service installation"
+        INSTALL_UI_STAGE_STATE=pending
+        INSTALL_UI_RESULT="Worker not started (systemd unavailable)"
         return 0
     fi
+    mkdir -p "${HOME}/.memql/state"
     local unit_dir="${HOME}/.config/systemd/user"
     mkdir -p "$unit_dir"
     # Migrate: retire the pre-rename unit so an upgraded machine never
@@ -264,83 +277,26 @@ UNIT
     systemctl --user enable memql-worker.service
     systemctl --user restart memql-worker.service
     echo "INFO: enabled and started memql-worker.service"
+    INSTALL_SERVICE_STATE=started
+    INSTALL_UI_RESULT="Worker started"
 }
 
 function main() {
     parse_args "$@"
-    local target_ver
-    target_ver="$(resolve_target_version "$DOWNLOAD_BASE")"
-    memql_ascii_banner "$target_ver"
-
-    install_step 1 "Detect platform and release asset"
-    # Preflight the exact URL install_binary will fetch -- both derive
-    # it from the same (DOWNLOAD_BASE, binary_name_for "$FLAVOUR") pair,
-    # so the probe can never bless a different asset than the one
-    # downloaded, and --download-base overrides are honored. Runs BEFORE
-    # the state-dir mkdir, install_binary, and therefore before
-    # require_sudo and every file / service write: a flavour whose asset
-    # the release never published is a clean refusal here, not a curl
-    # 404 after the password prompt (#374). `local` and the assignment
-    # stay separate statements so a binary_name_for failure still aborts
-    # under set -e.
-    local asset_name
-    asset_name="$(binary_name_for "$FLAVOUR")"
-    echo "INFO: os=$(detect_os) arch=$(detect_arch) flavour=${FLAVOUR}"
-    # A workers.yaml this script cannot read is refused here, before
-    # anything is installed: step 3 would otherwise rewrite it holding
-    # only this cluster, dropping every sibling enrollment it held.
-    preflight_registry
-    preflight_asset "${DOWNLOAD_BASE}/${asset_name}" "$FLAVOUR"
-    mkdir -p "${HOME}/.memql/state"
-
-    install_step 2 "Download or skip binary (version-aware)"
-    install_binary
-
-    install_step 3 "Write workers.yaml (upsert home; siblings kept)"
-    write_config
-
-    install_step 4 "Install and start systemd user unit"
-    install_systemd_unit
-    # AFTER the unit, not before: `worker setup --inference` ends by
-    # signalling the running worker to re-read policy.yaml, and a worker
-    # that is not running yet is one it can only report it could not
-    # find. Its own refusals never fail this install -- see
-    # setup_inference.
-    if [[ "$INFERENCE" == "yes" ]]; then
-        install_step 5 "Set up local model serving (--inference)"
-        setup_inference "$INSTALLED_BINARY"
+    install_ui_init install
+    # Preflight must run before privileges, worker configuration, or services.
+    install_ui_stage "Checking the release" install_check_release
+    install_ui_stage "Installing Cockpit" install_binary
+    install_ui_stage "Configuring this machine" write_config
+    if [[ "$INSTALL_SERVICE" == yes ]]; then
+        install_ui_stage "Starting the worker" install_systemd_unit
     fi
-
-    install_step finish "Finished"
-    cat << EOF
-
-================================================================
-SUCCESS: memql-worker installed.
-
-Version:   $(read_binary_version "$INSTALLED_BINARY") (${FLAVOUR})
-Binary:    ${INSTALLED_BINARY}
-Cluster:   ${CLUSTER_URL}
-Home:      ${WORKER_YAML_HOME_ID} (${WORKER_YAML_ACTION})
-Config:    ${HOME}/.memql/workers.yaml (legacy mirror: worker.yaml)
-Logs:      ${HOME}/.memql/state/worker.log
-
-To check the status:
-
-  systemctl --user status memql-worker.service
-
-To stop it:
-
-  systemctl --user stop memql-worker.service
-
-To uninstall this worker (keeps clusters.yaml / credentials):
-
-  curl -fsSL ${RAW_BASE}/uninstall-linux.sh | bash -s --
-  # or, from a clone:  ./scripts/install/uninstall-linux.sh
-  # with one enrollment on this machine that is the one removed;
-  # add --cluster=${CLUSTER_URL} to name it, --purge to also remove
-  # state + policy.yaml
-================================================================
-EOF
+    # Setup signals the running worker to reload its policy, so service first.
+    # Runtime approval or model download failures do not undo enrollment.
+    if [[ "$INFERENCE" == "yes" ]]; then
+        install_ui_stage "Preparing local models" setup_inference "$INSTALLED_BINARY"
+    fi
+    install_ui_finish
 }
 
 main "$@"
