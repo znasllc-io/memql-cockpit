@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -90,6 +91,7 @@ func allowLocalClones(t *testing.T) {
 // extra is more of the pipelines block, indented two spaces.
 func pipelineTestPolicy(t *testing.T, extra string) (*Policy, string) {
 	t.Helper()
+	isolatePipelineCapacity(t)
 	root := filepath.Join(t.TempDir(), "pipelines")
 	return policyWith(t, "pipelines:\n  allow: true\n  workspace_root: "+root+"\n"+extra), root
 }
@@ -108,6 +110,8 @@ func stepArgs(t *testing.T, fx pipelineFixture, command string, extra map[string
 		"token":      "",
 		"repository": "o/r",
 		"command":    command,
+		"execution":  "native",
+		"platform":   runtime.GOOS + "/" + runtime.GOARCH,
 		"env":        map[string]any{"MEMQL_RUN_ID": "run-1"},
 		"timeoutSec": 60,
 	}

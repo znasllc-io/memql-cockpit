@@ -81,6 +81,9 @@ var buildAgnosticComputerActions = []string{computerWaitAction}
 // key this side misspells is never rejected, never logged, and simply
 // never read.
 type CapabilityDescriptor struct {
+	// ActionContracts comes from the implementation, never operator labels.
+	// Version 2 requires explicit execution/platform and executes image digests.
+	ActionContracts      map[string]int      `json:"actionContracts,omitempty"`
 	RepositoryScopes     map[string][]string `json:"repositoryScopes,omitempty"`
 	Platform             string              `json:"platform"`
 	DisplayServer        string              `json:"displayServer"`
@@ -126,6 +129,7 @@ func computeCapabilities(goos string, getenv func(string) string) CapabilityDesc
 		displays = displayCount()
 	}
 	return CapabilityDescriptor{
+		ActionContracts:      map[string]int{"workerHost.pipeline_step": 2},
 		Platform:             goos,
 		DisplayServer:        displayServer,
 		ComputerUseAvailable: buildHasComputerUse,
@@ -213,6 +217,7 @@ func runComputerCapabilities() (*memqlv1.Success, *memqlv1.Failure) {
 	preview := fmt.Sprintf("platform=%s displayServer=%s computerUseAvailable=%t actions=%d displays=%d",
 		desc.Platform, desc.DisplayServer, desc.ComputerUseAvailable, len(desc.Actions), desc.Displays)
 	return successComputerJSON(map[string]any{
+		"actionContracts":      desc.ActionContracts,
 		"platform":             desc.Platform,
 		"displayServer":        desc.DisplayServer,
 		"computerUseAvailable": desc.ComputerUseAvailable,

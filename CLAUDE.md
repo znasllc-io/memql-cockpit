@@ -704,16 +704,31 @@ under the same busy and floor guards). The capability descriptor carries
 `repositoryScopes["workerHost.pipeline_step"]`: absent means no consent,
 a present empty list explicitly accepts every repository. The engine filters
 before dispatch; the live policy check here still decides execution. Unknown
-scope metadata is ineligible, so engine and Cockpit upgrade together.
+scope metadata is ineligible, so engine and Cockpit upgrade together. The
+implementation also reports `actionContracts["workerHost.pipeline_step"] = 2`;
+the engine must require it before dispatching the native/container contract.
+An operator label cannot substitute for this build-provided metadata.
 
 **THE TOKEN NEVER TOUCHES DISK OR ARGV**: it is an `http.extraheader` in
 `GIT_CONFIG_COUNT/KEY/VALUE`. And the fetch is hermetic, because "an empty
 token is an anonymous fetch" is false otherwise: no global or system gitconfig
 (an `insteadOf` would fetch with the owner's SSH key), credential helpers
 reset, the machine's `GIT_` variables stripped, no prompt, https only. The
-COMMAND is the opposite -- it INHERITS the machine environment, unlike exec,
-because a CI step needs this machine's toolchains; only `MEMQL_WORKER_TOKEN`
-is held back.
+NATIVE COMMAND inherits the machine environment, excluding
+`MEMQL_WORKER_TOKEN`. Execution and OS/architecture are explicit; missing or
+mismatched contracts refuse before cloning. CONTAINER work uses its pinned
+image on a freshly checked Docker daemon, with only the checkout mounted;
+request environment travels on container stdin and cannot configure the host
+Docker client. No fallback to native execution.
+
+**BUILD CAPACITY IS SHARED ACROSS CLUSTERS.** A per-OS-user kernel lock lives
+outside cluster-specific homes. The durable attempt record is written before
+starting the command/container. A worker crash releases the kernel lock but
+not that record: another worker reconciles only that exact container on the
+same daemon before reuse. Interrupted native work and uncertain cleanup
+require reconciliation. Never unlink the lock file (a second inode defeats
+mutual exclusion), and never sweep containers by a broad label. This pipeline
+reservation does not yet reserve agent workloads or other OS users' resources.
 
 **EVERY CHUNK BEFORE THE RESULT.** The engine relays a `ToolStream` only while
 its call is pending and drops one that arrives after the result, so
