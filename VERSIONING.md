@@ -19,24 +19,28 @@ A release **is** an annotated git tag of the form `vMAJOR.MINOR.PATCH`
   version via `git describe --tags --exact-match` (the exact tag when
   the checkout sits on one) and falls back to the `VERSION` file
   otherwise, then injects it through `-ldflags "-X main.version=..."`.
-  The compiled-in `main.version` constant (`0.9.0`) is the fallback
+  The compiled-in `main.version` variable is the fallback
   for `go build`-only / `go install` flows that don't go through the
   Makefile.
 
 There is **no epoch / timestamp suffix**. Earlier builds stamped
 `0.1.0-<unix-epoch>` via a `make version-stamp` target; that target
-has been removed. Versions are plain semver, pinned to tags.
+has been removed. Release numbers are pinned to tags. Executables append semver build metadata
+identifying their source revision, such as `0.16.0+g688c08f464fe`, with `.dirty`
+for local changes. The Makefile stamps this metadata; direct Go builds
+use Go's VCS build information when available. An unstamped build reports
+`+unknown`. This metadata does not change semver precedence or archive names.
 
 ## How the Cockpit reports its version
 
 ```
 $ memql --version
-memql 0.9.0
+memql 0.16.0+g688c08f464fe (computeruse)
 ```
 
 The same string is sent on the worker-protocol `Register` handshake
 (`cockpitVersion()` in
-`cmd/memql/internal/worker/connect.go`) so the hub can see
+`internal/worker/connect.go`) so the hub can see
 which Cockpit a worker is running.
 
 ## Baseline: 0.9.0
