@@ -9,6 +9,7 @@ function show_help() {
     cat <<'HELP'
 Usage: bash scripts/install/preview.sh [options]
   --scenario=installed|current|models-pending|failure
+             uninstalled|disconnected|uninstall-failure|uninstall-plan
   --plain       No animation, color, or artwork
   --verbose     Show the synthetic diagnostics
   --help        Show this help
@@ -45,6 +46,24 @@ function preview_models() {
     INSTALL_UI_STAGE_STATE=pending
 }
 
+function preview_uninstall() {
+    preview_step 'Removal checked'
+    case "$SCENARIO" in
+        disconnected)
+            OTHER_HOMES=1
+            CLUSTER_URL=https://api.memql.localhost
+            ;;
+        uninstalled) record_removed 'the worker and selected enrollment' ;;
+        uninstall-failure)
+            record_removed 'the selected enrollment'
+            record_kept 'the worker service (could not restart)'
+            echo 'ERROR: The worker for the remaining enrollment could not restart.' >&2
+            return 5
+            ;;
+    esac
+    exit 0
+}
+
 function main() {
     SCENARIO=installed; INSTALL_VERBOSE=no; INSTALL_PLAIN=no
     while [[ $# -gt 0 ]]; do
@@ -57,8 +76,17 @@ function main() {
         esac
         shift
     done
-    case "$SCENARIO" in installed|current|models-pending|failure) ;; *) show_help >&2; return 2 ;; esac
+    case "$SCENARIO" in installed|current|models-pending|failure|uninstalled|disconnected|uninstall-failure|uninstall-plan) ;; *) show_help >&2; return 2 ;; esac
     printf '\n  Preview only — no changes to this machine.\n'
+    case "$SCENARIO" in
+        uninstalled|disconnected|uninstall-failure|uninstall-plan)
+            PURGE=no; DRY_RUN=no
+            [[ "$SCENARIO" != uninstall-plan ]] || DRY_RUN=yes
+            install_ui_init uninstall
+            install_ui_stage 'Checking this machine' preview_uninstall
+            return
+            ;;
+    esac
     install_ui_init
     install_ui_stage 'Checking the release' preview_step 'Release available'
     install_ui_stage 'Installing Cockpit' preview_binary

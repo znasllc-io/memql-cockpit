@@ -9,6 +9,7 @@ import select
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -26,6 +27,7 @@ class InstallerUITest(unittest.TestCase):
                         TERM="xterm-256color", LANG="en_US.UTF-8", LC_ALL="", LC_CTYPE="",
                         COLUMNS="80")
         self.env.pop("NO_COLOR", None)
+        self.env.pop("MEMQL_INSTALL_LOG_DIR", None)
 
     def command(self, body):
         preamble = '''set -euo pipefail
@@ -138,6 +140,131 @@ install_ui_finish
         self.assertEqual(result.returncode, 0)
         self.assertIn("Worker not started", result.stdout)
         self.assertNotIn("Worker started", result.stdout)
+
+    def uninstall_fixture(self, driver, other=True):
+        fixture = self.root / driver
+        private = fixture / '.memql'
+        binary = private / 'bin/memql'
+        binary.parent.mkdir(parents=True)
+        registry = 'version: 1\nhomes:\n  - id: first\n    cluster_url: https://first.example\n    token: mql_wkr_first\n'
+        if other:
+            registry += '  - id: other\n    cluster_url: https://other.example\n    token: mql_wkr_other\n'
+        (private / 'workers.yaml').write_text(registry)
+        (private / 'policy.yaml').write_text('retained policy')
+        (private / 'credentials').mkdir()
+        (private / 'credentials/key').write_text('protected credential')
+        binary.write_text(f'#!{sys.executable}\n' + '''import os,sys,json
+from pathlib import Path
+if '--version' in sys.argv:
+    print('memql 0.16.0 (headless)'); sys.exit(0)
+registry=Path(os.environ['HOME'])/'.memql/workers.yaml'
+text=registry.read_text()
+header,*blocks=text.split('  - id:')
+remaining=[block for block in blocks if 'https://first.example' not in block]
+if '--dry-run' not in sys.argv:
+    registry.write_text(header+''.join('  - id:'+block for block in remaining))
+print(json.dumps({'removed':len(blocks)-len(remaining),'remaining':len(remaining)}))
+''')
+        binary.chmod(0o700)
+        shim = fixture / 'shim'
+        shim.mkdir()
+        # Both drivers must never reach real OS services during a fixture run.
+        for name in ('launchctl', 'systemctl'):
+            tool = shim / name
+            tool.write_text('#!/bin/bash\nexit 1\n')
+            tool.chmod(0o700)
+        env = dict(self.env, HOME=str(fixture), PATH=str(shim)+os.pathsep+self.env['PATH'],
+                   MEMQL_INSTALL_LOG_DIR=str(self.root/'uninstall-logs'))
+        return private, env
+
+    def uninstall(self, driver, env, *args):
+        return subprocess.run(['bash', str(HERE/driver), '--user-local', *args], env=env,
+                              capture_output=True, text=True, timeout=10)
+
+    def test_scoped_uninstall_keeps_cockpit_and_sibling_with_quiet_summary(self):
+        for driver in ('uninstall-mac.sh', 'uninstall-linux.sh'):
+            with self.subTest(driver=driver):
+                private, env = self.uninstall_fixture(driver)
+                result = self.uninstall(driver, env, '--cluster=https://first.example')
+                self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+                self.assertIn('Cluster disconnected.', result.stdout)
+                self.assertIn('kept for 1 other enrollment', result.stdout)
+                self.assertNotIn('INFO:', result.stdout)
+                self.assertNotIn('not present', result.stdout)
+                self.assertNotIn('mql_wkr_', result.stdout+result.stderr)
+                self.assertTrue((private/'bin/memql').exists())
+                self.assertNotIn('mql_wkr_first', (private/'workers.yaml').read_text())
+                self.assertIn('mql_wkr_other', (private/'workers.yaml').read_text())
+                self.assertEqual((private/'policy.yaml').read_text(), 'retained policy')
+
+    def test_full_uninstall_and_repeated_removal_report_actual_result(self):
+        for driver in ('uninstall-mac.sh', 'uninstall-linux.sh'):
+            with self.subTest(driver=driver):
+                private, env = self.uninstall_fixture(driver, other=False)
+                result = self.uninstall(driver, env, '--all-homes')
+                self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+                self.assertIn('Cockpit removed.', result.stdout)
+                self.assertNotIn('INFO:', result.stdout)
+                self.assertFalse((private/'bin/memql').exists())
+                self.assertFalse((private/'workers.yaml').exists())
+                self.assertEqual((private/'credentials/key').read_text(), 'protected credential')
+                again = self.uninstall(driver, env, '--all-homes')
+                self.assertEqual(again.returncode, 0, again.stdout+again.stderr)
+                self.assertIn('Nothing to remove.', again.stdout)
+
+    def test_uninstall_dry_run_and_refusal_keep_all_enrollments(self):
+        for driver in ('uninstall-mac.sh', 'uninstall-linux.sh'):
+            with self.subTest(driver=driver):
+                private, env = self.uninstall_fixture(driver)
+                before = (private/'workers.yaml').read_bytes()
+                plan = self.uninstall(driver, env, '--cluster=https://first.example', '--dry-run')
+                self.assertEqual(plan.returncode, 0, plan.stdout+plan.stderr)
+                self.assertIn('Preview only. Nothing was changed.', plan.stdout)
+                self.assertIn('would stay for 1 other', plan.stdout)
+                self.assertNotIn('Cluster disconnected.', plan.stdout)
+                refused = self.uninstall(driver, env, '--cluster=https://first.example', '--purge')
+                self.assertEqual(refused.returncode, 3, refused.stdout+refused.stderr)
+                self.assertIn('Removal did not finish.', refused.stdout)
+                self.assertIn('--purge would erase state shared', refused.stdout)
+                self.assertNotIn('Cockpit removed.', refused.stdout)
+                self.assertEqual((private/'workers.yaml').read_bytes(), before)
+
+    def test_partial_uninstall_and_interrupt_do_not_claim_success(self):
+        result = self.run_ui('''
+PURGE=no; DRY_RUN=no
+install_ui_init uninstall
+function work() {
+    record_removed 'cluster enrollment'
+    record_kept 'service could not restart'
+    echo 'ERROR: Worker restart failed. mql_wkr_do-not-print' >&2
+    return 5
+}
+install_ui_stage 'Disconnecting this cluster' work
+''')
+        self.assertEqual(result.returncode, 5)
+        self.assertIn('Removal incomplete.', result.stdout)
+        self.assertIn('Worker restart failed. [redacted]', result.stdout)
+        self.assertNotIn('do-not-print', result.stdout)
+        self.assertNotIn('Cockpit removed.', result.stdout)
+        rc, output = self.run_pty('''
+PURGE=no; DRY_RUN=no
+install_ui_init uninstall
+function work() { sleep 5; }
+install_ui_stage 'Removing Cockpit' work
+''', interrupt=True)
+        self.assertEqual(rc, 143)
+        self.assertIn('Removal interrupted.', output)
+        self.assertIn('\x1b[?25h', output)
+
+    def test_redaction_keeps_paths_with_memql_unchanged(self):
+        result = self.run_ui('''
+INSTALL_VERBOSE=yes
+install_ui_init
+function work() { echo '/tmp/memql_worker/path mql_wkr_secret'; }
+install_ui_stage 'Checking' work
+''')
+        self.assertEqual(result.returncode, 0)
+        self.assertIn('/tmp/memql_worker/path [redacted]', result.stdout)
 
     def test_real_drivers_preflight_stays_quiet_and_changes_no_worker_state(self):
         for driver in ("install-mac.sh", "install-linux.sh"):

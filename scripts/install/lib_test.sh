@@ -156,6 +156,9 @@ fi
 # ---------------------------------------------------------------
 
 _tmp="$(mktemp -d)"
+# Diagnostics stay outside fixture HOME so filesystem assertions still cover
+# every worker/config/service path, including refusals and dry runs.
+export MEMQL_INSTALL_LOG_DIR="${_tmp}/diagnostics"
 trap 'rm -rf "$_tmp"' EXIT
 _wy="${_tmp}/worker.yaml"
 
@@ -892,7 +895,7 @@ mkdir -p "$_nobin"
 # awk reads the enrollment registry (list_enrolled_cluster_urls), id
 # names the launchd domain, sleep paces the stop loops -- all three are
 # on every macOS and Linux box the scripts run on.
-for _tool in bash dirname basename uname rm rmdir sed head ls tr cat mktemp awk id sleep; do
+for _tool in bash dirname basename uname rm rmdir sed head ls tr cat mktemp awk id sleep mkdir date mkfifo; do
     if _real="$(command -v "$_tool")"; then
         ln -s "$_real" "${_nobin}/${_tool}"
     else
@@ -1038,7 +1041,8 @@ chmod +x "${_uninstall_systemctl_dir}/systemctl"
 # run_uninstaller runs one uninstaller against a HOME with the reduced
 # PATH, from the script dir so the sibling lib.sh is what gets sourced.
 # Output (both streams) on stdout; the caller reads $? for the code. No
-# flag is added: a run with neither --cluster nor --all-homes is the
+# removal flag is added; --verbose exposes the diagnostic ledger. A run
+# with neither --cluster nor --all-homes is the
 # shape MemQL OS emitted, and the script decides from the fixture.
 function run_uninstaller() {
     local script="$1"
@@ -1046,7 +1050,7 @@ function run_uninstaller() {
     shift 2
     local tool_path="$_nobin"
     if [[ "$script" == uninstall-linux.sh ]]; then tool_path="${_uninstall_systemctl_dir}:$_nobin"; fi
-    (cd "$_script_dir" && HOME="$home" PATH="$tool_path" bash "./${script}" "$@" 2>&1)
+    (cd "$_script_dir" && HOME="$home" PATH="$tool_path" bash "./${script}" --verbose "$@" 2>&1)
 }
 
 # run_uninstaller_piped is the same run as the one-liner makes it: the
@@ -1060,7 +1064,7 @@ function run_uninstaller_piped() {
     local tool_path="${_pipebin}:$_nobin"
     if [[ "$script" == uninstall-linux.sh ]]; then tool_path="${_uninstall_systemctl_dir}:${tool_path}"; fi
     (cd "$_piped_cwd" && HOME="$home" PATH="$tool_path" MEMQL_INSTALL_RAW_BASE="file://${_script_dir}" \
-        bash -s -- "$@" < "${_script_dir}/${script}" 2>&1)
+        bash -s -- --verbose "$@" < "${_script_dir}/${script}" 2>&1)
 }
 
 # tree_fingerprint prints every path under $1 with its content hash or
@@ -1325,7 +1329,7 @@ for _stop_failure in no yes; do
     _native_home="${_tmp}/native-stop-${_stop_failure}"
     uninstall_fixture "$_native_home" linux
     _native_log="${_tmp}/native-stop-${_stop_failure}.log"
-    _out="$(cd "$_script_dir" && HOME="$_native_home" PATH="${_native_systemctl_dir}:$_nobin" MEMQL_TEST_SYSTEMCTL_LOG="$_native_log" MEMQL_TEST_STOP_FAIL="$_stop_failure" bash ./uninstall-linux.sh --user-local --purge 2>&1)"
+    _out="$(cd "$_script_dir" && HOME="$_native_home" PATH="${_native_systemctl_dir}:$_nobin" MEMQL_TEST_SYSTEMCTL_LOG="$_native_log" MEMQL_TEST_STOP_FAIL="$_stop_failure" bash ./uninstall-linux.sh --verbose --user-local --purge 2>&1)"
     _rc=$?
     if [[ "$_stop_failure" == no ]]; then
         expect_eq "native uninstall exits cleanly after systemd stops" "$_rc" "0"
@@ -1346,7 +1350,7 @@ done
 # Missing the command does not establish that an installed service stopped.
 _native_missing_home="${_tmp}/native-stop-missing"
 uninstall_fixture "$_native_missing_home" linux
-_out="$(cd "$_script_dir" && HOME="$_native_missing_home" PATH="$_nobin" bash ./uninstall-linux.sh --user-local --purge 2>&1)"
+_out="$(cd "$_script_dir" && HOME="$_native_missing_home" PATH="$_nobin" bash ./uninstall-linux.sh --verbose --user-local --purge 2>&1)"
 _rc=$?
 if [[ "$_rc" -eq 5 && "$_out" == *PARTIAL* && -e "${_native_missing_home}/.memql/ollama/runtime/bin/ollama" && -e "${_native_missing_home}/.config/systemd/user/memql-ollama.service" && ! -e "${_native_missing_home}/.memql/worker.yaml" ]]; then
     pass "missing systemctl preserves runtime for safe retry and removes token"
@@ -1801,7 +1805,7 @@ function run_uninstaller_agent() {
     shift 3
     local tool_path="${_review_launchctl_dir}:$_nobin"
     if [[ "$script" == uninstall-linux.sh ]]; then tool_path="${_review_systemctl_dir}:$_nobin"; fi
-    (cd "$_script_dir" && HOME="$home" PATH="$tool_path" MEMQL_TEST_AGENT_STATE="$state" bash "./${script}" "$@" 2>&1)
+    (cd "$_script_dir" && HOME="$home" PATH="$tool_path" MEMQL_TEST_AGENT_STATE="$state" bash "./${script}" --verbose "$@" 2>&1)
 }
 
 # run_with_system_shape runs the REAL driver with install_mode_dir and
@@ -1832,7 +1836,7 @@ function run_with_system_shape() {
         function worker_app_for_mode() {
             case "$1" in system) echo "$MEMQL_TEST_SYSBIN/MemQL.app" ;; *) echo "$HOME/Applications/MemQL.app" ;; esac
         }
-        main "$@"
+        main --verbose "$@"
     ' "$_script_dir/$script" "$@" 2>&1)
 }
 
@@ -2409,7 +2413,7 @@ for _platform in mac linux; do
             > "${_h}/Applications/MemQL.app/Contents/Info.plist"
         : > "${_h}/Applications/MemQL.app/Contents/locked/f"
         chmod 555 "${_h}/Applications/MemQL.app/Contents/locked"
-        _out="$(cd "$_script_dir" && HOME="$_h" PATH="${_tcc}:${_review_launchctl_dir}:$_nobin" MEMQL_TEST_AGENT_STATE="$_state" bash ./uninstall-mac.sh --all-homes --user-local 2>&1)"
+        _out="$(cd "$_script_dir" && HOME="$_h" PATH="${_tcc}:${_review_launchctl_dir}:$_nobin" MEMQL_TEST_AGENT_STATE="$_state" bash ./uninstall-mac.sh --verbose --all-homes --user-local 2>&1)"
         _rc=$?
         chmod 755 "${_h}/Applications/MemQL.app/Contents/locked"
         expect_eq "$_un a user-local app that cannot be removed exits 5" "$_rc" "5"

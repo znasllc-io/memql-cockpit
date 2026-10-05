@@ -112,15 +112,26 @@ function install_step() {
 # Stage callbacks MUST be simple commands, never the condition of if/||/!: a
 # conditional call disables errexit throughout the callback on Bash 3.2 too.
 function install_ui_log_directory() {
+    if [[ -n "${MEMQL_INSTALL_LOG_DIR:-}" ]]; then
+        printf '%s\n' "$MEMQL_INSTALL_LOG_DIR"
+        return
+    fi
+    if [[ "${INSTALL_UI_OPERATION:-install}" == uninstall && "${DRY_RUN:-no}" == yes ]]; then
+        mktemp -d "${TMPDIR:-/tmp}/memql-uninstall-preview.XXXXXX"
+        return
+    fi
     case "$(uname -s)" in
         Darwin) printf '%s\n' "$HOME/Library/Logs/MemQL" ;;
-        *) printf '%s\n' "${XDG_STATE_HOME:-$HOME/.local/state}/memql/install" ;;
+        *) printf '%s\n' "${XDG_STATE_HOME:-$HOME/.local/state}/memql/${INSTALL_UI_OPERATION:-install}" ;;
     esac
 }
 
 function install_ui_init() {
     local log_dir
     exec 3>&1
+    INSTALL_UI_OPERATION="${1:-install}"
+    INSTALL_UI_CAPTION='Machine setup'
+    [[ "$INSTALL_UI_OPERATION" != uninstall ]] || INSTALL_UI_CAPTION='Remove from this machine'
     INSTALL_UI_ACTIVE=yes
     INSTALL_UI_TTY=no; INSTALL_UI_UNICODE=no
     INSTALL_UI_ACCENT=""; INSTALL_UI_DIM=""; INSTALL_UI_RESET=""
@@ -143,7 +154,7 @@ function install_ui_init() {
         printf '\n  Could not create the installer log directory: %s\n' "$log_dir" >&3
         return 5
     fi
-    INSTALL_LOG="$(umask 077; mktemp "$log_dir/install-$(date +%Y%m%d-%H%M%S).XXXXXX")"
+    INSTALL_LOG="$(umask 077; mktemp "$log_dir/${INSTALL_UI_OPERATION}-$(date +%Y%m%d-%H%M%S).XXXXXX")"
     trap 'install_ui_exit "$?"' EXIT
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -153,18 +164,18 @@ function install_ui_init() {
 function install_ui_header() {
     local line row=0 caption
     printf '\n' >&3
-    if [[ "$INSTALL_UI_UNICODE" == yes && "${COLUMNS:-80}" -ge 48 ]]; then
+    if [[ "$INSTALL_UI_UNICODE" == yes && "${COLUMNS:-80}" -ge 64 ]]; then
         while IFS= read -r line; do
             caption=""
             case "$row" in
                 3) caption="MemQL Cockpit" ;;
-                5) caption="Machine setup" ;;
+                5) caption="$INSTALL_UI_CAPTION" ;;
             esac
             printf '  %s%s%s    %s\n' "$INSTALL_UI_ACCENT" "$line" "$INSTALL_UI_RESET" "$caption" >&3
             row=$((row + 1))
         done < <(memql_terminal_mark)
     else
-        printf '  MemQL Cockpit\n  Machine setup\n' >&3
+        printf '  MemQL Cockpit\n  %s\n' "$INSTALL_UI_CAPTION" >&3
     fi
     printf '\n' >&3
 }
@@ -176,7 +187,11 @@ function install_log_filter() {
         {
             gsub(/\033\[[0-?]*[ -\/]*[@-~]/, "")
             gsub(/[[:cntrl:]]/, "")
-            gsub(/mql_[[:alnum:]_-]+/, "[redacted]")
+            while (match($0, /(^|[^[:alnum:]_])mql_[[:alnum:]_-]+/)) {
+                prefix = substr($0, RSTART, 1)
+                if (prefix == "m") prefix = ""
+                $0 = substr($0, 1, RSTART - 1) prefix "[redacted]" substr($0, RSTART + RLENGTH)
+            }
             gsub(/[Bb][Ee][Aa][Rr][Ee][Rr][ ]+[^ ,;]+/, "Bearer [redacted]")
             print; fflush()
             if (verbose == "yes") { print "      " $0 > "/dev/fd/3"; fflush("/dev/fd/3") }
@@ -217,6 +232,17 @@ function install_ui_stop_progress() {
         printf '\r\033[2K\033[?25h' >&3
         INSTALL_UI_CURSOR_HIDDEN=no
     fi
+}
+
+# Change the active operation without adding per-file notices to the screen.
+function install_ui_update_stage() {
+    install_ui_stop_progress
+    INSTALL_UI_STAGE="$1"
+    printf '\n[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$INSTALL_UI_STAGE"
+    if [[ "$INSTALL_UI_TTY" != yes || "${INSTALL_VERBOSE:-no}" == yes ]]; then
+        printf '  ...  %s\n' "$INSTALL_UI_STAGE" >&3
+    fi
+    install_ui_start_progress
 }
 
 function install_ui_close_log() {
@@ -268,6 +294,10 @@ function install_ui_exit() {
     rm -f "$INSTALL_LOG.pipe"
     if declare -F cleanup_native_stage >/dev/null; then
         cleanup_native_stage 2>&1 | install_log_filter >> "$INSTALL_LOG" || true
+    fi
+    if [[ "$INSTALL_UI_OPERATION" == uninstall ]]; then
+        uninstall_ui_finish "$rc"
+        exit "$rc"
     fi
     if [[ "$rc" != 0 ]]; then
         if [[ "$rc" == 130 || "$rc" == 143 ]]; then
@@ -323,6 +353,64 @@ function install_ui_finish() {
 function install_sudo() {
     require_sudo
     sudo -n "$@"
+}
+
+function uninstall_ui_finish() {
+    local rc="$1" other error_line heading color="$INSTALL_UI_ACCENT"
+    if [[ "$rc" != 0 ]]; then
+        color="$INSTALL_UI_RESET"
+        heading='Removal did not finish.'
+        [[ -z "$UNINSTALL_REMOVED" ]] || heading='Removal incomplete. Some items need attention.'
+        [[ "$rc" != 130 && "$rc" != 143 ]] || heading='Removal interrupted.'
+        printf '\n  %s\n' "$heading" >&3
+        # One reason on screen; the full removed/kept ledger and remedies stay
+        # in the redacted log. Never claim nothing changed after a failed step.
+        error_line="$(awk '/ERROR:/{sub(/^.*ERROR: */, ""); print; exit}' "$INSTALL_LOG")"
+        [[ -z "$error_line" ]] || printf '  %s\n' "$error_line" >&3
+        if [[ -n "${UNINSTALL_UI_CHOICES:-}" ]]; then
+            printf '  Choose one with --cluster=URL, or use --all-homes:\n' >&3
+            while IFS= read -r other; do
+                [[ -z "$other" ]] || printf '    %s\n' "$other" >&3
+            done <<< "$UNINSTALL_UI_CHOICES"
+        fi
+        printf '  Review the log before retrying; add --verbose for live details.\n' >&3
+    elif [[ "${DRY_RUN:-no}" == yes ]]; then
+        printf '\n  Preview only. Nothing was changed.\n' >&3
+        if [[ "${OTHER_HOMES:-0}" -gt 0 ]]; then
+            printf '  Would disconnect: %s\n' "$CLUSTER_URL" >&3
+            printf '  Cockpit and shared data would stay for %s other enrollment(s).\n' "$OTHER_HOMES" >&3
+        else
+            printf '  Would remove the selected Cockpit runtime and enrollments.\n' >&3
+            if [[ "$PURGE" == yes ]]; then
+                printf '  Would also remove eligible local worker data.\n' >&3
+            else
+                printf '  Local worker data would be kept.\n' >&3
+            fi
+        fi
+        printf '  The full plan is in the log; --verbose shows it here.\n' >&3
+    elif [[ "${OTHER_HOMES:-0}" -gt 0 ]]; then
+        printf '\n  %sCluster disconnected.%s\n  %s\n' "$color" "$INSTALL_UI_RESET" "$CLUSTER_URL" >&3
+        if [[ "$OTHER_HOMES" == 1 ]]; then
+            printf '  Cockpit and shared data kept for 1 other enrollment.\n' >&3
+        else
+            printf '  Cockpit and shared data kept for %s other enrollments.\n' "$OTHER_HOMES" >&3
+        fi
+    else
+        heading='Cockpit removed.'
+        [[ -n "$UNINSTALL_REMOVED" ]] || heading='Nothing to remove.'
+        printf '\n  %s%s%s\n' "$color" "$heading" "$INSTALL_UI_RESET" >&3
+        if [[ -n "$UNINSTALL_KEPT" ]]; then
+            printf '  Retained items are listed in the log.\n' >&3
+            [[ "$PURGE" != no ]] || printf '  Local worker data is kept unless you use --purge.\n' >&3
+        fi
+        if other="$(command -v "$INSTALLED_COMMAND" 2>/dev/null)" && [[ -n "$other" ]]; then
+            printf '  Another memql command is still installed: %s\n' "$other" >&3
+        fi
+    fi
+    if [[ "$rc" == 0 && "${DRY_RUN:-no}" != yes && ( -n "$UNINSTALL_REMOVED" || "${OTHER_HOMES:-0}" -gt 0 ) ]]; then
+        printf '  Remove its cluster registration in Fleet > Machines if needed.\n' >&3
+    fi
+    printf '\n  %sUninstall log: %s%s\n\n' "$INSTALL_UI_DIM" "$INSTALL_LOG" "$INSTALL_UI_RESET" >&3
 }
 
 # normalize_semver strips a leading v and any build metadata / variant
@@ -936,7 +1024,7 @@ function require_sudo() {
     fi
     if [[ "${INSTALL_UI_ACTIVE:-no}" == yes ]]; then
         install_ui_stop_progress
-        printf '       Administrator access is needed to install Cockpit.\n' >&3
+        printf '       Administrator access is needed to %s Cockpit.\n' "$action" >&3
         if ! sudo -v >&3 2>&3; then
             echo "ERROR: sudo authentication failed. Pass --user-local for a passwordless ${action}." >&2
             return 1
@@ -2077,6 +2165,7 @@ function uninstall_invocation() {
 function print_enrollment_commands() {
     local script_name="$1" carried="$2" urls="$3"
     local prefix url all_flags="$carried"
+    UNINSTALL_UI_CHOICES="$urls"
     prefix="$(uninstall_invocation "$script_name")"
     [[ "${PURGE:-no}" != yes ]] || all_flags="${all_flags} --purge"
     while IFS= read -r url; do

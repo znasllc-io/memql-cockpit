@@ -117,6 +117,8 @@ Options:
                               needed -- and print that plan without changing
                               anything. Exit 0, or the refusal the real run
                               would give before touching anything.
+    --verbose                 Show diagnostic output and the full removal ledger
+    --plain                   Disable color, logo artwork, and animation
     --help                    Print this help
 
 Exit codes: 0 everything that existed was removed; 2 bad parameter (or
@@ -135,6 +137,8 @@ function parse_args() {
     CLUSTER_URL=""
     ALL_HOMES="no"
     DRY_RUN="no"
+    INSTALL_VERBOSE="no"
+    INSTALL_PLAIN="no"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -150,6 +154,8 @@ function parse_args() {
             # read `--dry-run` as the cluster and ran for real.
             --cluster)    [[ $# -gt 1 && -n "$2" && "$2" != -* ]] || { echo "ERROR: --cluster needs a URL" >&2; exit 2; }; CLUSTER_URL="$2"; shift 2 ;;
             --all-homes)  ALL_HOMES="yes"; shift ;;
+            --verbose)    INSTALL_VERBOSE="yes"; shift ;;
+            --plain)      INSTALL_PLAIN="yes"; shift ;;
             --help|-h)    show_help; exit 0 ;;
             *)
                 # 2 is "bad parameter" in the capability-script exit
@@ -464,8 +470,7 @@ function finish() {
     exit "$rc"
 }
 
-function main() {
-    parse_args "$@"
+function run_uninstall() {
     # The flags a printed remedy must carry so it is the same run plus
     # the missing piece: --user-local and --dry-run, which stay valid
     # whatever scope is chosen (--purge is added only where it is
@@ -475,6 +480,13 @@ function main() {
     [[ "$DRY_RUN" != yes ]] || CARRIED_FLAGS="${CARRIED_FLAGS} --dry-run"
     resolve_uninstall_scope "$SCRIPT_NAME" "$CARRIED_FLAGS" || exit $?
     detect_install_shapes
+    if [[ "$DRY_RUN" == yes ]]; then
+        install_ui_update_stage "Planning removal"
+    elif [[ -n "$CLUSTER_URL" ]]; then
+        install_ui_update_stage "Disconnecting this cluster"
+    else
+        install_ui_update_stage "Removing Cockpit"
+    fi
     # Read BEFORE the token files go: --purge deletes the directory the
     # worker actually used, and the default is only where that usually
     # is.
@@ -521,6 +533,14 @@ function main() {
     if [[ "$unit_rc" -ne 0 ]]; then binary_rc="$unit_rc"; fi
     [[ "$binary_rc" -ne 0 ]] || binary_rc="$UNINSTALL_LEFTOVER_RC"
     finish "$binary_rc"
+}
+
+function main() {
+    parse_args "$@"
+    install_ui_init uninstall
+    # The existing removal routine owns partial failures and exit codes.
+    # Keep it a simple call so unexpected failures still reach the exit trap.
+    install_ui_stage "Checking this machine" run_uninstall
 }
 
 main "$@"

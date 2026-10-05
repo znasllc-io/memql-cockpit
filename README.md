@@ -99,6 +99,13 @@ conventions and includes a safe local preview command.
 
 ### Uninstall
 
+Uninstall uses the same terminal presentation as install. It distinguishes
+disconnecting one cluster while Cockpit stays for other enrollments from
+removing the shared runtime. Add `--verbose` for per-file diagnostics and the
+full removed/kept ledger, or `--plain` to disable artwork and animation. The
+summary names a private uninstall log; `--dry-run` uses temporary diagnostic
+storage and leaves the installation unchanged.
+
 One line, like the install. It stops and removes the service, removes the
 binary and its symlink, and removes `~/.memql/workers.yaml` and the legacy
 `worker.yaml` — the files that hold the tokens:
