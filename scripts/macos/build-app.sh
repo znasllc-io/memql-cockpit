@@ -18,7 +18,12 @@ function main() {
     [[ "$worker" == /* && -x "$worker" ]] || cap_fail 2 "worker must name a built executable"
     [[ "$output" == /* && "$output" == *.app ]] || cap_fail 2 "output must be an absolute .app path"
     actual_version="$("$worker" --version)"
-    [[ "$actual_version" == "memql $version (computeruse)" ]] || cap_fail 3 "worker version/build does not match the bundle"
+    # Build metadata identifies the worker without changing its release number.
+    local reported_version
+    [[ "$actual_version" == memql\ *\ \(computeruse\) ]] || cap_fail 3 "worker version/build does not match the bundle"
+    reported_version="${actual_version#memql }"
+    reported_version="${reported_version% (computeruse)}"
+    [[ "${reported_version%%+*}" == "$version" ]] || cap_fail 3 "worker version/build does not match the bundle"
     minimum_os="$(xcrun vtool -show-build "$worker" | awk '$1 == "minos" || $1 == "version" {print $2; exit}')"
     [[ "$minimum_os" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || cap_fail 3 "could not determine the worker's minimum macOS version"
     [[ "${minimum_os%%.*}" -ge 13 ]] || minimum_os=13.0

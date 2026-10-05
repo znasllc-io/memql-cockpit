@@ -59,6 +59,7 @@ import (
 // build tag, not stamped, so there is nothing for -X to set.
 // TestVersionIsSettableByLdflags guards the difference.
 var version = "0.16.0"
+var revision, dirty string
 
 func main() {
 	// The worker registers this version with the cluster, and this
@@ -66,6 +67,7 @@ func main() {
 	// what keeps the machine's recorded version the one it was built
 	// from rather than a second constant somebody has to remember to
 	// bump (memql-cockpit#346's registration row is read by /machines).
+	version = stampedVersion(version, revision, dirty == "true")
 	worker.SetVersion(version)
 	if openBundledApplication() {
 		return

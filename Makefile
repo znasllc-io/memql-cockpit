@@ -19,7 +19,9 @@ BIN_DIR     := bin
 # tag -- the tag is the source of truth (see VERSIONING.md). Prefer the exact
 # tag on a clean tagged checkout so release artifacts stamp the real version.
 VERSION     := $(shell t=`git describe --tags --exact-match 2>/dev/null`; if [ -n "$$t" ]; then echo "$$t" | sed 's/^v//'; else cat VERSION 2>/dev/null || echo "dev"; fi)
-LDFLAGS     := -X main.version=$(VERSION)
+REVISION    := $(shell git rev-parse --short=12 HEAD 2>/dev/null)
+DIRTY       := $(shell test -z "$$(git status --porcelain --untracked-files=normal 2>/dev/null)" || echo true)
+LDFLAGS     := -X main.version=$(VERSION) -X main.revision=$(REVISION) -X main.dirty=$(DIRTY)
 GOFLAGS     := -v -ldflags "$(LDFLAGS)"
 
 # Run-target configuration.
