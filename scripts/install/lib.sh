@@ -80,34 +80,249 @@ readonly OLLAMA_LABEL_LINUX="memql-ollama"
 # (see write_worker_yaml). Same version → no-op skip; newer installed →
 # refuse downgrade; older/missing → install/upgrade.
 
-# memql_ascii_banner prints a compact mark + wordmark + version line.
-# Inspired by brand/mark.svg (9-node graph); kept small for macOS
-# Terminal and Linux TTYs alike.
-function memql_ascii_banner() {
-    local ver="${1:-}"
-    local ver_line="MemQL Cockpit worker installer"
-    if [[ -n "$ver" ]]; then
-        ver_line="MemQL Cockpit worker installer  v${ver#v}"
-    fi
-    cat << 'BANNER'
-        .  o   .
-     o--+--+--+--o
-        |\/|\/|
-     o--+--+--+--o
-        |\/|\/|
-     o--+--+--+--o
-        '  o   .
-BANNER
-    echo "  ${ver_line}"
-    echo ""
+# Terminal artwork is generated from native/macos/mark.svg by render-mark.py.
+function memql_terminal_mark() {
+# BEGIN GENERATED MEMQL MARK
+    cat <<'MEMQL_MARK'
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣤⣤⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⢀⣤⣀⣀⣤⠤⠖⣺⠿⠿⣄⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠸⡿⠟⠶⢦⣶⣾⣁⣀⠀⠈⠓⢄⠀⠀⠀⠀⠀
+⠀⠀⢠⡇⠀⢀⡼⠛⢯⠉⠉⠙⠛⠒⠲⣿⣿⡆⠀⠀
+⠀⠀⣸⢀⡴⠋⠀⠀⠈⢧⠀⠀⠀⠀⣰⢫⡏⠁⠀⠀
+⠀⣴⣿⡋⠀⠀⠀⠀⠀⠈⣇⠀⣠⠞⠁⣸⠀⠀⠀⠀
+⠀⠛⠛⢯⡉⠙⠓⠒⠲⠦⣾⣿⣇⠀⢀⡏⠀⠀⠀⠀
+⠀⠀⠀⠀⠙⠦⡀⠀⢀⡴⠋⢉⣉⡽⣿⣿⡀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⢸⣿⣿⠒⠋⠉⠀⠀⠀⠀⢙⣶⣦⠀
+⠀⠀⠀⠀⠀⠀⠀⠉⠁⠀⠀⠀⠀⠀⠀⠀⠈⠛⠛⠀
+MEMQL_MARK
+# END GENERATED MEMQL MARK
 }
 
-# install_step prints a numbered human-readable step header.
+# Keep the existing entry point for uninstallers, which share this library.
+function memql_ascii_banner() {
+    printf '\n  MemQL Cockpit%s\n\n' "${1:+  v${1#v}}"
+}
+
 function install_step() {
-    local n="$1"
-    local msg="$2"
-    echo ""
-    echo "==> [${n}] ${msg}"
+    printf '\n  %s\n' "$2"
+}
+
+# Installer presentation stays here so `curl | bash` needs just this library.
+# fd 3 is the terminal; fd 4 carries diagnostics through a redactor to disk.
+# Stage callbacks MUST be simple commands, never the condition of if/||/!: a
+# conditional call disables errexit throughout the callback on Bash 3.2 too.
+function install_ui_log_directory() {
+    case "$(uname -s)" in
+        Darwin) printf '%s\n' "$HOME/Library/Logs/MemQL" ;;
+        *) printf '%s\n' "${XDG_STATE_HOME:-$HOME/.local/state}/memql/install" ;;
+    esac
+}
+
+function install_ui_init() {
+    local log_dir
+    exec 3>&1
+    INSTALL_UI_ACTIVE=yes
+    INSTALL_UI_TTY=no; INSTALL_UI_UNICODE=no
+    INSTALL_UI_ACCENT=""; INSTALL_UI_DIM=""; INSTALL_UI_RESET=""
+    INSTALL_UI_SPINNER=""; INSTALL_UI_LOGGER=""; INSTALL_UI_STAGE=""
+    INSTALL_UI_CURSOR_HIDDEN=no
+    INSTALL_MODELS_STATE=off; INSTALL_SERVICE_STATE=skipped
+    if [[ -t 3 && "${TERM:-dumb}" != dumb && "${INSTALL_PLAIN:-no}" != yes ]]; then
+        INSTALL_UI_TTY=yes
+        case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in
+            *UTF-8*|*utf-8*|*UTF8*|*utf8*) INSTALL_UI_UNICODE=yes ;;
+        esac
+        if [[ -z "${NO_COLOR+x}" ]]; then
+            INSTALL_UI_ACCENT=$'\033[32m'; INSTALL_UI_DIM=$'\033[2m'; INSTALL_UI_RESET=$'\033[0m'
+        fi
+    fi
+    log_dir="$(install_ui_log_directory)"
+    # Only diagnostic storage exists before preflight. Never touch worker
+    # configuration or ask for privileges just to prepare a log.
+    if ! (umask 077; mkdir -p "$log_dir"); then
+        printf '\n  Could not create the installer log directory: %s\n' "$log_dir" >&3
+        return 5
+    fi
+    INSTALL_LOG="$(umask 077; mktemp "$log_dir/install-$(date +%Y%m%d-%H%M%S).XXXXXX")"
+    trap 'install_ui_exit "$?"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    install_ui_header
+}
+
+function install_ui_header() {
+    local line row=0 caption
+    printf '\n' >&3
+    if [[ "$INSTALL_UI_UNICODE" == yes && "${COLUMNS:-80}" -ge 48 ]]; then
+        while IFS= read -r line; do
+            caption=""
+            case "$row" in
+                3) caption="MemQL Cockpit" ;;
+                5) caption="Machine setup" ;;
+            esac
+            printf '  %s%s%s    %s\n' "$INSTALL_UI_ACCENT" "$line" "$INSTALL_UI_RESET" "$caption" >&3
+            row=$((row + 1))
+        done < <(memql_terminal_mark)
+    else
+        printf '  MemQL Cockpit\n  Machine setup\n' >&3
+    fi
+    printf '\n' >&3
+}
+
+function install_log_filter() {
+    # No raw log is written, even temporarily. Strip terminal controls and
+    # common credentials before either persisting or showing verbose output.
+    LC_ALL=C awk -v verbose="${INSTALL_VERBOSE:-no}" '
+        {
+            gsub(/\033\[[0-?]*[ -\/]*[@-~]/, "")
+            gsub(/[[:cntrl:]]/, "")
+            gsub(/mql_[[:alnum:]_-]+/, "[redacted]")
+            gsub(/[Bb][Ee][Aa][Rr][Ee][Rr][ ]+[^ ,;]+/, "Bearer [redacted]")
+            print; fflush()
+            if (verbose == "yes") { print "      " $0 > "/dev/fd/3"; fflush("/dev/fd/3") }
+        }
+    '
+}
+
+function install_ui_start_progress() {
+    [[ "$INSTALL_UI_TTY" == yes && "${INSTALL_VERBOSE:-no}" != yes ]] || return 0
+    INSTALL_UI_CURSOR_HIDDEN=yes
+    printf '\033[?25l' >&3
+    (
+        local frame=0 dots
+        while :; do
+            case "$frame" in
+                0) dots='o . .' ;;
+                1|3) dots='. o .' ;;
+                2) dots='. . o' ;;
+            esac
+            if [[ "$INSTALL_UI_UNICODE" == yes ]]; then
+                dots="${dots//o/●}"; dots="${dots//./·}"
+            fi
+            printf '\r\033[2K  %s%s%s  %s' "$INSTALL_UI_ACCENT" "$dots" "$INSTALL_UI_RESET" "$INSTALL_UI_STAGE" >&3
+            frame=$(((frame + 1) % 4))
+            sleep 0.18
+        done
+    ) &
+    INSTALL_UI_SPINNER=$!
+}
+
+function install_ui_stop_progress() {
+    if [[ -n "$INSTALL_UI_SPINNER" ]]; then
+        kill "$INSTALL_UI_SPINNER" 2>/dev/null || true
+        wait "$INSTALL_UI_SPINNER" 2>/dev/null || true
+        INSTALL_UI_SPINNER=""
+    fi
+    if [[ "$INSTALL_UI_CURSOR_HIDDEN" == yes ]]; then
+        printf '\r\033[2K\033[?25h' >&3
+        INSTALL_UI_CURSOR_HIDDEN=no
+    fi
+}
+
+function install_ui_close_log() {
+    if [[ -n "$INSTALL_UI_LOGGER" ]]; then
+        exec 4>&-
+        wait "$INSTALL_UI_LOGGER"
+        INSTALL_UI_LOGGER=""
+    fi
+}
+
+function install_ui_stage() {
+    INSTALL_UI_STAGE="$1"; shift
+    INSTALL_UI_RESULT="$INSTALL_UI_STAGE"
+    INSTALL_UI_STAGE_STATE='done'
+    if [[ "$INSTALL_UI_TTY" != yes || "${INSTALL_VERBOSE:-no}" == yes ]]; then
+        printf '  ...  %s\n' "$INSTALL_UI_STAGE" >&3
+    fi
+    install_ui_start_progress
+    # An explicit reader is waitable on macOS Bash 3.2; a process
+    # substitution is not, and could lose the tail of a diagnostic log.
+    mkfifo -m 600 "$INSTALL_LOG.pipe"
+    install_log_filter < "$INSTALL_LOG.pipe" >> "$INSTALL_LOG" &
+    INSTALL_UI_LOGGER=$!
+    exec 4> "$INSTALL_LOG.pipe"
+    rm -f "$INSTALL_LOG.pipe"
+    printf '\n[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$INSTALL_UI_STAGE" >&4
+    "$@" >&4 2>&1
+    install_ui_stop_progress
+    install_ui_close_log
+    local symbol='+' color="$INSTALL_UI_ACCENT"
+    [[ "$INSTALL_UI_UNICODE" != yes ]] || symbol='✓'
+    if [[ "$INSTALL_UI_STAGE_STATE" == pending ]]; then
+        symbol='-'; color="$INSTALL_UI_DIM"
+        [[ "$INSTALL_UI_UNICODE" != yes ]] || symbol='○'
+    fi
+    printf '  %s%s%s  %s\n' "$color" "$symbol" "$INSTALL_UI_RESET" "$INSTALL_UI_RESULT" >&3
+    INSTALL_UI_STAGE=""
+}
+
+function install_ui_exit() {
+    local rc="$1"
+    trap - EXIT INT TERM
+    # An exit inside the callback still has stdout/stderr pointing at the
+    # diagnostic pipe. Release those writers too before waiting for EOF.
+    exec 1>&3 2>&3
+    # Cleanup must not replace the original operation's exit status.
+    install_ui_stop_progress
+    install_ui_close_log || true
+    rm -f "$INSTALL_LOG.pipe"
+    if declare -F cleanup_native_stage >/dev/null; then
+        cleanup_native_stage 2>&1 | install_log_filter >> "$INSTALL_LOG" || true
+    fi
+    if [[ "$rc" != 0 ]]; then
+        if [[ "$rc" == 130 || "$rc" == 143 ]]; then
+            printf '\n  Installation interrupted.\n' >&3
+        else
+            printf '\n  Could not finish: %s.\n' "${INSTALL_UI_STAGE:-installation}" >&3
+        fi
+        printf '  Details: %s\n  Re-run the same command to retry; add --verbose for live details.\n\n' "$INSTALL_LOG" >&3
+    fi
+    exit "$rc"
+}
+
+function install_check_release() {
+    local asset_name
+    # shellcheck disable=SC2153 # assigned by both platform drivers
+    asset_name="$(binary_name_for "$FLAVOUR")"
+    echo "INFO: os=$(detect_os) arch=$(detect_arch) flavour=${FLAVOUR}"
+    preflight_registry
+    # shellcheck disable=SC2153 # assigned by both platform drivers
+    preflight_asset "${DOWNLOAD_BASE}/${asset_name}" "$FLAVOUR"
+    INSTALL_UI_RESULT='Release available'
+}
+
+function install_ui_binary_result() {
+    case "$INSTALL_BINARY_ACTION" in
+        skip) INSTALL_UI_RESULT="Cockpit v${INSTALL_BINARY_AFTER} is up to date" ;;
+        upgrade) INSTALL_UI_RESULT="Cockpit updated to v${INSTALL_BINARY_AFTER}" ;;
+        *) INSTALL_UI_RESULT="Cockpit v${INSTALL_BINARY_AFTER} installed" ;;
+    esac
+}
+
+function install_ui_finish() {
+    local version command
+    version="$(read_binary_version "$INSTALLED_BINARY")"
+    printf '\n  %sCockpit v%s is installed.%s\n' "$INSTALL_UI_ACCENT" "$version" "$INSTALL_UI_RESET" >&3
+    if [[ "$INSTALL_SERVICE_STATE" == started ]]; then
+        printf '  Worker started. Return to Fleet to check the connection.\n' >&3
+    else
+        printf '  Worker not started. Run:\n\n    %q worker run\n' "$INSTALLED_BINARY" >&3
+    fi
+    case "$INSTALL_MODELS_STATE" in
+        pending|failed)
+            command='Local models need setup.'
+            [[ "$INSTALL_MODELS_STATE" != failed ]] || command='Local model setup did not finish. See the log for details.'
+            printf '\n  %s When ready, run:\n\n    %q worker setup --inference\n' "$command" "$INSTALLED_BINARY" >&3
+            ;;
+    esac
+    printf '\n  %sInstall log: %s%s\n\n' "$INSTALL_UI_DIM" "$INSTALL_LOG" "$INSTALL_UI_RESET" >&3
+}
+
+# Privileged commands in a quiet stage must never wait on a hidden prompt.
+# Revalidate immediately before each write in case a long download expired it.
+function install_sudo() {
+    require_sudo
+    sudo -n "$@"
 }
 
 # normalize_semver strips a leading v and any build metadata / variant
@@ -719,6 +934,16 @@ function require_sudo() {
     if sudo -n true 2>/dev/null; then
         return 0
     fi
+    if [[ "${INSTALL_UI_ACTIVE:-no}" == yes ]]; then
+        install_ui_stop_progress
+        printf '       Administrator access is needed to install Cockpit.\n' >&3
+        if ! sudo -v >&3 2>&3; then
+            echo "ERROR: sudo authentication failed. Pass --user-local for a passwordless ${action}." >&2
+            return 1
+        fi
+        install_ui_start_progress
+        return 0
+    fi
     echo "INFO: $INSTALL_PREFIX_SYSTEM ${action} requires sudo; you'll be prompted for your password..."
     if ! sudo -v; then
         echo "ERROR: sudo authentication failed. Pass --user-local for a passwordless ${action}." >&2
@@ -847,10 +1072,10 @@ function install_binary_with_mode() {
                 echo "INFO: fresh install → v${dl_ver}"
                 INSTALL_BINARY_ACTION="fresh"
             fi
-            sudo mkdir -p "$dest_dir"
-            sudo install -m 0755 "$tmp" "$INSTALL_BINARY_DEST"
+            install_sudo mkdir -p "$dest_dir"
+            install_sudo install -m 0755 "$tmp" "$INSTALL_BINARY_DEST"
             rm -f "$tmp"
-            sudo ln -sf "$INSTALL_BINARY_DEST" "$INSTALL_BINARY_FRIENDLY"
+            install_sudo ln -sf "$INSTALL_BINARY_DEST" "$INSTALL_BINARY_FRIENDLY"
             ;;
         user-local)
             mkdir -p "$dest_dir"
@@ -924,7 +1149,7 @@ function install_binary_with_mode() {
     for legacy in $LEGACY_BINARIES; do
         case "$mode" in
             system)
-                sudo rm -f "$dest_dir/$legacy" 2>/dev/null || true
+                install_sudo rm -f "$dest_dir/$legacy" 2>/dev/null || true
                 ;;
             *)
                 rm -f "$dest_dir/$legacy" 2>/dev/null || true
@@ -1186,9 +1411,14 @@ function setup_inference() {
     "$binary" worker setup --inference --non-interactive || rc=$?
     case "$rc" in
         0)
+            INSTALL_MODELS_STATE=ready
+            INSTALL_UI_RESULT="Local models ready"
             return 0
             ;;
         3)
+            INSTALL_MODELS_STATE=pending
+            INSTALL_UI_STAGE_STATE=pending
+            INSTALL_UI_RESULT="Local models need your approval"
             echo ""
             echo "INFO: the model runtime is not installed here, and a scripted run"
             echo "      is not allowed to approve installing it. Run this yourself,"
@@ -1198,6 +1428,9 @@ function setup_inference() {
             echo ""
             ;;
         *)
+            INSTALL_MODELS_STATE=failed
+            INSTALL_UI_STAGE_STATE=pending
+            INSTALL_UI_RESULT="Local model setup needs attention"
             echo "WARN: '${binary} worker setup --inference' exited ${rc}." >&2
             echo "      This machine is paired and working; it is not offering local" >&2
             echo "      models. Run the command above without --non-interactive to" >&2

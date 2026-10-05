@@ -628,7 +628,7 @@ for _installer in install-mac.sh install-linux.sh; do
     mkdir -p "$_pf_home"
     _out="$(cd "$_script_dir" && HOME="$_pf_home" "./${_installer}" \
         --token mql_wkr_test --cluster https://c.example --computeruse \
-        --user-local --no-service \
+        --user-local --no-service --verbose \
         --download-base "file://${_pf_assets}-none" 2>&1)"
     _rc=$?
     expect_eq "$_installer missing asset exits 4" "$_rc" "4"
@@ -640,7 +640,7 @@ for _installer in install-mac.sh install-linux.sh; do
         fail "$_installer refusal should name URL + flavour/platform; got: $_out"
     fi
 
-    if [[ ! -e "${_pf_home}/.memql" && ! -e "${_pf_home}/Library" \
+    if [[ ! -e "${_pf_home}/.memql" && ! -e "${_pf_home}/Library/LaunchAgents" \
         && ! -e "${_pf_home}/.config" && "$_out" != *"INFO: downloading"* ]]; then
         pass "$_installer refusal mutates nothing (no ~/.memql, no service dir, no download)"
     else
@@ -653,7 +653,7 @@ for _installer in install-mac.sh install-linux.sh; do
     mkdir -p "$_pf_home_ok"
     _out="$(cd "$_script_dir" && HOME="$_pf_home_ok" "./${_installer}" \
         --token mql_wkr_test --cluster https://c.example \
-        --user-local --no-service \
+        --user-local --no-service --verbose \
         --download-base "file://${_pf_assets}" 2>&1)"
     _rc=$?
     if [[ "$_rc" != "4" && "$_out" != *"release asset not found"* ]]; then
@@ -802,8 +802,8 @@ for _installer in install-mac.sh install-linux.sh; do
     # The order matters: worker.yaml first (nothing to configure
     # without it), the service next (so there is a running worker for
     # the setup's SIGHUP to reach), setup_inference last.
-    _line_cfg="$(grep -nF '    write_config' "${_script_dir}/${_installer}" | head -1 | cut -d: -f1)"
-    _line_inf="$(grep -nF '        setup_inference' "${_script_dir}/${_installer}" | head -1 | cut -d: -f1)"
+    _line_cfg="$(grep -nF 'install_ui_stage "Configuring this machine" write_config' "${_script_dir}/${_installer}" | head -1 | cut -d: -f1)"
+    _line_inf="$(grep -nF 'install_ui_stage "Preparing local models" setup_inference' "${_script_dir}/${_installer}" | head -1 | cut -d: -f1)"
     if [[ -n "$_line_cfg" && -n "$_line_inf" && "$_line_inf" -gt "$_line_cfg" ]]; then
         pass "$_installer runs setup_inference after worker.yaml is written"
     else
@@ -2462,7 +2462,7 @@ for _installer in install-mac.sh install-linux.sh; do
         mkdir -p "$_vh"
         # shellcheck disable=SC2086  # the spelling may be two words
         _out="$(cd "$_script_dir" && HOME="$_vh" MEMQL_INSTALL_RELEASE_BASE="file://${_rel}" "./${_installer}" \
-            --token mql_wkr_test --cluster https://c.example --user-local --no-service $_spelling 2>&1)"
+            --token mql_wkr_test --cluster https://c.example --user-local --no-service --verbose $_spelling 2>&1)"
         _rc=$?
         if [[ "$_rc" != 4 && "$_out" == *"INFO: checking release asset file://${_rel}/download/v0.16.0/${_pf_headless}"* \
             && "$_out" == *"INFO: downloading file://${_rel}/download/v0.16.0/${_pf_headless}"* ]]; then
@@ -2481,7 +2481,7 @@ for _installer in install-mac.sh install-linux.sh; do
     _vh="${_tmp}/ver-home-${_installer}-latest"
     mkdir -p "$_vh"
     _out="$(cd "$_script_dir" && HOME="$_vh" MEMQL_INSTALL_RELEASE_BASE="file://${_rel}" "./${_installer}" \
-        --token mql_wkr_test --cluster https://c.example --user-local --no-service 2>&1)"
+        --token mql_wkr_test --cluster https://c.example --user-local --no-service --verbose 2>&1)"
     if [[ "$_out" == *"INFO: checking release asset file://${_rel}/latest/download/${_pf_headless}"* ]]; then
         pass "$_installer without --version downloads from latest/download"
     else
@@ -2492,7 +2492,7 @@ for _installer in install-mac.sh install-linux.sh; do
     _vh="${_tmp}/ver-home-${_installer}-both"
     mkdir -p "$_vh"
     _out="$(cd "$_script_dir" && HOME="$_vh" MEMQL_INSTALL_RELEASE_BASE="file://${_rel}" "./${_installer}" \
-        --token mql_wkr_test --cluster https://c.example --user-local --no-service \
+        --token mql_wkr_test --cluster https://c.example --user-local --no-service --verbose \
         --version=v0.16.0 --download-base "file://${_pf_assets}" 2>&1)"
     if [[ "$_out" == *"INFO: checking release asset file://${_pf_assets}/${_pf_headless}"* ]]; then
         pass "$_installer --download-base wins over --version for the location"
@@ -2504,7 +2504,7 @@ for _installer in install-mac.sh install-linux.sh; do
     _vh="${_tmp}/ver-home-${_installer}-bad"
     mkdir -p "$_vh"
     _out="$(cd "$_script_dir" && HOME="$_vh" "./${_installer}" \
-        --token mql_wkr_test --cluster https://c.example --user-local --no-service --version=banana 2>&1)"
+        --token mql_wkr_test --cluster https://c.example --user-local --no-service --verbose --version=banana 2>&1)"
     _rc=$?
     expect_eq "$_installer --version=banana exits 2" "$_rc" "2"
     if [[ "$_out" == *"ERROR: --version wants"* && "$_out" != *"checking release asset"* ]]; then
@@ -2513,7 +2513,7 @@ for _installer in install-mac.sh install-linux.sh; do
         fail "$_installer --version=banana; got: $_out"
     fi
     _out="$(cd "$_script_dir" && HOME="$_vh" "./${_installer}" \
-        --token mql_wkr_test --cluster https://c.example --user-local --no-service --version 2>&1)"
+        --token mql_wkr_test --cluster https://c.example --user-local --no-service --verbose --version 2>&1)"
     expect_eq "$_installer --version without a value exits 2" "$?" "2"
     if [[ "$_out" == *"--version"* ]]; then
         pass "$_installer documents --version in its help"
@@ -2757,18 +2757,18 @@ for _platform in mac linux; do
     expect_eq "$_un piped --dry-run + a JSON registry leaves HOME byte-identical" "$(tree_fingerprint "$_h")" "$_before"
 done
 
-# The installers refuse BEFORE the download, with nothing under HOME
-# changed: a registry they cannot read is one they would rewrite
+# The installers refuse BEFORE the download, with worker state unchanged
+# (a diagnostic log is still written): a registry they cannot read is one they would rewrite
 # holding only the new home.
 for _installer in install-mac.sh install-linux.sh; do
     _ih="${_tmp}/unreadable-install-${_installer}"
     mkdir -p "${_ih}/.memql"
     write_unreadable_registry jsonline "${_ih}/.memql/workers.yaml"
     chmod 600 "${_ih}/.memql/workers.yaml"
-    _before="$(tree_fingerprint "$_ih")"
+    _before="$(tree_fingerprint "$_ih/.memql")"
     _out="$(cd "$_script_dir" && HOME="$_ih" "./${_installer}" \
         --token mql_wkr_test --cluster https://e.example \
-        --user-local --no-service \
+        --user-local --no-service --verbose \
         --download-base "file://${_pf_assets}" 2>&1)"
     _rc=$?
     expect_eq "$_installer over an unreadable registry exits 5" "$_rc" "5"
@@ -2778,7 +2778,7 @@ for _installer in install-mac.sh install-linux.sh; do
     else
         fail "$_installer over an unreadable registry; got: $_out"
     fi
-    expect_eq "$_installer over an unreadable registry leaves HOME byte-identical" "$(tree_fingerprint "$_ih")" "$_before"
+    expect_eq "$_installer over an unreadable registry leaves worker state byte-identical" "$(tree_fingerprint "$_ih/.memql")" "$_before"
 done
 
 # A legacy service file that will not unlink after a sibling-remaining
