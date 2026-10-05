@@ -7,7 +7,9 @@ The arrangement is made in two places: the repository's pipeline says a step
 may run on the fleet, and this machine's `policy.yaml` says this machine will
 take it. Engine half: epic memql#5478 (`workerHost.pipeline_step`, issue
 memql#5494). This half: the `pipeline_step` action, the `pipelines` policy and
-the `pipelines=allowed` registration label.
+the `pipelines=allowed` registration label and the action's reported repository
+scope. A machine that does not report a scope is not eligible for a pipeline
+step; upgrade and reconnect it first.
 
 ---
 
@@ -67,7 +69,8 @@ pipelines:
 `SIGHUP` reloads it (`kill -HUP $(pgrep -f 'memql worker run')`). The block
 **replaces** on reload rather than merging: removing `allow`, or narrowing
 `repos`, takes effect for the next step that arrives. The worker then
-re-registers so the cluster's router sees the new answer -- at the first moment
+re-registers for either an allow-flag or repository-list change so the
+cluster's router sees the new answer -- at the first moment
 nothing is running, because work in flight is never cut short. A step routed
 here on the old answer in the meantime is refused by the new one.
 

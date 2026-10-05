@@ -322,7 +322,7 @@ func consentConnection(serve string) *Connection {
 // sharing consent, and the given pipelines consent.
 func pipelinesConnection(pipelines bool) *Connection {
 	c := consentConnection(tools.ServeOwner)
-	c.AdvertisedPipelines = pipelines
+	c.AdvertisedPipelines = (tools.PipelinesPolicy{Allow: pipelines}).AdvertisementFingerprint()
 	return c
 }
 
@@ -338,7 +338,7 @@ func TestAChangedPipelinesPolicyIsAChangedAdvertisement(t *testing.T) {
 	inv.serve(oneModel())
 	allowed := false
 	r := testRunner(inv, &clock)
-	r.pipelines = func() bool { return allowed }
+	r.pipelines = func() tools.PipelinesPolicy { return tools.PipelinesPolicy{Allow: allowed} }
 
 	if r.maybeReadvertiseModels(context.Background(), pipelinesConnection(false)) {
 		t.Fatal("an unchanged pipelines policy is no reason to reconnect")
@@ -451,5 +451,23 @@ func TestAConnectionBeingClosedIsNotReEvaluated(t *testing.T) {
 	}
 	if r.maybeReadvertiseModels(context.Background(), conn) {
 		t.Fatal("a connection already being closed must not be closed -- and announced -- again")
+	}
+}
+
+func TestRepositoryOnlyPolicyChangeReadvertises(t *testing.T) {
+	clock := time.Unix(1_700_000_000, 0)
+	inv := &fakeModelInventory{}
+	inv.serve(oneModel())
+	policy := tools.PipelinesPolicy{Allow: true, Repos: []string{"o/a"}}
+	r := testRunner(inv, &clock)
+	r.pipelines = func() tools.PipelinesPolicy { return policy }
+	conn := consentConnection(tools.ServeOwner)
+	conn.AdvertisedPipelines = policy.AdvertisementFingerprint()
+	if r.maybeReadvertiseModels(context.Background(), conn) {
+		t.Fatal("unchanged scope reconnects")
+	}
+	policy.Repos = []string{"o/b"}
+	if !r.maybeReadvertiseModels(context.Background(), conn) {
+		t.Fatal("repository-only policy change was hidden until a later restart")
 	}
 }

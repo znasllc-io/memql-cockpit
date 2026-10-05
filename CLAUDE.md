@@ -699,8 +699,12 @@ does), and one whose clone URL's path does not name its `repository` (so
 operator label of that name -- the opposite of the model labels' rule -- because
 the engine's router requires the label, and a machine that would refuse every
 step routed on it must not carry it. Like every label it binds at Register, so
-a changed policy re-registers (`maybeReadvertiseModels`, under the same busy
-and floor guards).
+a changed allow flag OR repository list re-registers (`maybeReadvertiseModels`,
+under the same busy and floor guards). The capability descriptor carries
+`repositoryScopes["workerHost.pipeline_step"]`: absent means no consent,
+a present empty list explicitly accepts every repository. The engine filters
+before dispatch; the live policy check here still decides execution. Unknown
+scope metadata is ineligible, so engine and Cockpit upgrade together.
 
 **THE TOKEN NEVER TOUCHES DISK OR ARGV**: it is an `http.extraheader` in
 `GIT_CONFIG_COUNT/KEY/VALUE`. And the fetch is hermetic, because "an empty

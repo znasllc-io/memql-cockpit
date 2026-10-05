@@ -17,7 +17,7 @@ import (
 // liveReaders are the Options fields that read the LIVE policy. Each is a
 // function because a SIGHUP changes its answer, and each decides something a
 // runner advertises -- or withholds -- on Register.
-var liveReaders = []string{"InferenceServe", "PipelinesAllowed"}
+var liveReaders = []string{"InferenceServe", "PipelinesPolicy"}
 
 // workerSources parses every non-test Go file of this package, build tags
 // regardless: a file built only on darwin builds a Runner on darwin.
@@ -173,7 +173,7 @@ func TestAPolicyReloadAnnouncesAChangedConsent(t *testing.T) {
 	if !reloadPolicy(slogJSON(logs), policy) {
 		t.Fatalf("a valid file did not reload:\n%s", logs)
 	}
-	for _, want := range []string{"inference.serve changed", "pipelines.allow changed"} {
+	for _, want := range []string{"inference.serve changed", "pipeline repository policy changed"} {
 		if logs.count(want) != 1 {
 			t.Errorf("the reload did not say %q once:\n%s", want, logs)
 		}
@@ -185,6 +185,12 @@ func TestAPolicyReloadAnnouncesAChangedConsent(t *testing.T) {
 	}
 	if logs.count("changed") != 0 {
 		t.Errorf("an unchanged reload announced a change:\n%s", logs)
+	}
+
+	write("inference:\n  serve: cluster\npipelines:\n  allow: true\n  repos: [o/a]\n")
+	logs = &logBuffer{}
+	if !reloadPolicy(slogJSON(logs), policy) || logs.count("pipeline repository policy changed") != 1 {
+		t.Fatalf("repository-only reload was not announced: %s", logs)
 	}
 
 	write("pipelines: [not, a, mapping\n")

@@ -52,11 +52,10 @@ type Connection struct {
 	// The runner compares the live policy against it (memql-cockpit#428).
 	AdvertisedServe string
 
-	// AdvertisedPipelines is whether this connection registered with the
-	// pipelines=allowed label (memql#5494): policy.yaml's pipelines.allow
-	// when it registered. Bound at Register like the rest of the
+	// AdvertisedPipelines fingerprints the allow flag and repository scope
+	// reported by the machine's live policy when this connection registered. Bound at Register like the rest of the
 	// advertisement, so the runner compares the live policy against it.
-	AdvertisedPipelines bool
+	AdvertisedPipelines string
 
 	// cancel ends the context this connection's stream was opened on (the
 	// runner opens each stream on its own); Close uses it when a graceful
@@ -119,12 +118,12 @@ func dialSDK(ctx context.Context, cfg Config, logger *slog.Logger) (stream, erro
 
 // handshake runs Register / RegisterAck over an open stream and returns
 // the live connection, or closes the stream and returns why it failed.
-func handshake(ctx context.Context, s stream, cfg Config, inventory []apps.Info, modelInv models.Inventory, hw hardware.Inventory, inferenceServe string, pipelinesAllowed bool, logger *slog.Logger) (*Connection, error) {
+func handshake(ctx context.Context, s stream, cfg Config, inventory []apps.Info, modelInv models.Inventory, hw hardware.Inventory, inferenceServe string, pipelines tools.PipelinesPolicy, logger *slog.Logger) (*Connection, error) {
 	c := &Connection{
 		conn:   s,
 		logger: logger,
 	}
-	if err := c.register(ctx, cfg, inventory, modelInv, hw, inferenceServe, pipelinesAllowed); err != nil {
+	if err := c.register(ctx, cfg, inventory, modelInv, hw, inferenceServe, pipelines); err != nil {
 		c.Close()
 		return nil, err
 	}
@@ -184,7 +183,7 @@ func withPipelinesLabel(labels map[string]string, allowed bool) map[string]strin
 // shape -- in particular that capability_descriptor_json always
 // satisfies the server-side validation rules (memql#1331: raw size,
 // schemaVersion, action-name pattern) -- without a live stream.
-func buildRegister(cfg Config, inventory []apps.Info, modelInv models.Inventory, hw hardware.Inventory, inferenceServe string, pipelinesAllowed bool) *memqlv1.Register {
+func buildRegister(cfg Config, inventory []apps.Info, modelInv models.Inventory, hw hardware.Inventory, inferenceServe string, pipelines tools.PipelinesPolicy) *memqlv1.Register {
 	hostname, _ := os.Hostname()
 	// Local models (memql-cockpit#361). They ride the EXISTING
 	// registration mechanism -- `model:<id>` and `runtime:<kind>` labels
@@ -197,7 +196,7 @@ func buildRegister(cfg Config, inventory []apps.Info, modelInv models.Inventory,
 	// The owner's consent to CI pipeline steps (memql#5494), from the live
 	// policy. Also a copy, so the machine id below never lands in the
 	// config's own map.
-	labels = withPipelinesLabel(labels, pipelinesAllowed)
+	labels = withPipelinesLabel(labels, pipelines.Allow)
 	if mid, err := machineIDFor(cfg); err == nil && mid != "" {
 		if labels == nil {
 			labels = map[string]string{}
@@ -233,7 +232,7 @@ func buildRegister(cfg Config, inventory []apps.Info, modelInv models.Inventory,
 	// proto field is optional -- on the (never-expected) marshal
 	// failure we register without it rather than fail the handshake;
 	// the server treats omission as valid.
-	if descJSON, err := tools.CapabilityDescriptorJSONFor(inferenceServe); err == nil {
+	if descJSON, err := tools.CapabilityDescriptorJSONFor(inferenceServe, pipelines.RepositoryScopes()); err == nil {
 		register.CapabilityDescriptorJson = descJSON
 	}
 	registerHardware(register, hw)
@@ -241,11 +240,11 @@ func buildRegister(cfg Config, inventory []apps.Info, modelInv models.Inventory,
 }
 
 // register sends the Register message and waits for the RegisterAck.
-func (c *Connection) register(ctx context.Context, cfg Config, inventory []apps.Info, modelInv models.Inventory, hw hardware.Inventory, inferenceServe string, pipelinesAllowed bool) error {
-	register := buildRegister(cfg, inventory, modelInv, hw, inferenceServe, pipelinesAllowed)
+func (c *Connection) register(ctx context.Context, cfg Config, inventory []apps.Info, modelInv models.Inventory, hw hardware.Inventory, inferenceServe string, pipelines tools.PipelinesPolicy) error {
+	register := buildRegister(cfg, inventory, modelInv, hw, inferenceServe, pipelines)
 	c.ModelFingerprint = advertisedFingerprint(modelInv.Labels())
 	c.AdvertisedServe = inferenceServe
-	c.AdvertisedPipelines = pipelinesAllowed
+	c.AdvertisedPipelines = pipelines.AdvertisementFingerprint()
 	if err := c.Send(&memqlv1.WorkerClientMessage{
 		Payload: &memqlv1.WorkerClientMessage_Register{Register: register},
 	}); err != nil {
@@ -287,7 +286,7 @@ func (c *Connection) register(ctx context.Context, cfg Config, inventory []apps.
 			"owner_user_id", c.OwnerUserId,
 			"models_offered", len(modelInv.Advertised()),
 			"inference_serve", inferenceServe,
-			"pipelines_allowed", pipelinesAllowed,
+			"pipelines_allowed", pipelines.Allow,
 		)
 	}
 	return nil
