@@ -459,6 +459,18 @@ function read_binary_version_exact() {
     if [[ "$exact" =~ ^[0-9]+(\.[0-9]+){1,3}([-+][[:alnum:].-]+)*$ ]]; then printf '%s\n' "$exact"; else echo ""; fi
 }
 
+# A release selector retains its prerelease suffix. Revision metadata only
+# participates in equality when the caller explicitly selected that metadata.
+function binary_version_matches_selection() {
+    local actual="$1" selected="${2#v}"
+    [[ -n "$actual" && -n "$selected" ]] || return 1
+    if [[ "$selected" == *+* ]]; then
+        [[ "$actual" == "$selected" ]]
+    else
+        [[ "${actual%%+*}" == "$selected" ]]
+    fi
+}
+
 # compare_semver prints -1 / 0 / 1 for a<b / a==b / a>b (numeric dotted).
 # Non-numeric segments compare as 0. Empty either side → treat as 0.0.0.
 function compare_semver() {
@@ -1089,7 +1101,7 @@ function install_binary_with_mode() {
     if [[ -n "$installed_ver" && -n "$target_ver" ]]; then
         local cmp
         cmp="$(compare_semver "$installed_ver" "$target_ver")"
-        if [[ "$cmp" == "0" && ( -z "$target_exact" || "$installed_exact" == "$target_exact" ) ]]; then
+        if [[ "$cmp" == "0" ]] && { [[ -z "$target_exact" ]] || binary_version_matches_selection "$installed_exact" "$target_exact"; }; then
             echo "INFO: already at v${installed_ver}; skipping binary download"
             INSTALL_BINARY_ACTION="skip"
             INSTALL_BINARY_AFTER="$installed_ver"
@@ -1129,7 +1141,7 @@ function install_binary_with_mode() {
                 return 1
             fi
             local dl_ver
-            if [[ -n "$target_exact" && "$(read_binary_version_exact "$tmp")" != "$target_exact" ]]; then
+            if [[ -n "$target_exact" ]] && ! binary_version_matches_selection "$(read_binary_version_exact "$tmp")" "$target_exact"; then
                 echo "ERROR: downloaded binary does not match the explicitly selected build" >&2
                 rm -f "$tmp"; return 3
             fi
@@ -1174,7 +1186,7 @@ function install_binary_with_mode() {
                 return 1
             fi
             local dl_ver
-            if [[ -n "$target_exact" && "$(read_binary_version_exact "$tmp")" != "$target_exact" ]]; then
+            if [[ -n "$target_exact" ]] && ! binary_version_matches_selection "$(read_binary_version_exact "$tmp")" "$target_exact"; then
                 echo "ERROR: downloaded binary does not match the explicitly selected build" >&2
                 rm -f "$tmp"; return 3
             fi

@@ -2839,6 +2839,15 @@ else
     done
 fi
 
+# Build identity must not turn a selected release into a mismatch, or make
+# two different prereleases (or explicitly selected commits) interchangeable.
+for _version_case in '0.16.0+gabc|0.16.0|yes' '0.16.0-dev.ci+gabc|0.16.0-dev.ci|yes' '0.16.0-dev.old+gabc|0.16.0-dev.ci|no' '0.16.0+gabc|0.16.0+gdef|no' '0.16.0+gabc|0.16.0+gabc|yes' '0.15.0+gabc|0.16.0|no'; do
+    IFS='|' read -r _actual _selected _expected <<< "$_version_case"
+    _matched=no
+    binary_version_matches_selection "$_actual" "$_selected" && _matched=yes
+    expect_eq "build selection $_actual -> $_selected" "$_matched" "$_expected"
+done
+
 # ---------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------

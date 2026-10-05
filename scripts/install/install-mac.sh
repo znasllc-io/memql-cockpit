@@ -211,20 +211,21 @@ function write_config() {
 function install_native_app() {
     NATIVE_APP=""; NATIVE_STAGE=""
     [[ "$FLAVOUR" == computeruse ]] || return 0
-    local version base source_app app_version old_requirement new_requirement transition alternate
+    local version release_version base source_app app_version old_requirement new_requirement transition alternate
     version="$(read_binary_version_exact "$INSTALLED_BINARY")"
+    release_version="${version%%+*}"
     if [[ -z "$version" || "$(compare_semver "$version" 0.15.0)" == -1 ]]; then
         INSTALL_UI_STAGE_STATE=pending
         INSTALL_UI_RESULT="Native app requires Cockpit 0.15.0 or later"
         return 0
     fi
     base="$DOWNLOAD_BASE"
-    [[ "$base" != "$DEFAULT_DOWNLOAD_BASE" ]] || base="$(release_download_base "$version")"
+    [[ "$base" != "$DEFAULT_DOWNLOAD_BASE" ]] || base="$(release_download_base "$release_version")"
     NATIVE_STAGE="$(mktemp -d)"
     fetch_macos_app "$base" "$(detect_arch)" "$NATIVE_STAGE" || return $?
     source_app="$NATIVE_STAGE/unpacked/MemQL.app"
     app_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$source_app/Contents/Info.plist")"
-    [[ "$app_version" == "$version" ]] || { echo "ERROR: app and worker versions differ" >&2; return 3; }
+    [[ "$app_version" == "$release_version" && "$(read_binary_version_exact "$source_app/Contents/MacOS/MemQL")" == "$version" ]] || { echo "ERROR: app and worker versions differ" >&2; return 3; }
     case "$INSTALL_MODE" in system) NATIVE_APP="/Applications/MemQL.app" ;; *) NATIVE_APP="$HOME/Applications/MemQL.app" ;; esac
     if [[ -d "$NATIVE_APP" ]]; then
         old_requirement="$(macos_bundle_requirement "$NATIVE_APP" || true)"
