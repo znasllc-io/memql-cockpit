@@ -35,9 +35,18 @@ type ConsentGate interface {
 // Dispatcher is the cockpit-side tool dispatcher. Implements
 // internal/worker.ToolDispatcher.
 type Dispatcher struct {
-	logger  *slog.Logger
-	policy  *Policy
-	consent ConsentGate
+	logger       *slog.Logger
+	policy       *Policy
+	consent      ConsentGate
+	pipelineHome string
+}
+
+// NewHomeDispatcher binds cache reuse to this locally configured enrollment.
+// A request cannot select another enrollment's cache by inventing an argument.
+func NewHomeDispatcher(logger *slog.Logger, policy *Policy, consentGate ConsentGate, home string) *Dispatcher {
+	d := NewDispatcher(logger, policy, consentGate)
+	d.pipelineHome = home
+	return d
 }
 
 // NewDispatcher constructs a Dispatcher. The policy controls
@@ -331,7 +340,7 @@ func (d *Dispatcher) streamTo(callID string, send func(*memqlv1.ToolStream) erro
 func (d *Dispatcher) dispatchHost(ctx context.Context, action string, args map[string]any, agentID string, emit outputEmitter) (*memqlv1.Success, *memqlv1.Failure) {
 	switch action {
 	case "pipeline_step":
-		return runPipelineStep(ctx, agentID, args, d.policy, emit)
+		return runPipelineStep(context.WithValue(ctx, pipelineCacheHomeKey{}, d.pipelineHome), agentID, args, d.policy, emit)
 	case "exec":
 		return runExec(ctx, args, d.policy)
 	case "fs_read":

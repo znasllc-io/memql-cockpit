@@ -958,7 +958,7 @@ func machineIDLine(w WorkersFile) string {
 // which cluster every call came from.
 func homeDispatchers(logger *slog.Logger, policy *tools.Policy, homes *consent.Homes) func(string) ToolDispatcher {
 	return func(id string) ToolDispatcher {
-		return tools.NewDispatcher(logger.With("home", id), policy, homes.For(id))
+		return tools.NewHomeDispatcher(logger.With("home", id), policy, homes.For(id), id)
 	}
 }
 

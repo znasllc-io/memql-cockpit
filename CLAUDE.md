@@ -705,7 +705,7 @@ under the same busy and floor guards). The capability descriptor carries
 a present empty list explicitly accepts every repository. The engine filters
 before dispatch; the live policy check here still decides execution. Unknown
 scope metadata is ineligible, so engine and Cockpit upgrade together. The
-implementation also reports `actionContracts["workerHost.pipeline_step"] = 2`;
+implementation also reports `actionContracts["workerHost.pipeline_step"] = 3`;
 the engine must require it before dispatching the native/container contract.
 An operator label cannot substitute for this build-provided metadata.
 
@@ -717,9 +717,18 @@ reset, the machine's `GIT_` variables stripped, no prompt, https only. The
 NATIVE COMMAND inherits the machine environment, excluding
 `MEMQL_WORKER_TOKEN`. Execution and OS/architecture are explicit; missing or
 mismatched contracts refuse before cloning. CONTAINER work uses its pinned
-image on a freshly checked Docker daemon, with only the checkout mounted;
+image on a freshly checked Docker daemon, with the checkout and declared cache mounted;
 request environment travels on container stdin and cannot configure the host
 Docker client. No fallback to native execution.
+
+**SERVICES AND CACHES ARE CONTAINER CONTRACT 3.** Services share localhost on
+an attempt-specific bridge, with pinned images, bounded resources and Docker-
+managed readiness probes. They receive no checkout, cache, socket or step
+secrets. Persist every resource name BEFORE creation and reconcile every name
+before clearing capacity. Cache reuse is partitioned by the locally bound
+cluster enrollment, runner owner/repository/trust scope, clone URL, platform,
+image and UID/GID. The 10 GiB limit is retention BETWEEN builds, not an in-flight
+disk quota. Never prune while an uncertain container may still be writing.
 
 **BUILD CAPACITY IS SHARED ACROSS CLUSTERS.** A per-OS-user kernel lock lives
 outside cluster-specific homes. The durable attempt record is written before

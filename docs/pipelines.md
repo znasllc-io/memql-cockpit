@@ -10,7 +10,7 @@ memql#5494). This half: the `pipeline_step` action, the `pipelines` policy and
 the `pipelines=allowed` registration label and the action's reported repository
 scope. A machine that does not report a scope is not eligible for a pipeline
 step; upgrade and reconnect it first. The runtime also reports
-`actionContracts["workerHost.pipeline_step"] = 2`. The engine requires this
+`actionContracts["workerHost.pipeline_step"] = 3`. The engine requires this
 contract before sending an explicit native/container request; operator labels
 are not evidence of an implemented action contract.
 
@@ -39,7 +39,7 @@ commands it chooses, as you, for the repositories it names. The command is
 whatever the cluster sends -- this machine cannot see the pipeline it came
 from -- and it runs as the user the worker runs as, with that user's
 environment and files for an explicitly native step. A container step uses
-only its declared image, checkout and supplied environment. Native execution
+its declared image, checkout, declared caches and supplied environment. Native execution
 is not a sandbox. `pipelines.repos` narrows which
 repositories; the clone URL must name the same repository, so the list filters
 what is actually cloned rather than a name the request states.
@@ -94,9 +94,27 @@ here on the old answer in the meantime is refused by the new one.
    `needs: [docker]` request also probes the daemon before checkout. Host needs
    never pass through a container boundary. Container work requires a
    Linux platform and an `image` pinned by `@sha256:...`; a live Docker probe
-   must match it without emulation. No host-shell fallback occurs. Services
-   and caches currently refuse on this fleet contract rather than being
-   silently omitted.
+   must match it without emulation. The downloaded image's actual platform is
+   checked before starting it too. No host-shell fallback occurs. Contract 3
+   supports container services and caches; native steps cannot declare them.
+
+   Up to four services use digest-pinned images on the same Linux platform.
+   They share `localhost` with the command on an attempt-specific Docker bridge,
+   with no published host ports. Each receives only its declared plain `env`,
+   keeps its image entrypoint/user, and has two CPUs, 2 GiB memory and 512
+   processes available. Docker enforces the declared readiness probe's
+   five-second timeout; the worker waits up to three minutes for readiness,
+   within the step's overall timeout. The command never starts after failed
+   readiness, and a service that exits during it fails the step.
+
+   Declared `go` and `npm` caches persist under the OS user's worker-capacity
+   directory. Reuse is separated by local cluster enrollment, the runner's
+   owner/repository/trust scope, clone host, platform, image and UID/GID. Pull
+   request caches cannot populate trusted push/release caches. Only the
+   selected cache directory is mounted at `/cache`. The worker retains at
+   most 10 GiB between builds by evicting oldest directories; this is a
+   retention budget, not a hard filesystem quota during a command. Caches
+   remain advisory and may disappear before a later build.
 
    A kernel file lock reserves one build slot across all cluster enrollments
    and worker processes running as the same operating-system user, regardless
@@ -119,7 +137,7 @@ here on the old answer in the meantime is refused by the new one.
      and never prompts. Proxies set through `HTTPS_PROXY` still apply.
 5. **The command.** Native work uses `/bin/sh -c <command>` with the host's
    toolchains and environment, excluding `MEMQL_WORKER_TOKEN`. Container work
-   uses `/bin/sh` in the declared image with just the checkout mounted, as the
+   uses `/bin/sh` in the declared image with the checkout and any declared cache mounted, as the
    worker's UID/GID, and no Docker socket, privileged mode, host ports or host
    network. Its current bounds are two CPUs, 2 GiB memory and 512 processes.
    Request environment and multiline secrets travel to the container shell
@@ -145,10 +163,12 @@ here on the old answer in the meantime is refused by the new one.
    exit status. A declared path nothing matched is listed in
    `artifactsMissing`.
 9. **Cleanup and recovery.** Container cancellation removes the exact attempt's
-   container with a separate bounded cleanup context. Its reservation is
+   command container, services, anonymous volumes and network with a separate
+   thirty-second cleanup context. Every resource name is recorded before
+   creation. Its reservation is
    cleared only after confirmed removal; an uncertain cleanup reports
    `pipeline_cleanup_uncertain` and retains the workspace and durable record.
-   A replacement worker reconciles that recorded container only after the
+   A replacement worker reconciles those recorded resources only after the
    original Docker daemon identifies itself. An unavailable or different
    daemon, a corrupt record, or interrupted native work keeps capacity blocked
    with `pipeline_recovery_required`. Native recovery needs operator inspection
@@ -225,6 +245,10 @@ The worker test suite clones fixture commits from a local repository. Set
 Docker cases; daemon failure then fails the tests rather than skipping them.
 These verify the actual image/checkout, environment separation, multiline
 secret masking, artifacts, cancellation/removal, and recovery of an orphaned
-container. Separate process tests verify that cluster-specific workers cannot
+container, plus persistent caches and their enrollment/trust separation. Set
+`MEMQL_TEST_PIPELINE_POSTGRES_IMAGE` to a pinned PostgreSQL-compatible image to
+require the real service tests: an actual SQL query over localhost, service
+credential/mount boundaries, cancellation and complete resource cleanup.
+Separate process tests verify that cluster-specific workers cannot
 reserve the same build slot and cannot discard an interrupted attempt record.
 No test upgrades the installed worker or enables its pipeline policy.

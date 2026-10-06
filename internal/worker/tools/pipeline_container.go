@@ -63,17 +63,10 @@ func parsePipelineExecution(args map[string]any, req *pipelineStepRequest) error
 	if req.execution == "container" && len(req.needs) > 0 {
 		return errors.New("pipeline_step: host requirements do not pass through the container boundary")
 	}
-	// These are not implemented on the fleet yet. Refuse instead of executing
-	// a different environment from the one the author declared.
-	for _, key := range []string{"services", "caches"} {
-		if value, present := args[key]; present {
-			list, ok := value.([]any)
-			if !ok || len(list) != 0 {
-				return fmt.Errorf("pipeline_step: fleet %s are not supported by this worker", key)
-			}
-		}
+	if err := parsePipelineServices(args, req); err != nil {
+		return err
 	}
-	return nil
+	return parsePipelineCaches(args, req)
 }
 
 func checkPipelineRuntime(ctx context.Context, req *pipelineStepRequest) error {
@@ -124,6 +117,11 @@ func containerScript(req pipelineStepRequest) string {
 	for k, v := range req.secrets {
 		env[k] = v
 	}
+	for _, cache := range req.caches {
+		for k, v := range pipelineCacheEnvironment[cache] {
+			env[k] = v
+		}
+	}
 	keys := make([]string, 0, len(env))
 	for k := range env {
 		keys = append(keys, k)
@@ -168,15 +166,22 @@ func (r *pipelineRun) containerCommand(ctx context.Context) (code int, fail *mem
 	if r.req.dockerID == "" {
 		return 0, failure("pipeline_runtime_unavailable", "pipeline_step: Docker identity is unknown")
 	}
-	if err := r.reservation.begin(pipelineAttemptRecord{Execution: "container", Container: name, DockerID: r.req.dockerID, Workspace: r.dir}); err != nil {
+	record := pipelineAttemptRecord{Execution: "container", Container: name, DockerID: r.req.dockerID, Workspace: r.dir}
+	if len(r.req.services) > 0 {
+		record.Network = name + "-net"
+		for i := range r.req.services {
+			record.Services = append(record.Services, fmt.Sprintf("%s-svc-%d", name, i))
+		}
+	}
+	if err := r.reservation.begin(record); err != nil {
 		return 0, failure("pipeline_recovery_required", err.Error())
 	}
 	// The name is known BEFORE create: if create's reply is lost, cleanup can
 	// still address exactly this attempt. No other user's containers are swept.
 	defer func() {
-		cleanup, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		cleanup, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := removePipelineContainer(cleanup, name); err != nil {
+		if err := removePipelineAttempt(cleanup, record); err != nil {
 			code = 0
 			fail = failure("pipeline_cleanup_uncertain", "pipeline_step: container cleanup could not be confirmed; do not replay this attempt until its container is reconciled: "+name)
 		} else if err := r.reservation.clear(); err != nil {
@@ -187,6 +192,12 @@ func (r *pipelineRun) containerCommand(ctx context.Context) (code int, fail *mem
 	if strings.ContainsAny(r.dir, ",\n\r") {
 		return 0, failure("exec_failed", "pipeline_step: Docker workspace path contains an unsupported delimiter")
 	}
+	if err := r.startPipelineServices(ctx, record); err != nil {
+		if ctx.Err() != nil {
+			return 0, r.stopped(ctx)
+		}
+		return 0, failure("pipeline_service_failed", r.mask.mask(err.Error()))
+	}
 	args := []string{"create", "--name", name, "--interactive", "--init", "--restart=no",
 		"--label", "io.memql.pipeline-attempt=" + name,
 		"--platform", r.req.platform, "--pull=missing", "--entrypoint", "/bin/sh",
@@ -194,7 +205,14 @@ func (r *pipelineRun) containerCommand(ctx context.Context) (code int, fail *mem
 		"--cpus=2", "--memory=2g", "--memory-swap=2g",
 		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
 		"--mount", "type=bind,source=" + r.dir + ",target=/workspace",
-		"--workdir", "/workspace", "--env", "HOME=/tmp", r.req.image}
+		"--workdir", "/workspace", "--env", "HOME=/tmp"}
+	if len(record.Services) > 0 {
+		args = append(args, "--network", "container:"+record.Services[0])
+	}
+	if r.req.cacheDir != "" {
+		args = append(args, "--mount", "type=bind,source="+r.req.cacheDir+",target=/cache")
+	}
+	args = append(args, r.req.image)
 	// Creation/pulls can stream progress, but do not contain the command or its secrets.
 	result, err := runGroup(ctx, dockerCommand(args...), r.mask, r.emit)
 	r.bytes.Add(result.bytes)
@@ -203,6 +221,9 @@ func (r *pipelineRun) containerCommand(ctx context.Context) (code int, fail *mem
 	}
 	if err != nil || result.exitCode != 0 {
 		return 0, failure("pipeline_container_failed", "pipeline_step: Docker could not create the declared container")
+	}
+	if err := checkPipelineImagePlatform(ctx, r.req.image, r.req.platform); err != nil {
+		return 0, failure("pipeline_container_failed", err.Error())
 	}
 	cmd := dockerCommand("start", "--attach", "--interactive", name)
 	cmd.Stdin = strings.NewReader(containerScript(r.req))
@@ -236,7 +257,25 @@ func (r *pipelineRun) containerCommand(ctx context.Context) (code int, fail *mem
 		}
 		r.note(true, "memql: container exceeded its memory limit\n")
 	}
+	for i, service := range record.Services {
+		if err := pipelineServiceRunning(ctx, service); err != nil {
+			return 0, failure("pipeline_service_failed", "pipeline_step: service "+r.req.services[i].name+" did not remain running through the command")
+		}
+	}
 	return state.ExitCode, nil
+}
+
+// A matching daemon does not prove that a pinned single-platform image matches
+// it: Docker may otherwise run it through emulation. Creation has pulled the
+// image, but the repository's command has not started when this check runs.
+func checkPipelineImagePlatform(ctx context.Context, image, platform string) error {
+	probe, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	out, err := dockerOutput(probe, "image", "inspect", image, "--format", "{{.Os}}/{{.Architecture}}")
+	if err != nil || strings.TrimSpace(string(out)) != platform {
+		return errors.New("pipeline_step: image does not match the declared platform; emulation is not admitted")
+	}
+	return nil
 }
 
 func removePipelineContainer(ctx context.Context, name string) error {
@@ -261,16 +300,16 @@ func reconcilePipelineReservation(ctx context.Context, reservation *pipelineRese
 	if err != nil {
 		return err
 	}
-	if record.Execution != "container" || record.DockerID == "" || !regexp.MustCompile(`^memql-step-[0-9a-f]{32}$`).MatchString(record.Container) {
+	if !validPipelineAttempt(record) {
 		return errPipelineUnreconciled
 	}
-	cleanup, cancel := context.WithTimeout(ctx, 15*time.Second)
+	cleanup, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	out, err := dockerOutput(cleanup, "info", "--format", "{{.ID}}")
 	if err != nil || strings.TrimSpace(string(out)) != record.DockerID {
 		return errors.New("interrupted container's Docker daemon is unavailable or changed; reconciliation required")
 	}
-	if err = removePipelineContainer(cleanup, record.Container); err != nil {
+	if err = removePipelineAttempt(cleanup, record); err != nil {
 		return errPipelineUnreconciled
 	}
 	if filepath.IsAbs(record.Workspace) && strings.HasPrefix(filepath.Base(record.Workspace), "step-") {

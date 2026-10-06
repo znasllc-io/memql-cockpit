@@ -31,9 +31,11 @@ type pipelineReservation struct {
 	dirty bool
 }
 type pipelineAttemptRecord struct {
-	Workspace string `json:"workspace"`
-	Execution string `json:"execution"`
-	Container string `json:"container,omitempty"`
+	Workspace string   `json:"workspace"`
+	Execution string   `json:"execution"`
+	Container string   `json:"container,omitempty"`
+	Services  []string `json:"services,omitempty"`
+	Network   string   `json:"network,omitempty"`
 	// Identity of the Docker endpoint is needed before another worker may
 	// reconcile it; it must not remove a namesake on a different daemon.
 	DockerID string `json:"dockerID,omitempty"`

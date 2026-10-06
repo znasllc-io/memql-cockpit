@@ -8,7 +8,10 @@ var errPipelineBusy = errors.New("build capacity is occupied")
 var errPipelineUnreconciled = errors.New("interrupted build needs reconciliation")
 
 type pipelineReservation struct{ dirty bool }
-type pipelineAttemptRecord struct{ Execution, Container, DockerID, Workspace string }
+type pipelineAttemptRecord struct {
+	Execution, Container, DockerID, Workspace, Network string
+	Services                                           []string
+}
 
 func acquirePipelineReservation() (*pipelineReservation, error) {
 	return nil, errors.New("build capacity admission is supported only on macOS and Linux")

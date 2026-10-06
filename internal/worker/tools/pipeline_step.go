@@ -168,6 +168,11 @@ type pipelineStepRequest struct {
 	image      string
 	dockerID   string
 	needs      []string
+	services   []pipelineService
+	caches     []string
+	cacheScope string
+	cacheHome  string
+	cacheDir   string
 }
 
 // runPipelineStep implements workerHost.pipeline_step. agentID is the
@@ -201,6 +206,12 @@ func runPipelineStep(ctx context.Context, agentID string, args map[string]any, p
 	if err != nil {
 		return refuse("bad_request", err)
 	}
+	if len(req.caches) > 0 {
+		req.cacheHome, _ = ctx.Value(pipelineCacheHomeKey{}).(string)
+		if req.cacheHome == "" {
+			return refuse("bad_request", errors.New("pipeline_step: cache reuse requires a locally bound cluster enrollment"))
+		}
+	}
 	if err := gitUnusable(); err != nil {
 		return refuse("pipeline_clone_failed", err)
 	}
@@ -224,6 +235,20 @@ func runPipelineStep(ctx context.Context, agentID string, args map[string]any, p
 	}
 	if err := checkPipelineRuntime(stepCtx, &req); err != nil {
 		return refuse("pipeline_runtime_unavailable", err)
+	}
+	if len(req.caches) > 0 {
+		if err := preparePipelineCache(&req); err != nil {
+			return refuse("pipeline_cache_unavailable", err)
+		}
+		defer func() {
+			// Uncertain containers may still be writing: never prune beneath
+			// them or release the capacity reservation to another build.
+			if !reservation.dirty {
+				if err := prunePipelineCaches(); err != nil {
+					emit(true, []byte("memql: cache retention could not complete; the next cached build will recheck it\n"))
+				}
+			}
+		}()
 	}
 
 	if err := os.MkdirAll(settings.WorkspaceRoot, 0o700); err != nil {
@@ -343,6 +368,16 @@ func parsePipelineStep(args map[string]any) (pipelineStepRequest, error) {
 	for name := range req.secrets {
 		if _, clash := req.env[name]; clash {
 			return req, fmt.Errorf("pipeline_step: %s is both an env variable and a secret", name)
+		}
+	}
+	for _, cache := range req.caches {
+		for name := range pipelineCacheEnvironment[cache] {
+			if _, found := req.env[name]; found {
+				return req, errors.New("pipeline_step: environment overrides a declared cache")
+			}
+			if _, found := req.secrets[name]; found {
+				return req, errors.New("pipeline_step: secret overrides a declared cache")
+			}
 		}
 	}
 	if req.artifacts, err = artifactList(args); err != nil {
