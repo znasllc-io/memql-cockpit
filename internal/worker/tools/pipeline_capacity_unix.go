@@ -106,7 +106,10 @@ func (r *pipelineReservation) read() (pipelineAttemptRecord, error) {
 }
 func (r *pipelineReservation) begin(record pipelineAttemptRecord) error {
 	if r.dirty {
-		return errPipelineUnreconciled
+		previous, err := r.read()
+		if err != nil || previous.Execution != "cleanup" || previous.Workspace != record.Workspace || previous.Container != "" || previous.DockerID != "" || previous.Network != "" || len(previous.Services) != 0 {
+			return errPipelineUnreconciled
+		}
 	}
 	data, err := json.Marshal(record)
 	if err != nil {
@@ -114,6 +117,9 @@ func (r *pipelineReservation) begin(record pipelineAttemptRecord) error {
 	}
 	r.dirty = true
 	if _, err = r.file.WriteAt(data, 0); err != nil {
+		return err
+	}
+	if err = r.file.Truncate(int64(len(data))); err != nil {
 		return err
 	}
 	return r.file.Sync()
