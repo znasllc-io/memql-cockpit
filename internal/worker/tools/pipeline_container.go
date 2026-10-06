@@ -198,11 +198,16 @@ func (r *pipelineRun) containerCommand(ctx context.Context) (code int, fail *mem
 		}
 		return 0, failure("pipeline_service_failed", r.mask.mask(err.Error()))
 	}
+	memoryMiB := r.containerMemoryMiB
+	if memoryMiB == 0 {
+		memoryMiB = DefaultPipelineContainerMemoryMiB
+	}
+	memoryLimit := fmt.Sprintf("%dm", memoryMiB)
 	args := []string{"create", "--name", name, "--interactive", "--init", "--restart=no",
 		"--label", "io.memql.pipeline-attempt=" + name,
 		"--platform", r.req.platform, "--pull=missing", "--entrypoint", "/bin/sh",
 		"--cap-drop=ALL", "--security-opt=no-new-privileges", "--pids-limit=512",
-		"--cpus=2", "--memory=2g", "--memory-swap=2g",
+		"--cpus=2", "--memory=" + memoryLimit, "--memory-swap=" + memoryLimit,
 		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
 		"--mount", "type=bind,source=" + r.dir + ",target=/workspace",
 		"--workdir", "/workspace", "--env", "HOME=/tmp"}

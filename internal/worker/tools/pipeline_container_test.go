@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,62 @@ import (
 )
 
 const containerTestDigest = "example.com/test@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+func TestPipelineContainerMemoryComesFromLocalPolicy(t *testing.T) {
+	for _, limit := range []int{0, 4096} {
+		t.Run(fmt.Sprint(limit), func(t *testing.T) {
+			fx := newPipelineFixture(t)
+			allowLocalClones(t)
+			policy, _ := pipelineTestPolicy(t, fmt.Sprintf("  container_memory_mib: %d\n", limit))
+			argv := filepath.Join(t.TempDir(), "docker-argv")
+			fakePipelineDocker(t, `case "$1" in
+info) printf 'daemon-id\nlinux/arm64';;
+create) printf '%s\n' "$@" > `+shellLiteral(argv)+`;;
+image) echo linux/arm64;;
+start) cat >/dev/null;;
+inspect) printf '%s' '{"Status":"exited","Running":false,"ExitCode":0}';;
+rm|ps) exit 0;;
+esac`)
+			result := decoded(t)(runPipelineStep(context.Background(), "", stepArgs(t, fx, "exit 0", map[string]any{
+				"execution": "container", "platform": "linux/arm64", "image": containerTestDigest,
+				// A cluster request cannot enlarge the machine's policy.
+				"container_memory_mib": 32768,
+			}), policy, nil))
+			if result.ExitCode != 0 {
+				t.Fatalf("container exit %d", result.ExitCode)
+			}
+			args, err := os.ReadFile(argv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if limit == 0 {
+				limit = 2048
+			}
+			for _, expected := range []string{fmt.Sprintf("--memory=%dm\n", limit), fmt.Sprintf("--memory-swap=%dm\n", limit), "--cpus=2\n", "--cap-drop=ALL\n"} {
+				if !strings.Contains(string(args), expected) {
+					t.Errorf("missing %q in Docker arguments: %s", expected, args)
+				}
+			}
+		})
+	}
+}
+
+func TestInvalidPipelineMemoryRefusesBeforeCheckout(t *testing.T) {
+	fx := newPipelineFixture(t)
+	allowLocalClones(t)
+	for _, limit := range []int{-1, 255, 32769} {
+		t.Run(fmt.Sprint(limit), func(t *testing.T) {
+			policy, root := pipelineTestPolicy(t, fmt.Sprintf("  container_memory_mib: %d\n", limit))
+			_, fail := runPipelineStep(context.Background(), "", stepArgs(t, fx, "exit 0", nil), policy, nil)
+			if fail == nil || fail.GetErrorCode() != "denied_by_policy" || !strings.Contains(fail.GetErrorMessage(), "container_memory_mib") {
+				t.Fatalf("invalid memory was not explained/refused: %v", fail)
+			}
+			if _, err := os.Stat(root); !os.IsNotExist(err) {
+				t.Fatal("checkout started with invalid memory policy")
+			}
+		})
+	}
+}
 
 func TestPipelineExecutionRequiresAnHonestContract(t *testing.T) {
 	fx := newPipelineFixture(t)

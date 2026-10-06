@@ -886,6 +886,7 @@ func TestPipelineStepPacksTheDeclaredArtifacts(t *testing.T) {
 // must not turn into a character class. And a directory declared with a
 // trailing slash is the directory.
 func TestPipelineStepArtifactGlobsAreRelativeToTheCheckoutOnly(t *testing.T) {
+	isolatePipelineCapacity(t)
 	allowLocalClones(t)
 	fx := newPipelineFixture(t)
 	root := filepath.Join(t.TempDir(), "ci [main] *")
