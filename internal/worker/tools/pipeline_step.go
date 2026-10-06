@@ -34,6 +34,7 @@ import (
 //	{"action":"pipeline_step","pipeline_step":{
 //	  "cloneUrl":"https://github.com/o/r.git","sha":"<40 hex>","token":"<short-lived or empty>",
 //	  "repository":"o/r","command":"go test ./...","env":{"MEMQL_RUN_ID":"..."},
+//	  "execution":"native","platform":"darwin/arm64",
 //	  "secrets":{"NAME":"value"},"artifacts":["dist/report.xml"],"timeoutSec":1200}}
 //
 // answered with
@@ -64,12 +65,13 @@ import (
 // system gitconfig (no insteadOf onto the owner's SSH key), none of the
 // machine's GIT_ variables, no prompt.
 //
-// THE COMMAND INHERITS THE MACHINE'S ENVIRONMENT, unlike exec, which replaces
+// A NATIVE COMMAND INHERITS THE MACHINE'S ENVIRONMENT, unlike exec, which replaces
 // it: a CI step needs this machine's PATH and toolchains. The request's env and
 // secrets are laid over it. The one thing held back is the worker's own
 // credential (MEMQL_WORKER_TOKEN), so a test that prints its environment does
 // not print it into a log. This is not a sandbox: the step runs as the user
-// the worker runs as, which is what pipelines.allow consents to.
+// the worker runs as, which is what pipelines.allow consents to. Container
+// commands instead follow the explicit image/platform contract in pipeline_container.go.
 //
 // SECRETS ARE MASKED as the cluster masks them -- "***" for every value in
 // every form it is printed in: as stored, without the whitespace around it,
@@ -161,6 +163,11 @@ type pipelineStepRequest struct {
 	secrets    map[string]string
 	artifacts  []string
 	timeoutSec int
+	execution  string
+	platform   string
+	image      string
+	dockerID   string
+	needs      []string
 }
 
 // runPipelineStep implements workerHost.pipeline_step. agentID is the
@@ -201,6 +208,23 @@ func runPipelineStep(ctx context.Context, agentID string, args map[string]any, p
 	timeout := pipelineStepTimeout(req.timeoutSec, settings.MaxTimeoutSec)
 	stepCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	reservation, err := acquirePipelineReservation()
+	if err != nil {
+		code := "pipeline_capacity_unavailable"
+		if errors.Is(err, errPipelineBusy) {
+			code = "pipeline_capacity_busy"
+		}
+		return refuse(code, err)
+	}
+	defer reservation.close()
+	if reservation.dirty {
+		if err := reconcilePipelineReservation(stepCtx, reservation); err != nil {
+			return refuse("pipeline_recovery_required", err)
+		}
+	}
+	if err := checkPipelineRuntime(stepCtx, &req); err != nil {
+		return refuse("pipeline_runtime_unavailable", err)
+	}
 
 	if err := os.MkdirAll(settings.WorkspaceRoot, 0o700); err != nil {
 		return refuse("exec_failed", fmt.Errorf("pipeline_step: cannot make the pipelines workspace root %s (pipelines.workspace_root): %w", settings.WorkspaceRoot, err))
@@ -209,9 +233,13 @@ func runPipelineStep(ctx context.Context, agentID string, args map[string]any, p
 	if err != nil {
 		return refuse("exec_failed", fmt.Errorf("pipeline_step: cannot make a step directory under %s: %w", settings.WorkspaceRoot, err))
 	}
-	defer removeStepDir(dir)
+	defer func() {
+		if !reservation.dirty {
+			removeStepDir(dir)
+		}
+	}()
 
-	run := &pipelineRun{req: req, dir: dir, mask: mask, emit: emit, started: started}
+	run := &pipelineRun{req: req, dir: dir, mask: mask, emit: emit, started: started, reservation: reservation}
 	if fail := run.fetch(stepCtx); fail != nil {
 		return nil, fail
 	}
@@ -301,6 +329,9 @@ func parsePipelineStep(args map[string]any) (pipelineStepRequest, error) {
 	}
 	if strings.TrimSpace(req.command) == "" {
 		return req, errors.New("pipeline_step: command required")
+	}
+	if err := parsePipelineExecution(args, &req); err != nil {
+		return req, err
 	}
 	var err error
 	if req.env, err = stringMap(args, "env"); err != nil {
@@ -479,11 +510,12 @@ func macDeveloperToolsPresent() bool {
 
 // pipelineRun is one step in flight.
 type pipelineRun struct {
-	req     pipelineStepRequest
-	dir     string
-	mask    *secretMasker
-	emit    outputEmitter
-	started time.Time
+	req         pipelineStepRequest
+	dir         string
+	mask        *secretMasker
+	emit        outputEmitter
+	started     time.Time
+	reservation *pipelineReservation
 	// bytes is the output the step produced, before masking.
 	bytes atomic.Int64
 }
@@ -530,11 +562,20 @@ func (r *pipelineRun) fetch(ctx context.Context) *memqlv1.Failure {
 // command runs the step's command in the checkout and reports its exit
 // status: its own code, or 128 plus the signal that ended it.
 func (r *pipelineRun) command(ctx context.Context) (int, *memqlv1.Failure) {
+	if r.req.execution == "container" {
+		return r.containerCommand(ctx)
+	}
+	if err := r.reservation.begin(pipelineAttemptRecord{Execution: "native", Workspace: r.dir}); err != nil {
+		return 0, failure("pipeline_recovery_required", err.Error())
+	}
 	cmd := exec.Command("/bin/sh", "-c", r.req.command)
 	cmd.Dir = r.dir
 	cmd.Env = stepEnvironment(os.Environ(), r.req.env, r.req.secrets)
 	res, err := runGroup(ctx, cmd, r.mask, r.emit)
 	r.bytes.Add(res.bytes)
+	if err := r.reservation.clear(); err != nil {
+		return 0, failure("pipeline_recovery_required", "pipeline_step: could not clear the completed build reservation")
+	}
 	if res.stopped {
 		return 0, r.stopped(ctx)
 	}

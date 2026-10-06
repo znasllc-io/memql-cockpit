@@ -109,6 +109,8 @@ func FuzzSanitizeLedgerName(f *testing.F) {
 // case would not think of ("aaa" inside "aaaa", a secret that is a
 // prefix of itself, a secret spanning a rune boundary).
 func FuzzRedactor(f *testing.F) {
+	f.Add("0000000[", "00000000000000[")
+	f.Add("session credential", "a session credential here")
 	for _, seed := range []struct{ secret, body string }{
 		{"mql_wkr_abc123", "Authorization: Bearer mql_wkr_abc123"},
 		{"aa", "aaaa"},

@@ -69,7 +69,7 @@ type Runner struct {
 	pulls     *modelPuller
 	heartbeat time.Duration
 	serve     func() string
-	pipelines func() bool
+	pipelines func() tools.PipelinesPolicy
 	metrics   *Metrics
 
 	// toolCalls is every tool call in flight, so a ToolCancel -- or the
@@ -228,11 +228,9 @@ type Options struct {
 	// Nil reports tools.ServeOwner, which is the fail-closed default a
 	// build that does not wire this should send.
 	InferenceServe func() string
-	// PipelinesAllowed reads policy.yaml's pipelines.allow from the live
-	// policy (memql#5494): this machine registers pipelines=allowed exactly
-	// when it is true. A FUNCTION for InferenceServe's reason -- a SIGHUP
-	// changes it. Nil reports false, the default-deny.
-	PipelinesAllowed func() bool
+	// PipelinesPolicy reads the live allow flag and repository list together.
+	// A policy reload changes both. Nil grants no pipeline execution.
+	PipelinesPolicy func() tools.PipelinesPolicy
 	// ModelPull wires the cluster-driven pull (engine epic memql#5103;
 	// the install wizard's D13). Nil, or a Models of nil, means this
 	// build pulls nothing and answers every ModelPullStart with ok=false
@@ -266,7 +264,7 @@ func NewRunner(opts Options) (*Runner, error) {
 		heartbeat: hb,
 		metrics:   opts.Metrics,
 		serve:     opts.InferenceServe,
-		pipelines: opts.PipelinesAllowed,
+		pipelines: opts.PipelinesPolicy,
 		stop:      make(chan struct{}),
 		closed:    make(chan struct{}),
 		// Room for one. A nil channel would be safe (both the send and
@@ -437,7 +435,7 @@ func (r *Runner) connect(ctx context.Context) (*Connection, error) {
 	if dial == nil {
 		dial = func(ctx context.Context, cfg Config) (stream, error) { return dialSDK(ctx, cfg, r.logger) }
 	}
-	inventory, modelInv, serve, pipelines := r.inventory(ctx), r.modelInventory(ctx), r.inferenceServe(), r.pipelinesAllowed()
+	inventory, modelInv, serve, pipelines := r.inventory(ctx), r.modelInventory(ctx), r.inferenceServe(), r.pipelinesPolicy()
 	s, err := dial(ctx, r.cfg)
 	if err != nil {
 		return nil, err
@@ -651,9 +649,12 @@ func (r *Runner) inferenceServe() string {
 	return tools.ServeOwner
 }
 
-// pipelinesAllowed reads the live pipelines consent, defaulting closed.
-func (r *Runner) pipelinesAllowed() bool {
-	return r.pipelines != nil && r.pipelines()
+// pipelinesPolicy reads the live pipelines consent, defaulting closed.
+func (r *Runner) pipelinesPolicy() tools.PipelinesPolicy {
+	if r.pipelines == nil {
+		return tools.PipelinesPolicy{}
+	}
+	return r.pipelines()
 }
 
 // modelInventory takes the current local model inventory, or the zero
@@ -729,8 +730,8 @@ func (r *Runner) maybeReadvertiseModels(ctx context.Context, conn *Connection) b
 	// The pipelines label is the advertisement's third part (memql#5494),
 	// and an ordinary one: no floor bypass of its own, because a step routed
 	// on a stale grant is refused by the live policy before it runs.
-	pipelines := r.pipelinesAllowed()
-	pipelinesChanged := pipelines != conn.AdvertisedPipelines
+	pipelines := r.pipelinesPolicy()
+	pipelinesChanged := pipelines.AdvertisementFingerprint() != conn.AdvertisedPipelines
 	if !serveChanged && !labelsChanged && !pipelinesChanged {
 		// A withdrawal the owner took back before it landed: the
 		// advertisement on the wire is right again, so nothing is
@@ -776,8 +777,7 @@ func (r *Runner) maybeReadvertiseModels(ctx context.Context, conn *Connection) b
 		r.logger.Info("inference.serve changed; reconnecting so the cluster sees it",
 			"from", conn.AdvertisedServe, "to", serve)
 	case pipelinesChanged:
-		r.logger.Info("pipelines.allow changed; reconnecting so the cluster routes pipeline steps by it",
-			"from", conn.AdvertisedPipelines, "to", pipelines)
+		r.logger.Info("pipeline repository policy changed; reconnecting to update routing")
 	default:
 		r.logger.Info("local model inventory changed; reconnecting to re-advertise",
 			"models_offered", len(r.modelInventory(ctx).Advertised()),

@@ -419,16 +419,16 @@ func handleRun(args []string) {
 			HTTPClient: &http.Client{Timeout: 0},
 		})
 		runner, err = NewRunner(Options{
-			Logger:           logger,
-			Config:           legacyCfg,
-			Tools:            toolsFor(legacyCfg.Home),
-			Apps:             appInventories.For(legacyCfg.Home),
-			Models:           modelInventory,
-			Calls:            calls,
-			Sessions:         sessions,
-			Metrics:          metrics,
-			InferenceServe:   policy.InferenceServe,
-			PipelinesAllowed: policy.PipelinesAllowed,
+			Logger:          logger,
+			Config:          legacyCfg,
+			Tools:           toolsFor(legacyCfg.Home),
+			Apps:            appInventories.For(legacyCfg.Home),
+			Models:          modelInventory,
+			Calls:           calls,
+			Sessions:        sessions,
+			Metrics:         metrics,
+			InferenceServe:  policy.InferenceServe,
+			PipelinesPolicy: policy.Pipelines,
 			ModelPull: &ModelPullOptions{
 				PolicyPath:   policyPath,
 				OllamaBase:   discoverer.ResolvedOllamaBaseURL,
@@ -1067,7 +1067,7 @@ func logLevelProblems(logger *slog.Logger, policy *tools.Policy) {
 // reading the log learns why the worker is about to reconnect.
 func reloadPolicy(logger *slog.Logger, policy *tools.Policy) bool {
 	serveBefore := policy.InferenceServe()
-	pipelinesBefore := policy.PipelinesAllowed()
+	pipelinesBefore := policy.Pipelines().AdvertisementFingerprint()
 	if err := policy.Reload(); err != nil {
 		logger.Warn("policy reload failed", "error", err)
 		return false
@@ -1081,12 +1081,11 @@ func reloadPolicy(logger *slog.Logger, policy *tools.Policy) bool {
 		logger.Info("inference.serve changed; every cluster stream re-registers to carry it",
 			"from", serveBefore, "to", after)
 	}
-	if after := policy.PipelinesAllowed(); after != pipelinesBefore {
+	if after := policy.Pipelines().AdvertisementFingerprint(); after != pipelinesBefore {
 		// So does the pipelines label (memql#5494). A step already routed
 		// here on the old answer meets the new one when it arrives: the
 		// policy is read live.
-		logger.Info("pipelines.allow changed; every cluster stream re-registers to carry it",
-			"from", pipelinesBefore, "to", after)
+		logger.Info("pipeline repository policy changed; every cluster stream re-registers to carry it")
 	}
 	return true
 }

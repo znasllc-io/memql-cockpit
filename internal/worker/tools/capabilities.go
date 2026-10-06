@@ -81,13 +81,18 @@ var buildAgnosticComputerActions = []string{computerWaitAction}
 // key this side misspells is never rejected, never logged, and simply
 // never read.
 type CapabilityDescriptor struct {
-	Platform             string   `json:"platform"`
-	DisplayServer        string   `json:"displayServer"`
-	ComputerUseAvailable bool     `json:"computerUseAvailable"`
-	Actions              []string `json:"actions"`
-	Displays             int      `json:"displays"`
-	InferenceServe       string   `json:"inferenceServe"`
-	SchemaVersion        int      `json:"schemaVersion"`
+	Architecture string `json:"architecture"`
+	// ActionContracts comes from the implementation, never operator labels.
+	// Version 2 requires explicit execution/platform and executes image digests.
+	ActionContracts      map[string]int      `json:"actionContracts,omitempty"`
+	RepositoryScopes     map[string][]string `json:"repositoryScopes,omitempty"`
+	Platform             string              `json:"platform"`
+	DisplayServer        string              `json:"displayServer"`
+	ComputerUseAvailable bool                `json:"computerUseAvailable"`
+	Actions              []string            `json:"actions"`
+	Displays             int                 `json:"displays"`
+	InferenceServe       string              `json:"inferenceServe"`
+	SchemaVersion        int                 `json:"schemaVersion"`
 }
 
 // ComputeCapabilities builds the descriptor for the running binary
@@ -125,6 +130,8 @@ func computeCapabilities(goos string, getenv func(string) string) CapabilityDesc
 		displays = displayCount()
 	}
 	return CapabilityDescriptor{
+		Architecture:         runtime.GOARCH,
+		ActionContracts:      map[string]int{"workerHost.pipeline_step": 2},
 		Platform:             goos,
 		DisplayServer:        displayServer,
 		ComputerUseAvailable: buildHasComputerUse,
@@ -173,7 +180,7 @@ func detectDisplayServer(goos string, getenv func(string) string) string {
 // workerComputer.capabilities. Same source of truth as that action
 // (ComputeCapabilities), so the two can never disagree.
 func CapabilityDescriptorJSON() (string, error) {
-	return CapabilityDescriptorJSONFor(ServeOwner)
+	return CapabilityDescriptorJSONFor(ServeOwner, nil)
 }
 
 // CapabilityDescriptorJSONFor is the same descriptor with this
@@ -185,8 +192,9 @@ func CapabilityDescriptorJSON() (string, error) {
 // give this function a filesystem dependency on the Register path, and
 // a machine whose policy.yaml had gone missing would then fail its
 // handshake over a field that is optional.
-func CapabilityDescriptorJSONFor(serve string) (string, error) {
+func CapabilityDescriptorJSONFor(serve string, scopes map[string][]string) (string, error) {
 	desc := ComputeCapabilities()
+	desc.RepositoryScopes = scopes
 	// Normalised HERE as well as in the policy, because this function
 	// takes a bare string from any caller. Anything that is not the
 	// grant is the default, which is the direction a consent has to
@@ -211,6 +219,7 @@ func runComputerCapabilities() (*memqlv1.Success, *memqlv1.Failure) {
 	preview := fmt.Sprintf("platform=%s displayServer=%s computerUseAvailable=%t actions=%d displays=%d",
 		desc.Platform, desc.DisplayServer, desc.ComputerUseAvailable, len(desc.Actions), desc.Displays)
 	return successComputerJSON(map[string]any{
+		"actionContracts":      desc.ActionContracts,
 		"platform":             desc.Platform,
 		"displayServer":        desc.DisplayServer,
 		"computerUseAvailable": desc.ComputerUseAvailable,

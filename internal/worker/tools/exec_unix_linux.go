@@ -2,9 +2,17 @@
 
 package tools
 
-import "syscall"
+import (
+	"fmt"
+	"math"
+)
 
-// applyMemoryLimit sets RLIMIT_AS on Linux. Best-effort.
-func applyMemoryLimit(bytes uint64) {
-	_ = syscall.Setrlimit(syscall.RLIMIT_AS, &syscall.Rlimit{Cur: bytes, Max: bytes})
+func shellMemoryLimitKiB(megabytes int) (int, error) {
+	if megabytes <= 0 {
+		return 0, nil
+	}
+	if megabytes > math.MaxInt/1024 {
+		return 0, fmt.Errorf("shell memory limit is too large")
+	}
+	return megabytes * 1024, nil
 }

@@ -7,7 +7,12 @@ The arrangement is made in two places: the repository's pipeline says a step
 may run on the fleet, and this machine's `policy.yaml` says this machine will
 take it. Engine half: epic memql#5478 (`workerHost.pipeline_step`, issue
 memql#5494). This half: the `pipeline_step` action, the `pipelines` policy and
-the `pipelines=allowed` registration label.
+the `pipelines=allowed` registration label and the action's reported repository
+scope. A machine that does not report a scope is not eligible for a pipeline
+step; upgrade and reconnect it first. The runtime also reports
+`actionContracts["workerHost.pipeline_step"] = 2`. The engine requires this
+contract before sending an explicit native/container request; operator labels
+are not evidence of an implemented action contract.
 
 ---
 
@@ -33,7 +38,9 @@ Withdraw by removing `allow` (see below).
 commands it chooses, as you, for the repositories it names. The command is
 whatever the cluster sends -- this machine cannot see the pipeline it came
 from -- and it runs as the user the worker runs as, with that user's
-environment and files. This is not a sandbox. `pipelines.repos` narrows which
+environment and files for an explicitly native step. A container step uses
+only its declared image, checkout and supplied environment. Native execution
+is not a sandbox. `pipelines.repos` narrows which
 repositories; the clone URL must name the same repository, so the list filters
 what is actually cloned rather than a name the request states.
 
@@ -67,7 +74,8 @@ pipelines:
 `SIGHUP` reloads it (`kill -HUP $(pgrep -f 'memql worker run')`). The block
 **replaces** on reload rather than merging: removing `allow`, or narrowing
 `repos`, takes effect for the next step that arrives. The worker then
-re-registers so the cluster's router sees the new answer -- at the first moment
+re-registers for either an allow-flag or repository-list change so the
+cluster's router sees the new answer -- at the first moment
 nothing is running, because work in flight is never cut short. A step routed
 here on the old answer in the meantime is refused by the new one.
 
@@ -80,9 +88,24 @@ here on the old answer in the meantime is refused by the new one.
    setting to change. Then the request itself: an https clone URL whose path
    names the step's `repository` (`https://github.com/o/r.git` names `o/r`),
    and so on (`bad_request`). Nothing is created before all of it passes.
-2. **A fresh directory**, `step-*` under `workspace_root`, readable only by
+2. **Runtime and capacity.** `execution` is explicitly `native` or `container`.
+   `platform` names `darwin/arm64`, `darwin/amd64`, `linux/arm64` or
+   `linux/amd64`. Native work must match the binary-reported host OS/architecture. A native
+   `needs: [docker]` request also probes the daemon before checkout. Host needs
+   never pass through a container boundary. Container work requires a
+   Linux platform and an `image` pinned by `@sha256:...`; a live Docker probe
+   must match it without emulation. No host-shell fallback occurs. Services
+   and caches currently refuse on this fleet contract rather than being
+   silently omitted.
+
+   A kernel file lock reserves one build slot across all cluster enrollments
+   and worker processes running as the same operating-system user, regardless
+   of `MEMQL_HOME` or checkout location. Occupied capacity returns
+   `pipeline_capacity_busy` before cloning. This bounds pipeline concurrency;
+   it does not reserve resources consumed by agents or other OS users.
+3. **A fresh directory**, `step-*` under `workspace_root`, readable only by
    you.
-3. **The checkout**, the cluster Job's own clone script: `git init`, a depth-1
+4. **The checkout**, the cluster Job's own clone script: `git init`, a depth-1
    `git fetch` of exactly the commit, `git checkout FETCH_HEAD`.
    - Over `https` only. `ssh` and scp-like URLs would fetch with this machine's
      SSH key, and plain `http` would send the token in the clear.
@@ -94,22 +117,26 @@ here on the old answer in the meantime is refused by the new one.
      (so no `insteadOf` can turn it into an SSH fetch with your key), resets
      every credential helper, carries none of the worker's `GIT_` variables,
      and never prompts. Proxies set through `HTTPS_PROXY` still apply.
-4. **The command**, `/bin/sh -c <command>` in the checkout, in a process group
-   of its own. It runs with **this machine's environment** -- its `PATH` and
-   toolchains -- plus the step's environment variables and secrets. The one
-   thing held back is the worker's own credential (`MEMQL_WORKER_TOKEN`), so a
-   test that prints its environment does not print it into a log.
-5. **Output**, streamed to the cluster as it is written, stdout and stderr
+5. **The command.** Native work uses `/bin/sh -c <command>` with the host's
+   toolchains and environment, excluding `MEMQL_WORKER_TOKEN`. Container work
+   uses `/bin/sh` in the declared image with just the checkout mounted, as the
+   worker's UID/GID, and no Docker socket, privileged mode, host ports or host
+   network. Its current bounds are two CPUs, 2 GiB memory and 512 processes.
+   Request environment and multiline secrets travel to the container shell
+   over stdin, never to the host Docker client's environment or arguments.
+   The worker checks Docker's terminal container state before accepting an
+   exit status; losing the attached client is not a completed build.
+6. **Output**, streamed to the cluster as it is written, stdout and stderr
    apart. Every secret value of four characters or more -- and each line of a
    multi-line one -- is replaced with `***` before it leaves this machine.
    Output leaves in whole lines; a line longer than 64 KiB is sent in parts cut
    where no secret straddles, and held back for as long as a secret longer than
    that may still be arriving in it.
-6. **The timeout.** Past it, the whole process group is sent `SIGTERM`, and
+7. **The timeout.** Past it, the whole process group is sent `SIGTERM`, and
    `SIGKILL` ten seconds later; the step fails as `timeout`. When the command
    ends, anything it left running in its group is killed, the way a pod's
    teardown ends what its container started.
-7. **Artifacts**, the declared paths or globs relative to the checkout,
+8. **Artifacts**, the declared paths or globs relative to the checkout,
    directories taken whole, packed as a `tar.gz`. Only regular files travel,
    and never through a link that leads out of the checkout. Up to 64 MiB of
    files and 20 MiB compressed -- what one result can carry on the worker
@@ -117,8 +144,18 @@ here on the old answer in the meantime is refused by the new one.
    left out and the result says `artifactsTooLarge`; the step keeps its own
    exit status. A declared path nothing matched is listed in
    `artifactsMissing`.
-8. **The directory is removed**, whatever happened -- a tree the step made
-   read-only included.
+9. **Cleanup and recovery.** Container cancellation removes the exact attempt's
+   container with a separate bounded cleanup context. Its reservation is
+   cleared only after confirmed removal; an uncertain cleanup reports
+   `pipeline_cleanup_uncertain` and retains the workspace and durable record.
+   A replacement worker reconciles that recorded container only after the
+   original Docker daemon identifies itself. An unavailable or different
+   daemon, a corrupt record, or interrupted native work keeps capacity blocked
+   with `pipeline_recovery_required`. Native recovery needs operator inspection
+   because this contract cannot prove that a process escaped no group.
+   Completed work removes its checkout, including read-only trees. A local
+   cleanup receipt does not authorize replaying an external publication or
+   deployment; the engine must separately reconcile those effects.
 
 The result is the step's exit code (or 128 plus the signal that ended it, as a
 shell reports it), its duration, the artifacts and the missing paths:
@@ -163,10 +200,12 @@ A step inherits the **worker's** environment, which is not your login shell's.
 
 `shell.allow`, `shell.deny`, `shell.run_as_user` and the shell's `max_*`
 limits do not apply to a step: the command is the pipeline runner's,
-`pipelines` is its consent, and `max_timeout_sec` its limit. One caveat: the
-worker applies the shell's `max_*` limits to its own process the first time it
-runs a `workerHost.exec` call, and every process it starts after that -- a
-step included -- inherits them until the worker restarts.
+`pipelines` is its consent, and `max_timeout_sec` its limit. Shell resource
+limits are applied inside the exec call's child before its command starts;
+they do not change the worker or later pipeline steps. Limits imposed by the
+worker's launch service still apply to every child. Restart the worker when
+upgrading an older build that changed its own limits: lowered hard limits
+cannot be repaired in that running process.
 
 ---
 
@@ -178,3 +217,14 @@ step included -- inherits them until the worker restarts.
 - **Leftover cleanup after a crash.** A worker killed mid-step leaves that
   step's `step-*` directory behind. Anything under `workspace_root` that no
   step is running in can be deleted.
+
+## Local contract verification
+
+The worker test suite clones fixture commits from a local repository. Set
+`MEMQL_TEST_DOCKER_IMAGE` to an existing pinned Linux image to require the real
+Docker cases; daemon failure then fails the tests rather than skipping them.
+These verify the actual image/checkout, environment separation, multiline
+secret masking, artifacts, cancellation/removal, and recovery of an orphaned
+container. Separate process tests verify that cluster-specific workers cannot
+reserve the same build slot and cannot discard an interrupted attempt record.
+No test upgrades the installed worker or enables its pipeline policy.

@@ -852,7 +852,7 @@ func TestRunAStreamDropEndsTheToolCallsInFlight(t *testing.T) {
 func TestRunAGrantedPipelinesPolicyReRegistersWithTheLabel(t *testing.T) {
 	var allowed atomic.Bool
 	cluster := newFakeCluster(func(int) answer { return accept() })
-	r := runnerAgainst(t, cluster, Options{Config: testHomeConfig(t, "prod"), PipelinesAllowed: allowed.Load}, nil, &waitRecorder{})
+	r := runnerAgainst(t, cluster, Options{Config: testHomeConfig(t, "prod"), PipelinesPolicy: func() tools.PipelinesPolicy { return tools.PipelinesPolicy{Allow: allowed.Load()} }}, nil, &waitRecorder{})
 	runInBackground(t, r)
 	first := cluster.next(t)
 	awaitRegistered(t, r)

@@ -51,8 +51,9 @@ type Policy struct {
 // have the appropriate capability); silently ignored otherwise.
 //
 // The MaxCPUSeconds / MaxMemoryMB / MaxOpenFiles fields apply
-// rlimits to the child process via syscall.Setrlimit on Unix
-// (Linux + macOS). Zero or negative values leave the corresponding
+// rlimits in the child shell before the command starts on Linux/macOS; the
+// worker's own limits are unchanged. macOS does not apply max_memory_mb.
+// Zero or negative values leave the corresponding
 // rlimit at the inherited default.
 type ShellPolicy struct {
 	Allow         []string `yaml:"allow"`

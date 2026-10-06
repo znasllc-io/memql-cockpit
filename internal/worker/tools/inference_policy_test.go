@@ -92,7 +92,7 @@ func TestInferenceServeIsRevokableByReload(t *testing.T) {
 // the engine's ParseCapabilityDescriptor tolerates unknown keys in.
 func TestCapabilityDescriptorCarriesInferenceServe(t *testing.T) {
 	for _, serve := range []string{tools.ServeOwner, tools.ServeCluster} {
-		raw, err := tools.CapabilityDescriptorJSONFor(serve)
+		raw, err := tools.CapabilityDescriptorJSONFor(serve, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -115,7 +115,7 @@ func TestCapabilityDescriptorCarriesInferenceServe(t *testing.T) {
 // This is the same rule Displays shipped under, written down where the
 // next additive field will be added.
 func TestCapabilityDescriptorSchemaVersionStaysOne(t *testing.T) {
-	raw, err := tools.CapabilityDescriptorJSONFor(tools.ServeCluster)
+	raw, err := tools.CapabilityDescriptorJSONFor(tools.ServeCluster, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func TestCapabilityDescriptorSchemaVersionStaysOne(t *testing.T) {
 // A bare string from any caller is normalised the same way the policy
 // normalises one. Anything that is not the grant is the default.
 func TestCapabilityDescriptorNormalisesAnUnknownConsent(t *testing.T) {
-	raw, err := tools.CapabilityDescriptorJSONFor("everyone")
+	raw, err := tools.CapabilityDescriptorJSONFor("everyone", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
