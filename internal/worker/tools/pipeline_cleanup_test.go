@@ -158,3 +158,61 @@ func TestPipelineMaintenanceRetriesAndStopsWithoutACluster(t *testing.T) {
 		t.Fatalf("cleanup did not retry: %d", calls)
 	}
 }
+
+func TestWorkspaceIdentityPrecedesCreationAndSurvivesPreCheckoutCrash(t *testing.T) {
+	reservation := testPipelineReservation(t)
+	root := t.TempDir()
+	dir, err := makePipelineWorkspace(reservation, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := reservation.read()
+	if err != nil || record.Execution != "cleanup" || record.Workspace != dir {
+		t.Fatalf("workspace has no durable owner: %+v %v", record, err)
+	}
+	reservation.close()
+	if cleaned, err := reconcileIdlePipeline(context.Background()); !cleaned || err != nil {
+		t.Fatalf("pre-checkout crash left scratch data: %v %v", cleaned, err)
+	}
+	assertNoStepDirs(t, root)
+}
+
+func TestWorkspaceIsNotCreatedWhenOwnershipCannotBeRecorded(t *testing.T) {
+	reservation := testPipelineReservation(t)
+	reservation.close()
+	root := t.TempDir()
+	if _, err := makePipelineWorkspace(reservation, root); err == nil {
+		t.Fatal("created scratch without a durable record")
+	}
+	assertNoStepDirs(t, root)
+}
+
+func TestCheckoutCrashKeepsItsIdentityAndCannotBeOverwritten(t *testing.T) {
+	reservation := testPipelineReservation(t)
+	workspace, err := makePipelineWorkspace(reservation, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reservation.begin(pipelineAttemptRecord{Execution: "checkout", Workspace: workspace}); err != nil {
+		t.Fatal(err)
+	}
+	if err := reservation.begin(pipelineAttemptRecord{Execution: "native", Workspace: workspace}); !errors.Is(err, errPipelineUnreconciled) {
+		t.Fatal("unconfirmed Git process ownership was overwritten", err)
+	}
+	reservation.close()
+	if cleaned, err := reconcileIdlePipeline(context.Background()); cleaned || !errors.Is(err, errPipelineUnreconciled) {
+		t.Fatalf("checkout process absence was guessed: cleaned=%v err=%v", cleaned, err)
+	}
+	if _, err := os.Stat(workspace); err != nil {
+		t.Fatal("uncertain checkout workspace removed", err)
+	}
+	replacement, err := acquirePipelineReservation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replacement.close()
+	record, err := replacement.read()
+	if err != nil || record.Execution != "checkout" || record.Workspace != workspace {
+		t.Fatalf("checkout identity lost: %+v %v", record, err)
+	}
+}

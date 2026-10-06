@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -254,7 +256,7 @@ func runPipelineStep(ctx context.Context, agentID string, args map[string]any, p
 	if err := os.MkdirAll(settings.WorkspaceRoot, 0o700); err != nil {
 		return refuse("exec_failed", fmt.Errorf("pipeline_step: cannot make the pipelines workspace root %s (pipelines.workspace_root): %w", settings.WorkspaceRoot, err))
 	}
-	dir, err := os.MkdirTemp(settings.WorkspaceRoot, "step-")
+	dir, err := makePipelineWorkspace(reservation, settings.WorkspaceRoot)
 	if err != nil {
 		return refuse("exec_failed", fmt.Errorf("pipeline_step: cannot make a step directory under %s: %w", settings.WorkspaceRoot, err))
 	}
@@ -567,7 +569,17 @@ func (r *pipelineRun) note(stderr bool, line string) {
 
 // fetch makes the step directory a checkout of the sha: init, a depth-1 fetch
 // of exactly that commit, FETCH_HEAD checked out -- the Job's clone script.
-func (r *pipelineRun) fetch(ctx context.Context) *memqlv1.Failure {
+func (r *pipelineRun) fetch(ctx context.Context) (failed *memqlv1.Failure) {
+	if err := r.reservation.begin(pipelineAttemptRecord{Execution: "checkout", Workspace: r.dir}); err != nil {
+		return failure("pipeline_recovery_required", "pipeline_step: could not record checkout ownership")
+	}
+	defer func() {
+		// runGroup has joined each Git process and stopped its group. Only
+		// this normal return proves that no checkout command is still writing.
+		if err := r.reservation.cleanupReady(r.dir); err != nil {
+			failed = failure("pipeline_recovery_required", "pipeline_step: checkout ended but cleanup could not be recorded")
+		}
+	}()
 	env := gitEnvironment(os.Environ(), r.req.token)
 	for _, args := range [][]string{
 		{"init", "-q"},
@@ -758,6 +770,30 @@ func finishPipelineWorkspace(reservation *pipelineReservation, dir string) error
 
 // Injectable filesystem boundary for cleanup failure and recovery tests.
 var removePipelineWorkspace = removeStepDir
+
+// Record the scratch identity before creating it, including the crash window
+// before Git starts. A crash during Git leaves an explicit checkout attempt,
+// never an unrecorded directory that a later build can silently abandon.
+func makePipelineWorkspace(reservation *pipelineReservation, root string) (string, error) {
+	root, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", err
+	}
+	dir := filepath.Join(root, "step-"+hex.EncodeToString(nonce[:]))
+	if err := reservation.cleanupReady(dir); err != nil {
+		return "", err
+	}
+	if err := os.Mkdir(dir, 0700); err != nil {
+		// The directory was not created by this call. Never remove an
+		// existing namesake or infer ownership from a failed mkdir.
+		return "", errors.Join(err, reservation.clear())
+	}
+	return dir, nil
+}
 
 // --- running a process group --------------------------------------------
 

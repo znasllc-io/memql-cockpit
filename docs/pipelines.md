@@ -249,8 +249,10 @@ cannot be repaired in that running process.
 - **A consent window for steps.** The policy is the consent.
 - **Guessing ownership after a crash.** Recovery uses the durable attempt
   record and the original Docker daemon, never an age-based sweep or a global
-  Docker prune. Interrupted native commands and a crash during cloning before
-  a runtime attempt is recorded still need operator reconciliation. Do not
+  Docker prune. Interrupted native commands and a crash while Git is still running
+  still need operator reconciliation. The checkout identity is recorded before
+  its directory is created, so these interruptions retain a specific ownership
+  record; a pre-checkout crash is cleaned automatically. Do not
   delete a workspace merely because its name starts with `step-`.
 
 ## Local contract verification
