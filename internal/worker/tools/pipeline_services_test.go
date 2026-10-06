@@ -59,10 +59,13 @@ logs) exit 0;;
 *) exit 9;;
 esac`)
 			reservation := testPipelineReservation(t)
-			run := &pipelineRun{reservation: reservation, dir: t.TempDir(), req: pipelineStepRequest{execution: "container", dockerID: "daemon-id", platform: "linux/arm64", image: containerTestDigest, services: []pipelineService{{name: "db", image: containerTestDigest, ready: "false"}, {name: "other", image: containerTestDigest}}}, mask: newSecretMasker(nil), emit: func(bool, []byte) {}}
+			run := &pipelineRun{reservation: reservation, dir: pipelineTestWorkspace(t), req: pipelineStepRequest{execution: "container", dockerID: "daemon-id", platform: "linux/arm64", image: containerTestDigest, services: []pipelineService{{name: "db", image: containerTestDigest, ready: "false"}, {name: "other", image: containerTestDigest}}}, mask: newSecretMasker(nil), emit: func(bool, []byte) {}}
 			_, fail := run.containerCommand(context.Background())
 			if fail == nil {
 				t.Fatal("service failure became success")
+			}
+			if err := finishPipelineWorkspace(reservation, run.dir); err != nil {
+				t.Fatal(err)
 			}
 			if (failAt == "cleanup") != reservation.dirty {
 				t.Fatalf("dirty=%v after %s", reservation.dirty, failAt)

@@ -311,6 +311,8 @@ func runConfiguredWorker(clusterURL, token, name string, logger *slog.Logger) er
 
 	restoreTermios := enableQuitHotkeys(ctx, cancel, logger)
 	defer restoreTermios()
+	stopPipelineMaintenance := tools.StartPipelineMaintenance(ctx, logger)
+	defer stopPipelineMaintenance()
 
 	var runErr error
 	if fleet != nil {

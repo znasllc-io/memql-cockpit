@@ -79,6 +79,15 @@ func newPipelineFixture(t *testing.T) pipelineFixture {
 	return pipelineFixture{url: "file://" + bare, shas: shas}
 }
 
+func pipelineTestWorkspace(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp(t.TempDir(), "step-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
 // allowLocalClones opens the file:// door for one test.
 func allowLocalClones(t *testing.T) {
 	t.Helper()

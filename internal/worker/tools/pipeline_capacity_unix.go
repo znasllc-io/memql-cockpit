@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -43,6 +44,24 @@ type pipelineAttemptRecord struct {
 
 var errPipelineBusy = errors.New("this machine's build capacity is occupied")
 var errPipelineUnreconciled = errors.New("an interrupted build needs reconciliation before this machine can accept another build")
+
+func hasPipelineAttempt() (bool, error) {
+	root, err := pipelineCapacityRoot()
+	if err != nil {
+		return false, err
+	}
+	stat, err := os.Lstat(filepath.Join(root, "pipeline.lock"))
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !stat.Mode().IsRegular() {
+		return false, errPipelineUnreconciled
+	}
+	return stat.Size() != 0, nil
+}
 
 func acquirePipelineReservation() (*pipelineReservation, error) {
 	root, err := pipelineCapacityRoot()
@@ -99,6 +118,37 @@ func (r *pipelineReservation) begin(record pipelineAttemptRecord) error {
 	}
 	return r.file.Sync()
 }
+
+// cleanupReady is written only after runtime teardown is confirmed. A
+// replacement worker may then remove scratch data without Docker or replaying
+// the command. Keep the same locked inode throughout this transition.
+func (r *pipelineReservation) cleanupReady(workspace string) error {
+	if !filepath.IsAbs(workspace) || !strings.HasPrefix(filepath.Base(workspace), "step-") {
+		return errPipelineUnreconciled
+	}
+	if r.dirty {
+		record, err := r.read()
+		if err != nil {
+			return err
+		}
+		if record.Workspace != workspace {
+			return errPipelineUnreconciled
+		}
+	}
+	data, err := json.Marshal(pipelineAttemptRecord{Execution: "cleanup", Workspace: workspace})
+	if err != nil {
+		return err
+	}
+	r.dirty = true
+	if _, err = r.file.WriteAt(data, 0); err != nil {
+		return err
+	}
+	if err = r.file.Truncate(int64(len(data))); err != nil {
+		return err
+	}
+	return r.file.Sync()
+}
+
 func (r *pipelineReservation) clear() error {
 	if err := r.file.Truncate(0); err != nil {
 		return err

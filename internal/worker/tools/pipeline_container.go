@@ -184,9 +184,9 @@ func (r *pipelineRun) containerCommand(ctx context.Context) (code int, fail *mem
 		if err := removePipelineAttempt(cleanup, record); err != nil {
 			code = 0
 			fail = failure("pipeline_cleanup_uncertain", "pipeline_step: container cleanup could not be confirmed; do not replay this attempt until its container is reconciled: "+name)
-		} else if err := r.reservation.clear(); err != nil {
+		} else if err := r.reservation.cleanupReady(r.dir); err != nil {
 			code = 0
-			fail = failure("pipeline_recovery_required", "pipeline_step: container removed but its reservation could not be cleared")
+			fail = failure("pipeline_recovery_required", "pipeline_step: container removed but workspace cleanup could not be recorded")
 		}
 	}()
 	if strings.ContainsAny(r.dir, ",\n\r") {
@@ -305,6 +305,12 @@ func reconcilePipelineReservation(ctx context.Context, reservation *pipelineRese
 	if err != nil {
 		return err
 	}
+	if record.Execution == "cleanup" {
+		if !filepath.IsAbs(record.Workspace) || !strings.HasPrefix(filepath.Base(record.Workspace), "step-") || record.Container != "" || record.DockerID != "" || record.Network != "" || len(record.Services) != 0 {
+			return errPipelineUnreconciled
+		}
+		return finishPipelineWorkspace(reservation, record.Workspace)
+	}
 	if !validPipelineAttempt(record) {
 		return errPipelineUnreconciled
 	}
@@ -317,8 +323,8 @@ func reconcilePipelineReservation(ctx context.Context, reservation *pipelineRese
 	if err = removePipelineAttempt(cleanup, record); err != nil {
 		return errPipelineUnreconciled
 	}
-	if filepath.IsAbs(record.Workspace) && strings.HasPrefix(filepath.Base(record.Workspace), "step-") {
-		removeStepDir(record.Workspace)
+	if err := reservation.cleanupReady(record.Workspace); err != nil {
+		return err
 	}
-	return reservation.clear()
+	return finishPipelineWorkspace(reservation, record.Workspace)
 }

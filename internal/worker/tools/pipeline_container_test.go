@@ -176,7 +176,7 @@ inspect) printf '%s' `+shellLiteral(scenario.state)+`;;
 rm|ps) `+scenario.cleanup+`;;
 esac`)
 			reservation := testPipelineReservation(t)
-			run := &pipelineRun{reservation: reservation, dir: t.TempDir(), req: pipelineStepRequest{execution: "container", dockerID: "daemon-id", platform: "linux/arm64", image: containerTestDigest, command: "exit 0"}, mask: newSecretMasker(nil), emit: func(bool, []byte) {}}
+			run := &pipelineRun{reservation: reservation, dir: pipelineTestWorkspace(t), req: pipelineStepRequest{execution: "container", dockerID: "daemon-id", platform: "linux/arm64", image: containerTestDigest, command: "exit 0"}, mask: newSecretMasker(nil), emit: func(bool, []byte) {}}
 			_, fail := run.containerCommand(context.Background())
 			if fail == nil || fail.GetErrorCode() != scenario.code {
 				t.Fatalf("failure: %v", fail)
