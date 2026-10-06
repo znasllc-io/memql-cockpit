@@ -374,6 +374,15 @@ func parsePipelineStep(args map[string]any) (pipelineStepRequest, error) {
 			return req, fmt.Errorf("pipeline_step: %s is both an env variable and a secret", name)
 		}
 	}
+	if req.execution != "container" {
+		for _, name := range []string{"TMPDIR", "TMP", "TEMP"} {
+			_, envSet := req.env[name]
+			_, secretSet := req.secrets[name]
+			if envSet || secretSet {
+				return req, fmt.Errorf("pipeline_step: %s is owned by the native runner's scratch cleanup", name)
+			}
+		}
+	}
 	for _, cache := range req.caches {
 		for name := range pipelineCacheEnvironment[cache] {
 			if _, found := req.env[name]; found {
@@ -616,12 +625,21 @@ func (r *pipelineRun) command(ctx context.Context) (int, *memqlv1.Failure) {
 	if r.req.execution == "container" {
 		return r.containerCommand(ctx)
 	}
+	// The checkout already has durable ownership. Keep native tool scratch
+	// under it so failed packaging/compilation cannot strand files in the
+	// operator's global temp directory. Git's metadata directory keeps these
+	// files out of the source status and the build's VCS-dirty stamp.
+	scratch, err := os.MkdirTemp(filepath.Join(r.dir, ".git"), "memql-scratch-")
+	if err != nil {
+		return 0, failure("exec_failed", "pipeline_step: could not create owned native scratch")
+	}
 	if err := r.reservation.begin(pipelineAttemptRecord{Execution: "native", Workspace: r.dir}); err != nil {
 		return 0, failure("pipeline_recovery_required", err.Error())
 	}
 	cmd := exec.Command("/bin/sh", "-c", r.req.command)
 	cmd.Dir = r.dir
 	cmd.Env = stepEnvironment(os.Environ(), r.req.env, r.req.secrets)
+	cmd.Env = stepEnvironment(cmd.Env, map[string]string{"TMPDIR": scratch, "TMP": scratch, "TEMP": scratch}, nil)
 	res, err := runGroup(ctx, cmd, r.mask, r.emit)
 	r.bytes.Add(res.bytes)
 	if err := r.reservation.cleanupReady(r.dir); err != nil {

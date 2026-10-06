@@ -3,6 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$REPO_ROOT/../memql/scripts/lib/capability.sh"
+source "$REPO_ROOT/scripts/macos/build-scratch.sh"
 cap_init "cockpit.menubar.package" "Package the native menu app and standalone installer for this Mac architecture."
 cap_spec_param "arch" "Native release architecture: arm64 or amd64"
 cap_spec_param "output" "Output directory (default: dist)"
@@ -17,7 +18,8 @@ function main() {
     version="$(cap_param version "$(cat "$REPO_ROOT/VERSION")")"
     [[ "$arch" == arm64 || "$arch" == amd64 ]] || cap_fail 2 "arch must be arm64 or amd64"
     [[ "$output" == /* ]] || cap_fail 2 "output must be absolute"
-    stage="$(mktemp -d "${TMPDIR:-/tmp}/memql-menu-package.XXXXXX")"
+    create_build_scratch memql-menu-package
+    stage="$COCKPIT_BUILD_SCRATCH"
     "$REPO_ROOT/scripts/macos/build-menubar.sh" --output="$stage/MemQL Cockpit.app" --version="$version" >&2 || cap_fail 5 "menu build failed"
     expected_arch="$arch"
     [[ "$arch" != amd64 ]] || expected_arch=x86_64
@@ -28,7 +30,7 @@ function main() {
     asset="memql-menubar-darwin-${arch}.tar.gz"
     COPYFILE_DISABLE=1 tar -czf "$output/$asset" -C "$stage" 'MemQL Cockpit.app' scripts
     (cd "$output" && shasum -a 256 "$asset" > "$asset.sha256")
-    rm -rf "$stage"
+    cleanup_build_scratch || cap_fail 5 "build scratch cleanup failed"
     cap_changed
     cap_result_set archive "$output/$asset"
     cap_ok

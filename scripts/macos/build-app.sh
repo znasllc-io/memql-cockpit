@@ -3,6 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$REPO_ROOT/../memql/scripts/lib/capability.sh"
+source "$REPO_ROOT/scripts/macos/build-scratch.sh"
 cap_init "cockpit.app.build" "Bundle the actual worker and native menu as MemQL.app."
 cap_spec_param "worker" "Absolute path to the built macOS computer-use worker"
 cap_spec_param "output" "Absolute output .app path"
@@ -27,7 +28,8 @@ function main() {
     minimum_os="$(xcrun vtool -show-build "$worker" | awk '$1 == "minos" || $1 == "version" {print $2; exit}')"
     [[ "$minimum_os" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || cap_fail 3 "could not determine the worker's minimum macOS version"
     [[ "${minimum_os%%.*}" -ge 13 ]] || minimum_os=13.0
-    stage="$(mktemp -d "${TMPDIR:-/tmp}/memql-app.XXXXXX")"
+    create_build_scratch memql-app
+    stage="$COCKPIT_BUILD_SCRATCH"
     helper="$stage/MemQL.app/Contents/Library/LoginItems/MemQL Menu.app"
     mkdir -p "$(dirname "$helper")" "$stage/MemQL.app/Contents/MacOS" "$stage/MemQL.app/Contents/Resources"
     "$REPO_ROOT/scripts/macos/build-menubar.sh" --output="$helper" --version="$version" >&2 || cap_fail 5 "menu build failed"
@@ -47,7 +49,7 @@ function main() {
         ditto "$stage/MemQL.app" "$output" >&2 || cap_fail 5 "could not write app bundle"
         cap_changed
     fi
-    rm -rf "$stage"
+    cleanup_build_scratch || cap_fail 5 "build scratch cleanup failed"
     cap_result_set app "$output"
     cap_result_set signing "ad-hoc; Developer ID provisioning required for stable upgrades"
     cap_ok

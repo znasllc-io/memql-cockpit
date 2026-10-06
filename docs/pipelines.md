@@ -142,7 +142,13 @@ here on the old answer in the meantime is refused by the new one.
      every credential helper, carries none of the worker's `GIT_` variables,
      and never prompts. Proxies set through `HTTPS_PROXY` still apply.
 5. **The command.** Native work uses `/bin/sh -c <command>` with the host's
-   toolchains and environment, excluding `MEMQL_WORKER_TOKEN`. Container work
+   toolchains and environment, excluding `MEMQL_WORKER_TOKEN`. The runner sets
+   `TMPDIR`, `TMP` and `TEMP` to scratch inside its owned checkout; requests
+   cannot override them. Tools using these defaults have their temporary
+   files removed with the workspace, including after failure or cancellation.
+   Native commands still have the operator's filesystem access: a tool that
+   deliberately writes elsewhere must declare and clean up those resources.
+   Container work
    uses `/bin/sh` in the declared image with the checkout and any declared cache mounted, as the
    worker's UID/GID, and no Docker socket, privileged mode, host ports or host
    network. Its bounds are two CPUs, 512 processes and the local

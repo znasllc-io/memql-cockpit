@@ -4,6 +4,7 @@ set -euo pipefail
 # Native menu companion only. The worker stays a separate LaunchAgent.
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$REPO_ROOT/../memql/scripts/lib/capability.sh"
+source "$REPO_ROOT/scripts/macos/build-scratch.sh"
 cap_init "cockpit.menubar.build" "Build the native macOS menu companion."
 cap_spec_param "output" "Output .app bundle (default: bin/MemQL Cockpit.app)"
 cap_spec_param "version" "Display version (default: repository VERSION)"
@@ -17,7 +18,8 @@ function main() {
     [[ "$output" == /* && "$output" == *.app ]] || cap_fail 2 "output must be an absolute .app path"
     command -v swiftc >/dev/null || cap_fail 4 "swiftc is required (Xcode command line tools)"
     command -v codesign >/dev/null || cap_fail 4 "codesign is required on macOS"
-    stage="$(mktemp -d "${TMPDIR:-/tmp}/memql-menubar.XXXXXX")/MemQL Cockpit.app"
+    create_build_scratch memql-menubar
+    stage="$COCKPIT_BUILD_SCRATCH/MemQL Cockpit.app"
     mkdir -p "$stage/Contents/MacOS" "$stage/Contents/Resources"
     swiftc -target "$(uname -m)-apple-macosx13.0" -framework AppKit "$REPO_ROOT/native/macos/Mark.swift" "$REPO_ROOT/native/macos/PermissionSetup.swift" "$REPO_ROOT/native/macos/tests/PermissionSetupTests.swift" -o "$(dirname "$stage")/permission-tests" >&2 || cap_fail 5 "permission tests failed to compile"
     "$(dirname "$stage")/permission-tests" >&2 || cap_fail 5 "permission behavior checks failed"
@@ -39,7 +41,7 @@ function main() {
         ditto "$stage" "$output" >&2 || cap_fail 5 "could not write menu bundle"
         cap_changed
     fi
-    rm -rf "$(dirname "$stage")"
+    cleanup_build_scratch || cap_fail 5 "build scratch cleanup failed"
     cap_result_set app "$output"
     cap_ok
 }
