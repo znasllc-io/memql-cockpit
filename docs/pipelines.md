@@ -180,7 +180,13 @@ here on the old answer in the meantime is refused by the new one.
    daemon, a corrupt record, or interrupted native work keeps capacity blocked
    with `pipeline_recovery_required`. Native recovery needs operator inspection
    because this contract cannot prove that a process escaped no group.
-   Completed work removes its checkout, including read-only trees. A local
+   Completed work removes its checkout, including read-only trees, before
+   releasing capacity or returning success. Filesystem failures retain a
+   cleanup-only checkpoint and return `pipeline_cleanup_uncertain`. Once
+   runtime teardown is confirmed, scratch cleanup can recover without Docker
+   and without replaying the command. A worker reconciles its recorded attempt
+   at startup and every minute while idle, including while disconnected from
+   the cluster; it does not wait for another build to arrive. A local
    cleanup receipt does not authorize replaying an external publication or
    deployment; the engine must separately reconcile those effects.
 
@@ -241,9 +247,11 @@ cannot be repaired in that running process.
 - **A sandbox.** A step runs the pipeline runner's command as you; choose the
   repositories in `pipelines.repos` accordingly.
 - **A consent window for steps.** The policy is the consent.
-- **Leftover cleanup after a crash.** A worker killed mid-step leaves that
-  step's `step-*` directory behind. Anything under `workspace_root` that no
-  step is running in can be deleted.
+- **Guessing ownership after a crash.** Recovery uses the durable attempt
+  record and the original Docker daemon, never an age-based sweep or a global
+  Docker prune. Interrupted native commands and a crash during cloning before
+  a runtime attempt is recorded still need operator reconciliation. Do not
+  delete a workspace merely because its name starts with `step-`.
 
 ## Local contract verification
 

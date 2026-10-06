@@ -177,7 +177,7 @@ type pipelineStepRequest struct {
 
 // runPipelineStep implements workerHost.pipeline_step. agentID is the
 // dispatch envelope's agent_id; emit may be nil, which drops the output.
-func runPipelineStep(ctx context.Context, agentID string, args map[string]any, policy *Policy, emit outputEmitter) (*memqlv1.Success, *memqlv1.Failure) {
+func runPipelineStep(ctx context.Context, agentID string, args map[string]any, policy *Policy, emit outputEmitter) (result *memqlv1.Success, failed *memqlv1.Failure) {
 	started := time.Now()
 	if emit == nil {
 		emit = func(bool, []byte) {}
@@ -259,8 +259,9 @@ func runPipelineStep(ctx context.Context, agentID string, args map[string]any, p
 		return refuse("exec_failed", fmt.Errorf("pipeline_step: cannot make a step directory under %s: %w", settings.WorkspaceRoot, err))
 	}
 	defer func() {
-		if !reservation.dirty {
-			removeStepDir(dir)
+		if err := finishPipelineWorkspace(reservation, dir); err != nil {
+			result = nil
+			failed = failure("pipeline_cleanup_uncertain", mask.mask("pipeline_step: workspace cleanup could not be confirmed; capacity remains reserved: "+err.Error()))
 		}
 	}()
 
@@ -611,8 +612,8 @@ func (r *pipelineRun) command(ctx context.Context) (int, *memqlv1.Failure) {
 	cmd.Env = stepEnvironment(os.Environ(), r.req.env, r.req.secrets)
 	res, err := runGroup(ctx, cmd, r.mask, r.emit)
 	r.bytes.Add(res.bytes)
-	if err := r.reservation.clear(); err != nil {
-		return 0, failure("pipeline_recovery_required", "pipeline_step: could not clear the completed build reservation")
+	if err := r.reservation.cleanupReady(r.dir); err != nil {
+		return 0, failure("pipeline_recovery_required", "pipeline_step: could not record completed command cleanup")
 	}
 	if res.stopped {
 		return 0, r.stopped(ctx)
@@ -715,9 +716,9 @@ func stepEnvironment(machine []string, env, secrets map[string]string) []string 
 // tree the step made read-only -- a Go module cache does exactly that --
 // refuses RemoveAll, so its directories are made writable and the removal is
 // tried again.
-func removeStepDir(dir string) {
+func removeStepDir(dir string) error {
 	if err := os.RemoveAll(dir); err == nil {
-		return
+		return nil
 	}
 	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err == nil && d.IsDir() {
@@ -725,8 +726,38 @@ func removeStepDir(dir string) {
 		}
 		return nil
 	})
-	_ = os.RemoveAll(dir)
+	return os.RemoveAll(dir)
 }
+
+// A successful command is not a completed attempt until its scratch tree is
+// gone. Keep a durable cleanup-only record while packing artifacts and deleting
+// the workspace, so a crash or a filesystem error cannot silently leak it.
+// An uncertain running container/native process is deliberately left alone.
+func finishPipelineWorkspace(reservation *pipelineReservation, dir string) error {
+	if reservation.dirty {
+		record, err := reservation.read()
+		if err != nil {
+			return err
+		}
+		if record.Execution != "cleanup" {
+			return nil
+		}
+		if record.Workspace != dir {
+			return errPipelineUnreconciled
+		}
+	} else if err := reservation.cleanupReady(dir); err != nil {
+		// Fetch may fail before a command reserves the runtime. Persist the
+		// directory even on this path before attempting its removal.
+		return err
+	}
+	if err := removePipelineWorkspace(dir); err != nil {
+		return err
+	}
+	return reservation.clear()
+}
+
+// Injectable filesystem boundary for cleanup failure and recovery tests.
+var removePipelineWorkspace = removeStepDir
 
 // --- running a process group --------------------------------------------
 
