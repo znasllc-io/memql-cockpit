@@ -82,6 +82,9 @@ func TestPipelinesPolicyDefaults(t *testing.T) {
 	if pp.MaxTimeoutSec != DefaultPipelineMaxTimeoutSec || DefaultPipelineMaxTimeoutSec != 3600 {
 		t.Errorf("max_timeout_sec defaults to %d (constant %d), want 3600", pp.MaxTimeoutSec, DefaultPipelineMaxTimeoutSec)
 	}
+	if pp.ContainerMemoryMiB != 2048 || (*Policy)(nil).Pipelines().ContainerMemoryMiB != 2048 {
+		t.Fatal("the default command memory cap changed")
+	}
 	if want := filepath.Join(home, ".memql", "pipelines"); pp.WorkspaceRoot != want {
 		t.Errorf("with no workspace root anywhere, steps run under %q, want %q", pp.WorkspaceRoot, want)
 	}
@@ -112,13 +115,17 @@ func TestPipelinesPolicyReplacesOnReloadSoTheConsentCanBeWithdrawn(t *testing.T)
 			t.Fatal(err)
 		}
 	}
-	write("pipelines:\n  allow: true\n  repos: [o/r]\n")
+	write("pipelines:\n  allow: true\n  repos: [o/r]\n  container_memory_mib: 4096\n")
 	p, err := LoadPolicy(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := p.Pipelines().Check("o/r"); err != nil {
 		t.Fatalf("the first file's grant was not honoured: %v", err)
+	}
+	previous := p.Pipelines()
+	if previous.ContainerMemoryMiB != 4096 {
+		t.Fatal("the configured memory cap was not loaded")
 	}
 
 	// REPLACE, not merge -- the opposite of the allow lists beside it, and
@@ -142,6 +149,9 @@ func TestPipelinesPolicyReplacesOnReloadSoTheConsentCanBeWithdrawn(t *testing.T)
 	}
 	if err := p.Pipelines().Check("o/other"); err != nil {
 		t.Fatalf("the reloaded list is not in force: %v", err)
+	}
+	if p.Pipelines().ContainerMemoryMiB != 2048 || previous.ContainerMemoryMiB != 4096 {
+		t.Fatal("reload must restore the default for new steps without changing a running step's snapshot")
 	}
 }
 

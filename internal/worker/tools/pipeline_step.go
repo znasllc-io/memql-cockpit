@@ -264,7 +264,8 @@ func runPipelineStep(ctx context.Context, agentID string, args map[string]any, p
 		}
 	}()
 
-	run := &pipelineRun{req: req, dir: dir, mask: mask, emit: emit, started: started, reservation: reservation}
+	run := &pipelineRun{req: req, dir: dir, mask: mask, emit: emit, started: started, reservation: reservation,
+		containerMemoryMiB: settings.ContainerMemoryMiB}
 	if fail := run.fetch(stepCtx); fail != nil {
 		return nil, fail
 	}
@@ -551,6 +552,8 @@ type pipelineRun struct {
 	emit        outputEmitter
 	started     time.Time
 	reservation *pipelineReservation
+	// Local policy snapshot, never populated from cluster request arguments.
+	containerMemoryMiB int
 	// bytes is the output the step produced, before masking.
 	bytes atomic.Int64
 }

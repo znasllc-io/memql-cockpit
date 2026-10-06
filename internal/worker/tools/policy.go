@@ -274,20 +274,25 @@ type BackupPolicy struct {
 // workspace_root is where each step's fresh checkout is made and removed
 // again; absent, it is fs.workspace_root/pipelines, else ~/.memql/pipelines.
 // max_timeout_sec caps the timeout a step asks for (default 3600).
+// container_memory_mib sizes the command container only (default 2048).
+// Services keep their separate 2 GiB caps. The request cannot override this.
 //
 // The whole block REPLACES on reload, unlike the allow lists above: it is a
 // consent, and one a SIGHUP could not take back would be a grant the file no
 // longer states.
 type PipelinesPolicy struct {
-	Allow         bool     `yaml:"allow"`
-	Repos         []string `yaml:"repos"`
-	WorkspaceRoot string   `yaml:"workspace_root"`
-	MaxTimeoutSec int      `yaml:"max_timeout_sec"`
+	Allow              bool     `yaml:"allow"`
+	Repos              []string `yaml:"repos"`
+	WorkspaceRoot      string   `yaml:"workspace_root"`
+	MaxTimeoutSec      int      `yaml:"max_timeout_sec"`
+	ContainerMemoryMiB int      `yaml:"container_memory_mib"`
 }
 
 // DefaultPipelineMaxTimeoutSec is the longest a pipeline step may run when
 // policy.yaml names no max_timeout_sec.
 const DefaultPipelineMaxTimeoutSec = 3600
+
+const DefaultPipelineContainerMemoryMiB = 2048
 
 // Check decides whether this machine runs a pipeline step of repository. The
 // refusal is a sentence naming the setting that changes it: it reaches the
@@ -295,6 +300,9 @@ const DefaultPipelineMaxTimeoutSec = 3600
 func (pp PipelinesPolicy) Check(repository string) error {
 	if !pp.Allow {
 		return errors.New("this machine runs no pipeline steps: its owner has not set pipelines.allow: true in policy.yaml")
+	}
+	if pp.ContainerMemoryMiB != 0 && (pp.ContainerMemoryMiB < 256 || pp.ContainerMemoryMiB > 32768) {
+		return errors.New("pipelines.container_memory_mib must be between 256 and 32768 MiB, or omitted for the 2048 MiB default")
 	}
 	if len(pp.Repos) == 0 {
 		return nil
@@ -561,8 +569,9 @@ func (p *Policy) PipelinesAllowed() bool {
 func (p *Policy) Pipelines() PipelinesPolicy {
 	if p == nil {
 		return PipelinesPolicy{
-			WorkspaceRoot: pipelinesWorkspaceRoot("", ""),
-			MaxTimeoutSec: DefaultPipelineMaxTimeoutSec,
+			WorkspaceRoot:      pipelinesWorkspaceRoot("", ""),
+			MaxTimeoutSec:      DefaultPipelineMaxTimeoutSec,
+			ContainerMemoryMiB: DefaultPipelineContainerMemoryMiB,
 		}
 	}
 	p.mu.RLock()
@@ -574,6 +583,9 @@ func (p *Policy) Pipelines() PipelinesPolicy {
 	out.WorkspaceRoot = pipelinesWorkspaceRoot(p.pipelines.WorkspaceRoot, p.fs.WorkspaceRoot)
 	if out.MaxTimeoutSec <= 0 {
 		out.MaxTimeoutSec = DefaultPipelineMaxTimeoutSec
+	}
+	if out.ContainerMemoryMiB == 0 {
+		out.ContainerMemoryMiB = DefaultPipelineContainerMemoryMiB
 	}
 	return out
 }

@@ -70,6 +70,12 @@ pipelines:
 | `repos` | empty: any repository | When it lists any, only these repositories' steps run here. `owner/name`, compared without regard to case or a `.git` suffix -- and the clone URL must name the same repository. |
 | `workspace_root` | `fs.workspace_root/pipelines`, else `~/.memql/pipelines` | Where each step's fresh checkout is made, and removed again. |
 | `max_timeout_sec` | `3600` | The longest a step may run, whatever it asks for. A step that names no timeout gets the cluster's own default, 1200 seconds, under this cap. |
+| `container_memory_mib` | `2048` | Command container memory in MiB, from 256 through 32768. Docker's total memory-plus-swap limit is the same value, so no additional swap is available. Services keep separate 2 GiB limits; native commands are unaffected. |
+
+For a test or build that needs more than 2 GiB, set `container_memory_mib: 4096`
+on a machine with enough free Docker memory. This uses existing machine
+capacity. It creates no cloud resources and the cluster cannot override it.
+Allow headroom for service containers, the local cluster and other work.
 
 `SIGHUP` reloads it (`kill -HUP $(pgrep -f 'memql worker run')`). The block
 **replaces** on reload rather than merging: removing `allow`, or narrowing
@@ -139,7 +145,8 @@ here on the old answer in the meantime is refused by the new one.
    toolchains and environment, excluding `MEMQL_WORKER_TOKEN`. Container work
    uses `/bin/sh` in the declared image with the checkout and any declared cache mounted, as the
    worker's UID/GID, and no Docker socket, privileged mode, host ports or host
-   network. Its current bounds are two CPUs, 2 GiB memory and 512 processes.
+   network. Its bounds are two CPUs, 512 processes and the local
+   `container_memory_mib` setting (2 GiB by default).
    Request environment and multiline secrets travel to the container shell
    over stdin, never to the host Docker client's environment or arguments.
    The worker checks Docker's terminal container state before accepting an
