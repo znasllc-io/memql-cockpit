@@ -131,7 +131,7 @@ func computeCapabilities(goos string, getenv func(string) string) CapabilityDesc
 	}
 	return CapabilityDescriptor{
 		Architecture:         runtime.GOARCH,
-		ActionContracts:      map[string]int{"workerHost.pipeline_step": 2},
+		ActionContracts:      map[string]int{"workerHost.pipeline_step": 3},
 		Platform:             goos,
 		DisplayServer:        displayServer,
 		ComputerUseAvailable: buildHasComputerUse,

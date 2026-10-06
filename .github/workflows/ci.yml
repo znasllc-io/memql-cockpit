@@ -66,6 +66,10 @@ jobs:
           cache-dependency-path: memql-cockpit/go.sum
       - name: go test
         working-directory: memql-cockpit
+        env:
+          # Public multi-platform digests: these cases must run on CI, not skip.
+          MEMQL_TEST_DOCKER_IMAGE: alpine@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11
+          MEMQL_TEST_PIPELINE_POSTGRES_IMAGE: postgres@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
         # -race: the worker holds one gRPC stream that many goroutines
         # write (heartbeat, pong, tool results, model deltas, pulls, app
         # sessions), and the runner's loop, hold and drain run beside them

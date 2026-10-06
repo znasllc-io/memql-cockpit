@@ -113,6 +113,7 @@ func TestPipelineDockerClientExitIsNotAReceipt(t *testing.T) {
 		t.Run(scenario.name, func(t *testing.T) {
 			fakePipelineDocker(t, `case "$1" in
 create) exit 0;;
+image) echo linux/arm64;;
 start) cat >/dev/null; exit 0;;
 inspect) printf '%s' `+shellLiteral(scenario.state)+`;;
 rm|ps) `+scenario.cleanup+`;;
