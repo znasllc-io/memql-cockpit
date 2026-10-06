@@ -33,6 +33,33 @@ func TestRedactor_MarkerIsVisible(t *testing.T) {
 	}
 }
 
+func TestRedactorMarkerCannotRecreateASecret(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		secrets    []string
+	}{
+		{"boundary", "00000000000000[", []string{"0000000["}},
+		{"inside-marker", "a session credential here", []string{"session credential"}},
+		{"renewal-order", "00000000000000[", []string{"redacted", "0000000["}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRedactor(tc.secrets...)
+			got := r.apply2(tc.body)
+			if got != "***" {
+				t.Fatalf("ambiguous replacement must suppress the chunk: %q", got)
+			}
+			for _, secret := range tc.secrets {
+				if strings.Contains(got, secret) {
+					t.Fatal("a replacement reconstructed a registered value")
+				}
+			}
+			if r.apply2(got) != got {
+				t.Fatal("fallback redaction is not stable")
+			}
+		})
+	}
+}
+
 // TestRedactor_IgnoresShortSecrets: a redactor that matched a
 // two-character string would scribble over ordinary output.
 func TestRedactor_IgnoresShortSecrets(t *testing.T) {

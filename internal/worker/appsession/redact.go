@@ -98,6 +98,15 @@ func (r *redactor) apply(data []byte) []byte {
 			out = bytes.ReplaceAll(out, secret, redactedMarker)
 		}
 	}
+	// A marker can itself contain a registered value, or recreate one at
+	// its boundary with the retained text. Replacing repeatedly can loop
+	// forever. In that exceptional case suppress the whole chunk with a
+	// marker shorter than every secret we accept, then stop.
+	for _, secret := range r.secrets {
+		if bytes.Contains(out, secret) {
+			return []byte("***")
+		}
+	}
 	return out
 }
 
