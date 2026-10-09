@@ -687,6 +687,17 @@ then died is a successful install and a runtime that is not there.
 
 ## Progress during reasoning
 
+Model loading and prompt evaluation, before the first runtime output, use the
+call’s overall deadline. They do not count as a stall between generated tokens.
+For streaming calls, after the first answer, thinking or tool output, the shorter
+idle ceiling applies; a runtime that subsequently stops is cancelled even while
+worker keepalives flow. Native Ollama tool-enabled calls use the overall deadline
+throughout: Ollama buffers complete tool arguments, so a quiet interval after
+reasoning can still be active generation. Compatible runtimes stream partial tool
+arguments and retain the shorter idle ceiling.
+A runtime that never produces output still reaches the overall deadline and
+releases its request and model slot.
+
 The runtime idle watchdog counts answer text, thinking tokens and tool-call
 fragments as progress. Ollama's `message.thinking` and compatible runtimes'
 `reasoning` / `reasoning_content` fields update liveness without entering the
