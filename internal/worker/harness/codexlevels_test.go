@@ -119,6 +119,31 @@ func TestCodexAppServerOwnerModelReachesThreadStart(t *testing.T) {
 	}
 }
 
+func TestCodexAppServerSessionOverrideReachesProtocol(t *testing.T) {
+	for _, resume := range []string{"", codexFakeResumed} {
+		t.Run("resume="+resume, func(t *testing.T) {
+			bin, log := fakeCodexAppServer(t, codexTurnOK)
+			spec := codexSpec(t, bin)
+			spec.Level = "reasoning"
+			spec.Model = "gpt-5.6-terra"
+			spec.Effort = "medium"
+			spec.ResumeRef = resume
+			h := startCodexAppServer(t, spec)
+			if _, err := h.Turn(context.Background(), "one bounded research answer", &recorder{}); err != nil {
+				t.Fatal(err)
+			}
+			method := codexMethodThreadStart
+			if resume != "" {
+				method = codexMethodThreadResume
+			}
+			params := codexCalls(t, log, method)[0]
+			if params["model"] != spec.Model || codexConfigEffort(params) != spec.Effort {
+				t.Fatalf("explicit override lost at app protocol: %v", params)
+			}
+		})
+	}
+}
+
 // An attach resumes a thread, and ThreadResumeParams takes the same
 // overrides -- so a resumed session runs at its level too.
 func TestCodexAppServerLevelReachesThreadResume(t *testing.T) {

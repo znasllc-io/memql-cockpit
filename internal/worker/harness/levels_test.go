@@ -213,3 +213,36 @@ func TestSpecKnobs(t *testing.T) {
 		t.Error("an effort Claude Code would ignore reached the harness")
 	}
 }
+
+func TestExplicitSessionKnobsOverrideDefaultsWithoutChangingOtherSessions(t *testing.T) {
+	for _, word := range []string{HarnessCodexAppServer, HarnessCodexMCP, HarnessClaudeHeadless} {
+		t.Run(word, func(t *testing.T) {
+			table := BuiltinLevels(word)
+			before, _ := ResolveLevel("strong", table)
+			s := Spec{Level: "strong", Levels: table, Model: "test-balanced-model", Effort: "medium"}
+			got, err := s.knobs(word)
+			if err != nil || got.Model != s.Model || got.Effort != "medium" {
+				t.Fatalf("override lost: %+v %v", got, err)
+			}
+			after, _ := ResolveLevel("strong", table)
+			if after != before {
+				t.Fatal("session changed shared defaults")
+			}
+			s.Level = ""
+			if got, err = s.knobs(word); err != nil || got.Model != s.Model {
+				t.Fatalf("pin without level lost: %+v %v", got, err)
+			}
+			s.Effort = "High!"
+			if _, err = s.knobs(word); err == nil {
+				t.Fatal("invalid explicit effort silently fell back")
+			}
+			s.Effort = "medium"
+			s.ResumeRef = "existing"
+			if word == HarnessCodexMCP {
+				if _, err = s.knobs(word); err == nil {
+					t.Fatal("unconfigurable resume silently lost override")
+				}
+			}
+		})
+	}
+}

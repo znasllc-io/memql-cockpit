@@ -417,6 +417,14 @@ level=WARN msg="policy.yaml apps.levels has a problem" problem="apps.levels.clau
 
 ### Checking what a level runs at here
 
+A model or effort chosen for one step overrides that field of the resolved
+level for that session only. Omitted fields keep the level's value; shared
+defaults and `policy.yaml` are unchanged. The same validation runs before
+launch, and an explicit choice cannot revive a level refused by policy.
+The transcript identifies a session override separately from the level's
+defaults. Completed-session model and effort still come from the app's own
+report, not from the requested values.
+
 `memql worker apps` prints each app, whether the cluster can use it here (and
 the fix when it cannot), how it is driven, and what every level becomes — each
 row saying whose entry it is:

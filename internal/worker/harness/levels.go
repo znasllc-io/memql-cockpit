@@ -155,6 +155,22 @@ func ResolveLevel(level string, table Table) (Knobs, error) {
 	return knobs, nil
 }
 
+// ResolveSessionKnobs overlays the explicitly requested fields only. Callers
+// validate the result for the selected harness before starting a process.
+func ResolveSessionKnobs(level string, table Table, requested Knobs) (Knobs, error) {
+	knobs, err := ResolveLevel(level, table)
+	if err != nil {
+		return Knobs{}, err
+	}
+	if model := strings.TrimSpace(requested.Model); model != "" {
+		knobs.Model = model
+	}
+	if effort := strings.TrimSpace(requested.Effort); effort != "" {
+		knobs.Effort = effort
+	}
+	return knobs, nil
+}
+
 // claudeEfforts are the words `claude --effort` takes, from `claude --help`
 // on 2.1.270 (verified 2026-09-13): "Effort level for the current session
 // (low, medium, high, xhigh, max)".
@@ -289,7 +305,7 @@ func (s Spec) knobs(harnessWord string) (Knobs, error) {
 	if table == nil {
 		table = BuiltinLevels(harnessWord)
 	}
-	knobs, err := ResolveLevel(s.Level, table)
+	knobs, err := ResolveSessionKnobs(s.Level, table, Knobs{Model: s.Model, Effort: s.Effort})
 	if err != nil {
 		return Knobs{}, err
 	}

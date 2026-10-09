@@ -658,7 +658,8 @@ type levelPlan struct {
 	// policy.yaml rather than the built-in table -- the first thing a
 	// person reading the transcript needs when the model is not the one
 	// they expected.
-	owner bool
+	owner    bool
+	explicit bool
 }
 
 // resolveLevel settles the knobs this session runs at.
@@ -694,7 +695,8 @@ func (s *session) resolveLevel(spec apps.Spec) (levelPlan, error) {
 	for level := range refused {
 		delete(table, level)
 	}
-	knobs, err := harness.ResolveLevel(level, table)
+	requested := harness.Knobs{Model: s.start.GetModel(), Effort: s.start.GetEffort()}
+	knobs, err := harness.ResolveSessionKnobs(level, table, requested)
 	if err == nil {
 		err = harness.CheckKnobs(spec.Harness, knobs)
 	}
@@ -709,7 +711,8 @@ func (s *session) resolveLevel(spec apps.Spec) (levelPlan, error) {
 		return levelPlan{}, fmt.Errorf("app session: %s cannot run at level %q: %w", spec.ID, level, err)
 	}
 	_, owner := override[level]
-	return levelPlan{level: level, table: table, knobs: knobs, owner: owner}, nil
+	return levelPlan{level: level, table: table, knobs: knobs, owner: owner,
+		explicit: strings.TrimSpace(requested.Model) != "" || strings.TrimSpace(requested.Effort) != ""}, nil
 }
 
 // levelNote is the line a session writes into its transcript saying what
@@ -724,6 +727,13 @@ func levelNote(spec apps.Spec, p levelPlan) string {
 	source := "the cockpit's built-in table"
 	if p.owner {
 		source = "this machine's policy.yaml apps.levels"
+	}
+	if p.explicit {
+		source = "the session's explicit override over its level"
+	}
+	if p.level == "" {
+		return fmt.Sprintf("[memql] session runs %s with %s (the session's explicit override)\n",
+			spec.ID, harness.DescribeKnobs(spec.Harness, p.knobs))
 	}
 	return fmt.Sprintf("[memql] level %s runs %s with %s (%s)\n",
 		p.level, spec.ID, harness.DescribeKnobs(spec.Harness, p.knobs), source)
@@ -850,6 +860,8 @@ func (s *session) runTurns(ctx context.Context, spec apps.Spec, workspace, resum
 		ResumeRef:      resumeRef,
 		Level:          plan.level,
 		Levels:         plan.table,
+		Model:          s.start.GetModel(),
+		Effort:         s.start.GetEffort(),
 		DenyPaths:      s.denyPaths(),
 		Launch:         s.launcher(),
 	}
@@ -864,7 +876,7 @@ func (s *session) runTurns(ctx context.Context, spec apps.Spec, workspace, resum
 
 	// Said once the harness has taken the level, so the line never
 	// describes a session that did not start at it.
-	if plan.level != "" {
+	if plan.level != "" || plan.explicit {
 		s.logger.Info("app session running at its level",
 			"level", plan.level, "model", plan.knobs.Model, "effort", plan.knobs.Effort, "owner_entry", plan.owner)
 		_ = s.emitChunk(StreamStderr, []byte(levelNote(spec, plan)))
