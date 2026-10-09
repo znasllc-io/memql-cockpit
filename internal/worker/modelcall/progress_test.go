@@ -165,3 +165,74 @@ func TestPromptThatNeverProducesOutputStillTimesOutAndReleasesSlot(t *testing.T)
 	}
 	m.limiter.release("m")
 }
+
+// Native Ollama emits reasoning, then goes silent while constructing a complete
+// tool call. Exercise that real protocol gap across the worker wire, including
+// the absolute deadline and resource release when the tool never completes.
+func TestBufferedToolsUseAbsoluteDeadline(t *testing.T) {
+	for _, completes := range []bool{true, false} {
+		t.Run(fmt.Sprint(completes), func(t *testing.T) {
+			t.Parallel()
+			cancelled := make(chan struct{}, 1)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				drain(r)
+				fmt.Fprintln(w, `{"message":{"thinking":"planning"}}`)
+				w.(http.Flusher).Flush()
+				if completes {
+					select {
+					case <-time.After(1600 * time.Millisecond):
+						fmt.Fprintln(w, `{"message":{"tool_calls":[{"function":{"name":"respondToUser","arguments":{"status":"complete","response":"ready"}}}]},"done":true}`)
+						return
+					case <-r.Context().Done():
+					}
+				} else {
+					<-r.Context().Done()
+				}
+				cancelled <- struct{}{}
+			}))
+			defer srv.Close()
+			m := managerFor(inventoryWith(ollamaModel(srv.URL, "m", models.Attributes{Tools: true, MaxConcurrent: 1})))
+			rec := newRecorder()
+			st := start("buffered-tool", "m", KindChat)
+			st.Tools = []*memqlv1.ModelCallTool{{Name: "respondToUser", ParametersJson: `{"type":"object"}`}}
+			st.Limits = &memqlv1.ModelCallLimits{TimeoutSeconds: 3, IdleTimeoutSeconds: 1, KeepaliveSeconds: 1}
+			began := time.Now()
+			m.Start(context.Background(), rec, st)
+			end := rec.wait(t)
+			if completes {
+				if end.GetError() != "" || len(end.GetToolCalls()) != 1 || end.GetToolCalls()[0].GetName() != "respondToUser" {
+					t.Fatalf("buffered tool call was lost: %+v", end)
+				}
+			} else {
+				if end.GetFinishReason() != FinishTimeout || time.Since(began) < 2800*time.Millisecond {
+					t.Fatalf("buffered call did not use absolute deadline: %+v", end)
+				}
+				select {
+				case <-cancelled:
+				case <-time.After(time.Second):
+					t.Fatal("buffered runtime request was not cancelled")
+				}
+			}
+			if rec.content() != "" {
+				t.Fatal("private reasoning leaked into answer")
+			}
+			deadline := time.Now().Add(time.Second)
+			for {
+				m.mu.Lock()
+				live := len(m.live)
+				m.mu.Unlock()
+				if live == 0 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("buffered call retained live state")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if !m.limiter.tryAcquire("m", 1, 1) {
+				t.Fatal("buffered call retained model slot")
+			}
+			m.limiter.release("m")
+		})
+	}
+}

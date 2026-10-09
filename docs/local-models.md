@@ -689,8 +689,12 @@ then died is a successful install and a runtime that is not there.
 
 Model loading and prompt evaluation, before the first runtime output, use the
 call’s overall deadline. They do not count as a stall between generated tokens.
-After the first answer, thinking or tool output, the shorter idle ceiling applies;
-a runtime that subsequently stops is cancelled even while worker keepalives flow.
+For streaming calls, after the first answer, thinking or tool output, the shorter
+idle ceiling applies; a runtime that subsequently stops is cancelled even while
+worker keepalives flow. Native Ollama tool-enabled calls use the overall deadline
+throughout: Ollama buffers complete tool arguments, so a quiet interval after
+reasoning can still be active generation. Compatible runtimes stream partial tool
+arguments and retain the shorter idle ceiling.
 A runtime that never produces output still reaches the overall deadline and
 releases its request and model slot.
 

@@ -545,6 +545,13 @@ func (m *Manager) run(ctx context.Context, sender Sender, c *call, info models.I
 	// legitimately outlast the inter-output ceiling. The absolute deadline
 	// still bounds startup and time spent queued.
 	stream.touch()
+	client := m.clientFor(info)
+	// Ollama buffers each tool call until its arguments are complete. Even
+	// after streamed reasoning, silence can mean active tool generation.
+	// That protocol cannot prove inter-output idleness for tool-enabled calls;
+	// the absolute deadline and cancellation still bound the whole request.
+	_, buffersTools := client.(*ollamaClient)
+	observeIdle := !buffersTools || len(start.GetTools()) == 0
 
 	// The watchdog is stopped BEFORE the End is sent, not by a defer that
 	// runs after it. A keepalive racing out behind the End is a delta for
@@ -554,10 +561,9 @@ func (m *Manager) run(ctx context.Context, sender Sender, c *call, info models.I
 	var stopOnce sync.Once
 	stopWatchdog := func() { stopOnce.Do(func() { close(watchdogDone) }) }
 	defer stopWatchdog()
-	go m.watchdog(ctx, c, stream, limits, watchdogDone)
+	go m.watchdog(ctx, c, stream, limits, observeIdle, watchdogDone)
 
 	ctx = withRuntimeProgress(ctx, stream.runtimeProgress)
-	client := m.clientFor(info)
 	var (
 		res   Result
 		modal modalityResult
@@ -613,7 +619,7 @@ func (m *Manager) run(ctx context.Context, sender Sender, c *call, info models.I
 
 // watchdog enforces the idle ceiling and emits the keepalives that make
 // it enforceable on the other side too.
-func (m *Manager) watchdog(ctx context.Context, c *call, stream *deltaStream, limits callLimits, done <-chan struct{}) {
+func (m *Manager) watchdog(ctx context.Context, c *call, stream *deltaStream, limits callLimits, observeIdle bool, done <-chan struct{}) {
 	// THE CHECK CADENCE IS HALF THE KEEPALIVE INTERVAL, and the halving
 	// is what makes keepalives fire at all.
 	//
@@ -643,7 +649,7 @@ func (m *Manager) watchdog(ctx context.Context, c *call, stream *deltaStream, li
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if stream.idleExpired(limits.idle) {
+			if observeIdle && stream.idleExpired(limits.idle) {
 				// This machine's own runtime has gone quiet past the
 				// ceiling. Ending it here frees the GPU; waiting for the
 				// engine's copy of the same deadline would not.
