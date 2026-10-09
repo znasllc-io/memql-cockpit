@@ -540,8 +540,10 @@ func (m *Manager) run(ctx context.Context, sender Sender, c *call, info models.I
 		"request_id", c.requestID, "model", info.ID, "kind", start.GetKind(),
 		"level", start.GetLevel(), "purpose", start.GetPurpose())
 
-	// The idle clock starts with the generation, not with the wait for a
-	// slot: time spent queued is not the runtime going quiet.
+	// The send clock starts after admission. The idle verdict starts only
+	// after actual runtime output: model loading and prompt evaluation can
+	// legitimately outlast the inter-output ceiling. The absolute deadline
+	// still bounds startup and time spent queued.
 	stream.touch()
 
 	// The watchdog is stopped BEFORE the End is sent, not by a defer that
@@ -641,8 +643,7 @@ func (m *Manager) watchdog(ctx context.Context, c *call, stream *deltaStream, li
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			idle := stream.idleFor()
-			if idle >= limits.idle {
+			if stream.idleExpired(limits.idle) {
 				// This machine's own runtime has gone quiet past the
 				// ceiling. Ending it here frees the GPU; waiting for the
 				// engine's copy of the same deadline would not.
@@ -888,6 +889,7 @@ type deltaStream struct {
 	// to the whole-call timeout while the engine, receiving keepalives,
 	// believes the machine is healthy.
 	lastContent time.Time
+	started     bool // actual runtime output; worker keepalives do not start generation
 }
 
 func (s *deltaStream) touch() {
@@ -902,6 +904,7 @@ func (s *deltaStream) touch() {
 func (s *deltaStream) runtimeProgress() {
 	s.mu.Lock()
 	s.lastContent = time.Now()
+	s.started = true
 	s.mu.Unlock()
 }
 
@@ -911,6 +914,16 @@ func (s *deltaStream) idleFor() time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return time.Since(s.lastContent)
+}
+
+// Loading the model and evaluating its prompt happen before the first output.
+// They are bounded by the call's absolute deadline, not the inter-output idle
+// ceiling. Once any answer, reasoning or tool output arrives, that shorter
+// ceiling applies. Keepalives never turn startup into apparent model progress.
+func (s *deltaStream) idleExpired(limit time.Duration) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.started && time.Since(s.lastContent) >= limit
 }
 
 // sinceSend is how long since anything went out on the stream, which is
@@ -941,6 +954,7 @@ func (s *deltaStream) send(content string, keepalive bool) error {
 	// letting it reset the idle verdict is what makes the ceiling
 	// unenforceable from this side.
 	if !keepalive {
+		s.started = true
 		s.lastContent = now
 	}
 	s.mu.Unlock()
