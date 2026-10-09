@@ -363,3 +363,31 @@ func TestSession_TheLastTurnThatReportedAModelWins(t *testing.T) {
 			s.servedModel, s.servedEffort)
 	}
 }
+
+func TestSessionWireModelAndEffortReachTheApp(t *testing.T) {
+	argvFile := levelApp(t)
+	h := newRig(t)
+	end := h.start(t, func(s *memqlv1.AppSessionStart) { s.Level = "reasoning"; s.Model = "sonnet"; s.Effort = "medium" })
+	if end.GetError() != "" {
+		t.Fatal(end.GetError())
+	}
+	argv := readArgv(t, argvFile)
+	if argvValue(argv, "--model") != "sonnet" || argvValue(argv, "--effort") != "medium" {
+		t.Fatalf("wire override lost: %v", argv)
+	}
+	if !strings.Contains(stderrChunks(h), "session's explicit override") {
+		t.Fatal("transcript misattributes override to defaults")
+	}
+}
+
+func TestSessionExplicitModelWithoutLevelIsReported(t *testing.T) {
+	argvFile := levelApp(t)
+	h := newRig(t)
+	end := h.start(t, func(s *memqlv1.AppSessionStart) { s.Model = "sonnet" })
+	if end.GetError() != "" {
+		t.Fatal(end.GetError())
+	}
+	if argvValue(readArgv(t, argvFile), "--model") != "sonnet" || !strings.Contains(stderrChunks(h), "session's explicit override") {
+		t.Fatal("model-only override was lost or not recorded")
+	}
+}

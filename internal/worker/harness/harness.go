@@ -232,6 +232,10 @@ type Spec struct {
 	// built-in table with the machine owner's policy.yaml entries laid
 	// over it.
 	Levels Table
+	// Model and Effort are explicit per-session overrides from the owner.
+	// Empty fields retain the level's value. They never change the table.
+	Model  string
+	Effort string
 	// DenyPaths are absolute paths the app must neither READ nor write:
 	// this worker's own files (its tokens, and policy.yaml, whose
 	// apps.allow is the app consent gate) and this machine's fs.deny list.

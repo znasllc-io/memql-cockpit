@@ -864,6 +864,11 @@ func (t *claudeTurn) failure(spec Spec, code int, waitErr error) error {
 	if t.result != nil && len(t.result.Errors) > 0 {
 		detail = strings.Join(t.result.Errors, "; ")
 	}
+	if detail == "" && t.result != nil && t.result.IsError {
+		// Quota refusals can say subtype=success, is_error=true and carry
+		// their only explanation in result (no errors array or stderr).
+		detail = strings.TrimSpace(t.result.Result)
+	}
 	if detail == "" {
 		detail = strings.TrimSpace(string(t.stderrTail))
 	}
