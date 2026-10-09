@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -701,6 +702,30 @@ func TestClaudeHeadlessMissingResultEventIsNamed(t *testing.T) {
 	}
 	if res.Usage.Known {
 		t.Errorf("Usage = %+v, want Known false", res.Usage)
+	}
+}
+
+// Recorded from a bounded Sonnet probe on 2026-10-09. Identifiers and reset
+// date were removed; subtype=success with is_error=true is the real shape.
+func TestClaudeHeadlessWeeklyLimitIsFailureWithItsOwnExplanation(t *testing.T) {
+	const limited = `{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"seven_day","overageStatus":"rejected","isUsingOverage":false}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"You've hit your weekly limit"}]},"error":"rate_limit","is_api_error_message":true}
+{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"terminal_reason":"api_error","result":"You've hit your weekly limit","total_cost_usd":0,"usage":{"input_tokens":0,"output_tokens":0},"modelUsage":{}}`
+	for _, exit := range []int{0, 1} {
+		t.Run(fmt.Sprint(exit), func(t *testing.T) {
+			bin, log := fakeClaude(t, prints(limited)+fmt.Sprintf("exit %d\n", exit))
+			h := startClaude(t, claudeSpec(t, bin))
+			res, err := h.Turn(context.Background(), "availability check", &recorder{})
+			if err == nil || !strings.Contains(err.Error(), "weekly limit") {
+				t.Fatalf("quota refusal became success or lost its explanation: %+v %v", res, err)
+			}
+			if !res.Usage.Known || res.Usage.InputTokens != 0 || res.Usage.OutputTokens != 0 || res.Model != "" {
+				t.Fatalf("refused call invented model usage: %+v", res)
+			}
+			if calls := recordedArgv(t, log); len(calls) != 1 {
+				t.Fatalf("quota refusal retried: %v", calls)
+			}
+		})
 	}
 }
 
