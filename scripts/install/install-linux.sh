@@ -82,7 +82,8 @@ Options:
                               (siblings kept). Not required to refresh the
                               same cluster_url or re-run install; never
                               means "binary exists".
-    --no-service              Skip systemd unit installation
+    --no-menu                 Skip the desktop tray companion
+    --no-service              Skip worker service and desktop tray installation
     --verbose                 Show diagnostic output as it happens
     --plain                   Disable color, logo artwork, and animation
     --help                    Print this help
@@ -97,6 +98,7 @@ function parse_args() {
     DOWNLOAD_BASE="$DEFAULT_DOWNLOAD_BASE"
     FORCE="no"
     INSTALL_SERVICE="yes"
+    INSTALL_MENU="yes"
     INSTALL_MODE="system"  # default: sudo-gated /usr/local/bin (#66)
     INFERENCE="no"
     PIN_VERSION=""
@@ -125,6 +127,7 @@ function parse_args() {
                 PIN_VERSION="$(parse_version_flag "$2")" || exit 2
                 shift 2 ;;
             --force)         FORCE="yes"; shift ;;
+            --no-menu)       INSTALL_MENU="no"; shift ;;
             --no-service)    INSTALL_SERVICE="no"; shift ;;
             --verbose)       INSTALL_VERBOSE="yes"; shift ;;
             --plain)         INSTALL_PLAIN="yes"; shift ;;
@@ -281,6 +284,25 @@ UNIT
     INSTALL_UI_RESULT="Worker started"
 }
 
+# The companion is included in the same versioned Linux binary, so repair and
+# upgrade cannot leave a tray talking a different worker-control protocol.
+function install_menu_companion() {
+    [[ "$INSTALL_SERVICE" == yes && "$INSTALL_MENU" == yes ]] || return 0
+    if ! "$INSTALLED_BINARY" menu --help >/dev/null 2>&1; then
+        echo "INFO: this Cockpit release does not include a Linux tray; upgrade to a release with desktop menu support"
+        INSTALL_UI_STAGE_STATE=pending
+        INSTALL_UI_RESULT="Desktop menu requires a newer Cockpit release"
+        return 0
+    fi
+    "$INSTALLED_BINARY" menu --install
+    if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+        INSTALL_UI_STAGE_STATE=pending
+        INSTALL_UI_RESULT="Desktop menu starts at your next desktop sign-in"
+    else
+        INSTALL_UI_RESULT="Desktop menu started"
+    fi
+}
+
 function main() {
     parse_args "$@"
     install_ui_init install
@@ -290,6 +312,9 @@ function main() {
     install_ui_stage "Configuring this machine" write_config
     if [[ "$INSTALL_SERVICE" == yes ]]; then
         install_ui_stage "Starting the worker" install_systemd_unit
+        if [[ "$INSTALL_MENU" == yes ]]; then
+            install_ui_stage "Preparing the desktop menu" install_menu_companion
+        fi
     fi
     # Setup signals the running worker to reload its policy, so service first.
     # Runtime approval or model download failures do not undo enrollment.

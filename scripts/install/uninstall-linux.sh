@@ -29,8 +29,8 @@
 # composes this as a one-liner and the person copying it should not
 # have to know either answer.
 #
-# What this never touches: anything outside ~/.memql, the three systemd
-# unit files, and the binary paths under the detected prefixes. The
+# Removal is limited to ~/.memql, owned systemd units and desktop-menu
+# entries, and the binary paths under the detected prefixes. The
 # machine's registration on the cluster is revoked from MemQL OS
 # (Fleet -> Machines), not from here -- by the time this script could
 # ask, the token that would have spoken for the machine is gone.
@@ -85,8 +85,8 @@ Removes memql-worker from this machine: the user-systemd units (the
 worker's, and the model runtime's memql-ollama.service when
 \`memql worker setup --inference\` wrote one), the binary and its
 symlink, and ~/.memql/workers.yaml plus the legacy worker.yaml (the
-tokens) and worker.env. Nothing outside ~/.memql, the unit files and
-the binary paths is touched.
+tokens) and worker.env. Full removal also removes the Cockpit tray service,
+launcher, icon and autostart entry. Other desktop files are kept.
 
 With no options the script decides from the machine: one enrolled
 cluster is removed as if --cluster=<its URL> were given; no enrollment
@@ -357,6 +357,37 @@ function scoped_unpair() {
 # removed. A machine with no systemctl on PATH gets the same
 # preservation: an absent command cannot establish that the service
 # stopped.
+# Full runtime removal only; scoped disconnection with sibling homes returns
+# before reaching this function. The tray never owns worker enrollment data.
+function remove_menu_companion() {
+    local binary config_dir data_dir path
+    config_dir="${XDG_CONFIG_HOME:-${HOME}/.config}"
+    data_dir="${XDG_DATA_HOME:-${HOME}/.local/share}"
+    [[ -f "$config_dir/systemd/user/memql-menu.service" || -f "$config_dir/autostart/memql-cockpit.desktop" || -f "$data_dir/applications/memql-cockpit.desktop" || -f "$data_dir/icons/hicolor/64x64/apps/memql-cockpit.png" ]] || return 0
+    binary="$(installed_memql_binary)" || binary=""
+    if [[ -n "$binary" ]] && "$binary" menu --help >/dev/null 2>&1; then
+        "$binary" menu --uninstall || { record_kept "Cockpit menu (stop/removal failed; retry uninstall)"; return 5; }
+        record_removed "Cockpit desktop menu and autostart"
+        return 0
+    fi
+    # A removed binary must not strand its autostart entry. Refuse unfamiliar
+    # files, and stop the unit before removing its launch files.
+    if [[ -f "$config_dir/systemd/user/memql-menu.service" ]]; then
+        grep -q '^# Managed by MemQL Cockpit desktop menu$' "$config_dir/systemd/user/memql-menu.service" || { record_kept "unrecognized Cockpit menu service"; return 5; }
+        systemctl --user stop memql-menu.service || return 5
+    fi
+    for path in "$config_dir/systemd/user/memql-menu.service" "$config_dir/autostart/memql-cockpit.desktop" "$data_dir/applications/memql-cockpit.desktop"; do
+        [[ -f "$path" ]] || continue
+        if ! grep -q '^# Managed by MemQL Cockpit desktop menu$' "$path"; then
+            record_kept "$path (unrecognized menu file)"
+            return 5
+        fi
+        remove_path_if_present "$path" || return 5
+    done
+    remove_path_if_present "$data_dir/icons/hicolor/64x64/apps/memql-cockpit.png" || return 5
+    systemctl --user daemon-reload || return 5
+}
+
 function remove_systemd_unit() {
     local unit_dir="${HOME}/.config/systemd/user"
     local have_systemctl="yes"
@@ -421,6 +452,9 @@ function remove_binaries_for_modes() {
 # in main()'s order, so what it prints is what the real run would do.
 # systemctl is-active reads; nothing here writes or prompts.
 function print_dry_run_plan() {
+    if [[ -f "${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user/memql-menu.service" ]]; then
+        echo "DRY RUN: would stop the Cockpit desktop menu and remove its service, launcher and autostart entry."
+    fi
     local state_dir="$1" label unit path mode
     echo ""
     echo "DRY RUN: the plan for this machine. Nothing below has been done."
@@ -513,6 +547,7 @@ function run_uninstall() {
     # Restart=on-failure unit still running would re-exec a binary that
     # is about to go, with a token that is about to go.
     local unit_rc=0
+    remove_menu_companion || finish $?
     remove_systemd_unit || unit_rc=$?
     # A binary that needs sudo this run cannot get is reported and
     # left; the tokens still go, because they matter more, and the exit

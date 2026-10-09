@@ -235,6 +235,9 @@ main() {
     # in the gap finds something to exec.
     migrate_service "$os" "${bindir}/${BINARY}"
     remove_legacy_binaries "$bindir"
+    if [ "$os" = linux ] && "${bindir}/${BINARY}" menu --help >/dev/null 2>&1; then
+        "${bindir}/${BINARY}" menu --install || die "Cockpit installed, but the desktop menu could not start. Retry: ${bindir}/${BINARY} menu --install"
+    fi
 
     log ""
     log "installed ${BINARY} ${tag} -> ${bindir}/${BINARY}"
