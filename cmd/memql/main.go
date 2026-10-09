@@ -91,6 +91,8 @@ func main() {
 		// non-zero when MEMQL_COCKPIT_CRED_STORE names an unavailable backend,
 		// which `memql access --help` should not pay for or die of.
 		os.Exit(access.HandleCommand(os.Args[2:], installCredStore))
+	case "menu":
+		handleMenu(os.Args[2:])
 	case "worker":
 		worker.HandleCommand(os.Args[2:])
 	case "creds":
@@ -431,6 +433,7 @@ func printUsage() {
 	fmt.Println("  memql access [<cluster>] [--json] Show your role, rank, groups and account scope")
 	fmt.Println("  memql creds <subcommand>          Inspect / migrate the credential store")
 	fmt.Println("  memql worker <subcommand>         Pair / run / configure this machine's worker")
+	fmt.Println("  memql menu [flags]                Linux desktop tray (install / start / uninstall)")
 	fmt.Println("  memql lint [path]                 Validate a .memql file or DSL tree")
 	fmt.Println("  memql setup project [flags]       Stamp a new product workspace from the template")
 	fmt.Println("  memql --version                   Print version + build variant")

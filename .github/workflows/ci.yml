@@ -41,6 +41,14 @@ jobs:
         working-directory: memql-cockpit
         run: go build ./...
 
+      - name: Linux desktop tray protocol
+        working-directory: memql-cockpit
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq dbus python3-dbus python3-gi
+          go build -o /tmp/memql-menu-smoke ./cmd/memql
+          dbus-run-session -- /usr/bin/python3 scripts/install/linux_menu_smoke.py --binary=/tmp/memql-menu-smoke
+
   test:
     name: test
     runs-on: ubuntu-latest

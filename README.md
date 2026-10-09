@@ -94,6 +94,22 @@ refused (exit 5) before anything is downloaded or written, rather than
 rewritten without the enrollments it holds (see the registry bullet under
 Uninstall).
 
+On Linux desktops, installation also adds the **MemQL Cockpit** tray icon and
+starts it at desktop sign-in. It uses StatusNotifierItem/DBusMenu, including on
+Pop!_OS COSMIC with its system tray applet. The menu shows worker connections,
+opens MemQL OS and redacted logs, and pauses or resumes a server connection.
+It does not start a second worker. SSH installs prepare the menu for the next
+desktop sign-in. `--no-menu` on the worker installer skips the companion;
+`--no-service` skips both the worker service and companion.
+
+For a source install, or to repair the Linux launcher, run `memql menu --install`.
+`memql menu --start` restarts the installed companion in the current desktop
+session. `memql menu --uninstall` removes only the companion; the normal Linux
+uninstaller removes it when removing the last enrollment or all homes. The
+launcher and service honor `XDG_CONFIG_HOME` and `XDG_DATA_HOME`. The desktop
+must provide a tray host to display the icon. macOS keeps its existing native
+[menu bar companion](docs/macos-menu.md).
+
 The [installer design guide](scripts/install/README.md) describes the terminal
 conventions and includes a safe local preview command.
 
