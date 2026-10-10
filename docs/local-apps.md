@@ -14,13 +14,22 @@ where, and what to check when it does not work.
 
 ## Turning it on
 
-Nothing is on by default. Two switches, and both must be thrown:
+The Linux and macOS Fleet installers detect installed Claude Code and Codex
+executables and allow them for the cluster being added, before starting the
+worker. This also runs when you repeat the installer to repair an enrollment.
+Add `--no-apps` to install or repair without changing app permissions. Detection
+uses PATH and the same standard app directories the worker searches.
+
+Permission setup uses Cockpit 0.17.0 or later. If it fails, installation continues
+and prints a recovery command. Apps installed later are not automatically
+allowed by the running worker; use the command below. An app still needs its
+own sign-in before MemQL can use it.
 
 **1. Allow the app for a cluster** — the machine owner's word, given to ONE
 cluster at a time:
 
 ```sh
-memql worker apps --allow claude-code --home api.memql.localhost
+memql worker apps --allow claude-code --allow codex --home https://api.memql.localhost
 ```
 
 That writes `apps.homes.<cluster>.allow` in `~/.memql/policy.yaml` — a textual
@@ -40,7 +49,7 @@ apps:
 ```
 
 **Default-deny, per cluster.** A cluster the block does not name is allowed
-nothing — including a cluster paired after you wrote it. An app session does
+nothing — the installer grants only its named cluster. An app session does
 exactly what `workerHost.exec` does, so it gets the same default-deny posture
 as the rest of `policy.yaml`, and consent given for a local test cluster is
 never consent for production. `SIGHUP` (or restart) after a hand edit; the

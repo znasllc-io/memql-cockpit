@@ -57,6 +57,8 @@ Required:
     --cluster <url>           Cluster URL (e.g. https://app.copresent.ai)
 
 Options:
+    --no-apps                Keep app permissions unchanged. By default, installed
+                              Claude Code and Codex are allowed for this cluster.
     --name <name>             Worker name (default: hostname -s)
     --computeruse             Install the computer-use variant. Wayland and
                               displayless sessions register HEADLESS; X11 enables COMPUTERUSE.
@@ -101,6 +103,7 @@ function parse_args() {
     INSTALL_MENU="yes"
     INSTALL_MODE="system"  # default: sudo-gated /usr/local/bin (#66)
     INFERENCE="no"
+    INSTALL_APPS="yes"
     PIN_VERSION=""
     DOWNLOAD_BASE_SET="no"
     INSTALL_VERBOSE="no"
@@ -113,6 +116,7 @@ function parse_args() {
             --name)          NAME="$2"; shift 2 ;;
             --computeruse)           FLAVOUR="computeruse"; shift ;;
             --inference)     INFERENCE="yes"; shift ;;
+            --no-apps)       INSTALL_APPS="no"; shift ;;
             --user-local)    INSTALL_MODE="user-local"; shift ;;
             --download-base) DOWNLOAD_BASE="$2"; DOWNLOAD_BASE_SET="yes"; shift 2 ;;
             --download-base=*) DOWNLOAD_BASE="${1#*=}"; DOWNLOAD_BASE_SET="yes"; shift ;;
@@ -310,6 +314,7 @@ function main() {
     install_ui_stage "Checking the release" install_check_release
     install_ui_stage "Installing Cockpit" install_binary
     install_ui_stage "Configuring this machine" write_config
+    install_ui_stage "Preparing apps" allow_installed_apps "$INSTALLED_BINARY"
     if [[ "$INSTALL_SERVICE" == yes ]]; then
         install_ui_stage "Starting the worker" install_systemd_unit
         if [[ "$INSTALL_MENU" == yes ]]; then
