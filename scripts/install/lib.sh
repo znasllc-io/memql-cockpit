@@ -345,6 +345,9 @@ function install_ui_finish() {
             printf '\n  %s When ready, run:\n\n    %q worker setup --inference\n' "$command" "$INSTALLED_BINARY" >&3
             ;;
     esac
+    if [[ -n "${INSTALL_APPS_RECOVERY:-}" ]]; then
+        printf '\n  App permissions need attention (Cockpit 0.17.0 or later).\n  See the log, then run:\n\n    %s\n' "$INSTALL_APPS_RECOVERY" >&3
+    fi
     printf '\n  %sInstall log: %s%s\n\n' "$INSTALL_UI_DIM" "$INSTALL_LOG" "$INSTALL_UI_RESET" >&3
 }
 
@@ -1501,6 +1504,53 @@ $(echo "$capabilities" | tr ',' '\n' | sed 's/^/  - /')
 YAML
     chmod 600 "$path"
     echo "INFO: mirrored legacy $path"
+}
+
+# Match the directories appended by internal/worker/servicepath.go. Resolve
+# executable files only: a shell alias/function is not an installed worker app.
+function installed_worker_app() {
+    local PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}:${HOME}/.local/bin:${HOME}/.claude/local:/opt/homebrew/bin:/usr/local/bin"
+    type -P "$1" >/dev/null 2>&1
+}
+
+# Running this enrollment installer grants this cluster the supported apps
+# present now. The worker never grants apps on a heartbeat or on discovery.
+# --no-apps lets an operator install/repair without changing app permissions.
+# Use the installed CLI's per-home policy editor, never edit policy.yaml here.
+function allow_installed_apps() {
+    local binary="$1" labels="" command arg
+    local -a args=()
+    INSTALL_APPS_RECOVERY=""
+    if [[ "${INSTALL_APPS:-yes}" == no ]]; then
+        INSTALL_UI_RESULT="App permissions unchanged"
+        return 0
+    fi
+    if installed_worker_app claude; then
+        args+=(--allow claude-code)
+        labels="Claude Code"
+    fi
+    if installed_worker_app codex; then
+        args+=(--allow codex)
+        labels="${labels:+${labels}, }Codex"
+    fi
+    if [[ ${#args[@]} == 0 ]]; then
+        INSTALL_UI_STAGE_STATE=pending
+        INSTALL_UI_RESULT="Claude Code and Codex are not installed"
+        return 0
+    fi
+    printf -v command '%q worker apps' "$binary"
+    for arg in "${args[@]}" --home "$CLUSTER_URL"; do
+        printf -v command '%s %q' "$command" "$arg"
+    done
+    echo "INFO: allowing ${labels} for ${CLUSTER_URL}"
+    if "$binary" worker apps "${args[@]}" --home "$CLUSTER_URL"; then
+        INSTALL_UI_RESULT="${labels} allowed for this cluster"
+    else
+        INSTALL_UI_STAGE_STATE=pending
+        INSTALL_UI_RESULT="App permissions need attention"
+        INSTALL_APPS_RECOVERY="$command"
+        echo "ERROR: app permissions could not be configured; use Cockpit 0.17.0 or later and retry: ${command}" >&2
+    fi
 }
 
 function setup_inference() {

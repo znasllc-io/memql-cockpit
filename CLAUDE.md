@@ -234,6 +234,10 @@ Four rules here are load-bearing, and each is the kind that fails silently:
    An app present but unlisted is reported with `allowed=false` rather than
    omitted -- the portal can then say "present, blocked" instead of
    rendering it identically to "not installed".
+   The Linux/macOS enrollment installers explicitly grant installed Claude
+   Code and Codex for their named cluster through `worker apps --allow` before
+   starting the service. Repeating an installer repeats that grant; `--no-apps`
+   preserves existing permissions. Discovery/heartbeats never grant consent.
 4. **The MCP config file is deleted on every exit path.** The per-run bearer
    **cannot be revoked** (the engine's verify path is JWKS-only and DB-free),
    so deletion is the security control, not housekeeping. A `defer` is not

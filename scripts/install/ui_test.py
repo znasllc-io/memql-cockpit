@@ -330,6 +330,106 @@ exit 3
             server.server_close()
             thread.join()
 
+    def test_app_grant_selection_scope_opt_out_and_failure(self):
+        for present, disabled, failed in (("claude codex", False, False), ("claude", False, False),
+                                          ("codex", False, False), ("", False, False),
+                                          ("claude codex", True, False), ("claude codex", False, True)):
+            with self.subTest(present=present, disabled=disabled, failed=failed):
+                recorder = self.root / "apps-args"
+                recorder.unlink(missing_ok=True)
+                self.env.update(FIXTURE_APPS=present, FIXTURE_DISABLE="yes" if disabled else "no",
+                                FIXTURE_FAIL="yes" if failed else "no")
+                result = self.run_ui('''
+CLUSTER_URL="https://api.fixture.example"
+INSTALL_APPS="$FIXTURE_DISABLE"
+[[ "$INSTALL_APPS" != yes ]] && INSTALL_APPS=yes || INSTALL_APPS=no
+function installed_worker_app() { [[ " $FIXTURE_APPS " == *" $1 "* ]]; }
+function fixture_memql() {
+    printf '%s\\n' "$@" > "$TEST_ROOT/apps-args"
+    [[ "$FIXTURE_FAIL" != yes ]]
+}
+install_ui_init
+install_ui_stage 'Preparing apps' allow_installed_apps fixture_memql
+printf 'RECOVERY=%s\\n' "${INSTALL_APPS_RECOVERY:-}" >&3
+''')
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                if not present or disabled:
+                    self.assertFalse(recorder.exists())
+                    self.assertNotIn("allowed for this cluster", result.stdout)
+                else:
+                    expected = ["worker", "apps"]
+                    for app, app_id in (("claude", "claude-code"), ("codex", "codex")):
+                        if app in present.split():
+                            expected += ["--allow", app_id]
+                    expected += ["--home", "https://api.fixture.example"]
+                    self.assertEqual(recorder.read_text().splitlines(), expected)
+                    if failed:
+                        self.assertIn("App permissions need attention", result.stdout)
+                        self.assertIn("RECOVERY=fixture_memql worker apps --allow claude-code --allow codex --home https://api.fixture.example", result.stdout)
+                        self.assertNotIn("allowed for this cluster", result.stdout)
+                    else:
+                        self.assertIn("allowed for this cluster", result.stdout)
+
+    def test_app_detection_finds_worker_locations_but_not_shell_functions(self):
+        app_dir = self.root / ".local/bin"
+        app_dir.mkdir(parents=True)
+        executable = app_dir / "fixture-installed-app"
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+        result = self.run_ui('''
+function fixture-only-function() { :; }
+installed_worker_app fixture-installed-app
+if installed_worker_app fixture-only-function; then exit 1; fi
+if installed_worker_app fixture-missing-app; then exit 1; fi
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_real_drivers_grant_detected_apps_after_enrollment_and_retry(self):
+        # Same-version repair exercises the real main functions without
+        # network downloads, services or any access to the operator's policy.
+        for driver in ("install-mac.sh", "install-linux.sh"):
+            fixture_home = self.root / driver
+            binary = fixture_home / ".memql/bin/memql"
+            binary.parent.mkdir(parents=True)
+            binary.write_text('''#!/bin/bash
+if [[ "$1" == --version ]]; then echo 'memql 0.17.0 (headless)'; exit 0; fi
+[[ -s "$HOME/.memql/workers.yaml" ]] || exit 7
+printf '%s\\n' "$@" > "$HOME/apps-args"
+[[ "${FIXTURE_FAIL:-no}" != yes ]]
+''')
+            binary.chmod(0o755)
+            app_dir = fixture_home / ".local/bin"
+            app_dir.mkdir(parents=True)
+            for app in ("claude", "codex"):
+                (app_dir / app).write_text("#!/bin/sh\nexit 0\n")
+                (app_dir / app).chmod(0o755)
+            env = dict(self.env, HOME=str(fixture_home), MEMQL_INSTALL_VERSION="0.17.0")
+            command = ["bash", str(HERE / driver), "--token", "mql_wkr_fixture",
+                       "--cluster", "https://fixture.example", "--user-local", "--no-service",
+                       "--download-base", "file://" + str(binary.parent)]
+            # Preflight only checks presence; the already-installed version
+            # means the platform asset is not downloaded or executed.
+            for platform in ("darwin", "linux"):
+                for arch in ("amd64", "arm64"):
+                    (binary.parent / f"memql-{platform}-{arch}").write_text("fixture")
+            for failed in (True, False):
+                with self.subTest(driver=driver, failed=failed):
+                    env["FIXTURE_FAIL"] = "yes" if failed else "no"
+                    result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=15)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertEqual((fixture_home / "apps-args").read_text().splitlines(),
+                                     ["worker", "apps", "--allow", "claude-code", "--allow", "codex", "--home", "https://fixture.example"])
+                    self.assertNotIn("mql_wkr_fixture", result.stdout + result.stderr)
+                    if failed:
+                        self.assertIn("App permissions need attention", result.stdout)
+                        self.assertIn("worker apps --allow claude-code --allow codex --home https://fixture.example", result.stdout)
+                    else:
+                        self.assertIn("Claude Code, Codex allowed for this cluster", result.stdout)
+            (fixture_home / "apps-args").unlink()
+            result = subprocess.run(command + ["--no-apps"], env=env, capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse((fixture_home / "apps-args").exists())
+
     def run_pty(self, body, interrupt=False):
         master, slave = pty.openpty()
         proc = subprocess.Popen(self.command(body), env=self.env, stdin=slave, stdout=slave,
