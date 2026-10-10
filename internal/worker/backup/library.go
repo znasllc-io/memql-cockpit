@@ -102,12 +102,12 @@ type PushResult struct {
 // `resumeID` is a session this caller previously opened for the SAME path at
 // the SAME size, or "". It is a hint: an unusable one costs one extra request
 // and falls through to a fresh session.
-func (l *Library) Push(ctx context.Context, workerID, path, folderID string, size int64, resumeID string) (PushResult, error) {
+func (l *Library) Push(ctx context.Context, workerID, watchID, path, folderID string, size int64, resumeID string) (PushResult, error) {
 	if size <= l.oneShotLimit {
-		out, err := l.pushOneShot(ctx, workerID, path, folderID)
+		out, err := l.pushOneShot(ctx, workerID, watchID, path, folderID)
 		return out, err
 	}
-	return l.pushSession(ctx, workerID, path, path, folderID, size, resumeID, 0, nil)
+	return l.pushSession(ctx, workerID, watchID, path, path, folderID, size, resumeID, 0, nil)
 }
 
 func (l *Library) authorized(ctx context.Context, req *http.Request) error {
@@ -145,11 +145,11 @@ func readCapped(r io.Reader) []byte {
 // one shot
 // ---------------------------------------------------------------------------
 
-func (l *Library) pushOneShot(ctx context.Context, workerID, path, folderID string) (PushResult, error) {
-	return l.pushSnapshotOneShot(ctx, workerID, path, path, folderID, 0)
+func (l *Library) pushOneShot(ctx context.Context, workerID, watchID, path, folderID string) (PushResult, error) {
+	return l.pushSnapshotOneShot(ctx, workerID, watchID, path, path, folderID, 0)
 }
 
-func (l *Library) pushSnapshotOneShot(ctx context.Context, workerID, path, sourcePath, folderID string, expectedVersion int) (PushResult, error) {
+func (l *Library) pushSnapshotOneShot(ctx context.Context, workerID, watchID, path, sourcePath, folderID string, expectedVersion int) (PushResult, error) {
 	f, err := os.Open(sourcePath)
 	if err != nil {
 		return PushResult{}, err
@@ -169,6 +169,7 @@ func (l *Library) pushSnapshotOneShot(ctx context.Context, workerID, path, sourc
 		"name":                   filepath.Base(path),
 		"uploadedFromWorkerId":   workerID,
 		"uploadedFromPath":       path,
+		"backupWatchId":          watchID,
 		"uploadedFromWorkerName": "",
 	}
 	if folderID != "" {
@@ -248,7 +249,7 @@ type inventoryResponse struct {
 // On a folder of video over a domestic uplink that is the difference between
 // a backup that finishes and one that starts again every time the laptop
 // sleeps.
-func (l *Library) pushSession(ctx context.Context, workerID, path, sourcePath, folderID string, size int64, resumeID string, expectedVersion int, remember func(string) error) (PushResult, error) {
+func (l *Library) pushSession(ctx context.Context, workerID, watchID, path, sourcePath, folderID string, size int64, resumeID string, expectedVersion int, remember func(string) error) (PushResult, error) {
 	name := filepath.Base(path)
 
 	// RESUME FIRST, and this is the half the first draft was missing. It
@@ -289,6 +290,7 @@ func (l *Library) pushSession(ctx context.Context, workerID, path, sourcePath, f
 		"size":                 size,
 		"uploadedFromWorkerId": workerID,
 		"uploadedFromPath":     path,
+		"backupWatchId":        watchID,
 	}
 	if folderID != "" {
 		body["folderId"] = folderID

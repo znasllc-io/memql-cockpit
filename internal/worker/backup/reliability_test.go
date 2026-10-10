@@ -115,7 +115,7 @@ func TestCompletedSessionRecoversLostResponseWithoutNewVersion(t *testing.T) {
 	}))
 	defer server.Close()
 	l := NewLibrary(server.URL, server.Client(), func(context.Context) (string, error) { return "t", nil })
-	out, err := l.pushSession(context.Background(), "w", "source", "snapshot", "", 8, "saved", 2, nil)
+	out, err := l.pushSession(context.Background(), "w", "watch", "source", "snapshot", "", 8, "saved", 2, nil)
 	if err != nil || out.VersionNumber != 3 || len(calls) != 2 || calls[1] != "POST /artifacts/uploads/saved/complete" {
 		t.Fatalf("result=%+v err=%v calls=%v", out, err, calls)
 	}
@@ -126,7 +126,7 @@ func TestInventoryOutageDoesNotAbandonExistingUpload(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; http.Error(w, "temporarily unavailable", 503) }))
 	defer server.Close()
 	l := NewLibrary(server.URL, server.Client(), func(context.Context) (string, error) { return "t", nil })
-	_, err := l.pushSession(context.Background(), "w", "source", "snapshot", "", 8, "saved", 0, nil)
+	_, err := l.pushSession(context.Background(), "w", "watch", "source", "snapshot", "", 8, "saved", 0, nil)
 	if err == nil || calls != 1 {
 		t.Fatalf("err=%v calls=%d", err, calls)
 	}

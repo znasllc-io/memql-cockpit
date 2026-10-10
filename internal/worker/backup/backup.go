@@ -161,7 +161,7 @@ func (m *Manager) Run(ctx context.Context, registrationID func() string) {
 				}
 				lastSaved = id
 			}
-			m.SweepOnce(ctx, id)
+			m.sweep(ctx, id, false)
 		} else if !announced {
 			// Said ONCE. A machine that has not registered yet is the ordinary
 			// state for the first few seconds, and logging it every five
@@ -190,6 +190,12 @@ func (m *Manager) Run(ctx context.Context, registrationID func() string) {
 // refuses. A parameter makes the id impossible to forget, and the guard makes
 // a forgotten one loud rather than a silent no-op that reports success.
 func (m *Manager) SweepOnce(ctx context.Context, workerID string) {
+	m.sweep(ctx, workerID, true)
+}
+
+// Scheduled polling shares the same pass, but skips folders that are not due.
+// An explicit --once request bypasses the schedule, never pause or policy.
+func (m *Manager) sweep(ctx context.Context, workerID string, force bool) {
 	if m == nil {
 		return
 	}
@@ -208,7 +214,7 @@ func (m *Manager) SweepOnce(ctx context.Context, workerID string) {
 		if err := ctx.Err(); err != nil {
 			return
 		}
-		if !watch.Active() {
+		if !watch.Active() || (!force && !watch.Due(time.Now())) {
 			// Paused. Nothing is scanned, nothing is reported, and the ledger
 			// is deliberately LEFT ALONE -- resuming must not re-push a folder
 			// somebody paused for an afternoon.
@@ -384,9 +390,9 @@ func (m *Manager) pushIfChanged(ctx context.Context, watch Watch, ledger *Ledger
 	}
 	var result PushResult
 	if fresh.Size <= m.library.oneShotLimit {
-		result, err = m.library.pushSnapshotOneShot(ctx, m.workerID, entry.Path, sourcePath, watch.FolderID, prior.VersionNumber)
+		result, err = m.library.pushSnapshotOneShot(ctx, m.workerID, watch.ID, entry.Path, sourcePath, watch.FolderID, prior.VersionNumber)
 	} else {
-		result, err = m.library.pushSession(ctx, m.workerID, entry.Path, sourcePath, watch.FolderID, fresh.Size, resumeID, prior.VersionNumber, remember)
+		result, err = m.library.pushSession(ctx, m.workerID, watch.ID, entry.Path, sourcePath, watch.FolderID, fresh.Size, resumeID, prior.VersionNumber, remember)
 	}
 	if err != nil {
 		var failure *httpFailure

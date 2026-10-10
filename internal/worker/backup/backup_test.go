@@ -113,6 +113,10 @@ func (f *fakeEngine) handleOneShot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := r.FormValue("uploadedFromPath")
+	if r.FormValue("backupWatchId") == "" {
+		http.Error(w, "backup scope required", http.StatusBadRequest)
+		return
+	}
 	file, _, err := r.FormFile("file")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -129,12 +133,18 @@ func (f *fakeEngine) handleOneShot(w http.ResponseWriter, r *http.Request) {
 
 func (f *fakeEngine) handleInit(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Name string `json:"name"`
-		Size int64  `json:"size"`
-		Path string `json:"uploadedFromPath"`
+		Name    string `json:"name"`
+		Size    int64  `json:"size"`
+		Path    string `json:"uploadedFromPath"`
+		WatchID string `json:"backupWatchId"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	f.mu.Lock()
+	if body.WatchID == "" {
+		f.mu.Unlock()
+		http.Error(w, "backup scope required", http.StatusBadRequest)
+		return
+	}
 	f.sessionSize = body.Size
 	f.uploads[body.Path] = 0
 	f.mu.Unlock()
