@@ -54,7 +54,7 @@ machine runs on authenticates its *stream*; the Library needs a **user**
 sign-in, and a PAT will not do (PATs verify only on the identity node). Once
 signed in, the session refreshes silently — the worker never opens a browser.
 
-**3. Arrange the backup in MemQL OS.** Files → Backups → *Back up a folder*:
+**3. Arrange the backup in MemQL OS.** Files → Backups → **+**:
 pick this machine, type the folder's full path, choose where it lands.
 
 **4. Check what this machine will do:**
@@ -77,7 +77,18 @@ that computer's to honour.
 
 ## What it does, and how often
 
-Every five minutes, per watched folder:
+The worker checks schedules every five minutes. Each folder runs only when its
+`intervalMinutes` has elapsed since the server’s last sweep report. New backups
+default to daily; older arrangements keep their five-minute cadence. Missed runs
+are combined into one catch-up run after reconnecting. `--once` runs immediately
+but still respects paused status and local policy.
+
+Ordinary uploads are independent copies and do not retain host paths or follow
+local changes. Only a configured directory backup sends `backupWatchId`, which
+the engine verifies against the caller, machine and directory. This reference
+also travels with resumable upload sessions.
+
+For each folder that is due:
 
 1. Check the path against `backup.roots`. Refused → report *this machine said
    no*, with the reason, and stop.

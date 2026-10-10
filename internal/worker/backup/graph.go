@@ -145,13 +145,15 @@ func constructOf(call string) string {
 
 // Watch is one arrangement this machine is asked to keep.
 type Watch struct {
-	ID            string
-	WorkerID      string
-	LocalPath     string
-	FolderID      string
-	Status        string
-	ExcludeGlobs  []string
-	IncludeHidden bool
+	IntervalMinutes int
+	LastSweepAt     time.Time
+	ID              string
+	WorkerID        string
+	LocalPath       string
+	FolderID        string
+	Status          string
+	ExcludeGlobs    []string
+	IncludeHidden   bool
 }
 
 // Active reports whether the sweeper should be doing anything for this watch.
@@ -182,14 +184,16 @@ func (g *Graph) Watches(ctx context.Context, workerID string) ([]Watch, error) {
 	out := make([]Watch, 0, len(rows))
 	for _, row := range rows {
 		w := Watch{
-			ID:            rowString(row, "id"),
-			WorkerID:      rowString(row, "workerId"),
-			LocalPath:     rowString(row, "localPath"),
-			FolderID:      rowString(row, "folderId"),
-			Status:        rowString(row, "status"),
-			ExcludeGlobs:  rowStrings(row, "excludeGlobs"),
-			IncludeHidden: rowBool(row, "includeHidden"),
+			ID:              rowString(row, "id"),
+			WorkerID:        rowString(row, "workerId"),
+			LocalPath:       rowString(row, "localPath"),
+			FolderID:        rowString(row, "folderId"),
+			Status:          rowString(row, "status"),
+			ExcludeGlobs:    rowStrings(row, "excludeGlobs"),
+			IncludeHidden:   rowBool(row, "includeHidden"),
+			IntervalMinutes: backupInterval(row["intervalMinutes"]),
 		}
+		w.LastSweepAt, _ = time.Parse(time.RFC3339Nano, rowString(row, "lastSweepAt"))
 		// A row with no id or no path is one this build cannot act on. Skipped
 		// rather than errored: one malformed row must not stop the other
 		// watches on this machine from being swept.
@@ -319,4 +323,22 @@ func (g *Graph) FileAt(ctx context.Context, workerID, path string) (map[string]a
 func (g *Graph) Relink(ctx context.Context, fileID, workerID, previousPath, path string) error {
 	_, err := g.call(ctx, "builtin relinkLibraryFileOrigin(fileId: "+langparser.QuoteString(fileID)+", workerId: "+langparser.QuoteString(workerID)+", previousPath: "+langparser.QuoteString(previousPath)+", path: "+langparser.QuoteString(path)+")")
 	return err
+}
+
+// Invalid legacy values use the former cadence. The DSL bounds new values.
+func backupInterval(v any) int {
+	value, err := strconv.Atoi(fmt.Sprint(v))
+	if err != nil || value < 5 || value > 525600 {
+		return 5
+	}
+	return value
+}
+
+func (w Watch) Due(now time.Time) bool {
+	minutes := w.IntervalMinutes
+	if minutes < 5 || minutes > 525600 {
+		minutes = 5
+	}
+	// A future server stamp must not suspend a backup indefinitely after clock correction.
+	return w.LastSweepAt.IsZero() || w.LastSweepAt.After(now) || !now.Before(w.LastSweepAt.Add(time.Duration(minutes)*time.Minute))
 }
