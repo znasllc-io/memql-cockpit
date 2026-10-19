@@ -139,7 +139,10 @@ type inferenceSetup struct {
 // this command just changed.
 func newInferenceSetup(configPath string, ids []string, nonInteractive bool, runtimeFlag string) *inferenceSetup {
 	policyPath := filepath.Join(filepath.Dir(configPath), "policy.yaml")
-	discoverer := &models.Discoverer{}
+	discoverer := newDiscoverer()
+	// The closing block prints the `max` the cluster will see, and this runs
+	// in the owner's shell: it reads the worker's environment, not its own.
+	followWorkerEnvironment(discoverer, configPath)
 	return &inferenceSetup{
 		out:            os.Stdout,
 		in:             os.Stdin,
@@ -186,7 +189,7 @@ func policyAt(policyPath string) *tools.Policy {
 // line -- an id that Allow refused to write is then visibly absent.
 func probeWithPolicy(ctx context.Context, d *models.Discoverer, policyPath string) models.Inventory {
 	policy := policyAt(policyPath)
-	return d.Probe(ctx, models.Request{Allow: policy.ModelsAllow(), Runtimes: policy.ModelRuntimes()})
+	return d.Probe(ctx, modelsRequest(policy))
 }
 
 // runInferenceSetup runs the flow and returns the process exit code.

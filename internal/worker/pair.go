@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/znasllc-io/memql-cockpit/internal/worker/consent"
-	"github.com/znasllc-io/memql-cockpit/internal/worker/models"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/tools"
 	"github.com/znasllc-io/memql/component/identity/workerpairing"
 )
@@ -232,12 +231,15 @@ func runConfiguredWorker(clusterURL, token, name string, logger *slog.Logger) er
 	// As `worker run` does, before anything resolves a binary.
 	ensureServicePath(logger)
 
-	discoverer := &models.Discoverer{}
+	discoverer := newDiscoverer()
 	modelInventory := NewModelInventory(policy, discoverer)
 	appInventories := NewAppInventories(policy, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// The worker's own record of the ceiling it advertises, once per served
+	// model, at start and after every reload (announceModelCeilings).
+	go announceModelCeilings(ctx, logger, modelInventory)
 
 	workers, werr := LoadWorkers(DefaultWorkersPath(), DefaultConfigPath())
 	useFleet := werr == nil && workers.ValidateRun() == nil
@@ -301,6 +303,9 @@ func runConfiguredWorker(clusterURL, token, name string, logger *slog.Logger) er
 					} else if runner != nil {
 						runner.RequestImmediateReadvertise()
 					}
+					// After the request above, which drops the cached inventory:
+					// the ceilings are then read under the policy just loaded.
+					go announceModelCeilings(ctx, logger, modelInventory)
 				}
 			default:
 				logger.Info("worker shutting down", "signal", sig.String())

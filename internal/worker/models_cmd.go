@@ -74,11 +74,13 @@ func handleModels(args []string) {
 	// to see that they have three models pulled, because "you have models
 	// but this machine cannot serve them" and "you have no models" send
 	// them to entirely different places.
-	inv := (&models.Discoverer{}).Probe(ctx, models.Request{
-		Allow:    policy.ModelsAllow(),
-		Runtimes: policy.ModelRuntimes(),
-	})
+	d := newDiscoverer()
+	// This runs in the owner's shell and the worker does not: the ceiling it
+	// prints is the one the worker's own environment gives, not the shell's.
+	followWorkerEnvironment(d, *configPath)
+	inv := d.Probe(ctx, modelsRequest(policy))
 	printModelInventory(os.Stdout, inv, policyPath)
+	printModelsTuning(ctx, os.Stdout, tuningHost{Runtime: d, Now: time.Now()}, inv, policy)
 }
 
 // printModelInventory writes the report. Split out so the shape is

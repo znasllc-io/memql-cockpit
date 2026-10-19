@@ -103,6 +103,11 @@ type Request struct {
 	Allow []string
 	// Runtimes are the declared OpenAI-compatible endpoints.
 	Runtimes []DeclaredRuntime
+	// Parallel is policy.yaml models.parallel, validated. Zero is "not said".
+	Parallel int
+	// Resident is policy.yaml models.resident, validated. Empty changes
+	// nothing about how any model is called.
+	Resident []Resident
 }
 
 // Discoverer probes this machine. Every external fact is a seam, so the
@@ -119,6 +124,25 @@ type Discoverer struct {
 	OllamaBaseURL string
 	// FloorFn defaults to Floor.
 	FloorFn func() FloorVerdict
+	// ManagedParallel reports the OLLAMA_NUM_PARALLEL of a runtime this
+	// cockpit manages -- the unit it wrote, read where it lives -- or zero
+	// when there is none or it says nothing. A seam rather than a file read
+	// here, because this package knows nothing about systemd and the
+	// package that wrote the unit is the one that can read it back. Nil
+	// means there is no such runtime (Docker, a Mac, one started by hand).
+	ManagedParallel func() int
+	// ParallelEnv answers "what OLLAMA_NUM_PARALLEL does the WORKER have", for a
+	// process that is not the worker. It returns the variable's text and the
+	// name of the place it was read, as the tail of a sentence ("the worker's
+	// environment file (~/.memql/worker.env)").
+	//
+	// Nil means this process IS the worker, and Getenv is its environment. A
+	// command that runs in the owner's shell is not: the worker takes its
+	// environment from its unit, so the shell's value is the shell's, and
+	// reading it names a ceiling the worker does not advertise. When set, this
+	// replaces Getenv for the ceiling and for nothing else (OLLAMA_HOST is
+	// still Getenv's).
+	ParallelEnv func() (value, from string)
 }
 
 // DefaultOllamaBaseURL is where Ollama listens unless told otherwise.
@@ -177,7 +201,7 @@ func (d *Discoverer) Probe(ctx context.Context, req Request) Inventory {
 		}
 	}
 
-	found, note := d.probeOllama(ctx)
+	found, note := d.probeOllama(ctx, req)
 	if note != "" {
 		inv.ProbeNotes = append(inv.ProbeNotes, note)
 	}
@@ -214,6 +238,7 @@ func (d *Discoverer) Probe(ctx context.Context, req Request) Inventory {
 		return inv.Models[i].Runtime < inv.Models[j].Runtime
 	})
 	inv.Models, inv.ProbeNotes = resolveDuplicates(inv.Models, inv.ProbeNotes)
+	inv.ProbeNotes = append(inv.ProbeNotes, residentNotes(inv.Models, req.Resident)...)
 	return inv
 }
 
@@ -336,20 +361,73 @@ func (d *Discoverer) ollamaBaseURL() string {
 	return strings.TrimRight(host, "/")
 }
 
-// ollamaParallelism is the per-model concurrency this machine will claim.
+// envParallelism is OLLAMA_NUM_PARALLEL as the worker's own environment
+// states it, or zero when it is unset or not a positive number, and the name of
+// the place it was read.
+func (d *Discoverer) envParallelism() (int, string) {
+	value, from := d.getenv("OLLAMA_NUM_PARALLEL"), "the worker's environment"
+	if d != nil && d.ParallelEnv != nil {
+		value, from = d.ParallelEnv()
+	}
+	return ParseOllamaCount(value), from
+}
+
+// ParseOllamaCount reads a count out of the text of an environment variable
+// the way Ollama's own envconfig reads OLLAMA_NUM_PARALLEL: spaces are
+// trimmed, then any quotes around what is left, then strconv.ParseUint in
+// base ten. So "+2", "2.0", "0x2" and "1_0" are not counts -- Ollama logs them
+// as invalid and runs its default of one slot, and a ceiling read more
+// generously here would advertise slots that do not exist. Spaces INSIDE the
+// quotes are part of the text, as they are to Ollama.
+//
+// It returns zero for text that says no usable count: empty, invalid, zero
+// (Ollama's "decide for me"), or past what an int holds on every platform,
+// which would wrap when the machine ceiling is summed -- and a ceiling of
+// zero is the engine's "unlimited". A caller treats zero as "this source says
+// nothing" and moves on to the next.
+func ParseOllamaCount(s string) int {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	n, err := strconv.ParseUint(strings.Trim(s, "\"'"), 10, 31)
+	if err != nil {
+		return 0
+	}
+	return int(n)
+}
+
+// ParallelSource is the per-model concurrency this machine will claim and
+// the sentence-ready name of where it came from. The sources are read most
+// deliberate first: the owner's models.parallel, the worker's
+// OLLAMA_NUM_PARALLEL (the only knob there was before the policy key, so it
+// keeps its place ahead of the unit; a command that is not the worker reads it
+// through ParallelEnv), the unit this cockpit wrote for its own Ollama, and
+// one.
 //
 // ZERO IS NOT AN OPTION HERE, and this is the one place in the package
 // where absent is the PERMISSIVE direction rather than the safe one: the
 // engine reads a missing `max=` as unlimited. Left unset, a laptop with a
 // single 8B model would be handed as many concurrent generations as the
-// router had work for. So a ceiling is always declared -- OLLAMA_NUM_PARALLEL
-// when the operator set one, and otherwise one, which is what Ollama itself
-// falls back to when it cannot fit more.
-func (d *Discoverer) ollamaParallelism() int {
-	if v := strings.TrimSpace(d.getenv("OLLAMA_NUM_PARALLEL")); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
+// router had work for. So a ceiling is always declared, and a source that
+// holds a nonsense value is skipped rather than believed.
+//
+// The sources can disagree with the Ollama that is actually running --
+// the unit is edited and Ollama has not restarted yet -- and that is the
+// benign direction either way: a call admitted past the runtime's slots
+// queues inside Ollama, and a ceiling below them wastes a slot until the
+// next refresh.
+func (d *Discoverer) ParallelSource(configured int) (int, string) {
+	if configured > 0 {
+		return configured, "models.parallel in policy.yaml"
+	}
+	if n, from := d.envParallelism(); n > 0 {
+		return n, "OLLAMA_NUM_PARALLEL in " + from
+	}
+	if d != nil && d.ManagedParallel != nil {
+		if n := d.ManagedParallel(); n > 0 {
+			return n, "the memql-ollama.service unit"
 		}
 	}
-	return 1
+	return 1, "the default"
 }

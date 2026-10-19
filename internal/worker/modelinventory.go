@@ -2,10 +2,12 @@ package worker
 
 import (
 	"context"
+	"log/slog"
 	"sort"
 	"sync"
 	"time"
 
+	"github.com/znasllc-io/memql-cockpit/internal/worker/inference"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/models"
 	"github.com/znasllc-io/memql-cockpit/internal/worker/tools"
 )
@@ -71,6 +73,62 @@ type policyModelInventory struct {
 	now    func() time.Time
 }
 
+// newDiscoverer is the ONE place a models.Discoverer is built. Seven
+// commands and run paths probe this machine, and every one of them has to
+// read the same sources for the same facts -- the worker's environment, the
+// unit it manages -- or `memql worker models` prints a ceiling the worker
+// does not advertise. TestEveryDiscoveryIsBuiltInOnePlace holds the seven
+// to it.
+func newDiscoverer() *models.Discoverer {
+	return &models.Discoverer{ManagedParallel: inference.ManagedParallel}
+}
+
+// logModelCeilings says, for every model this machine serves, how many
+// requests the worker takes at once and where that number came from: one Info
+// line per model. It is the worker's own record, and the only one that cannot
+// differ from what it advertises. `memql worker models` runs in the owner's
+// shell and can only read the worker's environment file, as it is now, while
+// this line is written by the process that took its environment when it
+// started, from the sources discovery actually used.
+//
+// Only the models the machine serves are logged (Advertised): a blocked model,
+// or any model below the hardware floor, is offered no ceiling at all.
+func logModelCeilings(logger *slog.Logger, inv models.Inventory) {
+	for _, m := range inv.Advertised() {
+		logger.Info("model concurrency ceiling",
+			"model", m.ID, "model_max", m.MaxConcurrent, "source", m.CeilingSource)
+	}
+}
+
+// announceModelCeilings logs the ceilings from the shared inventory. It is
+// called when the worker starts and after every SIGHUP reload, and by `go`:
+// it asks the inventory, which probes Ollama when its cache is cold, and neither
+// the worker's start nor the goroutine that also handles SIGTERM may wait on
+// that. The inventory is cached for 90 seconds, so the registration that
+// follows reuses this probe. After a reload it must be called AFTER
+// RequestImmediateReadvertise, which drops the cache: otherwise it would log the
+// ceiling the old policy gave.
+func announceModelCeilings(ctx context.Context, logger *slog.Logger, inventory ModelInventory) {
+	if inventory == nil {
+		return
+	}
+	logModelCeilings(logger, inventory.Models(ctx))
+}
+
+// modelsRequest is what this machine's policy asks discovery: which models
+// may be offered, which runtimes are declared, and the owner's tuning --
+// the per-model ceiling and the models kept loaded. The ONE place that
+// reads those out of the policy, for newDiscoverer's reason.
+func modelsRequest(policy *tools.Policy) models.Request {
+	tuning := policy.ModelsTuning()
+	return models.Request{
+		Allow:    policy.ModelsAllow(),
+		Runtimes: policy.ModelRuntimes(),
+		Parallel: tuning.Parallel,
+		Resident: tuning.Resident,
+	}
+}
+
 // NewModelInventory builds the reporter the worker runs with.
 //
 // The discoverer is the CALLER's, not built here, because the runner's
@@ -78,7 +136,7 @@ type policyModelInventory struct {
 // one would read OLLAMA_HOST again, and two readings drift.
 func NewModelInventory(policy *tools.Policy, discoverer *models.Discoverer) ModelInventory {
 	if discoverer == nil {
-		discoverer = &models.Discoverer{}
+		discoverer = newDiscoverer()
 	}
 	return &policyModelInventory{
 		discoverer: discoverer,
@@ -103,10 +161,7 @@ func (p *policyModelInventory) Models(ctx context.Context) models.Inventory {
 	if !p.at.IsZero() && p.clock().Sub(p.at) < p.ttl {
 		return p.cached
 	}
-	p.cached = p.discoverer.Discover(ctx, models.Request{
-		Allow:    p.policy.ModelsAllow(),
-		Runtimes: p.policy.ModelRuntimes(),
-	})
+	p.cached = p.discoverer.Discover(ctx, modelsRequest(p.policy))
 	p.at = p.clock()
 	return p.cached
 }
