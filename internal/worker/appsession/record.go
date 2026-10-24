@@ -97,6 +97,20 @@ func (k sessionSink) Record(a harness.Action) {
 // policy, and sends it.
 func (s *session) recordAction(a harness.Action) {
 	s.contentPolicy().fill(a.Contents)
+	s.mu.Lock()
+	if s.written == nil {
+		s.written = map[string]bool{}
+	}
+	for _, c := range a.Contents {
+		if c.Op == harness.ContentWrite {
+			path := c.Path
+			if !filepath.IsAbs(path) {
+				path = filepath.Join(s.workspace, path)
+			}
+			s.written[filepath.Clean(path)] = true
+		}
+	}
+	s.mu.Unlock()
 	body, err := encodeAction(a, maxActionBytes)
 	if err != nil {
 		// Not sent at all. The action seq is dense, so the hole this leaves
@@ -324,6 +338,16 @@ func (p *contentPolicy) mayCarry(op, real string, data, seen []byte) bool {
 	for _, dir := range strings.Split(filepath.ToSlash(filepath.Dir(rel)), "/") {
 		if pushExcludedDirs[strings.ToLower(dir)] {
 			return false
+		}
+	}
+	// Selection is not the only upload path: recheck every ancestor on the
+	// resolved path before carrying a write's bytes or retaining an output.
+	for dir := filepath.Dir(real); ; dir = filepath.Dir(dir) {
+		if isBrowserRuntimeDir(dir) {
+			return false
+		}
+		if dir == p.root || filepath.Dir(dir) == dir {
+			break
 		}
 	}
 	return true

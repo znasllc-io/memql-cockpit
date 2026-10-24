@@ -244,6 +244,14 @@ Four rules here are load-bearing, and each is the kind that fails silently:
    enough: every write is recorded in a ledger under the state dir, and
    `appsession.Sweep` clears what a SIGKILL left behind at the next start.
 
+**A RUN WORKSPACE IS SHARED; SESSION SCAFFOLDING IS NOT.** Transcripts, Claude
+configs, and interactive launcher/exit paths have exclusive names inside
+`.memql-session/`. New Codex conversations get private homes. A workspace-local
+ref index lets attach reuse provider state after credential cleanup, guarded by
+an OS lock so a second attach cannot replace an active bearer. Legacy refs use
+only the old home in that workspace. Keep provider state separate from credential
+lifetime; randomizing every attach home silently loses the conversation.
+
 **AN EMPTY `AppSessionStart.workspace` IS THE MACHINE'S CHOICE**, never a
 refusal: the engine cannot know a path here. `appsession/workspace.go` makes
 `<fs.workspace_root or the platform data dir>/<home>/<run_id or session_id>`,
@@ -260,6 +268,15 @@ worker's own files (`sessionWorkerPaths`: the config dir, state, token file,
 consent socket) or an `fs.deny` entry is refused -- `CheckPath` alone accepts
 `$HOME` and `/`. The same paths reach the app as `harness.Spec.DenyPaths`,
 denied for READING too: without them the sandbox confines writes alone.
+
+**BROWSER PROFILES ARE RUNTIME, NOT OUTPUT.** Chromium user-data roots may have
+arbitrary names beside the proof they produced. `isBrowserRuntimeDir` recognizes
+multiple on-disk markers without reading their contents; collection, snapshots,
+fingerprints and write-byte retention share that boundary. Keep sibling PNGs,
+scripts and receipts. Do not solve over-retention by deleting work or weakening
+the output archive's integrity checks. Other task-owned runtime belongs under
+an already-excluded cache directory; cleanup and old Library artifacts are
+separate from future selection.
 
 **CLAUDE CODE'S PERMISSIONS ARE IN THE ARGV, NOT IN ~/.claude**
 (`claudeGrantArgs`): `--setting-sources=` (no settings file),
@@ -917,7 +934,8 @@ directory (`.git/config` holds remote URLs and their tokens). A file
 holding any credential the session was given travels as neither data nor
 digest (`contains_credential`), at any size -- it is scanned in the pass
 that hashes it -- and the end-of-session push skips it too
-(`redactor.holdsFile`): the redactor rewrites text on its way out, but it
+(`contentPolicy.readOutput` scans the same bytes it bundles and hashes):
+the redactor rewrites text on its way out, but it
 never sees inside base64 or a file pushed whole, and the bearer cannot be
 revoked. A remembered digest is trusted only while the redactor holds no
 new credential. 256 KiB per file and 1 MiB per action travel inline; up to 64 MiB
